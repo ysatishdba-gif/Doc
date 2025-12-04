@@ -51,13 +51,25 @@ TASKS:
    - Each intent: intent_title, description, nature, sub_nature
    - Each sub_nature: category, elements, entities
 
-3. FINAL QUERIES GENERATION:
-   - Every element in each sub_nature must appear in at least one final query
-   - Queries must be concise (2–5 words), clinically meaningful
-   - Combine related elements when appropriate
-   - Cover all dimensions (anatomical, temporal, severity, triggers, associated symptoms)
+3. Drill down dynamically into each intent and sub_nature:
+   - For example, for intent "current medication" -> "medications being taken as of {date}"
+   - Dynamically identify sub-components such as:
+     Medication name (Generic Name, Brand Name, Standardized codes)
+     Dosage information (Strength, Dosage, Form, Quantity)
+     Administration instructions (Prescribing provider, Order type, Order number, Date/time)
+     Status and dates (Start date, End date, Medication status)
+     Dispensing info (Lot number, Manufacturer, Expiry date)
+     Patient info (Patient name, Patient ID, Allergies, Diagnoses)
+     Documentation details (Date/time of administration, Admin initials, Confirmation)
+   - Do NOT hardcode; generate sub-components dynamically based on the intent and context
+
+4. FINAL QUERIES GENERATION:
+   - Every element and sub-component must appear in at least one final query
+   - Queries must be clinically meaningful and concise (2–6 words)
+   - Combine related elements where clinically appropriate
+   - Include temporal, status, and patient-specific dimensions
    - Remove duplicates
-   - Ensure traceability to taxonomy elements (nature, sub_nature, category, elements)
+   - Maintain traceability to hierarchy (nature, sub_nature, category, elements)
 
 Return structured JSON:
 {{
@@ -74,9 +86,12 @@ Return structured JSON:
       "sub_nature": [
         {{
           "category": "string",
-          "elements": ["concept1", "concept2"],
+          "elements": ["concept1", "concept2", "sub-component1", "sub-component2"],
           "entities": ["entity_type1", "entity_type2"]
         }}
+      ],
+      "final_queries": [
+        "concise, clinically meaningful query combining related elements and sub-components"
       ]
     }}
   ]
@@ -92,7 +107,7 @@ Timestamp: {timestamp}
 class ContextualIntentPipeline:
     """
     Clinical intent extraction pipeline with fully dynamic LLM reasoning.
-    Final queries generated inline, covering all elements.
+    Final queries generated inline, covering all sub-components.
     """
 
     def __init__(self, project: str, location: str = "us-central1", 
@@ -154,28 +169,6 @@ class ContextualIntentPipeline:
         }
 
     # ======================================================
-    # UTILITY: DYNAMIC FINAL QUERY GENERATION
-    # ======================================================
-    def _generate_final_queries(self, sub_natures: List[Dict[str, Any]]) -> List[str]:
-        """
-        Convert all elements in sub_natures into concise, clinically meaningful final queries.
-        Each element must appear at least once.
-        """
-        final_queries = []
-        for sub in sub_natures:
-            elements = sub.get("elements", [])
-            for elem in elements:
-                final_queries.append(elem.strip())
-        # Remove duplicates while preserving order
-        seen = set()
-        final_queries_clean = []
-        for q in final_queries:
-            if q not in seen:
-                final_queries_clean.append(q)
-                seen.add(q)
-        return final_queries_clean
-
-    # ======================================================
     # STEP 2: INTENT EXTRACTION + FINAL QUERY GENERATION
     # ======================================================
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
@@ -198,13 +191,16 @@ class ContextualIntentPipeline:
             }
 
         intents = data.get("intents", [])
-        for intent in intents:
-            sub_natures = intent.get("sub_nature", [])
-            intent["final_queries"] = self._generate_final_queries(sub_natures)
+        validated_intents = []
+        for idx, intent in enumerate(intents):
+            if "final_queries" not in intent or not intent["final_queries"]:
+                print(f"⚠️ Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
+                continue
+            validated_intents.append(intent)
 
         return {
-            "intents": intents,
-            "total_intents_detected": data.get("total_intents_detected", len(intents)),
+            "intents": validated_intents,
+            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
             "is_clinical": True,
             "original_query": data.get("original_query", original_query),
             "expanded_query": data.get("expanded_query", expanded_query)
@@ -217,10 +213,12 @@ class ContextualIntentPipeline:
         start_time = datetime.utcnow()
         if verbose: print(f"Original Query: {query}")
 
+        # Step 1: Expansion
         expansion_result = self.expand_query(query)
         expanded_query = expansion_result["expanded_query"]
         if verbose: print(f"Expanded Query: {expanded_query}")
 
+        # Step 2: Intent extraction + final queries
         intent_result = self.extract_intents(query, expanded_query)
         if not intent_result.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
@@ -261,18 +259,17 @@ class ContextualIntentPipeline:
             "timestamp": datetime.utcnow().isoformat()
         }
 
-
 # ======================================================
 # EXAMPLE USAGE
 # ======================================================
 if __name__ == "__main__":
-    PROJECT_ID = "your-gcp-project-id"  # Replace with your GCP project ID
+    PROJECT_ID = "your-gcp-project-id"
     pipeline = ContextualIntentPipeline(project=PROJECT_ID)
 
     test_queries = [
-        "Family history of diabetes",
+        "Current medications for patient",
         "Patient with chest pain and shortness of breath",
-        "List all current medications as of 11/25/2025"
+        "Family history of diabetes"
     ]
 
     for idx, query in enumerate(test_queries, 1):
