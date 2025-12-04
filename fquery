@@ -9,17 +9,17 @@ from vertexai.generative_models import GenerativeModel
 # PROMPT FOR QUERY EXPANSION
 # ======================================================
 QUERY_EXPANSION_PROMPT = """
-You are an expert medical AI assistant specializing in clinical query expansion.
+You are an expert clinical AI assistant.
 
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
 
 INSTRUCTIONS:
-1. Expand all medical abbreviations
-2. Clarify vague terms
-3. Add relevant clinical context
-4. Identify implicit clinical concepts
-5. Do NOT hallucinate beyond reasonable interpretation
-6. Maintain original query intent
+1. Expand all medical abbreviations.
+2. Clarify vague terms.
+3. Add relevant clinical context.
+4. Identify implicit clinical concepts.
+5. Do NOT hallucinate beyond reasonable interpretation.
+6. Maintain original query intent.
 
 Return ONLY valid JSON:
 {{
@@ -35,7 +35,7 @@ User Input: {query}
 # PROMPT FOR INTENT EXTRACTION + FINAL QUERY GENERATION
 # ======================================================
 INTENT_EXTRACTION_FULL_QUERY_PROMPT = """
-You are an expert clinical intent extraction and CUI-optimized query engine.
+You are an expert clinical intent extraction and query engine.
 
 TASKS:
 
@@ -47,31 +47,30 @@ TASKS:
   "intents": []
 }}
 
-2. If clinical, extract all intents and their hierarchy:
-   - Each intent: intent_title, description, nature, sub_nature
-   - Each sub_nature: category, elements, entities
+2. If clinical, perform a FULL DYNAMIC DRILL-DOWN of all detected intents:
+   - For each intent:
+     - Identify intent_title and description
+     - Determine nature and sub_nature
+     - Dynamically identify sub-components (categories and elements) relevant to that intent
+       - Example categories for any intent (illustrative, do NOT hardcode):
+         Medication name (Generic Name, Brand Name, Standardized codes)
+         Dosage info (Strength, Dosage, Form, Quantity)
+         Administration instructions (Prescribing provider, Order type, Order number, Date/time)
+         Status and dates (Start date, End date, Medication status)
+         Dispensing info (Lot number, Manufacturer, Expiry date)
+         Patient info (Patient name, Patient ID, Allergies, Diagnoses)
+         Documentation details (Date/time of administration, Admin initials, Confirmation)
+   - The model should dynamically create similar sub-components for ANY clinical intent.
 
-3. Drill down dynamically into each intent and sub_nature:
-   - For example, for intent "current medication" -> "medications being taken as of {date}"
-   - Dynamically identify sub-components such as:
-     Medication name (Generic Name, Brand Name, Standardized codes)
-     Dosage information (Strength, Dosage, Form, Quantity)
-     Administration instructions (Prescribing provider, Order type, Order number, Date/time)
-     Status and dates (Start date, End date, Medication status)
-     Dispensing info (Lot number, Manufacturer, Expiry date)
-     Patient info (Patient name, Patient ID, Allergies, Diagnoses)
-     Documentation details (Date/time of administration, Admin initials, Confirmation)
-   - Do NOT hardcode; generate sub-components dynamically based on the intent and context
+3. Generate FINAL QUERIES:
+   - Every element in each sub_nature must appear in at least one query.
+   - Queries must be clinically meaningful and concise (2–5 words).
+   - Combine related elements when appropriate.
+   - Cover all dimensions: anatomical, temporal, severity, triggers, associated symptoms.
+   - Remove duplicates.
+   - Ensure traceability to taxonomy elements.
 
-4. FINAL QUERIES GENERATION:
-   - Every element and sub-component must appear in at least one final query
-   - Queries must be clinically meaningful and concise (2–6 words)
-   - Combine related elements where clinically appropriate
-   - Include temporal, status, and patient-specific dimensions
-   - Remove duplicates
-   - Maintain traceability to hierarchy (nature, sub_nature, category, elements)
-
-Return structured JSON:
+Return JSON ONLY in the following structure:
 {{
   "is_clinical": true,
   "reason": "",
@@ -86,12 +85,14 @@ Return structured JSON:
       "sub_nature": [
         {{
           "category": "string",
-          "elements": ["concept1", "concept2", "sub-component1", "sub-component2"],
-          "entities": ["entity_type1", "entity_type2"]
+          "elements": ["concept1", "concept2", "..."],
+          "entities": ["entity_type1", "entity_type2", "..."]
         }}
       ],
       "final_queries": [
-        "concise, clinically meaningful query combining related elements and sub-components"
+        "concise query 1",
+        "concise query 2",
+        "..."
       ]
     }}
   ]
@@ -107,11 +108,19 @@ Timestamp: {timestamp}
 class ContextualIntentPipeline:
     """
     Clinical intent extraction pipeline with fully dynamic LLM reasoning.
-    Final queries generated inline, covering all sub-components.
+    Final queries generated inline, covering all elements.
     """
 
     def __init__(self, project: str, location: str = "us-central1", 
                  model: str = "gemini-2.0-flash-exp"):
+        """
+        Initialize pipeline with GCP Vertex AI.
+
+        Args:
+            project: GCP project ID
+            location: GCP region
+            model: Vertex AI model name
+        """
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
 
@@ -263,13 +272,13 @@ class ContextualIntentPipeline:
 # EXAMPLE USAGE
 # ======================================================
 if __name__ == "__main__":
-    PROJECT_ID = "your-gcp-project-id"
+    PROJECT_ID = "your-gcp-project-id"  # Replace with your GCP project ID
     pipeline = ContextualIntentPipeline(project=PROJECT_ID)
 
     test_queries = [
-        "Current medications for patient",
-        "Patient with chest pain and shortness of breath",
-        "Family history of diabetes"
+        "Patient taking multiple medications for hypertension and diabetes",
+        "History of chest pain with shortness of breath",
+        "Allergies to penicillin and sulfa drugs"
     ]
 
     for idx, query in enumerate(test_queries, 1):
