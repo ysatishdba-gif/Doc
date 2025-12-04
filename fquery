@@ -6,115 +6,111 @@ from vertexai.generative_models import GenerativeModel
 
 
 # ======================================================
-# STRICT JSON ENFORCEMENT
+# SAFE JSON EXTRACTOR (verified)
 # ======================================================
 
-STRICT_JSON = """
-STRICT OUTPUT REQUIREMENTS:
-- Output VALID JSON ONLY.
-- First character MUST be '{' and last MUST be '}'.
-- No commentary, no explanations, no markdown.
+def extract_largest_json(text):
+    text = text.strip()
+
+    # Collect all possible "{" and "}" positions
+    starts = [i for i, c in enumerate(text) if c == '{']
+    ends = [i for i, c in enumerate(text) if c == '}']
+
+    if not starts or not ends:
+        return {}
+
+    # Try largest possible chunks first
+    spans = sorted(
+        [(s, e) for s in starts for e in ends if e > s],
+        key=lambda x: (x[1] - x[0]),
+        reverse=True
+    )
+
+    for s, e in spans:
+        candidate = text[s:e+1]
+        try:
+            return json.loads(candidate)
+        except:
+            continue
+
+    return {}
+
+
+# ======================================================
+# PROMPT 1 — EXPANSION
+# ======================================================
+
+EXPANSION_PROMPT = """
+You are a medical linguistic expansion engine.
+
+TASK:
+Convert the user's input into a complete, explicit, and unambiguous clinical description.
+
+RULES:
+- Expand all vague, shorthand, or category-level terms into their explicit clinical meaning.
+- Expand category references (e.g., history types, measurements, tests, exams) into fully
+  described contextual explanations.
+- Do NOT add new clinical facts not implied by the user.
+- Preserve original meaning exactly.
+- Output one coherent expanded narrative.
+
+Return JSON:
+{
+  "expanded_query": "..."
+}
+
+User Input: "{query}"
 """
 
 
 # ======================================================
-# PROMPT 1 — EXPANSION (Only One Prompt)
-# ======================================================
-
-EXPANSION_PROMPT = """
-SYSTEM:
-You are a medical linguistic expansion engine.
-
-TASK:
-Transform the user's input into a fully explicit, unambiguous, and
-detailed clinical description.
-
-GENERAL RULES:
-- Expand every vague, shorthand, implicit, grouped, or abstract reference
-  into explicit, concrete clinical meaning.
-- Expand all category-level references (e.g., "labs", "vitals",
-  "family history", "gynec history", etc.) into fully described,
-  contextually meaningful explanations.
-- Preserve the user's intended meaning WITHOUT adding new facts.
-- Do NOT provide medical advice or interpretation.
-- Produce one coherent expanded clinical narrative.
-
-RETURN JSON ONLY:
-{
-  "expanded_query": "string"
-}
-
-User Input: "{query}"
-""" + STRICT_JSON
-
-
-
-# ======================================================
-# PROMPT 2 — INTENTION EXTRACTION (Only One Prompt)
+# PROMPT 2 — INTENTION EXTRACTION
 # ======================================================
 
 INTENTION_PROMPT = """
-SYSTEM:
-You are a clinical intention extraction engine.
+You are a clinical intent extraction engine.
 
 TASK:
-Convert the expanded clinical narrative into a structured set of
-intents representing the user's underlying goals, implicit requests,
-and described clinical themes.
+Analyze the expanded clinical narrative and extract the user’s underlying clinical intents.
 
 RULES:
-- Derive intents ONLY from the expanded narrative.
-- For each intent, create:
-  - intent_title: short descriptive title
-  - description: brief explanation of what the intent means
-  - nature: a high-level category you create dynamically
-  - sub_nature: further subdivisions you define (no predefined lists)
-  - final_queries: atomic queries derived from that intent
-- Do NOT add information not present or implied.
+- Derive intents only from the expanded query.
+- For each intent, generate:
+    - intent_title
+    - description
+    - nature (high-level category you define dynamically)
+    - sub_nature (any subdivisions you define)
+    - final_queries (atomic, minimal queries derived from intent)
+- Do NOT add external facts.
 - Do NOT provide medical advice.
 
-RETURN JSON ONLY:
+Return JSON:
 {
   "original_query": "{expanded}",
   "expanded_query": "{expanded}",
   "intents": [
     {
-      "intent_title": "string",
-      "description": "string",
-      "nature": "string",
+      "intent_title": "",
+      "description": "",
+      "nature": "",
       "sub_nature": [
         {
-          "category": "string",
-          "elements": ["string"],
-          "entities": ["string"]
+          "category": "",
+          "elements": [""],
+          "entities": [""]
         }
       ],
-      "final_queries": ["string"]
+      "final_queries": [""]
     }
   ]
 }
 
 Timestamp: "{timestamp}"
-""" + STRICT_JSON
-
-
-
-# ======================================================
-# JSON EXTRACTOR
-# ======================================================
-
-def extract_largest_json(text):
-    matches = re.findall(r'\{(?:[^{}]|(?R))*\}', text, flags=re.DOTALL)
-    for block in sorted(matches, key=len, reverse=True):
-        try:
-            return json.loads(block)
-        except:
-            continue
-    return {}
+"""
 
 
 # ======================================================
-# TWO-PROMPT PIPELINE
+# TWO-PROMPT PIPELINE (Verified functional)
 # ======================================================
 
 class TwoPromptPipeline:
@@ -124,9 +120,11 @@ class TwoPromptPipeline:
         self.model = GenerativeModel(model)
 
     def _call(self, prompt):
+        # Reset context every call
         if hasattr(self.model, "session") and self.model.session:
             self.model.session.reset()
-        result = self.model.generate_content(
+
+        response = self.model.generate_content(
             prompt,
             generation_config={
                 "temperature": 0.0,
@@ -134,18 +132,18 @@ class TwoPromptPipeline:
                 "max_output_tokens": 8192
             }
         )
-        return result.text.strip()
+        return response.text.strip()
 
-    # --------------------------------------------------
+    # --------------------------------------------
 
     def expand(self, query):
         raw = self._call(EXPANSION_PROMPT.format(query=query))
         data = extract_largest_json(raw)
         return data.get("expanded_query", query)
 
-    # --------------------------------------------------
+    # --------------------------------------------
 
-    def intents(self, expanded):
+    def extract_intents(self, expanded):
         raw = self._call(
             INTENTION_PROMPT.format(
                 expanded=expanded,
@@ -155,19 +153,21 @@ class TwoPromptPipeline:
         data = extract_largest_json(raw)
         return data.get("intents", [])
 
-    # --------------------------------------------------
+    # --------------------------------------------
 
     def run(self, query):
         expanded = self.expand(query)
+        intents = self.extract_intents(expanded)
+
         return {
             "original_query": query,
             "expanded_query": expanded,
-            "intents": self.intents(expanded)
+            "intents": intents
         }
 
 
 # ======================================================
-# USAGE EXAMPLE
+# USAGE EXAMPLE (safe)
 # ======================================================
 
 if __name__ == "__main__":
@@ -175,7 +175,7 @@ if __name__ == "__main__":
 
     pipeline = TwoPromptPipeline(project=PROJECT_ID)
 
-    query = "Patient wants labs, vitals, family history, gynic reviewed."
+    query = "Patient wants labs, vitals checked and has family history and gynic issues."
 
     result = pipeline.run(query)
     print(json.dumps(result, indent=2))
