@@ -77,11 +77,6 @@ Return structured JSON:
           "elements": ["concept1", "concept2"],
           "entities": ["entity_type1", "entity_type2"]
         }}
-      ],
-      "final_queries": [
-        "concise query 1",
-        "concise query 2",
-        "... (each element must appear at least once in final_queries)"
       ]
     }}
   ]
@@ -102,14 +97,6 @@ class ContextualIntentPipeline:
 
     def __init__(self, project: str, location: str = "us-central1", 
                  model: str = "gemini-2.0-flash-exp"):
-        """
-        Initialize pipeline with GCP Vertex AI.
-
-        Args:
-            project: GCP project ID
-            location: GCP region
-            model: Vertex AI model name
-        """
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
 
@@ -167,6 +154,28 @@ class ContextualIntentPipeline:
         }
 
     # ======================================================
+    # UTILITY: DYNAMIC FINAL QUERY GENERATION
+    # ======================================================
+    def _generate_final_queries(self, sub_natures: List[Dict[str, Any]]) -> List[str]:
+        """
+        Convert all elements in sub_natures into concise, clinically meaningful final queries.
+        Each element must appear at least once.
+        """
+        final_queries = []
+        for sub in sub_natures:
+            elements = sub.get("elements", [])
+            for elem in elements:
+                final_queries.append(elem.strip())
+        # Remove duplicates while preserving order
+        seen = set()
+        final_queries_clean = []
+        for q in final_queries:
+            if q not in seen:
+                final_queries_clean.append(q)
+                seen.add(q)
+        return final_queries_clean
+
+    # ======================================================
     # STEP 2: INTENT EXTRACTION + FINAL QUERY GENERATION
     # ======================================================
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
@@ -188,18 +197,14 @@ class ContextualIntentPipeline:
                 "expanded_query": expanded_query
             }
 
-        # Validate that all intents have final_queries
         intents = data.get("intents", [])
-        validated_intents = []
-        for idx, intent in enumerate(intents):
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"⚠️ Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            validated_intents.append(intent)
+        for intent in intents:
+            sub_natures = intent.get("sub_nature", [])
+            intent["final_queries"] = self._generate_final_queries(sub_natures)
 
         return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
+            "intents": intents,
+            "total_intents_detected": data.get("total_intents_detected", len(intents)),
             "is_clinical": True,
             "original_query": data.get("original_query", original_query),
             "expanded_query": data.get("expanded_query", expanded_query)
@@ -212,12 +217,10 @@ class ContextualIntentPipeline:
         start_time = datetime.utcnow()
         if verbose: print(f"Original Query: {query}")
 
-        # Step 1: Expansion
         expansion_result = self.expand_query(query)
         expanded_query = expansion_result["expanded_query"]
         if verbose: print(f"Expanded Query: {expanded_query}")
 
-        # Step 2: Intent extraction + final queries
         intent_result = self.extract_intents(query, expanded_query)
         if not intent_result.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
@@ -258,6 +261,7 @@ class ContextualIntentPipeline:
             "timestamp": datetime.utcnow().isoformat()
         }
 
+
 # ======================================================
 # EXAMPLE USAGE
 # ======================================================
@@ -268,7 +272,7 @@ if __name__ == "__main__":
     test_queries = [
         "Family history of diabetes",
         "Patient with chest pain and shortness of breath",
-        "What is the weather like today?"
+        "List all current medications as of 11/25/2025"
     ]
 
     for idx, query in enumerate(test_queries, 1):
