@@ -6,57 +6,60 @@ from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel
 
 # ======================================================
-# PROMPTS
+# PROMPT FOR QUERY EXPANSION
 # ======================================================
-
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 
-TASK: Expand the user's query into a detailed clinical description.
+TASK: Expand the user's query into a comprehensive, detailed clinical description.
 
 INSTRUCTIONS:
-1. Expand ALL medical abbreviations (e.g., HTN → Hypertension)
-2. Clarify vague medical terms
-3. Add relevant context
+1. Expand all medical abbreviations
+2. Clarify vague terms
+3. Add relevant clinical context
 4. Identify implicit clinical concepts
-5. Do NOT hallucinate or add assumptions
+5. Do NOT hallucinate beyond reasonable interpretation
+6. Maintain original query intent
 
 Return ONLY valid JSON:
 {{
   "expanded_query": "comprehensive expanded clinical description",
   "abbreviations_expanded": ["list of abbreviations expanded"],
-  "concepts_added": ["list of concepts made explicit"]
+  "concepts_added": ["list of concepts added"]
 }}
 
 User Input: {query}
 """
 
-INTENT_EXTRACTION_REFINED_PROMPT = """
-You are an expert clinical intent extraction engine.
+# ======================================================
+# PROMPT FOR INTENT EXTRACTION + FINAL QUERY GENERATION
+# ======================================================
+INTENT_EXTRACTION_FULL_QUERY_PROMPT = """
+You are an expert clinical intent extraction and CUI-optimized query engine.
 
 TASKS:
 
-1. Determine if the query is CLINICAL.
-   - If NOT clinical, return:
+1. Verify if the query is CLINICAL.
+   - If NOT, return:
 {{
   "is_clinical": false,
   "reason": "Query is not clinical",
   "intents": []
 }}
 
-2. If clinical, extract all relevant intents and their hierarchy:
-   - Each intent must include: intent_title, description, nature, sub_nature
-   - Each sub_nature must include: category, elements, entities
+2. If clinical, extract all intents and their hierarchy:
+   - Each intent: intent_title, description, nature, sub_nature
+   - Each sub_nature: category, elements, entities
 
-3. For each intent, generate FINAL QUERIES that satisfy:
-   - Based explicitly on nature, sub_nature, category, and elements
-   - Concise: 2–5 words
+3. FINAL QUERIES GENERATION:
+   - Every element in each sub_nature must appear in at least one final query
+   - Queries must be concise (2–5 words), clinically meaningful
+   - Combine related elements when appropriate
+   - Cover all dimensions (anatomical, temporal, severity, triggers, associated symptoms)
    - Remove duplicates
-   - Each query should cover multiple dimensions: anatomical, temporal, severity, functional, triggers, associated symptoms
-   - Target 2–15 CUIs per query
-   - Ensure traceability to taxonomy elements
+   - Ensure traceability to taxonomy elements (nature, sub_nature, category, elements)
 
-4. Return structured JSON exactly in this format:
+Return structured JSON:
 {{
   "is_clinical": true,
   "reason": "",
@@ -77,7 +80,8 @@ TASKS:
       ],
       "final_queries": [
         "concise query 1",
-        "concise query 2"
+        "concise query 2",
+        "... (each element must appear at least once in final_queries)"
       ]
     }}
   ]
@@ -88,16 +92,24 @@ Timestamp: {timestamp}
 """
 
 # ======================================================
-# PIPELINE
+# CONTEXTUAL INTENT PIPELINE
 # ======================================================
-
-class RefinedIntentPipeline:
+class ContextualIntentPipeline:
     """
-    Clinical intent extraction pipeline with built-in query refinement.
+    Clinical intent extraction pipeline with fully dynamic LLM reasoning.
+    Final queries generated inline, covering all elements.
     """
 
-    def __init__(self, project: str, location: str = "us-central1",
+    def __init__(self, project: str, location: str = "us-central1", 
                  model: str = "gemini-2.0-flash-exp"):
+        """
+        Initialize pipeline with GCP Vertex AI.
+
+        Args:
+            project: GCP project ID
+            location: GCP region
+            model: Vertex AI model name
+        """
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
 
@@ -127,20 +139,26 @@ class RefinedIntentPipeline:
         except json.JSONDecodeError:
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
+                try: return json.loads(match.group(0))
+                except: pass
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try: return json.loads(match.group(0))
+                except: pass
+            print(f"Failed to parse JSON from response: {text[:200]}")
             return {}
 
-    # -------------------------------
-    # STEP 1: Query Expansion
-    # -------------------------------
+    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
+        return all(key in data for key in required_keys)
+
+    # ======================================================
+    # STEP 1: QUERY EXPANSION
+    # ======================================================
     def expand_query(self, query: str) -> Dict[str, Any]:
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
         raw_response = self._call_model(prompt)
         data = self._safe_json(raw_response)
-        if "expanded_query" not in data:
+        if not self._validate_json_structure(data, ["expanded_query"]):
             return {"expanded_query": query, "abbreviations_expanded": [], "concepts_added": []}
         return {
             "expanded_query": data.get("expanded_query", query),
@@ -148,11 +166,11 @@ class RefinedIntentPipeline:
             "concepts_added": data.get("concepts_added", [])
         }
 
-    # -------------------------------
-    # STEP 2: Intent Extraction + Refined Query Generation
-    # -------------------------------
-    def extract_intents_refined(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-        prompt = INTENT_EXTRACTION_REFINED_PROMPT.format(
+    # ======================================================
+    # STEP 2: INTENT EXTRACTION + FINAL QUERY GENERATION
+    # ======================================================
+    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+        prompt = INTENT_EXTRACTION_FULL_QUERY_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
             timestamp=datetime.utcnow().isoformat()
@@ -165,31 +183,45 @@ class RefinedIntentPipeline:
                 "intents": [],
                 "total_intents_detected": 0,
                 "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query not clinical"),
+                "rejected_reason": data.get("reason", "Query is not clinical"),
                 "original_query": original_query,
                 "expanded_query": expanded_query
             }
-        return data
 
-    # -------------------------------
-    # RUN FULL PIPELINE
-    # -------------------------------
+        # Validate that all intents have final_queries
+        intents = data.get("intents", [])
+        validated_intents = []
+        for idx, intent in enumerate(intents):
+            if "final_queries" not in intent or not intent["final_queries"]:
+                print(f"⚠️ Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
+                continue
+            validated_intents.append(intent)
+
+        return {
+            "intents": validated_intents,
+            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
+            "is_clinical": True,
+            "original_query": data.get("original_query", original_query),
+            "expanded_query": data.get("expanded_query", expanded_query)
+        }
+
+    # ======================================================
+    # FULL PIPELINE
+    # ======================================================
     def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
         start_time = datetime.utcnow()
-        if verbose:
-            print(f"Original Query: {query}")
+        if verbose: print(f"Original Query: {query}")
 
+        # Step 1: Expansion
         expansion_result = self.expand_query(query)
         expanded_query = expansion_result["expanded_query"]
-        if verbose:
-            print(f"Expanded Query: {expanded_query}")
+        if verbose: print(f"Expanded Query: {expanded_query}")
 
-        intent_result = self.extract_intents_refined(query, expanded_query)
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
-
+        # Step 2: Intent extraction + final queries
+        intent_result = self.extract_intents(query, expanded_query)
         if not intent_result.get("is_clinical", True):
-            if verbose:
-                print(f"Status: NON-CLINICAL | Time: {processing_time:.2f}s\n")
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            if verbose: print(f"Status: NON-CLINICAL | Processing Time: {processing_time:.2f}s")
             return {
                 "original_query": query,
                 "expanded_query": expanded_query,
@@ -203,10 +235,11 @@ class RefinedIntentPipeline:
         intents = intent_result.get("intents", [])
         total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
         total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
 
         if verbose:
             print(f"Status: CLINICAL | Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
-            print(f"Processing Time: {processing_time:.2f}s\n")
+            print(f"Processing Time: {processing_time:.2f}s")
 
         return {
             "original_query": query,
@@ -226,17 +259,11 @@ class RefinedIntentPipeline:
         }
 
 # ======================================================
-# USAGE EXAMPLE
+# EXAMPLE USAGE
 # ======================================================
-
 if __name__ == "__main__":
-    PROJECT_ID = "your-gcp-project-id"
-
-    pipeline = RefinedIntentPipeline(
-        project=PROJECT_ID,
-        location="us-central1",
-        model="gemini-2.0-flash-exp"
-    )
+    PROJECT_ID = "your-gcp-project-id"  # Replace with your GCP project ID
+    pipeline = ContextualIntentPipeline(project=PROJECT_ID)
 
     test_queries = [
         "Family history of diabetes",
@@ -247,7 +274,7 @@ if __name__ == "__main__":
     for idx, query in enumerate(test_queries, 1):
         print(f"\n{'='*80}\nQuery {idx}/{len(test_queries)}\n{'='*80}")
         result = pipeline.run(query, verbose=True)
-        output_filename = f"query_result_refined_{idx}.json"
+        output_filename = f"query_result_{idx}.json"
         with open(output_filename, 'w') as f:
             json.dump(result, f, indent=2)
         print(f"Saved to: {output_filename}")
