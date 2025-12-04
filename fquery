@@ -1,3 +1,48 @@
+INTENT_EXTRACTION_PROMPT = """
+You are an expert clinical intent extraction engine.
+
+⚠️ FIRST: Verify this is a CLINICAL query. If NOT related to healthcare/medical/clinical information, return:
+{{
+  "is_clinical": false,
+  "reason": "Query is not clinical in nature",
+  "intents": []
+}}
+
+TASK: Extract ALL clinical intents and generate specific queries optimized for CUI extraction.
+
+KEY PRINCIPLES:
+1. Create DEEP hierarchical taxonomies (3-5 levels minimum)
+2. Generate queries from ATOMIC ELEMENTS (deepest level only)
+3. Focus on CLINICAL RELEVANCE (10-40 queries per intent)
+4. Use CONCISE format (2-5 words per query)
+
+NATURE DETERMINATION - Ask yourself:
+- WHEN: Past/Present/Future?
+- WHY: Background/Assessment/Decision/Risk/Treatment?
+- HOW: Main/Supporting/Baseline?
+- WHERE: Patient/Measurement/Documentation/Calculation?
+
+SUB-NATURE STRUCTURE - CRITICAL:
+For EACH sub_nature, you MUST provide:
+1. **category**: Hierarchical classification (use"""
+===============================================================================
+CLINICAL INTENT EXTRACTION PIPELINE
+===============================================================================
+Production-ready system for extracting clinical intents from medical queries
+and generating optimized queries for CUI (Concept Unique Identifier) extraction.
+
+Features:
+- Deep hierarchical taxonomy generation (3-5 levels)
+- Principle-based LLM reasoning (no hardcoded rules)
+- Inline clinical validation
+- Optimized for speed (15-23 seconds per query)
+- Generates 10-40 focused queries per intent
+
+Author: Medical AI Team
+Version: 1.0
+===============================================================================
+"""
+
 import json
 import re
 from datetime import datetime
@@ -5,9 +50,19 @@ from typing import Dict, Any, List
 from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel
 
-# ======================================================
-# ENHANCED LLM PROMPTS - No Hardcoding
-# ======================================================
+
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
+
+PROJECT_ID = "your-gcp-project-id"  # TODO: Replace with your GCP project ID
+LOCATION = "us-central1"
+MODEL_NAME = "gemini-2.0-flash-exp"
+
+
+# ==============================================================================
+# LLM PROMPTS
+# ==============================================================================
 
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
@@ -15,558 +70,77 @@ You are an expert medical AI assistant specializing in clinical query expansion.
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
 
 INSTRUCTIONS:
-1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
+1. Expand ALL medical abbreviations (HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
 2. Clarify vague medical terms with specific clinical language
 3. Add relevant medical context based on standard clinical practice
-4. Identify implicit clinical concepts that should be explicit
-5. DO NOT add assumptions beyond reasonable clinical interpretation
-6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
-7. DO NOT hallucinate information not implied by the query
-8. Maintain the original query's intent and scope
+4. DO NOT add assumptions beyond reasonable clinical interpretation
+5. DO NOT hallucinate information not implied by the query
+6. Maintain the original query's intent and scope
 
-EXAMPLES:
-- "Pt with DM" → "Patient with Diabetes Mellitus"
-- "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
-- "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
-- "SOB on exertion" → "Shortness of breath on exertion"
-
-Return ONLY valid JSON (no markdown, no explanation):
+Return ONLY valid JSON:
 {{
   "expanded_query": "comprehensive expanded clinical description",
-  "abbreviations_expanded": ["list of abbreviations that were expanded"],
-  "concepts_added": ["list of medical concepts that were made explicit"]
+  "abbreviations_expanded": ["list of abbreviations expanded"],
+  "concepts_added": ["list of medical concepts made explicit"]
 }}
 
 User Input: {query}
 """
 
 INTENT_EXTRACTION_PROMPT = """
-You are an expert clinical intent extraction engine specialized in medical information retrieval and taxonomic classification.
+You are an expert clinical intent extraction engine.
 
-⚠️ FIRST: Verify this is a CLINICAL query. If the query is NOT related to healthcare, medical conditions, symptoms, treatments, or clinical information, return:
+⚠️ FIRST: Verify this is a CLINICAL query. If NOT related to healthcare/medical/clinical information, return:
 {{
   "is_clinical": false,
   "reason": "Query is not clinical in nature",
   "intents": []
 }}
 
-Examples of NON-CLINICAL queries to reject:
-- Weather, sports, entertainment, general knowledge
-- Technical/IT support unrelated to medical systems
-- Travel, food, shopping (unless medically relevant)
-
-If the query IS clinical, proceed with intent extraction.
-
-TASK: Extract ALL clinical intents from the expanded query and generate specific, granular queries optimized for CUI (Concept Unique Identifier) extraction.
-
-⚠️ CRITICAL: EVERY intent MUST have final_queries. Do NOT return any intent without final_queries array populated.
-
-UNDERSTANDING INTENTS:
-An intent represents a distinct clinical information need embedded in the query. Queries often contain multiple intents within a single text.
-
-INTENT STRUCTURE - HIERARCHICAL TAXONOMY:
-
-⚠️ CRITICAL: Create DEEP, MULTI-LEVEL taxonomies. Do NOT create shallow classifications.
-
-Each intent must have a HIERARCHICAL structure with multiple levels of decomposition:
-
-1. **intent_title**: Clear, specific title of the intent
-2. **description**: What this intent represents clinically and why it's needed
-3. **nature**: HIGH-LEVEL category representing the primary characteristic (Level 1)
-4. **sub_nature**: Array of DETAILED subcategories with DEEP taxonomic hierarchy (Levels 2-4+)
-
-**SUB_NATURE STRUCTURE - MULTI-LEVEL DECOMPOSITION:**
-
-Each sub_nature must drill down through MULTIPLE classification levels:
-
-```
-{
-  "category": "Level 2 - Broad Clinical Domain",
-  "subcategories": [
-    {
-      "name": "Level 3 - Specific Clinical Area",
-      "subdivisions": [
-        {
-          "name": "Level 4 - Granular Clinical Concept",
-          "elements": ["Level 5 - Most specific atomic elements"],
-          "entities": ["Medical entity types for ontology mapping"]
-        }
-      ]
-    }
-  ],
-  "elements": ["Discrete medical concepts at this level"],
-  "entities": ["Medical entity types"]
-}
-```
-
-**ALTERNATIVE FLATTENED STRUCTURE** (if JSON depth is an issue):
-```
-{
-  "category": "Level 2 Classification >> Level 3 Classification >> Level 4 Classification",
-  "elements": ["Most granular atomic concepts"],
-  "entities": ["Medical entity types"]
-}
-```
-
-**HIERARCHICAL CLASSIFICATION EXAMPLES:**
-
-These examples show the APPROACH, not a template. Apply the same deep thinking to ANY clinical concept.
-
-**Example 1 - Understanding Hierarchical Breakdown for Genetic Information:**
-
-When classifying hereditary disease information, think through these levels:
-```
-Level 1 (Nature): Clinical History
-Level 2: Hereditary Conditions
-Level 3: Body System (e.g., Endocrine/Metabolic, Cardiovascular, Neurological)
-Level 4: Specific Disease Category
-Level 5: Disease Subtypes/Variants
-
-Separate dimension - Relationships:
-Level 2: Family Relationships
-Level 3: Degree of Relation (First-degree, Second-degree)
-Level 4: Specific Relationship Type (Parents, Siblings, Grandparents)
-Level 5: Individual Relations (Father, Mother, etc.)
-
-Separate dimension - Disease Impact:
-Level 2: Disease Complications
-Level 3: Complication Type (Acute, Chronic, Systemic)
-Level 4: Organ System Affected
-Level 5: Specific Complications
-```
-
-**Example 2 - Understanding Hierarchical Breakdown for Symptom Information:**
-
-When classifying symptom characteristics, consider multiple dimensions:
-```
-Spatial Dimension:
-Level 2: Anatomical Characteristics
-Level 3: Location Type (Primary location, Radiation pattern)
-Level 4: Body Region
-Level 5: Specific Anatomical Sites
-
-Qualitative Dimension:
-Level 2: Sensory Characteristics  
-Level 3: Quality Category (Pressure-type, Sharp-type, Other)
-Level 4: Specific Descriptors
-
-Temporal Dimension:
-Level 2: Time-Related Characteristics
-Level 3: Aspect (Onset, Duration, Pattern)
-Level 4: Classification
-Level 5: Specific Values
-
-Intensity Dimension:
-Level 2: Severity Assessment
-Level 3: Measurement Type (Subjective scale, Functional impact)
-Level 4: Scale or Impact Category
-Level 5: Specific Levels
-
-Contextual Dimension:
-Level 2: Modifying Factors
-Level 3: Factor Type (Triggering, Relieving, Associated)
-Level 4: Category
-Level 5: Specific Factors
-```
-
-**Example 3 - Understanding Hierarchical Breakdown for Diagnostic Information:**
-
-When classifying laboratory or diagnostic data:
-```
-Level 1 (Nature): Diagnostic Investigation
-Level 2: Investigation Type (Laboratory, Imaging, etc.)
-Level 3: Clinical Domain (Chemistry, Hematology, Microbiology, etc.)
-Level 4: Test Category (e.g., Metabolic Markers, Cell Counts)
-Level 5: Specific Test Components
-```
-
-**THE PATTERN TO LEARN:**
-
-For ANY clinical concept, ask yourself:
-1. What is the broadest clinical category? (Nature)
-2. What major dimensions exist for this concept? (Multiple sub_nature branches)
-3. For EACH dimension, how does it break down from general to specific? (3-5 levels)
-4. What are the atomic elements at the lowest level? (Elements array)
-5. What other related concepts should be captured? (Additional dimensions)
-
-Then apply this systematic breakdown to create your taxonomy, regardless of whether it's a symptom, test, medication, procedure, or any other clinical entity.
-
-**DEPTH REQUIREMENTS:**
-
-1. **Minimum 3-4 levels of classification** for each clinical concept
-2. **Drill down from general to specific**: Broad Domain >> Specialty Area >> Clinical Category >> Specific Concept >> Atomic Elements
-3. **Create multiple sub_nature entries** representing different classification dimensions (anatomical, temporal, severity, functional, etc.)
-4. **Each level adds clinical specificity** that helps in precise documentation and retrieval
-
-**THINKING PROCESS FOR DEEP CLASSIFICATION:**
-
-For EACH clinical concept in the query, ask:
-1. What is the broadest category? (Nature)
-2. What clinical domain does it belong to? (Level 2)
-3. What specialty area within that domain? (Level 3)
-4. What specific clinical category? (Level 4)
-5. What are the atomic elements? (Level 5)
-6. What other dimensions exist? (temporal, severity, anatomical, functional, etc.)
-7. Repeat this for EACH dimension
-
-The goal is to create a **RICH, DETAILED, MULTI-DIMENSIONAL taxonomy** that captures ALL aspects of the clinical information need.
-5. **final_queries**: Array of HIGHLY SPECIFIC queries for CUI extraction (MANDATORY - MINIMUM 5 queries per intent)
-
-NATURE TAXONOMY GUIDELINES - UNIVERSAL PRINCIPLES:
-
-**NATURE represents the PRIMARY CHARACTERISTIC of the clinical information need.**
-
-**DETERMINING NATURE - FUNDAMENTAL APPROACH:**
-
-Nature should answer: "What is the CORE essence of this clinical information?"
-
-Ask yourself these questions and let the answers guide you to create an appropriate nature:
-
-**Question 1: WHEN does this information relate to?**
-- Past events, history, what has already occurred?
-- Current state, present condition, what is happening now?
-- Future prediction, what might occur, anticipated outcomes?
-
-**Question 2: WHY is this information needed clinically?**
-- To understand background and context?
-- To assess current status and severity?
-- To guide immediate clinical decision-making?
-- To predict outcomes or stratify risk?
-- To document treatment or intervention?
-- To track changes over time?
-
-**Question 3: HOW central is this to the clinical encounter?**
-- Is this the MAIN reason for clinical attention (highest priority)?
-- Is this SUPPORTING information (provides context but not primary focus)?
-- Is this BASELINE/REFERENCE information (establishes normal state)?
-
-**Question 4: WHERE does this information come from?**
-- Directly from patient (subjective report)?
-- From objective measurement or testing?
-- From previous documentation or records?
-- From clinical examination or observation?
-- From calculation or risk assessment?
-
-**CREATING THE NATURE CLASSIFICATION:**
-
-Based on your answers above, CREATE a nature that:
-1. **Captures the essence** - What is the single most important characteristic?
-2. **Is clinically meaningful** - Would clinicians understand this categorization?
-3. **Is appropriately broad** - Can encompass the full scope of the intent
-4. **Is sufficiently specific** - Distinguishes this from other types of information
-
-**NATURE NAMING CONVENTIONS:**
-
-Use clear, descriptive language that reflects the clinical domain:
-- Combine clinical concepts naturally (e.g., "Clinical History", "Diagnostic Evaluation", "Treatment Documentation")
-- Use hierarchical naming when needed (e.g., "Centrality / Main Problem", "Complementary Context / Supporting Information")
-- Avoid overly technical or ambiguous terms
-- Ensure the nature name would make sense to clinicians reviewing the taxonomy
-
-**ADAPTIVE NATURE CREATION:**
-
-**For EVERY clinical concept:**
-1. Analyze what makes this information unique and important
-2. Consider if an existing nature pattern from previous queries applies
-3. If no existing pattern fits well, CREATE A NEW NATURE that accurately represents this concept
-4. Don't force information into inappropriate categories - let the content guide the classification
-
-**HANDLING COMPLEX INTENTS:**
-
-When a single query contains multiple distinct clinical information needs with fundamentally different purposes:
-
-**Option A - Separate Intents:**
-Create multiple intent entries, each with its own appropriate nature
-Example: Query about "severe chest pain and family history"
-- Intent 1: Nature reflecting the acute symptom (current assessment)
-- Intent 2: Nature reflecting the genetic background (historical context)
-
-**Option B - Unified Intent:**
-Keep as single intent if one aspect primarily provides context for the other
-Choose the nature that represents the PRIMARY information need
-
-**Decision criteria:** Use clinical judgment - which approach creates clearer, more useful taxonomy?
-
-**KEY PRINCIPLES:**
-
-1. **Nature emerges from content** - Don't use predefined categories; analyze each query fresh
-2. **Clinical relevance guides naming** - Use terminology that clinicians would understand
-3. **Flexibility over rigidity** - Create new natures as needed rather than forcing fits
-4. **Consistency where appropriate** - If you encounter similar concepts, consider using similar nature classifications for clarity
-5. **Hierarchy when helpful** - Use hierarchical naming (with ">>" or "/") when it adds clarity to the primary characteristic
-
-**VALIDATION:**
-
-After determining a nature, ask yourself:
-- Does this accurately capture the PRIMARY characteristic of this clinical information?
-- Would a clinician reading this nature understand what type of information this represents?
-- Is this distinct enough from other natures in the output?
-- Is this broad enough to encompass all sub-natures under it?
-
-Let the clinical content and context drive your nature determination, not predefined templates.
-
-CRITICAL REQUIREMENTS FOR CUI OPTIMIZATION:
-- Final queries MUST be highly specific (e.g., "Type 2 Diabetes in father" NOT "Family history of diabetes")
-- Each query should target 2-15 CUIs maximum for precise concept matching
-- Break down broad concepts into atomic, searchable queries
-- Include specific family members, body locations, severity levels, time contexts
-- Generate queries that can be directly searched in medical ontologies (SNOMED, UMLS, ICD)
-
-INTENT CATEGORIES (detect dynamically based on query content):
-The system can detect ANY clinical intent. Common examples include but are NOT limited to:
-- Primary/Secondary Health Concerns
-- Family/Medical/Surgical/Social History
-- Laboratory/Imaging/Diagnostic Tests
-- Symptoms/Signs Assessment
-- Vital Signs/Physical Measurements
-- Medications/Treatments/Procedures
-- Risk Assessment/Screening
-- Functional Status/Quality of Life
-- Patient Goals/Preferences
-- Allergies/Adverse Reactions
-- Immunizations
-- ANY OTHER clinical information need
-
-⚠️ Do NOT limit yourself to this list. Extract ANY distinct clinical intent present in the query.
-
-FINAL QUERIES GENERATION - UNIVERSAL PRINCIPLES:
-
-⚠️ CRITICAL: Final queries are generated ONLY from the DEEPEST/LAST LEVEL of your taxonomic hierarchy.
-
-**PRINCIPLE: Queries come from ATOMIC ELEMENTS, not intermediate categories**
-
-**CORRECT APPROACH:**
-1. Build your deep hierarchical taxonomy (3-5+ levels)
-2. Identify the ATOMIC ELEMENTS at the deepest level of each sub_nature
-3. Generate final queries ONLY from these atomic elements
-4. Focus on CLINICALLY RELEVANT combinations, not exhaustive permutations
-
-**QUERY GENERATION FROM DEEP TAXONOMY:**
-
-**Step 1 - Identify Atomic Elements:**
-Extract elements ONLY from the LAST LEVEL of each classification branch.
-
-Example:
-```
-Category: "Symptom >> Pain >> Location >> Chest >> Specific Zones"
-Elements: ["Substernal", "Precordial", "Left anterior"]
-↓
-These are atomic - generate queries from these
-```
-
-NOT from intermediate levels:
-```
-Category: "Symptom >> Pain >> Location >> Chest"
-↓
-This is intermediate - do NOT generate queries here
-```
-
-**Step 2 - Selective Combination Strategy:**
-
-DO NOT generate every possible combination. Instead, generate queries based on:
-
-**A) Clinical Relevance:**
-- Which combinations are actually documented in medical practice?
-- Which combinations are clinically meaningful for diagnosis/treatment?
-- Which combinations would appear in medical records?
-
-**B) Common Clinical Patterns:**
-- Standard symptom characterizations (e.g., "Chest pain substernal", "Chest pain radiating left arm")
-- Typical disease presentations (e.g., "Type 2 Diabetes in father", not every relative)
-- Frequently ordered tests (e.g., "Hemoglobin", "LDL cholesterol")
-
-**C) Diagnostic Value:**
-- Which queries help narrow differential diagnosis?
-- Which queries have distinct CUI mappings?
-- Which queries are searchable in medical records?
-
-**FORMULA: Selective Cross-Product of Atomic Elements**
-
-Instead of: [Every element] × [Every other element] = Too many queries
-
-Use: [Core Clinical Concept] + [Clinically Relevant Element Combinations]
-
-**QUALITY OVER QUANTITY:**
-
-Target: 10-30 final queries per intent (not 50-100+)
-
-**For Simple Intents:** 5-15 queries
-Example: "Family history of diabetes" → Generate for immediate family (parents, siblings) and common types (Type 1, Type 2), not every possible relative
-
-**For Moderate Intents:** 15-25 queries
-Example: "Chest pain assessment" → Generate for key characteristics (location, radiation, quality, severity), not every possible combination
-
-**For Complex Intents:** 25-40 queries
-Example: "Comprehensive symptom with multiple dimensions" → Generate most clinically relevant combinations
-
-**PRIORITIZATION RULES:**
-
-1. **First-Degree Relations > Extended Family**
-   - Generate: Father, Mother, Siblings
-   - Skip (unless specifically mentioned): Cousins, Aunts, Uncles
-
-2. **Common Presentations > Rare Variants**
-   - Generate: Type 2 Diabetes (most common)
-   - De-prioritize: MODY, Neonatal Diabetes (unless specifically mentioned)
-
-3. **Standard Assessments > Comprehensive Panels**
-   - Generate: Core vital signs (BP, HR, Temp, RR, SpO2)
-   - Skip: Every possible position/context unless clinically indicated
-
-4. **Documented Characteristics > Theoretical Possibilities**
-   - Generate: Standard pain descriptors (sharp, dull, pressure-like)
-   - Skip: Every conceivable pain descriptor
-
-**EXAMPLES OF GOOD QUERY GENERATION:**
-
-**Example 1 - Family History of Diabetes:**
-
-Taxonomy has 5 sub_natures with many elements.
-
-❌ BAD (Too many - 50+ queries):
-- Type 1 Diabetes in father
-- Type 1 Diabetes in mother
-- Type 1 Diabetes in brother
-- Type 1 Diabetes in sister
-- Type 1 Diabetes in paternal grandfather
-- Type 1 Diabetes in maternal grandfather
-- ... (continues for all types × all relatives)
-
-✅ GOOD (Focused - 12 queries):
-- Type 1 Diabetes in father
-- Type 1 Diabetes in mother
-- Type 2 Diabetes in father
-- Type 2 Diabetes in mother
-- Type 2 Diabetes in sibling
-- Type 2 Diabetes in paternal grandparent
-- Type 2 Diabetes in maternal grandparent
-- Gestational diabetes in mother
-- Diabetic nephropathy in parent
-- Diabetic retinopathy in parent
-- Cardiovascular disease in diabetic father
-- Diabetes complications in family
-
-**Example 2 - Chest Pain Symptom:**
-
-Taxonomy has 23 sub_natures with dozens of elements.
-
-❌ BAD (Too many - 100+ queries):
-Every location × every quality × every severity × every trigger × every association...
-
-✅ GOOD (Focused - 20-25 queries):
-- Chest pain substernal (key location)
-- Chest pain left-sided (key location)
-- Chest pain radiating left arm (critical radiation)
-- Chest pain radiating jaw (critical radiation)
-- Chest pain pressure-like (key quality)
-- Chest pain sharp (key quality)
-- Chest pain severe (key severity)
-- Chest pain sudden onset (key temporal)
-- Chest pain duration minutes (key temporal)
-- Chest pain exertion (key trigger)
-- Chest pain rest (key trigger)
-- Chest pain with diaphoresis (key association)
-- Chest pain with dyspnea (key association)
-- Chest pain relieved nitroglycerin (key relief)
-- Chest pain unable walk (key impact)
-- Chest pain severe substernal (multi-dimensional)
-- Chest pain pressure-like radiating left arm (multi-dimensional)
-- Chest pain exertion with diaphoresis (multi-dimensional)
-
-**ADAPTIVE QUERY GENERATION:**
-
-For ANY clinical concept:
-
-1. **Build deep taxonomy** (3-5 levels, multiple dimensions)
-2. **Identify atomic elements** at the deepest level
-3. **Select clinically relevant elements** (not all elements)
-4. **Generate focused queries** from selected elements
-5. **Add key multi-dimensional combinations** where clinically meaningful
-
-**VALIDATION BEFORE RETURNING:**
-
-- Are queries derived from atomic elements (deepest level)?
-- Is the number of queries reasonable (10-40 per intent)?
-- Are queries clinically relevant and commonly documented?
-- Would these queries actually be searched in medical records?
-- Do queries avoid redundancy and unnecessary permutations?
-
-**KEY PRINCIPLE:**
-Create a RICH taxonomy with deep hierarchical classification, but generate FOCUSED queries from the atomic elements that have the highest clinical relevance and diagnostic value.
-
-Quality and clinical relevance trump exhaustive enumeration.
-
-**QUERY CONCISENESS - UNIVERSAL RULES:**
-
-Remove ALL unnecessary words. Each query should be the SHORTEST medical phrase that uniquely identifies the concept.
-
-**Words to ALWAYS remove:**
-- "history of", "family history of", "personal history of"
-- "location", "character", "quality", "severity", "assessment", "measurement", "level" (unless medically standard)
-- "associated with", "related to"
-- Articles: "the", "a", "an"
-- "patient", "user", "subject"
-- Unnecessary prepositions: "in relation to", "with respect to"
-
-**Standard formats (learn from these patterns, don't limit to them):**
-- Relationships: [Condition] in [person/location]
-- Characteristics: [Concept] [attribute]
-- Measurements: [Test] or [Test] [context]
-- Temporal: [Concept] [timeframe]
-- Severity: [Symptom] [descriptor]
-
-**Examples across different domains:**
-- "Diabetes Mellitus in father" (NOT "Family history of Diabetes Mellitus in father")
-- "Chest pain substernal" (NOT "Chest pain location substernal")
-- "LDL cholesterol" (NOT "LDL cholesterol level")
-- "Heart rate resting" (NOT "Heart rate at rest")
-- "Metformin 1000mg twice daily" (NOT "Metformin dosage of 1000mg taken twice daily")
-- "Walking difficulty" (NOT "Difficulty with walking")
-- "Pain onset sudden" (NOT "Pain with sudden onset")
-
-**ADAPTIVE QUERY GENERATION:**
-For ANY new clinical concept encountered:
-1. Identify what makes it searchable/specific
-2. Break it down into atomic components
-3. Generate queries following the conciseness principles
-4. Ensure each query targets 2-15 CUIs
-
-The goal is ALWAYS: Generate the most specific, concise, searchable queries possible for precise CUI extraction, regardless of the clinical domain.
-
-**VALIDATION BEFORE RETURNING:**
-- Verify EVERY intent has a populated final_queries array
-- Verify queries follow the atomic decomposition principle
-- Verify queries are concise (typically 2-5 words each)
-- Verify queries are specific enough for CUI extraction (2-15 CUIs per query)
-- No minimum or maximum number restrictions - generate as many queries as needed for complete coverage
-
-Return ONLY valid JSON (no markdown, no explanation):
+TASK: Extract ALL clinical intents and generate specific queries optimized for CUI extraction.
+
+KEY PRINCIPLES:
+1. Create DEEP hierarchical taxonomies (3-5 levels minimum)
+2. Generate queries from ATOMIC ELEMENTS (deepest level only)
+3. Focus on CLINICAL RELEVANCE (10-40 queries per intent)
+4. Use CONCISE format (2-5 words per query)
+5. ALWAYS populate elements AND entities arrays in sub_nature
+
+NATURE DETERMINATION:
+Ask: WHEN (Past/Present/Future)? WHY (Purpose)? HOW (Priority)? WHERE (Source)?
+Create nature names that capture the essence (e.g., "Clinical History", "Diagnostic Investigation")
+
+SUB-NATURE STRUCTURE:
+Each sub_nature MUST have:
+- category: "Level2 >> Level3 >> Level4" (hierarchical path)
+- elements: [atomic clinical concepts at deepest level]
+- entities: [medical entity types for ontology mapping]
+
+QUERY GENERATION:
+- Extract atomic elements from DEEPEST taxonomy level only
+- Generate 10-30 focused queries per intent
+- Format: [Concept] [Attribute] (e.g., "Diabetes in father", "Chest pain substernal")
+- Remove unnecessary words: "history of", "location", "level", "assessment"
+
+Return ONLY valid JSON:
 {{
-  "is_clinical": true,  // Set to false if query is non-clinical
-  "reason": "",  // Only if non-clinical
+  "is_clinical": true,
   "original_query": "{original_query}",
   "expanded_query": "{expanded_query}",
   "total_intents_detected": number,
   "intents": [
     {{
       "intent_title": "string",
-      "description": "string (explain the clinical purpose and information need)",
-      "nature": "string (primary characteristic/category)",
+      "description": "string",
+      "nature": "string",
       "sub_nature": [
         {{
-          "category": "string (specific clinical domain)",
-          "elements": ["specific medical concept 1", "specific medical concept 2", ...],
-          "entities": ["entity_type_1", "entity_type_2", ...]
+          "category": "Level2 >> Level3 >> Level4",
+          "elements": ["element1", "element2"],
+          "entities": ["entity1", "entity2"]
         }}
       ],
-      "final_queries": [
-        "highly specific query 1",
-        "highly specific query 2",
-        "highly specific query 3",
-        "highly specific query 4",
-        "highly specific query 5",
-        "... (minimum 5, typically 10-50+ for comprehensive coverage)"
-      ]
+      "final_queries": ["query1", "query2", "query3"]
     }}
   ]
 }}
@@ -575,100 +149,40 @@ User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
-QUERY_REFINEMENT_PROMPT = """
-You are an expert medical query optimizer for CUI extraction systems.
 
-TASK: Review the extracted intents and final queries. Optimize them for maximum conciseness while maintaining medical accuracy and completeness.
+# ==============================================================================
+# MAIN PIPELINE CLASS
+# ==============================================================================
 
-OPTIMIZATION PRINCIPLES:
-
-1. **Conciseness**: Remove all unnecessary words while preserving medical meaning
-   - Remove verbose phrases like "history of", "associated with", "location", "character"
-   - Use shortest medical form: "Diabetes in father" NOT "Family history of Diabetes in father"
-   
-2. **Specificity for CUI Extraction**: 
-   - Each query should target 2-15 CUIs maximum
-   - Break down broad concepts into atomic queries
-   - Ensure queries are directly searchable in medical ontologies
-   
-3. **Completeness**:
-   - Ensure all clinical dimensions are covered with queries
-   - Verify atomic decomposition is thorough
-   - Don't remove queries that add value
-   
-4. **Remove Redundancy**:
-   - Eliminate exact duplicate queries
-   - Combine only if they represent the same concept
-   
-5. **Maintain Medical Accuracy**:
-   - Don't over-abbreviate if it creates ambiguity
-   - Keep standard medical terminology
-   - Preserve clinical nuance
-
-UNIVERSAL OPTIMIZATION APPROACH:
-- Apply atomic decomposition principle to all intents
-- Apply conciseness rules universally
-- Let the clinical content dictate the number of queries needed
-- No artificial minimum or maximum limits
-
-Return ONLY valid JSON with refined intents:
-{{
-  "intents": [...refined intents array with optimized queries...],
-  "refinements_made": ["list of optimization changes applied"],
-  "total_queries": number,
-  "optimization_summary": "brief description of improvements made"
-}}
-
-Input Intents: {intents_json}
-"""
-
-# ======================================================
-# ENHANCED PIPELINE WITH PURE LLM-BASED PROCESSING
-# ======================================================
-
-class ContextualIntentPipeline:
+class ClinicalIntentPipeline:
     """
-    Production-ready clinical intent extraction pipeline using pure LLM reasoning.
-    No hardcoded logic - fully dynamic and adaptable to any medical query.
+    Production-ready clinical intent extraction pipeline.
+    
+    Uses pure LLM reasoning with no hardcoded medical knowledge.
+    Generates deep taxonomies and focused queries for CUI extraction.
     """
     
     def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = "gemini-2.0-flash-exp", 
-                 enable_refinement: bool = False):
-        """
-        Initialize the pipeline with GCP Vertex AI.
-        
-        Args:
-            project: GCP project ID
-            location: GCP region
-            model: Vertex AI model name (use flash for speed)
-            enable_refinement: Enable query refinement step (adds ~5-10 seconds)
-        """
+                 model: str = "gemini-2.0-flash-exp"):
+        """Initialize pipeline with GCP Vertex AI."""
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
-        self.enable_refinement = enable_refinement
-        
-    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8192) -> str:
-        """
-        Call Vertex AI model with error handling.
-        
-        Args:
-            prompt: The prompt to send to the model
-            temperature: Sampling temperature (0.0 for deterministic)
-            max_tokens: Maximum output tokens
-            
-        Returns:
-            Model response as string
-        """
+    
+    
+    # --------------------------------------------------------------------------
+    # UTILITY METHODS
+    # --------------------------------------------------------------------------
+    
+    def _call_model(self, prompt: str, max_tokens: int = 8192) -> str:
+        """Call Vertex AI model with error handling."""
         try:
-            # Reset session to avoid context carryover
             if hasattr(self.model, "session") and self.model.session is not None:
                 self.model.session.reset()
             
             response = self.model.generate_content(
                 prompt,
                 generation_config={
-                    "temperature": temperature,
+                    "temperature": 0.0,
                     "max_output_tokens": max_tokens,
                     "top_p": 0.95,
                     "top_k": 40
@@ -676,84 +190,38 @@ class ContextualIntentPipeline:
             )
             return response.text.strip()
         except Exception as e:
-            print(f"Error calling model: {str(e)}")
+            print(f"Error calling model: {e}")
             return "{}"
     
-    def _safe_json(self, text: str) -> Dict[str, Any]:
-        """
-        Safely extract and parse JSON from model response.
-        
-        Args:
-            text: Raw model response
-            
-        Returns:
-            Parsed JSON as dictionary
-        """
-        # Remove markdown code blocks if present
+    def _parse_json(self, text: str) -> Dict[str, Any]:
+        """Safely parse JSON from model response."""
+        # Remove markdown code blocks
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
         text = text.strip()
         
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            # Try to find JSON object in text
+        except:
+            # Try to find JSON in text
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
                 try:
                     return json.loads(match.group(0))
                 except:
                     pass
-            
-            # Try to find JSON array in text
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
-            
-            print(f"Failed to parse JSON from response: {text[:200]}")
             return {}
     
-    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
-        """
-        Validate that JSON has required structure.
-        
-        Args:
-            data: Parsed JSON data
-            required_keys: List of required keys
-            
-        Returns:
-            True if valid, False otherwise
-        """
-        return all(key in data for key in required_keys)
     
-    # ======================================================
-    # STEP 1: Query Expansion
-    # ======================================================
+    # --------------------------------------------------------------------------
+    # PIPELINE STEPS
+    # --------------------------------------------------------------------------
     
     def expand_query(self, query: str) -> Dict[str, Any]:
-        """
-        Expand query using LLM reasoning - no hardcoded abbreviations.
-        
-        Args:
-            query: User input query
-            
-        Returns:
-            Dictionary with expanded_query, abbreviations_expanded, concepts_added
-        """
+        """Step 1: Expand query with medical context."""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        raw_response = self._call_model(prompt)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["expanded_query"]):
-            # Fallback to original query if expansion fails
-            return {
-                "expanded_query": query,
-                "abbreviations_expanded": [],
-                "concepts_added": []
-            }
+        response = self._call_model(prompt)
+        data = self._parse_json(response)
         
         return {
             "expanded_query": data.get("expanded_query", query),
@@ -761,141 +229,69 @@ class ContextualIntentPipeline:
             "concepts_added": data.get("concepts_added", [])
         }
     
-    # ======================================================
-    # STEP 2: Intent Extraction
-    # ======================================================
-    
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-        """
-        Extract intents using pure LLM reasoning - fully dynamic.
-        Also handles clinical classification inline.
-        
-        Args:
-            original_query: Original user query
-            expanded_query: Expanded query from step 1
-            
-        Returns:
-            Dictionary with intents array and metadata
-        """
+        """Step 2: Extract intents with inline clinical validation."""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
             timestamp=datetime.utcnow().isoformat()
         )
+        response = self._call_model(prompt)
+        data = self._parse_json(response)
         
-        # Use higher token limit for complex queries
-        raw_response = self._call_model(prompt, max_tokens=8192)
-        data = self._safe_json(raw_response)
-        
-        # Check if query was rejected as non-clinical
+        # Check if non-clinical
         if not data.get("is_clinical", True):
             return {
-                "intents": [],
-                "total_intents_detected": 0,
                 "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query is not clinical"),
-                "original_query": original_query,
-                "expanded_query": expanded_query
+                "rejected_reason": data.get("reason", "Not clinical"),
+                "intents": []
             }
         
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "error": "Failed to extract intents"
-            }
-        
-        # Validate that all intents have final_queries
-        intents = data.get("intents", [])
-        validated_intents = []
-        
-        for idx, intent in enumerate(intents):
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"⚠️  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            
-            # No minimum requirement - let LLM decide based on complexity
-            validated_intents.append(intent)
+        # Validate intents have final_queries
+        intents = []
+        for intent in data.get("intents", []):
+            if intent.get("final_queries"):
+                intents.append(intent)
         
         return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
             "is_clinical": True,
-            "original_query": data.get("original_query", original_query),
-            "expanded_query": data.get("expanded_query", expanded_query)
+            "intents": intents,
+            "total_intents_detected": len(intents)
         }
     
-    # ======================================================
-    # STEP 3: Query Refinement (Optional)
-    # ======================================================
     
-    def refine_queries(self, intents: List[Dict]) -> Dict[str, Any]:
-        """
-        Refine queries for optimal CUI extraction using LLM.
-        
-        Args:
-            intents: Array of extracted intents
-            
-        Returns:
-            Dictionary with refined intents and refinement notes
-        """
-        if not self.enable_refinement or not intents:
-            return {
-                "intents": intents,
-                "refinements_made": [],
-                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
-            }
-        
-        prompt = QUERY_REFINEMENT_PROMPT.format(intents_json=json.dumps(intents, indent=2))
-        raw_response = self._call_model(prompt, max_tokens=8192)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["intents"]):
-            # Return original if refinement fails
-            return {
-                "intents": intents,
-                "refinements_made": ["Refinement failed - using original"],
-                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
-            }
-        
-        return {
-            "intents": data.get("intents", intents),
-            "refinements_made": data.get("refinements_made", []),
-            "total_queries": data.get("total_queries", 0)
-        }
-    
-    # ======================================================
-    # FULL PIPELINE EXECUTION
-    # ======================================================
+    # --------------------------------------------------------------------------
+    # MAIN EXECUTION
+    # --------------------------------------------------------------------------
     
     def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
         """
-        Execute the complete clinical intent extraction pipeline.
+        Execute the complete pipeline.
         
         Args:
             query: User input query
-            verbose: Print minimal progress information
+            verbose: Print minimal progress info
             
         Returns:
-            Complete pipeline results with all extracted intents and queries
+            Complete results with intents and queries
         """
         start_time = datetime.utcnow()
         
         if verbose:
             print(f"Original Query: {query}")
         
-        # Step 1: Query Expansion
-        expansion_result = self.expand_query(query)
-        expanded_query = expansion_result["expanded_query"]
+        # Step 1: Expand query
+        expansion = self.expand_query(query)
+        expanded_query = expansion["expanded_query"]
         
         if verbose:
             print(f"Expanded Query: {expanded_query}")
         
-        # Step 2: Intent Extraction (includes inline clinical classification)
-        intent_result = self.extract_intents(query, expanded_query)
+        # Step 2: Extract intents
+        extraction = self.extract_intents(query, expanded_query)
         
-        # Check if query was rejected as non-clinical
-        if not intent_result.get("is_clinical", True):
+        # Handle non-clinical queries
+        if not extraction.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             
             if verbose:
@@ -905,23 +301,18 @@ class ContextualIntentPipeline:
             return {
                 "original_query": query,
                 "expanded_query": expanded_query,
-                "intents": [],
                 "is_clinical": False,
-                "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
-                "timestamp": datetime.utcnow().isoformat(),
-                "processing_time_seconds": processing_time
+                "rejected_reason": extraction.get("rejected_reason"),
+                "intents": [],
+                "statistics": {},
+                "processing_time_seconds": processing_time,
+                "timestamp": datetime.utcnow().isoformat()
             }
         
-        intents = intent_result.get("intents", [])
-        
-        # Step 3: Query Refinement (Optional - disabled by default for speed)
-        if self.enable_refinement and intents:
-            refinement_result = self.refine_queries(intents)
-            intents = refinement_result["intents"]
-        
         # Calculate statistics
-        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
-        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
+        intents = extraction.get("intents", [])
+        total_queries = sum(len(intent.get("final_queries", [])) for intent in intents)
+        total_sub_natures = sum(len(intent.get("sub_nature", [])) for intent in intents)
         processing_time = (datetime.utcnow() - start_time).total_seconds()
         
         if verbose:
@@ -932,10 +323,10 @@ class ContextualIntentPipeline:
         return {
             "original_query": query,
             "expanded_query": expanded_query,
-            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            "concepts_added": expansion_result.get("concepts_added", []),
-            "intents": intents,
+            "abbreviations_expanded": expansion.get("abbreviations_expanded", []),
+            "concepts_added": expansion.get("concepts_added", []),
             "is_clinical": True,
+            "intents": intents,
             "statistics": {
                 "total_intents": len(intents),
                 "total_sub_natures": total_sub_natures,
@@ -947,277 +338,28 @@ class ContextualIntentPipeline:
         }
 
 
-# ======================================================
+# ==============================================================================
 # EXAMPLE USAGE
-# ======================================================
+# ==============================================================================
 
-"""
-EXPECTED OUTPUT STRUCTURE WITH DEEP HIERARCHICAL TAXONOMY:
-
-Input: "Patient has family history of diabetes. Reports severe chest pain radiating to left arm."
-
-Output:
-{
-  "original_query": "Patient has family history of diabetes. Reports severe chest pain radiating to left arm.",
-  "expanded_query": "Patient with family history of Diabetes Mellitus. Patient reports severe chest pain with radiation to left arm.",
-  "intents": [
-    {
-      "intent_title": "Family History Assessment - Diabetes Mellitus",
-      "description": "Evaluate genetic risk for Diabetes Mellitus through comprehensive family history documentation across multiple generations and disease subtypes",
-      "nature": "Clinical History",
-      "sub_nature": [
-        {
-          "category": "Hereditary Conditions >> Endocrine/Metabolic Disorders >> Diabetes Mellitus >> Disease Subtypes",
-          "elements": ["Type 1 Diabetes Mellitus", "Type 2 Diabetes Mellitus", "Gestational Diabetes Mellitus", "MODY", "Neonatal Diabetes"],
-          "entities": ["diabetes_type", "genetic_endocrine_disorder", "metabolic_condition"]
-        },
-        {
-          "category": "Family Relationships >> First-Degree Relatives >> Parental Line",
-          "elements": ["Father", "Mother"],
-          "entities": ["parent", "first_degree_relative", "direct_lineage"]
-        },
-        {
-          "category": "Family Relationships >> First-Degree Relatives >> Sibling Line",
-          "elements": ["Brother", "Sister", "Twin"],
-          "entities": ["sibling", "first_degree_relative", "collateral_lineage"]
-        },
-        {
-          "category": "Family Relationships >> Second-Degree Relatives >> Paternal Grandparents",
-          "elements": ["Paternal Grandfather", "Paternal Grandmother"],
-          "entities": ["grandparent", "second_degree_relative", "paternal_lineage"]
-        },
-        {
-          "category": "Family Relationships >> Second-Degree Relatives >> Maternal Grandparents",
-          "elements": ["Maternal Grandfather", "Maternal Grandmother"],
-          "entities": ["grandparent", "second_degree_relative", "maternal_lineage"]
-        },
-        {
-          "category": "Disease Complications >> Diabetes-Related >> Microvascular Complications",
-          "elements": ["Diabetic Nephropathy", "Diabetic Retinopathy", "Diabetic Neuropathy", "Diabetic Foot Disease"],
-          "entities": ["microvascular_complication", "end_organ_damage"]
-        },
-        {
-          "category": "Disease Complications >> Diabetes-Related >> Macrovascular Complications",
-          "elements": ["Coronary Artery Disease", "Peripheral Artery Disease", "Cerebrovascular Disease", "Myocardial Infarction"],
-          "entities": ["macrovascular_complication", "cardiovascular_disease"]
-        },
-        {
-          "category": "Disease Complications >> Diabetes-Related >> Metabolic Complications",
-          "elements": ["Diabetic Ketoacidosis", "Hyperosmolar Hyperglycemic State", "Severe Hypoglycemia"],
-          "entities": ["acute_complication", "metabolic_emergency"]
-        }
-      ],
-      "final_queries": [
-        "Type 1 Diabetes in father",
-        "Type 1 Diabetes in mother",
-        "Type 2 Diabetes in father",
-        "Type 2 Diabetes in mother",
-        "Type 2 Diabetes in sibling",
-        "Type 2 Diabetes in paternal grandparent",
-        "Type 2 Diabetes in maternal grandparent",
-        "Gestational diabetes in mother",
-        "Gestational diabetes in sister",
-        "MODY in parent",
-        "Diabetic nephropathy in parent",
-        "Diabetic retinopathy in parent",
-        "Diabetic neuropathy in family member",
-        "Cardiovascular disease in diabetic parent",
-        "Myocardial infarction in diabetic father"
-      ]
-    },
-    {
-      "intent_title": "Primary Health Concern - Severe Chest Pain with Radiation",
-      "description": "Urgent evaluation of severe chest pain with specific radiation pattern suggesting potential cardiac etiology requiring immediate clinical assessment",
-      "nature": "Centrality / Main Problem",
-      "sub_nature": [
-        {
-          "category": "Symptom Characteristics >> Anatomical Location >> Thoracic Regions >> Specific Zones",
-          "elements": ["Substernal", "Precordial", "Left anterior chest", "Right anterior chest", "Retrosternal", "Diffuse chest"],
-          "entities": ["anatomical_location", "chest_region", "topographical_descriptor"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Radiation >> Upper Extremity >> Left Side",
-          "elements": ["Left arm", "Left shoulder", "Left wrist", "Left hand", "Left fingers"],
-          "entities": ["radiation_pattern", "referred_pain", "upper_extremity"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Radiation >> Upper Extremity >> Right Side",
-          "elements": ["Right arm", "Right shoulder", "Both arms"],
-          "entities": ["radiation_pattern", "referred_pain", "upper_extremity"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Radiation >> Head and Neck",
-          "elements": ["Jaw", "Mandible", "Neck", "Throat"],
-          "entities": ["radiation_pattern", "referred_pain", "head_neck"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Radiation >> Trunk",
-          "elements": ["Back", "Interscapular", "Epigastrium", "Shoulder blade"],
-          "entities": ["radiation_pattern", "referred_pain", "truncal"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Quality >> Sensory Descriptors >> Pressure Sensations",
-          "elements": ["Pressure-like", "Crushing", "Squeezing", "Heavy", "Tight"],
-          "entities": ["pain_quality", "pressure_descriptor"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Quality >> Sensory Descriptors >> Sharp Sensations",
-          "elements": ["Sharp", "Stabbing", "Knife-like", "Piercing"],
-          "entities": ["pain_quality", "sharp_descriptor"]
-        },
-        {
-          "category": "Symptom Characteristics >> Pain Quality >> Sensory Descriptors >> Other",
-          "elements": ["Burning", "Aching", "Dull", "Throbbing"],
-          "entities": ["pain_quality", "sensory_descriptor"]
-        },
-        {
-          "category": "Temporal Characteristics >> Onset Pattern >> Acuity Classification",
-          "elements": ["Sudden onset", "Gradual onset", "Acute", "Subacute", "Insidious"],
-          "entities": ["temporal_pattern", "onset_classification"]
-        },
-        {
-          "category": "Temporal Characteristics >> Duration >> Time Intervals >> Short Duration",
-          "elements": ["Seconds", "Minutes (1-5)", "Minutes (5-30)", "Minutes (30-60)"],
-          "entities": ["duration", "short_term_temporal"]
-        },
-        {
-          "category": "Temporal Characteristics >> Duration >> Time Intervals >> Extended Duration",
-          "elements": ["Hours", "Days", "Weeks", "Ongoing"],
-          "entities": ["duration", "long_term_temporal"]
-        },
-        {
-          "category": "Temporal Characteristics >> Pattern >> Frequency",
-          "elements": ["Constant", "Intermittent", "Episodic", "Recurrent", "Progressive"],
-          "entities": ["temporal_pattern", "frequency_descriptor"]
-        },
-        {
-          "category": "Severity Assessment >> Intensity Scale >> Numeric Rating (0-10)",
-          "elements": ["Mild (1-3)", "Moderate (4-6)", "Severe (7-9)", "Excruciating (10)"],
-          "entities": ["pain_severity", "numeric_intensity"]
-        },
-        {
-          "category": "Severity Assessment >> Intensity Scale >> Descriptive Terms",
-          "elements": ["Severe", "Intense", "Unbearable", "Significant", "Mild", "Moderate"],
-          "entities": ["severity_descriptor", "qualitative_intensity"]
-        },
-        {
-          "category": "Severity Assessment >> Functional Impact >> Mobility Limitations",
-          "elements": ["Unable to walk", "Difficulty ambulating", "Requires assistance walking", "Cannot stand"],
-          "entities": ["functional_impairment", "mobility_limitation"]
-        },
-        {
-          "category": "Severity Assessment >> Functional Impact >> Activity Limitations",
-          "elements": ["Unable to work", "Cannot perform daily activities", "Difficulty sleeping", "Cannot eat", "Requires bed rest"],
-          "entities": ["functional_impairment", "activity_limitation"]
-        },
-        {
-          "category": "Severity Assessment >> Functional Impact >> Self-Care Limitations",
-          "elements": ["Cannot dress", "Cannot bathe", "Cannot feed self", "Requires total assistance"],
-          "entities": ["functional_impairment", "self_care_deficit"]
-        },
-        {
-          "category": "Triggering Factors >> Exertional Triggers",
-          "elements": ["Physical exertion", "Exercise", "Climbing stairs", "Walking", "Heavy lifting"],
-          "entities": ["trigger_factor", "exertional_precipitant"]
-        },
-        {
-          "category": "Triggering Factors >> Non-Exertional Triggers",
-          "elements": ["Emotional stress", "Cold weather", "After meals", "Deep breathing", "At rest"],
-          "entities": ["trigger_factor", "non_exertional_precipitant"]
-        },
-        {
-          "category": "Relieving Factors >> Pharmacological",
-          "elements": ["Nitroglycerin", "Antacids", "Analgesics", "Anti-inflammatory drugs"],
-          "entities": ["relieving_factor", "pharmacological_response"]
-        },
-        {
-          "category": "Relieving Factors >> Non-Pharmacological",
-          "elements": ["Rest", "Position change", "Sitting upright", "Deep breathing", "Pressure application"],
-          "entities": ["relieving_factor", "non_pharmacological_intervention"]
-        },
-        {
-          "category": "Associated Symptoms >> Cardiovascular Signs",
-          "elements": ["Diaphoresis", "Palpitations", "Dyspnea", "Lightheadedness", "Syncope", "Presyncope"],
-          "entities": ["associated_symptom", "cardiovascular_sign"]
-        },
-        {
-          "category": "Associated Symptoms >> Autonomic Signs",
-          "elements": ["Sweating", "Pallor", "Clammy skin", "Anxiety", "Sense of doom"],
-          "entities": ["associated_symptom", "autonomic_sign"]
-        },
-        {
-          "category": "Associated Symptoms >> Gastrointestinal Signs",
-          "elements": ["Nausea", "Vomiting", "Epigastric discomfort", "Indigestion"],
-          "entities": ["associated_symptom", "gastrointestinal_sign"]
-        }
-      ],
-      "final_queries": [
-        "Chest pain substernal",
-        "Chest pain precordial",
-        "Chest pain left-sided",
-        "Chest pain radiating left arm",
-        "Chest pain radiating left shoulder",
-        "Chest pain radiating jaw",
-        "Chest pain radiating back",
-        "Chest pain pressure-like",
-        "Chest pain crushing",
-        "Chest pain sharp",
-        "Chest pain stabbing",
-        "Chest pain burning",
-        "Chest pain severe",
-        "Chest pain sudden onset",
-        "Chest pain duration minutes",
-        "Chest pain duration hours",
-        "Chest pain constant",
-        "Chest pain intermittent",
-        "Chest pain exertion",
-        "Chest pain rest",
-        "Chest pain emotional stress",
-        "Chest pain relieved rest",
-        "Chest pain relieved nitroglycerin",
-        "Chest pain with diaphoresis",
-        "Chest pain with dyspnea",
-        "Chest pain with nausea",
-        "Chest pain unable walk",
-        "Chest pain severe substernal",
-        "Chest pain pressure-like radiating left arm",
-        "Chest pain exertion with diaphoresis"
-      ]
-    }
-  ],
-  "statistics": {
-    "total_intents": 2,
-    "total_sub_natures": 31,
-    "total_queries": 45,
-    "avg_sub_natures_per_intent": 15.5,
-    "avg_queries_per_intent": 22.5
-  }
-}
-"""
-
-if __name__ == "__main__":
-    # Initialize pipeline with your GCP project
-    PROJECT_ID = "your-gcp-project-id"  # Replace with your actual project ID
+def main():
+    """Example usage of the pipeline."""
     
-    # OPTIMIZED FOR SPEED - Now only 2 LLM calls instead of 3
-    pipeline = ContextualIntentPipeline(
+    # Initialize pipeline
+    pipeline = ClinicalIntentPipeline(
         project=PROJECT_ID,
-        location="us-central1",
-        model="gemini-2.0-flash-exp",  # Fast model
-        enable_refinement=False  # Disabled for speed (saves 5-10 seconds)
+        location=LOCATION,
+        model=MODEL_NAME
     )
     
     # Test queries
     test_queries = [
-        # Clinical queries
-        "Family history of diabetes",
-        "Patient with chest pain and shortness of breath",
-        
-        # Non-clinical query (should be rejected inline)
-        "What is the weather like today?",
+        "Family history of diabetes and heart disease",
+        "Patient with chest pain radiating to left arm",
+        "What is the weather like today?",  # Non-clinical
     ]
     
-    # Process each query
+    # Process queries
     for idx, query in enumerate(test_queries, 1):
         print(f"\n{'='*80}")
         print(f"Query {idx}/{len(test_queries)}")
@@ -1225,9 +367,13 @@ if __name__ == "__main__":
         
         result = pipeline.run(query, verbose=True)
         
-        # Save result to file
-        output_filename = f"query_result_{idx}.json"
-        with open(output_filename, 'w') as f:
+        # Save to file
+        filename = f"query_result_{idx}.json"
+        with open(filename, 'w') as f:
             json.dump(result, f, indent=2)
         
-        print(f"Saved to: {output_filename}")
+        print(f"Saved to: {filename}")
+
+
+if __name__ == "__main__":
+    main()
