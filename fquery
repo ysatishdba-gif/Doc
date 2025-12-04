@@ -57,8 +57,9 @@ INSTRUCTIONS:
 
 EXAMPLES:
 - "Pt with DM" → "Patient with Diabetes Mellitus"
-- "Check vitals" → "Vital signs including blood pressure, heart rate, temperature, respiratory rate, and oxygen saturation"
-- "Family hx of heart disease" → "Family history of cardiovascular disease including coronary artery disease, myocardial infarction, and heart failure"
+- "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
+- "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
+- "SOB on exertion" → "Shortness of breath on exertion"
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
@@ -107,17 +108,38 @@ FOR EACH INTENT:
    - **entities**: Medical entity types (for ontology mapping)
 5. **final_queries**: Array of HIGHLY SPECIFIC queries for CUI extraction
 
-FINAL QUERIES GENERATION RULES:
-- For family history: Generate separate queries for each condition × each family member
-  Example: "Type 2 Diabetes in father", "Hypertension in maternal grandmother"
-- For symptoms: Generate queries for each characteristic (location, radiation, quality, severity, timing)
-  Example: "Chest pain location substernal", "Chest pain radiating to left arm"
-- For labs: Generate queries for each specific test component
-  Example: "LDL cholesterol level", "Neutrophil absolute count"
-- For vital signs: Generate queries for each measurement × context
-  Example: "Systolic blood pressure sitting", "Heart rate at rest"
-- For medications: Generate queries for each drug with specific details
-  Example: "Metformin 1000mg twice daily", "Lisinopril adverse reactions"
+FINAL QUERIES GENERATION RULES - CRITICAL FOR CUI EXTRACTION:
+
+**QUERY CONCISENESS:** Generate the MOST CONCISE medical queries possible. Remove unnecessary words.
+
+- **For family history:** Generate queries as "[Condition] in [family member]"
+  CORRECT: "Diabetes Mellitus in father", "Hypertension in maternal grandmother"
+  INCORRECT: "Family history of Diabetes Mellitus in father" (too verbose)
+  
+- **For symptoms:** Generate queries as "[Symptom] [characteristic] [value]"
+  CORRECT: "Chest pain substernal", "Chest pain radiating left arm", "Dyspnea grade 3"
+  INCORRECT: "Chest pain location substernal" (remove "location"), "Chest pain radiating to left arm" (remove "to")
+  
+- **For labs:** Generate queries as "[Test name]" or "[Test name] level" only if medically standard
+  CORRECT: "LDL cholesterol", "Neutrophil absolute count", "HbA1c"
+  INCORRECT: "LDL cholesterol level test result" (too verbose)
+  
+- **For vital signs:** Generate queries as "[Measurement] [context]"
+  CORRECT: "Systolic blood pressure sitting", "Heart rate resting", "Oxygen saturation room air"
+  INCORRECT: "Systolic blood pressure measurement while sitting" (too verbose)
+  
+- **For medications:** Generate queries as "[Drug name] [dose] [frequency]" or "[Drug name] [adverse effect]"
+  CORRECT: "Metformin 1000mg twice daily", "Lisinopril cough", "Aspirin allergy"
+  INCORRECT: "Metformin dosage 1000mg taken twice daily" (too verbose)
+
+**REMOVE these unnecessary words/phrases:**
+- "history of", "family history of" (context is understood from intent)
+- "location", "character", "severity" (implied by the symptom)
+- "level", "measurement", "assessment" (unless medically standard terminology)
+- "associated with" (just state the association directly)
+- Articles: "the", "a", "an" (unless grammatically necessary)
+
+**PRINCIPLE:** Each query should be the SHORTEST possible medical phrase that uniquely identifies the concept for CUI mapping.
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
@@ -152,22 +174,49 @@ Timestamp: {timestamp}
 QUERY_REFINEMENT_PROMPT = """
 You are an expert medical query optimizer for CUI extraction systems.
 
-TASK: Review the extracted intents and final queries. Ensure they are optimized for medical concept identification.
+TASK: Review the extracted intents and final queries. Optimize them for maximum conciseness while maintaining medical accuracy.
+
+CRITICAL OPTIMIZATION RULES:
+1. **Remove verbose phrases:** 
+   - "family history of" → (remove, context in intent)
+   - "location", "character", "severity" → (remove, implied)
+   - "associated with" → (simplify to direct statement)
+   
+2. **Use shortest medical form:**
+   - "Diabetes Mellitus in father" NOT "Family history of Diabetes Mellitus in father"
+   - "Chest pain substernal" NOT "Chest pain location substernal"
+   - "LDL cholesterol" NOT "LDL cholesterol level"
+   - "Heart rate resting" NOT "Heart rate at rest"
+   
+3. **Ensure specificity for CUI extraction:**
+   - Each query targets 2-15 CUIs maximum
+   - Family queries separated by member
+   - Symptom queries broken by characteristic
+   - Lab queries atomic (one test)
+   
+4. **Remove redundancy:**
+   - Eliminate duplicate queries
+   - Combine overly similar queries if appropriate
+   
+5. **Maintain medical accuracy:**
+   - Don't over-abbreviate if it creates ambiguity
+   - Keep standard medical terminology
 
 VALIDATION CHECKLIST:
-1. Are queries specific enough (targeting 2-15 CUIs each)?
-2. Are family history queries separated by family member?
-3. Are symptom queries broken down by characteristic?
-4. Are lab queries atomic (one test per query)?
-5. Are there any redundant or overlapping queries?
-6. Are all medical terms properly expanded?
-7. Are queries directly searchable in medical ontologies?
+✓ Queries are concise (typically 2-5 words)
+✓ No unnecessary descriptive words
+✓ Family queries: "[Condition] in [member]"
+✓ Symptom queries: "[Symptom] [characteristic]"
+✓ Lab queries: "[Test name]"
+✓ Vital queries: "[Measurement] [context]"
+✓ Directly searchable in medical ontologies
 
 Return ONLY valid JSON with refined intents:
 {{
-  "intents": [...refined intents array...],
-  "refinements_made": ["list of changes made"],
-  "total_queries": number
+  "intents": [...refined intents array with optimized queries...],
+  "refinements_made": ["list of optimization changes"],
+  "total_queries": number,
+  "avg_query_length": number
 }}
 
 Input Intents: {intents_json}
