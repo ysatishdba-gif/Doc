@@ -1,17 +1,582 @@
-EXPANSION_PROMPT = """
-You are a medical assistant that reformulates user input into a clear, explicit clinical description.
+import json
+import re
+from datetime import datetime
+from typing import Dict, Any, List
+from google.cloud import aiplatform
+from vertexai.generative_models import GenerativeModel
 
-TASK:
-- For each sentence or clause in the input:
-    - Clarify any vague words or abbreviations, using only information explicitly present.
-    - Preserve relationships (e.g., family member → condition) exactly as stated.
-    - Do NOT invent any diseases, lab types, procedures, or symptoms not present.
-- Produce a single coherent narrative combining all sentences, but only using the original content.
+# ======================================================
+# ENHANCED LLM PROMPTS - No Hardcoding
+# ======================================================
 
-Return JSON:
-{
-  "expanded_query": "..."
-}
+CLINICAL_CLASSIFIER_PROMPT = """
+You are an expert medical AI assistant specializing in clinical query classification.
 
-User Input: "{query}"
+TASK: Determine if the user's query is clinical (medical/healthcare-related) or non-clinical.
+
+CLINICAL QUERIES include:
+- Patient symptoms, conditions, diseases
+- Medical history (personal or family)
+- Laboratory tests, imaging, diagnostics
+- Medications, treatments, procedures
+- Vital signs, physical examinations
+- Risk assessments, screenings
+- Medical documentation requests
+- Healthcare provider queries
+
+NON-CLINICAL QUERIES include:
+- General knowledge questions
+- Administrative/billing questions
+- Appointment scheduling
+- Generic health advice without clinical context
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "is_clinical": true/false,
+  "reason": "brief explanation of classification",
+  "confidence": "high/medium/low"
+}}
+
+User Query: "{query}"
 """
+
+QUERY_EXPANSION_PROMPT = """
+You are an expert medical AI assistant specializing in clinical query expansion.
+
+TASK: Expand the user's query into a comprehensive, detailed clinical description.
+
+INSTRUCTIONS:
+1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
+2. Clarify vague medical terms with specific clinical language
+3. Add relevant medical context based on standard clinical practice
+4. Identify implicit clinical concepts that should be explicit
+5. DO NOT add assumptions beyond reasonable clinical interpretation
+6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
+7. DO NOT hallucinate information not implied by the query
+8. Maintain the original query's intent and scope
+
+EXAMPLES:
+- "Pt with DM" → "Patient with Diabetes Mellitus"
+- "Check vitals" → "Vital signs including blood pressure, heart rate, temperature, respiratory rate, and oxygen saturation"
+- "Family hx of heart disease" → "Family history of cardiovascular disease including coronary artery disease, myocardial infarction, and heart failure"
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "expanded_query": "comprehensive expanded clinical description",
+  "abbreviations_expanded": ["list of abbreviations that were expanded"],
+  "concepts_added": ["list of medical concepts that were made explicit"]
+}}
+
+User Input: {query}
+"""
+
+INTENT_EXTRACTION_PROMPT = """
+You are an expert clinical intent extraction engine specialized in medical information retrieval.
+
+TASK: Extract ALL clinical intents from the expanded query and generate specific, granular queries optimized for CUI (Concept Unique Identifier) extraction.
+
+CRITICAL REQUIREMENTS FOR CUI OPTIMIZATION:
+- Final queries MUST be highly specific (e.g., "Type 2 Diabetes in father" NOT "Family history of diabetes")
+- Each query should target 2-15 CUIs maximum for precise concept matching
+- Break down broad concepts into atomic, searchable queries
+- Include specific family members, body locations, severity levels, time contexts
+- Generate queries that can be directly searched in medical ontologies (SNOMED, UMLS, ICD)
+
+INTENT CATEGORIES (detect dynamically, do not limit to these):
+1. Family History Assessment - genetic/hereditary conditions
+2. Laboratory Results Review - blood tests, biomarkers, panels
+3. Symptom Assessment - patient-reported symptoms with characteristics
+4. Vital Signs Monitoring - physiological measurements
+5. Medication History - current/past medications, adherence
+6. Diagnostic Imaging - radiology, scans, x-rays
+7. Risk Assessment - disease risk factors, screening
+8. Physical Examination - clinical findings
+9. Procedure History - surgeries, interventions
+10. Social History - lifestyle, occupational, behavioral factors
+11. Allergy Documentation - drug, food, environmental allergies
+12. Immunization History - vaccines, dates
+13. ANY OTHER clinical intent detected in the query
+
+FOR EACH INTENT:
+1. **intent_title**: Clear, specific title
+2. **description**: What this intent represents clinically
+3. **nature**: High-level category (Clinical History, Diagnostic Investigation, etc.)
+4. **sub_nature**: Array of subcategories, each containing:
+   - **category**: Specific medical domain
+   - **elements**: Discrete medical concepts within this category
+   - **entities**: Medical entity types (for ontology mapping)
+5. **final_queries**: Array of HIGHLY SPECIFIC queries for CUI extraction
+
+FINAL QUERIES GENERATION RULES:
+- For family history: Generate separate queries for each condition × each family member
+  Example: "Type 2 Diabetes in father", "Hypertension in maternal grandmother"
+- For symptoms: Generate queries for each characteristic (location, radiation, quality, severity, timing)
+  Example: "Chest pain location substernal", "Chest pain radiating to left arm"
+- For labs: Generate queries for each specific test component
+  Example: "LDL cholesterol level", "Neutrophil absolute count"
+- For vital signs: Generate queries for each measurement × context
+  Example: "Systolic blood pressure sitting", "Heart rate at rest"
+- For medications: Generate queries for each drug with specific details
+  Example: "Metformin 1000mg twice daily", "Lisinopril adverse reactions"
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "original_query": "{original_query}",
+  "expanded_query": "{expanded_query}",
+  "total_intents_detected": number,
+  "intents": [
+    {{
+      "intent_title": "string",
+      "description": "string",
+      "nature": "string",
+      "sub_nature": [
+        {{
+          "category": "string",
+          "elements": ["specific medical concept 1", "specific medical concept 2", ...],
+          "entities": ["entity_type_1", "entity_type_2", ...]
+        }}
+      ],
+      "final_queries": [
+        "highly specific query 1 optimized for CUI extraction",
+        "highly specific query 2 optimized for CUI extraction",
+        ...
+      ]
+    }}
+  ]
+}}
+
+User Input: {expanded_query}
+Timestamp: {timestamp}
+"""
+
+QUERY_REFINEMENT_PROMPT = """
+You are an expert medical query optimizer for CUI extraction systems.
+
+TASK: Review the extracted intents and final queries. Ensure they are optimized for medical concept identification.
+
+VALIDATION CHECKLIST:
+1. Are queries specific enough (targeting 2-15 CUIs each)?
+2. Are family history queries separated by family member?
+3. Are symptom queries broken down by characteristic?
+4. Are lab queries atomic (one test per query)?
+5. Are there any redundant or overlapping queries?
+6. Are all medical terms properly expanded?
+7. Are queries directly searchable in medical ontologies?
+
+Return ONLY valid JSON with refined intents:
+{{
+  "intents": [...refined intents array...],
+  "refinements_made": ["list of changes made"],
+  "total_queries": number
+}}
+
+Input Intents: {intents_json}
+"""
+
+# ======================================================
+# ENHANCED PIPELINE WITH PURE LLM-BASED PROCESSING
+# ======================================================
+
+class ContextualIntentPipeline:
+    """
+    Production-ready clinical intent extraction pipeline using pure LLM reasoning.
+    No hardcoded logic - fully dynamic and adaptable to any medical query.
+    """
+    
+    def __init__(self, project: str, location: str = "us-central1", 
+                 model: str = "gemini-2.0-flash-exp", 
+                 enable_refinement: bool = True):
+        """
+        Initialize the pipeline with GCP Vertex AI.
+        
+        Args:
+            project: GCP project ID
+            location: GCP region
+            model: Vertex AI model name
+            enable_refinement: Enable query refinement step for better CUI optimization
+        """
+        aiplatform.init(project=project, location=location)
+        self.model = GenerativeModel(model)
+        self.enable_refinement = enable_refinement
+        
+    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8192) -> str:
+        """
+        Call Vertex AI model with error handling.
+        
+        Args:
+            prompt: The prompt to send to the model
+            temperature: Sampling temperature (0.0 for deterministic)
+            max_tokens: Maximum output tokens
+            
+        Returns:
+            Model response as string
+        """
+        try:
+            # Reset session to avoid context carryover
+            if hasattr(self.model, "session") and self.model.session is not None:
+                self.model.session.reset()
+            
+            response = self.model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": temperature,
+                    "max_output_tokens": max_tokens,
+                    "top_p": 0.95,
+                    "top_k": 40
+                }
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"Error calling model: {str(e)}")
+            return "{}"
+    
+    def _safe_json(self, text: str) -> Dict[str, Any]:
+        """
+        Safely extract and parse JSON from model response.
+        
+        Args:
+            text: Raw model response
+            
+        Returns:
+            Parsed JSON as dictionary
+        """
+        # Remove markdown code blocks if present
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*', '', text)
+        text = text.strip()
+        
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to find JSON object in text
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            # Try to find JSON array in text
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            print(f"Failed to parse JSON from response: {text[:200]}")
+            return {}
+    
+    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
+        """
+        Validate that JSON has required structure.
+        
+        Args:
+            data: Parsed JSON data
+            required_keys: List of required keys
+            
+        Returns:
+            True if valid, False otherwise
+        """
+        return all(key in data for key in required_keys)
+    
+    # ======================================================
+    # STEP 0: Clinical Query Classification
+    # ======================================================
+    
+    def is_clinical_query(self, query: str) -> tuple:
+        """
+        Determine if query is clinical using LLM reasoning.
+        
+        Args:
+            query: User input query
+            
+        Returns:
+            Tuple of (is_clinical: bool, reason: str, confidence: str)
+        """
+        prompt = CLINICAL_CLASSIFIER_PROMPT.format(query=query)
+        raw_response = self._call_model(prompt)
+        data = self._safe_json(raw_response)
+        
+        is_clinical = data.get("is_clinical", False)
+        reason = data.get("reason", "Unable to determine")
+        confidence = data.get("confidence", "low")
+        
+        return is_clinical, reason, confidence
+    
+    # ======================================================
+    # STEP 1: Query Expansion
+    # ======================================================
+    
+    def expand_query(self, query: str) -> Dict[str, Any]:
+        """
+        Expand query using LLM reasoning - no hardcoded abbreviations.
+        
+        Args:
+            query: User input query
+            
+        Returns:
+            Dictionary with expanded_query, abbreviations_expanded, concepts_added
+        """
+        prompt = QUERY_EXPANSION_PROMPT.format(query=query)
+        raw_response = self._call_model(prompt)
+        data = self._safe_json(raw_response)
+        
+        if not self._validate_json_structure(data, ["expanded_query"]):
+            # Fallback to original query if expansion fails
+            return {
+                "expanded_query": query,
+                "abbreviations_expanded": [],
+                "concepts_added": []
+            }
+        
+        return {
+            "expanded_query": data.get("expanded_query", query),
+            "abbreviations_expanded": data.get("abbreviations_expanded", []),
+            "concepts_added": data.get("concepts_added", [])
+        }
+    
+    # ======================================================
+    # STEP 2: Intent Extraction
+    # ======================================================
+    
+    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+        """
+        Extract intents using pure LLM reasoning - fully dynamic.
+        
+        Args:
+            original_query: Original user query
+            expanded_query: Expanded query from step 1
+            
+        Returns:
+            Dictionary with intents array and metadata
+        """
+        prompt = INTENT_EXTRACTION_PROMPT.format(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        
+        # Use higher token limit for complex queries
+        raw_response = self._call_model(prompt, max_tokens=8192)
+        data = self._safe_json(raw_response)
+        
+        if not self._validate_json_structure(data, ["intents"]):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "error": "Failed to extract intents"
+            }
+        
+        return {
+            "intents": data.get("intents", []),
+            "total_intents_detected": data.get("total_intents_detected", len(data.get("intents", []))),
+            "original_query": data.get("original_query", original_query),
+            "expanded_query": data.get("expanded_query", expanded_query)
+        }
+    
+    # ======================================================
+    # STEP 3: Query Refinement (Optional)
+    # ======================================================
+    
+    def refine_queries(self, intents: List[Dict]) -> Dict[str, Any]:
+        """
+        Refine queries for optimal CUI extraction using LLM.
+        
+        Args:
+            intents: Array of extracted intents
+            
+        Returns:
+            Dictionary with refined intents and refinement notes
+        """
+        if not self.enable_refinement or not intents:
+            return {
+                "intents": intents,
+                "refinements_made": [],
+                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
+            }
+        
+        prompt = QUERY_REFINEMENT_PROMPT.format(intents_json=json.dumps(intents, indent=2))
+        raw_response = self._call_model(prompt, max_tokens=8192)
+        data = self._safe_json(raw_response)
+        
+        if not self._validate_json_structure(data, ["intents"]):
+            # Return original if refinement fails
+            return {
+                "intents": intents,
+                "refinements_made": ["Refinement failed - using original"],
+                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
+            }
+        
+        return {
+            "intents": data.get("intents", intents),
+            "refinements_made": data.get("refinements_made", []),
+            "total_queries": data.get("total_queries", 0)
+        }
+    
+    # ======================================================
+    # FULL PIPELINE EXECUTION
+    # ======================================================
+    
+    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
+        """
+        Execute the complete clinical intent extraction pipeline.
+        
+        Args:
+            query: User input query
+            verbose: Print detailed progress information
+            
+        Returns:
+            Complete pipeline results with all extracted intents and queries
+        """
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"CLINICAL INTENT EXTRACTION PIPELINE")
+            print(f"{'='*60}\n")
+            print(f"Original Query: {query}\n")
+        
+        # Step 0: Clinical Classification
+        if verbose:
+            print("STEP 0: Clinical Query Classification...")
+        
+        is_clinical, reason, confidence = self.is_clinical_query(query)
+        
+        if verbose:
+            print(f"  Result: {'CLINICAL' if is_clinical else 'NON-CLINICAL'}")
+            print(f"  Confidence: {confidence}")
+            print(f"  Reason: {reason}\n")
+        
+        if not is_clinical:
+            return {
+                "original_query": query,
+                "expanded_query": None,
+                "intents": [],
+                "is_clinical": False,
+                "rejected_reason": reason,
+                "confidence": confidence,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        
+        # Step 1: Query Expansion
+        if verbose:
+            print("STEP 1: Query Expansion...")
+        
+        expansion_result = self.expand_query(query)
+        expanded_query = expansion_result["expanded_query"]
+        
+        if verbose:
+            print(f"  Expanded Query: {expanded_query}")
+            if expansion_result["abbreviations_expanded"]:
+                print(f"  Abbreviations Expanded: {', '.join(expansion_result['abbreviations_expanded'])}")
+            if expansion_result["concepts_added"]:
+                print(f"  Concepts Added: {', '.join(expansion_result['concepts_added'])}\n")
+        
+        # Step 2: Intent Extraction
+        if verbose:
+            print("STEP 2: Intent Extraction...")
+        
+        intent_result = self.extract_intents(query, expanded_query)
+        intents = intent_result.get("intents", [])
+        
+        if verbose:
+            print(f"  Total Intents Detected: {len(intents)}")
+            for idx, intent in enumerate(intents, 1):
+                print(f"    {idx}. {intent.get('intent_title', 'Unknown')} - {len(intent.get('final_queries', []))} queries")
+            print()
+        
+        # Step 3: Query Refinement (Optional)
+        if self.enable_refinement and intents:
+            if verbose:
+                print("STEP 3: Query Refinement...")
+            
+            refinement_result = self.refine_queries(intents)
+            intents = refinement_result["intents"]
+            
+            if verbose:
+                if refinement_result["refinements_made"]:
+                    print(f"  Refinements Made:")
+                    for refinement in refinement_result["refinements_made"]:
+                        print(f"    - {refinement}")
+                print(f"  Total Final Queries: {refinement_result['total_queries']}\n")
+        
+        # Calculate statistics
+        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
+        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
+        
+        if verbose:
+            print(f"{'='*60}")
+            print(f"PIPELINE COMPLETE")
+            print(f"{'='*60}")
+            print(f"  Total Intents: {len(intents)}")
+            print(f"  Total Sub-natures: {total_sub_natures}")
+            print(f"  Total Queries Generated: {total_queries}")
+            print(f"{'='*60}\n")
+        
+        return {
+            "original_query": query,
+            "expanded_query": expanded_query,
+            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
+            "concepts_added": expansion_result.get("concepts_added", []),
+            "intents": intents,
+            "is_clinical": True,
+            "confidence": confidence,
+            "statistics": {
+                "total_intents": len(intents),
+                "total_sub_natures": total_sub_natures,
+                "total_queries": total_queries,
+                "avg_queries_per_intent": round(total_queries / len(intents), 2) if intents else 0
+            },
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+
+# ======================================================
+# EXAMPLE USAGE
+# ======================================================
+
+if __name__ == "__main__":
+    # Initialize pipeline with your GCP project
+    PROJECT_ID = "your-gcp-project-id"  # Replace with your actual project ID
+    
+    pipeline = ContextualIntentPipeline(
+        project=PROJECT_ID,
+        location="us-central1",
+        model="gemini-2.0-flash-exp",
+        enable_refinement=True  # Enable query refinement for better CUI extraction
+    )
+    
+    # Test queries - from simple to complex
+    test_queries = [
+        # Simple queries
+        "BP monitoring",
+        "Family history of diabetes",
+        "Check CBC results",
+        
+        # Medium complexity
+        "Patient with HTN needs BP and HR monitoring for last 3 months",
+        "Pt reports SOB and chest pain, check vitals and cardiac markers",
+        
+        # Complex queries
+        "The patient has a family history of diabetes and heart disease. They want their lab results reviewed. They also report fatigue and chest pain and shortness of breath.",
+        
+        # Very specific queries
+        "45 year old male with DM type 2, on metformin 1000mg BID, HbA1c 7.2%, family hx of MI in father at age 52, presenting with chest pain radiating to left arm, duration 30 minutes, associated with diaphoresis and dyspnea",
+        
+        # Non-clinical query (should be rejected)
+        "What is the weather like today?"
+    ]
+    
+    # Process each query
+    for idx, query in enumerate(test_queries, 1):
+        print(f"\n\n{'#'*80}")
+        print(f"TEST QUERY {idx}")
+        print(f"{'#'*80}")
+        
+        result = pipeline.run(query, verbose=True)
+        
+        # Save result to file
+        output_filename = f"query_result_{idx}.json"
+        with open(output_filename, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        print(f"\nResult saved to: {output_filename}")
