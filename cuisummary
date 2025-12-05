@@ -1,8 +1,5 @@
 """
 Enhanced CUI Reduction System with Information Content (IC) based Semantic Rollup
-Achieves 80-90% reduction using:
-  Stage 1: IC-based Semantic Rollup to Lowest Informative Ancestor (50-70%)
-  Stage 2: Semantic Clustering of similar concepts (additional 20-30%)
 """
 
 import os
@@ -27,6 +24,35 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# ============================================
+# CONFIGURATION - Update these values
+# ============================================
+class Config:
+    """Configuration for CUI Reduction System"""
+    
+    # GCP Configuration
+    PROJECT_ID = "your-gcp-project-id"  # UPDATE THIS
+    DATASET_ID = "your-dataset-id"       # UPDATE THIS
+    
+    # API Configuration
+    NER_API_URL = "https://your-ner-api-url.com/endpoint"  # UPDATE THIS
+    API_TIMEOUT = 60
+    API_TOP_K = 3
+    
+    # BigQuery Table Names
+    MRREL_TABLE = "MRREL"
+    CUI_DESCRIPTION_TABLE = "cui_descriptions"      # Columns: CUI, Definition
+    CUI_EMBEDDINGS_TABLE = "cui_embeddings"         # Columns: REF_CUI, REF_Embedding
+    CUI_NARROWER_TABLE = "cui_narrower_concepts"    # Columns: CUI, NarrowerCUI (comma-separated)
+    
+    # Reduction Parameters (defaults)
+    TARGET_REDUCTION = 0.85
+    IC_PERCENTILE = 50.0
+    SEMANTIC_THRESHOLD = 0.88
+    USE_SEMANTIC_CLUSTERING = True
+    ADAPTIVE_THRESHOLD = False
 
 
 @dataclass
@@ -237,9 +263,9 @@ class EnhancedCUIReducer:
             project_id: GCP project ID
             dataset_id: BigQuery dataset ID
             mrrel_table: MRREL table name
-            cui_description_table: CUI description table name
-            cui_embeddings_table: CUI embeddings table name
-            cui_narrower_table: CUI narrower concepts table name
+            cui_description_table: CUI description table (columns: CUI, Definition)
+            cui_embeddings_table: CUI embeddings table (columns: REF_CUI, REF_Embedding)
+            cui_narrower_table: CUI narrower concepts table (columns: CUI, NarrowerCUI - comma-separated)
         """
         self.client = bigquery.Client(project=project_id)
         self.project_id = project_id
@@ -294,7 +320,10 @@ class EnhancedCUIReducer:
         # Determine IC threshold
         if ic_threshold is None:
             ic_values = list(ic_scores.values())
-            if adaptive_threshold:
+            if len(ic_values) == 0:
+                logger.warning("No IC scores computed, using default threshold")
+                ic_threshold = 5.0
+            elif adaptive_threshold:
                 ic_threshold = self._find_adaptive_threshold(
                     input_cuis, hierarchy, ic_scores, target_reduction
                 )
@@ -309,7 +338,7 @@ class EnhancedCUIReducer:
             input_cuis, hierarchy, ic_scores, ic_threshold
         )
         after_rollup = len(rolled_up_cuis)
-        rollup_reduction = 1 - (after_rollup / initial_count)
+        rollup_reduction = 1 - (after_rollup / initial_count) if initial_count > 0 else 0
         
         logger.info(f"After IC rollup: {after_rollup} CUIs ({rollup_reduction*100:.1f}% reduction)")
         
@@ -321,7 +350,7 @@ class EnhancedCUIReducer:
                 rolled_up_cuis, ic_scores, semantic_threshold
             )
             final_count = len(final_cuis)
-            clustering_reduction = (after_rollup - final_count) / initial_count
+            clustering_reduction = (after_rollup - final_count) / initial_count if initial_count > 0 else 0
             logger.info(f"After clustering: {final_count} CUIs ({clustering_reduction*100:.1f}% additional reduction)")
         else:
             final_cuis = rolled_up_cuis
@@ -332,7 +361,7 @@ class EnhancedCUIReducer:
                 logger.info(f"Target reduction achieved, skipping clustering stage")
         
         # Calculate statistics
-        total_reduction = 1 - (final_count / initial_count)
+        total_reduction = 1 - (final_count / initial_count) if initial_count > 0 else 0
         processing_time = time.time() - start_time
         
         stats = ReductionStats(
@@ -354,32 +383,23 @@ class EnhancedCUIReducer:
     
     def _build_hierarchy(self, relevant_cuis: List[str]) -> Dict[str, Dict]:
         """
-        Build parent-child hierarchy from MRREL table
-        
-        Returns:
-            Dict with structure:
-            {
-                'child_to_parents': {cui: [parent_cuis]},
-                'parent_to_children': {cui: [child_cuis]},
-                'all_cuis': set of all CUIs in hierarchy
-            }
+        Build parent-child hierarchy from MRREL table and narrower concepts table
+        Handles comma-separated NarrowerCUI values
         """
         if self._hierarchy_cache is not None:
             return self._hierarchy_cache
         
         # Query MRREL for parent-child relationships
-        query = f"""
+        query_mrrel = f"""
         WITH input_cuis AS (
           SELECT DISTINCT cui FROM UNNEST(@cui_list) AS cui
         ),
-        -- Get all relationships where input CUIs are involved
         relevant_relations AS (
           SELECT DISTINCT cui1, cui2, rel
           FROM `{self.project_id}.{self.dataset_id}.{self.mrrel_table}`
           WHERE (cui1 IN (SELECT cui FROM input_cuis) OR cui2 IN (SELECT cui FROM input_cuis))
             AND rel IN ('PAR', 'CHD')
         ),
-        -- Expand to get full ancestor chains
         expanded_relations AS (
           SELECT DISTINCT m.cui1, m.cui2, m.rel
           FROM `{self.project_id}.{self.dataset_id}.{self.mrrel_table}` m
@@ -394,6 +414,30 @@ class EnhancedCUIReducer:
         SELECT cui1, cui2, rel FROM expanded_relations
         """
         
+        # Query narrower concepts table
+        # UPDATED: Handles comma-separated NarrowerCUI values
+        query_narrower = f"""
+        WITH input_cuis AS (
+          SELECT DISTINCT cui FROM UNNEST(@cui_list) AS cui
+        ),
+        narrower_raw AS (
+          SELECT CUI as parent_cui, NarrowerCUI as narrower_list
+          FROM `{self.project_id}.{self.dataset_id}.{self.cui_narrower_table}`
+          WHERE CUI IN (SELECT cui FROM input_cuis)
+            AND NarrowerCUI IS NOT NULL
+            AND NarrowerCUI != ''
+        ),
+        narrower_split AS (
+          SELECT 
+            parent_cui,
+            TRIM(child_cui) as child_cui
+          FROM narrower_raw,
+          UNNEST(SPLIT(narrower_list, ',')) as child_cui
+        )
+        SELECT parent_cui, child_cui FROM narrower_split
+        WHERE child_cui IS NOT NULL AND child_cui != ''
+        """
+        
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
                 bigquery.ArrayQueryParameter("cui_list", "STRING", relevant_cuis)
@@ -401,25 +445,47 @@ class EnhancedCUIReducer:
         )
         
         try:
-            df = self.client.query(query, job_config=job_config).to_dataframe()
-            
             child_to_parents = defaultdict(list)
             parent_to_children = defaultdict(list)
             all_cuis = set()
             
-            for _, row in df.iterrows():
-                cui1, cui2, rel = row['cui1'], row['cui2'], row['rel']
+            # Process MRREL relationships
+            try:
+                df_mrrel = self.client.query(query_mrrel, job_config=job_config).to_dataframe()
+                logger.info(f"Retrieved {len(df_mrrel)} relationships from MRREL")
                 
-                if rel == 'PAR':  # cui1 is parent of cui2
-                    parent_to_children[cui1].append(cui2)
-                    child_to_parents[cui2].append(cui1)
-                    all_cuis.add(cui1)
-                    all_cuis.add(cui2)
-                elif rel == 'CHD':  # cui1 is child of cui2
-                    parent_to_children[cui2].append(cui1)
-                    child_to_parents[cui1].append(cui2)
-                    all_cuis.add(cui1)
-                    all_cuis.add(cui2)
+                for _, row in df_mrrel.iterrows():
+                    cui1, cui2, rel = row['cui1'], row['cui2'], row['rel']
+                    
+                    if rel == 'PAR':
+                        parent_to_children[cui1].append(cui2)
+                        child_to_parents[cui2].append(cui1)
+                        all_cuis.add(cui1)
+                        all_cuis.add(cui2)
+                    elif rel == 'CHD':
+                        parent_to_children[cui2].append(cui1)
+                        child_to_parents[cui1].append(cui2)
+                        all_cuis.add(cui1)
+                        all_cuis.add(cui2)
+            except Exception as e:
+                logger.warning(f"Failed to query MRREL: {str(e)}")
+            
+            # Process narrower concepts (comma-separated values)
+            try:
+                df_narrower = self.client.query(query_narrower, job_config=job_config).to_dataframe()
+                logger.info(f"Retrieved {len(df_narrower)} narrower relationships")
+                
+                for _, row in df_narrower.iterrows():
+                    parent_cui = row['parent_cui']
+                    child_cui = row['child_cui']
+                    
+                    if parent_cui and child_cui:
+                        parent_to_children[parent_cui].append(child_cui)
+                        child_to_parents[child_cui].append(parent_cui)
+                        all_cuis.add(parent_cui)
+                        all_cuis.add(child_cui)
+            except Exception as e:
+                logger.warning(f"Failed to query narrower concepts: {str(e)}")
             
             hierarchy = {
                 'child_to_parents': dict(child_to_parents),
@@ -441,14 +507,7 @@ class EnhancedCUIReducer:
             }
     
     def _compute_ic_scores(self, hierarchy: Dict) -> Dict[str, float]:
-        """
-        Compute structural Information Content (IC) for all CUIs
-        
-        IC(cui) = -log((# descendants + 1) / # all CUIs)
-        
-        Higher IC = more specific (fewer descendants)
-        Lower IC = more general (many descendants)
-        """
+        """Compute structural Information Content (IC) for all CUIs"""
         if self._ic_scores_cache is not None:
             return self._ic_scores_cache
         
@@ -459,11 +518,9 @@ class EnhancedCUIReducer:
         if total_cuis == 0:
             return {}
         
-        # Count descendants for each CUI
         descendant_counts = {}
         
         def count_descendants(cui: str, visited: Set[str] = None) -> int:
-            """Recursively count all descendants"""
             if visited is None:
                 visited = set()
             
@@ -483,13 +540,11 @@ class EnhancedCUIReducer:
             descendant_counts[cui] = count
             return count
         
-        # Compute descendant counts for all CUIs
         logger.info("Computing descendant counts...")
         for cui in all_cuis:
             if cui not in descendant_counts:
                 count_descendants(cui)
         
-        # Compute IC scores
         ic_scores = {}
         for cui in all_cuis:
             desc_count = descendant_counts.get(cui, 0)
@@ -498,16 +553,16 @@ class EnhancedCUIReducer:
         
         self._ic_scores_cache = ic_scores
         
-        # Log statistics
-        ic_values = list(ic_scores.values())
-        logger.info(f"Computed IC scores for {len(ic_scores)} CUIs")
-        logger.info(f"IC range: [{min(ic_values):.3f}, {max(ic_values):.3f}]")
-        logger.info(f"IC median: {np.median(ic_values):.3f}")
+        if ic_scores:
+            ic_values = list(ic_scores.values())
+            logger.info(f"Computed IC scores for {len(ic_scores)} CUIs")
+            logger.info(f"IC range: [{min(ic_values):.3f}, {max(ic_values):.3f}]")
+            logger.info(f"IC median: {np.median(ic_values):.3f}")
         
         return ic_scores
     
     def _get_ancestors(self, cui: str, hierarchy: Dict) -> List[str]:
-        """Get all ancestors of a CUI (breadth-first traversal)"""
+        """Get all ancestors of a CUI"""
         child_to_parents = hierarchy['child_to_parents']
         ancestors = []
         visited = set()
@@ -534,42 +589,26 @@ class EnhancedCUIReducer:
         ic_scores: Dict[str, float],
         ic_threshold: float
     ) -> List[str]:
-        """
-        Roll up CUIs to their Lowest Informative Ancestor (LIA)
-        
-        For each CUI:
-        1. Get all ancestors
-        2. Filter ancestors with IC >= threshold
-        3. Select ancestor with lowest IC above threshold (most general while still informative)
-        4. If no valid ancestor, keep original CUI
-        """
+        """Roll up CUIs to their Lowest Informative Ancestor (LIA)"""
         rolled_up = {}
         
         for cui in cui_list:
-            # Get all ancestors
             ancestors = self._get_ancestors(cui, hierarchy)
-            
-            # Add the CUI itself as a candidate
             candidates = [cui] + ancestors
             
-            # Filter by IC threshold
             valid_candidates = [
                 c for c in candidates 
                 if ic_scores.get(c, 0) >= ic_threshold
             ]
             
             if valid_candidates:
-                # Select the one with lowest IC (most general while still informative)
                 lia = min(valid_candidates, key=lambda c: ic_scores.get(c, float('inf')))
                 rolled_up[cui] = lia
             else:
-                # No valid ancestor, keep original
                 rolled_up[cui] = cui
         
-        # Return unique rolled-up CUIs
         unique_rolled_up = list(set(rolled_up.values()))
         
-        # Log rollup statistics
         rollup_groups = defaultdict(list)
         for original, rolled in rolled_up.items():
             rollup_groups[rolled].append(original)
@@ -588,19 +627,18 @@ class EnhancedCUIReducer:
         similarity_threshold: float = 0.88
     ) -> List[str]:
         """
-        Cluster semantically similar CUIs and keep one representative per cluster
-        Prefers CUIs with lower IC (more general) as cluster representatives
+        Cluster semantically similar CUIs using embeddings
+        Table columns: REF_CUI, REF_Embedding
         """
         if len(cui_list) <= 1:
             return cui_list
         
         logger.info(f"Fetching embeddings for {len(cui_list)} CUIs...")
         
-        # Fetch embeddings from BigQuery
         query = f"""
-        SELECT cui, embedding
+        SELECT REF_CUI as cui, REF_Embedding as embedding
         FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
-        WHERE cui IN UNNEST(@cui_list)
+        WHERE REF_CUI IN UNNEST(@cui_list)
         """
         
         job_config = bigquery.QueryJobConfig(
@@ -616,14 +654,11 @@ class EnhancedCUIReducer:
                 logger.warning("No embeddings found, skipping semantic clustering")
                 return cui_list
             
-            # Convert embeddings to numpy array
             embeddings = np.vstack(df['embedding'].values)
             cuis = df['cui'].values
             
             logger.info(f"Retrieved embeddings for {len(cuis)} CUIs")
             
-            # Perform clustering
-            logger.info("Clustering similar CUIs...")
             clustering = AgglomerativeClustering(
                 n_clusters=None,
                 distance_threshold=1 - similarity_threshold,
@@ -636,7 +671,6 @@ class EnhancedCUIReducer:
             
             logger.info(f"Found {n_clusters} clusters from {len(cuis)} CUIs")
             
-            # Keep one representative per cluster (prefer lower IC = more general)
             final_cuis = []
             for cluster_id in np.unique(labels):
                 cluster_mask = labels == cluster_id
@@ -645,7 +679,6 @@ class EnhancedCUIReducer:
                 if len(cluster_cuis) == 1:
                     final_cuis.append(cluster_cuis[0])
                 else:
-                    # Pick the one with lowest IC (most general in cluster)
                     representative = min(
                         cluster_cuis,
                         key=lambda c: ic_scores.get(c, float('inf'))
@@ -667,39 +700,41 @@ class EnhancedCUIReducer:
         ic_scores: Dict[str, float],
         target_reduction: float
     ) -> float:
-        """
-        Dynamically find IC threshold to achieve target reduction
-        """
+        """Dynamically find IC threshold to achieve target reduction"""
         logger.info("Finding adaptive IC threshold...")
         
         ic_values = sorted(ic_scores.values())
         
-        # Try different percentiles
+        if not ic_values:
+            return 5.0
+        
         for percentile in [50, 40, 30, 25, 20, 15, 10]:
             threshold = np.percentile(ic_values, percentile)
             rolled_up = self._semantic_rollup_with_ic(cui_list, hierarchy, ic_scores, threshold)
-            reduction = 1 - len(rolled_up) / len(cui_list)
+            reduction = 1 - len(rolled_up) / len(cui_list) if len(cui_list) > 0 else 0
             
             logger.debug(f"Percentile {percentile} (threshold={threshold:.3f}): {reduction*100:.1f}% reduction")
             
-            if reduction >= target_reduction * 0.9:  # Within 90% of target
+            if reduction >= target_reduction * 0.9:
                 logger.info(f"Selected IC threshold: {threshold:.3f} (percentile {percentile})")
                 return threshold
         
-        # If still not enough, use lowest percentile
         threshold = np.percentile(ic_values, 5)
         logger.info(f"Using minimum IC threshold: {threshold:.3f}")
         return threshold
     
     def get_cui_descriptions(self, cui_list: List[str]) -> Dict[str, str]:
-        """Retrieve descriptions for a list of CUIs"""
+        """
+        Retrieve descriptions for a list of CUIs
+        Table columns: CUI, Definition
+        """
         if not cui_list:
             return {}
         
         query = f"""
-        SELECT cui, description
+        SELECT CUI as cui, Definition as description
         FROM `{self.project_id}.{self.dataset_id}.{self.cui_description_table}`
-        WHERE cui IN UNNEST(@cui_list)
+        WHERE CUI IN UNNEST(@cui_list)
         """
         
         job_config = bigquery.QueryJobConfig(
@@ -746,41 +781,22 @@ class CUIReductionPipeline:
         batch_size: int = 50,
         max_workers: int = 5
     ) -> Tuple[List[str], Dict[str, str], ReductionStats]:
-        """
-        Complete pipeline: extract CUIs from texts and reduce them
-        
-        Args:
-            texts: List of text strings to process
-            target_reduction: Target reduction percentage
-            ic_percentile: IC percentile for threshold
-            semantic_threshold: Similarity threshold for clustering
-            use_semantic_clustering: Enable Stage 2
-            adaptive_threshold: Auto-find IC threshold
-            batch_size: Texts per API batch
-            max_workers: Parallel workers for API calls
-        
-        Returns:
-            Tuple of (reduced CUIs, CUI descriptions, statistics)
-        """
-        # Step 1: Extract CUIs from texts
+        """Complete pipeline: extract CUIs from texts and reduce them"""
         logger.info(f"Processing {len(texts)} input texts...")
         
         if len(texts) > batch_size:
-            # Use parallel processing for large text collections
             initial_cuis = self.api_client.extract_cuis_parallel(
                 texts, 
                 batch_size=batch_size,
                 max_workers=max_workers
             )
         else:
-            # Single batch for small collections
             initial_cuis = self.api_client.extract_cuis_batch(texts)
         
         if not initial_cuis:
             logger.warning("No CUIs extracted from texts")
             return [], {}, None
         
-        # Step 2: Reduce CUIs
         reduced_cuis, stats = self.cui_reducer.reduce(
             list(initial_cuis),
             target_reduction=target_reduction,
@@ -790,7 +806,6 @@ class CUIReductionPipeline:
             adaptive_threshold=adaptive_threshold
         )
         
-        # Step 3: Get descriptions for final CUIs
         logger.info("Fetching descriptions for reduced CUIs...")
         descriptions = self.cui_reducer.get_cui_descriptions(reduced_cuis)
         
@@ -800,25 +815,20 @@ class CUIReductionPipeline:
 def main():
     """Example usage"""
     
-    # Configuration
-    PROJECT_ID = "your-gcp-project-id"
-    DATASET_ID = "your-dataset-id"
-    NER_API_URL = "https://your-ner-api-url.com/endpoint"
-    
-    # Initialize components
+    # Initialize components using Config class
     api_client = CUIAPIClient(
-        api_base_url=NER_API_URL,
-        timeout=60,
-        top_k=3
+        api_base_url=Config.NER_API_URL,
+        timeout=Config.API_TIMEOUT,
+        top_k=Config.API_TOP_K
     )
     
     cui_reducer = EnhancedCUIReducer(
-        project_id=PROJECT_ID,
-        dataset_id=DATASET_ID,
-        mrrel_table="MRREL",
-        cui_description_table="cui_descriptions",
-        cui_embeddings_table="cui_embeddings",
-        cui_narrower_table="cui_narrower_concepts"
+        project_id=Config.PROJECT_ID,
+        dataset_id=Config.DATASET_ID,
+        mrrel_table=Config.MRREL_TABLE,
+        cui_description_table=Config.CUI_DESCRIPTION_TABLE,
+        cui_embeddings_table=Config.CUI_EMBEDDINGS_TABLE,
+        cui_narrower_table=Config.CUI_NARROWER_TABLE
     )
     
     # Create pipeline
@@ -831,16 +841,14 @@ def main():
         "Prescribed metformin for blood sugar control."
     ]
     
-    # Process with enhanced reduction
+    # Process
     reduced_cuis, descriptions, stats = pipeline.process_texts(
         texts,
-        target_reduction=0.85,
-        ic_percentile=50.0,
-        semantic_threshold=0.88,
-        use_semantic_clustering=True,
-        adaptive_threshold=False,
-        batch_size=50,
-        max_workers=5
+        target_reduction=Config.TARGET_REDUCTION,
+        ic_percentile=Config.IC_PERCENTILE,
+        semantic_threshold=Config.SEMANTIC_THRESHOLD,
+        use_semantic_clustering=Config.USE_SEMANTIC_CLUSTERING,
+        adaptive_threshold=Config.ADAPTIVE_THRESHOLD
     )
     
     # Display results
