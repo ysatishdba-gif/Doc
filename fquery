@@ -1,585 +1,177 @@
-import json
-import re
-from datetime import datetime
-from typing import Dict, Any, List, Optional
-from google.cloud import aiplatform
-from vertexai.generative_models import GenerativeModel
-
-# ======================================================
-# CONFIGURATION
-# ======================================================
-MODEL_VERSION = "models/gemini-1.5-pro-002"  # Update as needed
-PROJECT_ID = "your-project-id"  # Update with your project ID
-
-# ======================================================
-# IMPROVED PROMPTS WITH CONSISTENT FORMAT ENFORCEMENT
-# ======================================================
-
-QUERY_EXPANSION_PROMPT = """
-You are an expert medical AI assistant specializing in clinical query expansion.
-
-TASK: Expand the user's query into a comprehensive, detailed clinical description.
-
-INSTRUCTIONS:
-1. Expand ALL medical abbreviations to full terms
-2. Clarify vague medical terms with specific clinical language
-3. Add relevant medical context based on standard clinical practice
-4. Identify implicit clinical concepts that should be explicit
-5. DO NOT add assumptions beyond reasonable clinical interpretation
-6. DO NOT include action verbs unless in original query
-7. DO NOT hallucinate information not implied by the query
-8. Maintain the original query's intent and scope
-
-Return ONLY valid JSON (no markdown, no explanation):
-{{
-  "expanded_query": "comprehensive expanded clinical description",
-  "abbreviations_expanded": ["list of abbreviations that were expanded"],
-  "concepts_added": ["list of medical concepts that were made explicit"]
-}}
-
-User Input: {query}
-"""
-
 INTENT_EXTRACTION_PROMPT = """
-You are an expert clinical intent extraction engine specialized in medical information retrieval.
+You are an advanced clinical intent extraction engine specializing in medical information retrieval and hierarchical taxonomic classification.
 
-CRITICAL FORMAT REQUIREMENT:
-You MUST use ONLY the flattened hierarchy format for sub_nature. Do NOT use nested structures.
+============================================================
+1. CLINICAL VALIDATION
+============================================================
+FIRST: Determine whether the query is clinical.
 
-TASK: Extract ALL clinical intents from the expanded query and generate specific queries for CUI extraction.
+If the query does NOT involve healthcare, medical conditions, symptoms, treatments, diagnostics, or clinically relevant information, return:
 
-First verify this is a CLINICAL query. If NOT clinical, return:
-{{
+{
   "is_clinical": false,
   "reason": "Query is not clinical in nature",
   "intents": []
-}}
+}
 
-For CLINICAL queries, extract intents with this EXACT structure:
+Examples of NON-CLINICAL content:
+- Weather, sports, entertainment, trivia
+- IT/technical support unrelated to medical systems
+- Travel, food, shopping (unless medically relevant)
 
-{{
+If the query IS clinical, continue.
+
+============================================================
+2. OVERALL TASK
+============================================================
+Extract ALL clinical intents within the expanded query.  
+Each intent must include:
+- A deep, multi-level hierarchical taxonomy  
+- Multiple sub_nature dimensions  
+- Atomic-level elements  
+- A populated final_queries array (minimum 5, typically 10–40)
+
+Every intent MUST have final_queries. No exceptions.
+
+============================================================
+3. INTENT STRUCTURE REQUIREMENTS
+============================================================
+Each intent must contain:
+
+1. intent_title  
+2. description (clinical purpose and information need)  
+3. nature (primary characteristic)  
+4. sub_nature (multiple multi-level taxonomic decompositions)  
+5. final_queries (strictly derived from atomic-level elements)
+
+============================================================
+4. HIERARCHICAL TAXONOMY DESIGN
+============================================================
+Build a deep classification (minimum 3–4 levels) using this pattern:
+
+Nature → Level 2 Clinical Domain → Level 3 Specialty Area →  
+Level 4 Specific Clinical Category → Level 5 Atomic Elements
+
+Each sub_nature should represent a separate dimension, such as:
+- Anatomical  
+- Temporal  
+- Severity  
+- Qualitative  
+- Functional  
+- Diagnostic  
+- Hereditary  
+- Relationship-based  
+
+Acceptable sub_nature format:
+
+{
+  "category": "Level2 >> Level3 >> Level4",
+  "elements": ["atomic element 1", "atomic element 2"],
+  "entities": ["entity_type_1", "entity_type_2"]
+}
+
+============================================================
+5. HOW TO DECIDE "NATURE"
+============================================================
+Nature describes the primary characteristic of the clinical information need.
+
+Determine it by answering:
+- WHEN does this information apply? (past/present/future)
+- WHY is it needed? (context, assessment, diagnostic, risk)
+- WHERE does it originate? (history, exam, test, relationship)
+- WHAT is its role in the clinical encounter? (central, supporting)
+
+Nature must be:
+- Clinically meaningful  
+- Broad enough to cover all sub_natures  
+- Specific enough to distinguish this intent  
+- Created dynamically based on the content (no forced templates)
+
+============================================================
+6. COMPLEX QUERIES → MULTIPLE INTENTS
+============================================================
+Separate intents when:
+- Information needs have different purposes (e.g., a symptom vs. family history)  
+- A concept introduces a distinct clinical objective  
+
+Keep a unified intent only when all details serve one primary goal.
+
+============================================================
+7. FINAL QUERY GENERATION RULES
+============================================================
+Generate final queries ONLY from ATOMIC (deepest-level) elements.
+
+Final queries must be:
+- Highly specific (2–5 words)  
+- Clinically meaningful  
+- Searchable in SNOMED/UMLS/ICD  
+- Focused on 2–15 CUIs per query  
+- NOT redundant  
+
+Follow these styles:
+- "[Condition] in [relative]"
+- "[Symptom] [location]"
+- "[Symptom] [quality]"
+- "[Test]"
+- "[Medication] [dose] [frequency]"
+
+Remove unnecessary words:
+- history of, family history of
+- location, character, quality, severity
+- associated with, related to
+- articles (the, a, an)
+- “level” unless medically standard
+
+============================================================
+8. QUERY SELECTION STRATEGY
+============================================================
+DO NOT create exhaustive permutations.
+
+Select atomic elements based on:
+- Clinical relevance  
+- Diagnostic usefulness  
+- Common documentation practice  
+- Typical presentation patterns  
+
+Prioritize:
+1. First-degree relatives  
+2. Common clinical variants  
+3. Standard diagnostic markers  
+4. High-yield symptom descriptors  
+
+Final total per intent: typically 10–40 queries, minimum 5.
+
+============================================================
+9. OUTPUT FORMAT (MANDATORY)
+============================================================
+Return ONLY valid JSON:
+
+{
   "is_clinical": true,
+  "reason": "",
   "original_query": "{original_query}",
   "expanded_query": "{expanded_query}",
   "total_intents_detected": number,
   "intents": [
-    {{
-      "intent_title": "Clear, specific title",
-      "description": "Clinical purpose and information need",
-      "nature": "Primary characteristic using >> for hierarchy if needed",
+    {
+      "intent_title": "string",
+      "description": "string",
+      "nature": "string",
       "sub_nature": [
-        {{
-          "category": "Level2 >> Level3 >> Level4",  // ALWAYS use >> format
-          "elements": ["atomic element 1", "atomic element 2"],  // Array of strings
-          "entities": ["entity type 1", "entity type 2"]  // Array of strings
-        }}
-        // NO nested subcategories or subdivisions allowed
+        {
+          "category": "string",
+          "elements": ["atomic1", "atomic2"],
+          "entities": ["entity_type1", "entity_type2"]
+        }
       ],
       "final_queries": [
-        "concise query 1",
-        "concise query 2",
-        "concise query 3",
-        // Minimum 5 queries, typically 10-40 based on complexity
+        "specific query 1",
+        "specific query 2",
+        "specific query 3",
+        "specific query 4",
+        "specific query 5"
       ]
-    }}
+    }
   ]
-}}
-
-SUB_NATURE FORMAT RULES:
-1. ALWAYS use the "category" field with >> separators for hierarchy
-2. NEVER use "subcategories" or "subdivisions" fields
-3. Elements and entities must be arrays of strings
-4. Create multiple sub_nature objects for different dimensions
-
-Example of CORRECT sub_nature format:
-{{
-  "category": "Symptom Characteristics >> Anatomical >> Chest >> Specific Zones",
-  "elements": ["Substernal", "Precordial", "Left anterior"],
-  "entities": ["Anatomical_Location", "Body_Region"]
-}}
-
-Example of INCORRECT format (DO NOT USE):
-{{
-  "category": "Symptom Characteristics",
-  "subcategories": [...]  // WRONG - do not use nested structures
-}}
-
-FINAL QUERIES GENERATION:
-- Generate from the ATOMIC ELEMENTS in your taxonomy
-- Focus on clinically relevant combinations
-- Target 10-40 queries per intent (not exhaustive permutations)
-- Make queries concise (2-5 words typically)
-- Remove unnecessary words like "history of", "assessment", etc.
-
-User Input: {expanded_query}
-Original Query: {original_query}
-Timestamp: {timestamp}
+}
 """
-
-QUERY_REFINEMENT_PROMPT = """
-You are an expert medical query optimizer for CUI extraction systems.
-
-TASK: Review and optimize the extracted intents while maintaining the EXACT format structure.
-
-CRITICAL: Maintain the flattened sub_nature format with >> separators. Do NOT introduce nested structures.
-
-OPTIMIZATION PRINCIPLES:
-1. Conciseness: Remove unnecessary words
-2. Specificity: Target 2-15 CUIs per query
-3. Completeness: Cover all clinical dimensions
-4. Remove exact duplicates only
-
-Return ONLY valid JSON maintaining the same structure:
-{{
-  "intents": [...refined intents with same format...],
-  "refinements_made": ["list of changes"],
-  "total_queries": number,
-  "optimization_summary": "brief description"
-}}
-
-Input Intents: {intents_json}
-"""
-
-# ======================================================
-# ENHANCED PIPELINE WITH FORMAT VALIDATION
-# ======================================================
-
-class ContextualIntentPipeline:
-    """
-    Production-ready clinical intent extraction pipeline with consistent formatting.
-    """
-    
-    def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = MODEL_VERSION, 
-                 enable_refinement: bool = False,
-                 strict_format_validation: bool = True):
-        """
-        Initialize the pipeline with GCP Vertex AI.
-        
-        Args:
-            project: GCP project ID
-            location: GCP region
-            model: Vertex AI model name
-            enable_refinement: Enable query refinement step
-            strict_format_validation: Enforce consistent sub_nature format
-        """
-        aiplatform.init(project=project, location=location)
-        self.model = GenerativeModel(model)
-        self.enable_refinement = enable_refinement
-        self.strict_format_validation = strict_format_validation
-        
-    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8192) -> str:
-        """Call Vertex AI model with error handling."""
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": temperature,
-                    "max_output_tokens": max_tokens,
-                    "top_p": 0.95,
-                    "top_k": 40
-                }
-            )
-            return response.text.strip()
-        except Exception as e:
-            print(f"Error calling model: {str(e)}")
-            return "{}"
-    
-    def _safe_json(self, text: str) -> Dict[str, Any]:
-        """Safely extract and parse JSON from model response."""
-        # Remove markdown code blocks
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```\s*', '', text)
-        text = text.strip()
-        
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            # Try to find JSON in text
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
-            print(f"Failed to parse JSON from response: {text[:200]}")
-            return {}
-    
-    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
-        """Validate that JSON has required structure."""
-        return all(key in data for key in required_keys)
-    
-    def _validate_sub_nature_format(self, intent: Dict) -> tuple[bool, List[str]]:
-        """
-        Validate that sub_nature follows the expected flattened format.
-        
-        Returns:
-            (is_valid, list_of_issues)
-        """
-        issues = []
-        
-        if "sub_nature" not in intent:
-            return False, ["Missing sub_nature field"]
-        
-        for idx, sub in enumerate(intent.get("sub_nature", [])):
-            # Check required fields
-            if not all(k in sub for k in ["category", "elements", "entities"]):
-                issues.append(f"Sub_nature {idx}: Missing required fields")
-                continue
-            
-            # Check for forbidden nested structures
-            if "subcategories" in sub or "subdivisions" in sub:
-                issues.append(f"Sub_nature {idx}: Contains forbidden nested structure")
-            
-            # Check that elements and entities are lists
-            if not isinstance(sub.get("elements", []), list):
-                issues.append(f"Sub_nature {idx}: elements is not a list")
-            if not isinstance(sub.get("entities", []), list):
-                issues.append(f"Sub_nature {idx}: entities is not a list")
-            
-            # Warn if category doesn't use >> format (but don't fail)
-            if ">>" not in sub.get("category", ""):
-                issues.append(f"Sub_nature {idx}: category doesn't use >> hierarchy (warning only)")
-        
-        return len(issues) == 0, issues
-    
-    def _normalize_sub_nature(self, intents: List[Dict]) -> List[Dict]:
-        """
-        Normalize sub_nature format to ensure consistency.
-        Converts any nested structures to flattened format.
-        """
-        for intent in intents:
-            if "sub_nature" not in intent:
-                continue
-            
-            normalized_sub_nature = []
-            for sub in intent["sub_nature"]:
-                # If it has nested structure, try to flatten it
-                if "subcategories" in sub or "subdivisions" in sub:
-                    # Attempt to create flattened version
-                    category = sub.get("category", "Unknown")
-                    if "subcategories" in sub and isinstance(sub["subcategories"], list):
-                        # Try to extract nested category names
-                        for subcat in sub["subcategories"]:
-                            if isinstance(subcat, dict) and "name" in subcat:
-                                category += f" >> {subcat['name']}"
-                    
-                    normalized_sub = {
-                        "category": category,
-                        "elements": sub.get("elements", []),
-                        "entities": sub.get("entities", [])
-                    }
-                    print(f"⚠️  Normalized nested structure in '{intent.get('intent_title', 'Unknown')}'")
-                else:
-                    # Already in correct format
-                    normalized_sub = sub
-                
-                # Ensure elements and entities are lists
-                if not isinstance(normalized_sub.get("elements"), list):
-                    normalized_sub["elements"] = []
-                if not isinstance(normalized_sub.get("entities"), list):
-                    normalized_sub["entities"] = []
-                
-                normalized_sub_nature.append(normalized_sub)
-            
-            intent["sub_nature"] = normalized_sub_nature
-        
-        return intents
-    
-    def expand_query(self, query: str) -> Dict[str, Any]:
-        """Expand query using LLM reasoning."""
-        prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        raw_response = self._call_model(prompt)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["expanded_query"]):
-            return {
-                "expanded_query": query,
-                "abbreviations_expanded": [],
-                "concepts_added": []
-            }
-        
-        return {
-            "expanded_query": data.get("expanded_query", query),
-            "abbreviations_expanded": data.get("abbreviations_expanded", []),
-            "concepts_added": data.get("concepts_added", [])
-        }
-    
-    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-        """Extract intents with format validation."""
-        prompt = INTENT_EXTRACTION_PROMPT.format(
-            original_query=original_query,
-            expanded_query=expanded_query,
-            timestamp=datetime.utcnow().isoformat()
-        )
-        
-        raw_response = self._call_model(prompt, max_tokens=8192)
-        data = self._safe_json(raw_response)
-        
-        # Check if query was rejected as non-clinical
-        if not data.get("is_clinical", True):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query is not clinical"),
-                "original_query": original_query,
-                "expanded_query": expanded_query
-            }
-        
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "error": "Failed to extract intents"
-            }
-        
-        intents = data.get("intents", [])
-        validated_intents = []
-        
-        for idx, intent in enumerate(intents):
-            # Check for final_queries
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"⚠️  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            
-            # Validate sub_nature format if strict validation is enabled
-            if self.strict_format_validation:
-                is_valid, issues = self._validate_sub_nature_format(intent)
-                if not is_valid:
-                    print(f"⚠️  Format issues in intent '{intent.get('intent_title', 'Unknown')}':")
-                    for issue in issues:
-                        print(f"    - {issue}")
-            
-            validated_intents.append(intent)
-        
-        # Normalize formats if needed
-        if self.strict_format_validation:
-            validated_intents = self._normalize_sub_nature(validated_intents)
-        
-        return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
-            "is_clinical": True,
-            "original_query": data.get("original_query", original_query),
-            "expanded_query": data.get("expanded_query", expanded_query)
-        }
-    
-    def refine_queries(self, intents: List[Dict]) -> Dict[str, Any]:
-        """Refine queries while maintaining format."""
-        if not self.enable_refinement or not intents:
-            return {
-                "intents": intents,
-                "refinements_made": [],
-                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
-            }
-        
-        prompt = QUERY_REFINEMENT_PROMPT.format(intents_json=json.dumps(intents, indent=2))
-        raw_response = self._call_model(prompt, max_tokens=8192)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": intents,
-                "refinements_made": ["Refinement failed - using original"],
-                "total_queries": sum(len(intent.get('final_queries', [])) for intent in intents)
-            }
-        
-        refined_intents = data.get("intents", intents)
-        
-        # Validate and normalize refined intents too
-        if self.strict_format_validation:
-            refined_intents = self._normalize_sub_nature(refined_intents)
-        
-        return {
-            "intents": refined_intents,
-            "refinements_made": data.get("refinements_made", []),
-            "total_queries": data.get("total_queries", 0)
-        }
-    
-    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
-        """
-        Execute the complete clinical intent extraction pipeline with format consistency.
-        
-        Args:
-            query: User input query
-            verbose: Print progress information
-            
-        Returns:
-            Complete pipeline results with consistent formatting
-        """
-        start_time = datetime.utcnow()
-        
-        if verbose:
-            print(f"📝 Original Query: {query}")
-        
-        # Step 1: Query Expansion
-        expansion_result = self.expand_query(query)
-        expanded_query = expansion_result["expanded_query"]
-        
-        if verbose:
-            print(f"📋 Expanded Query: {expanded_query}")
-        
-        # Step 2: Intent Extraction with format validation
-        intent_result = self.extract_intents(query, expanded_query)
-        
-        # Check if query was rejected as non-clinical
-        if not intent_result.get("is_clinical", True):
-            processing_time = (datetime.utcnow() - start_time).total_seconds()
-            
-            if verbose:
-                print(f"❌ Status: NON-CLINICAL (rejected)")
-                print(f"⏱️  Processing Time: {processing_time:.2f}s\n")
-            
-            return {
-                "original_query": query,
-                "expanded_query": expanded_query,
-                "intents": [],
-                "is_clinical": False,
-                "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
-                "timestamp": datetime.utcnow().isoformat(),
-                "processing_time_seconds": processing_time
-            }
-        
-        intents = intent_result.get("intents", [])
-        
-        # Step 3: Query Refinement (Optional)
-        if self.enable_refinement and intents:
-            refinement_result = self.refine_queries(intents)
-            intents = refinement_result["intents"]
-        
-        # Calculate statistics
-        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
-        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
-        
-        if verbose:
-            print(f"✅ Status: CLINICAL")
-            print(f"📊 Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
-            print(f"⏱️  Processing Time: {processing_time:.2f}s")
-            
-            # Report any format normalization that occurred
-            if self.strict_format_validation:
-                print(f"🔧 Format validation: ENABLED")
-        
-        return {
-            "original_query": query,
-            "expanded_query": expanded_query,
-            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            "concepts_added": expansion_result.get("concepts_added", []),
-            "intents": intents,
-            "is_clinical": True,
-            "statistics": {
-                "total_intents": len(intents),
-                "total_sub_natures": total_sub_natures,
-                "total_queries": total_queries,
-                "avg_queries_per_intent": round(total_queries / len(intents), 2) if intents else 0
-            },
-            "processing_time_seconds": processing_time,
-            "timestamp": datetime.utcnow().isoformat(),
-            "format_validated": self.strict_format_validation
-        }
-
-# ======================================================
-# FORMAT CONSISTENCY TESTING
-# ======================================================
-
-def test_format_consistency(pipeline: ContextualIntentPipeline):
-    """Test that the pipeline produces consistent output formats."""
-    
-    test_queries = [
-        "Patient with DM and HTN",
-        "The patient has a family history of diabetes and heart disease. They also want their lab results reviewed.",
-        "Current medication",
-        "Check vitals and review symptoms"
-    ]
-    
-    print("\n" + "="*80)
-    print("FORMAT CONSISTENCY TEST")
-    print("="*80)
-    
-    results = []
-    format_issues = []
-    
-    for idx, query in enumerate(test_queries, 1):
-        print(f"\nTest {idx}: {query[:50]}...")
-        result = pipeline.run(query, verbose=False)
-        results.append(result)
-        
-        # Check format consistency
-        if result.get("is_clinical", False):
-            for intent in result.get("intents", []):
-                is_valid, issues = pipeline._validate_sub_nature_format(intent)
-                if not is_valid:
-                    format_issues.append({
-                        "query": query[:50],
-                        "intent": intent.get("intent_title", "Unknown"),
-                        "issues": issues
-                    })
-    
-    # Report results
-    print("\n" + "-"*80)
-    print("TEST RESULTS:")
-    
-    if not format_issues:
-        print("✅ ALL OUTPUTS HAVE CONSISTENT FORMAT!")
-        print(f"   Tested {len(test_queries)} queries")
-        print(f"   All sub_nature fields use the flattened >> format")
-    else:
-        print("❌ FORMAT INCONSISTENCIES DETECTED:")
-        for issue in format_issues:
-            print(f"\n   Query: {issue['query']}")
-            print(f"   Intent: {issue['intent']}")
-            for problem in issue['issues']:
-                print(f"     - {problem}")
-    
-    return results, format_issues
-
-# ======================================================
-# MAIN EXECUTION
-# ======================================================
-
-if __name__ == "__main__":
-    # Initialize pipeline with strict format validation
-    pipeline = ContextualIntentPipeline(
-        project=PROJECT_ID,
-        location="us-central1",
-        model=MODEL_VERSION,
-        enable_refinement=False,  # Keep disabled for speed
-        strict_format_validation=True  # Enable format enforcement
-    )
-    
-    # Test queries matching your examples
-    test_queries = [
-        "The patient has a family history of diabetes and heart disease.They also want their lab results from the past year reviewed. Additionally, they are concerned about recent episodes of fatigue and shortness of breath.",
-        "current medication"
-    ]
-    
-    # Process each query
-    for idx, query in enumerate(test_queries, 1):
-        print(f"\n{'='*80}")
-        print(f"Query {idx}/{len(test_queries)}")
-        print(f"{'='*80}")
-        
-        result = pipeline.run(query, verbose=True)
-        
-        # Save result to file
-        output_filename = f"query_result_fixed_{idx}.json"
-        with open(output_filename, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        print(f"💾 Saved to: {output_filename}")
-    
-    # Run format consistency test
-    print("\n" + "="*80)
-    test_results, issues = test_format_consistency(pipeline)
-    
-    # Save test results
-    with open("format_consistency_test.json", 'w') as f:
-        json.dump({
-            "test_queries": test_queries,
-            "format_issues": issues,
-            "all_consistent": len(issues) == 0
-        }, f, indent=2)
-    
-    print("\n✅ Pipeline testing complete!")
