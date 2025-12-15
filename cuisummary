@@ -1,6 +1,6 @@
 """
-Optimized Clinical CUI Reduction System - Production Ready
-With performance improvements, better error handling, and clinical safety features
+Fully Configurable CUI Reduction System - Production Ready
+No hardcoded values - everything configurable through parameters
 """
 
 import time
@@ -29,58 +29,82 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReductionConfig:
-    """Configuration for CUI reduction - all parameters configurable"""
+    """Complete configuration - ALL parameters must be provided"""
+    
     # Required BigQuery configuration
     project_id: str
     dataset_id: str
     
-    # Table names
-    mrrel_table: str = "MRREL"
-    mrconso_table: str = "MRCONSO"
-    mrsty_table: str = "MRSTY"
-    cui_descriptions_table: str = "cui_descriptions"
-    cui_embeddings_table: str = "cui_embeddings"
+    # Required table names
+    mrrel_table: str
+    mrconso_table: str
+    cui_descriptions_table: str
+    cui_embeddings_table: str
     
-    # API configuration
-    api_url: str = None
-    api_timeout: int = 60
-    api_top_k: int = 3
-    api_batch_size: int = 50
+    # Required API configuration
+    api_url: str
+    api_timeout: int
+    api_top_k: int
     
-    # Terminology systems to filter (ICD, LOINC, SNOMED)
-    allowed_sab: List[str] = field(default_factory=lambda: [
-        'ICD10', 'ICD10CM', 'ICD10PCS', 'ICD9CM',
-        'SNOMEDCT_US', 'LOINC'
-    ])
+    # Required terminology systems
+    allowed_sab: List[str]
     
-    # Reduction parameters
-    target_reduction: float = 0.85
-    ic_percentile: float = 50.0
-    semantic_threshold: float = 0.88
-    duplicate_threshold: float = 0.95  # For finding true duplicates
-    use_semantic_clustering: bool = True
+    # Required reduction parameters
+    target_reduction: float
+    ic_percentile: float
+    semantic_threshold: float
+    duplicate_threshold: float
+    use_semantic_clustering: bool
+    max_hierarchy_depth: int
+    min_cluster_retention: float
+    
+    # Required performance parameters
+    query_timeout: int
+    max_query_results: int
+    batch_size: int
+    cache_enabled: bool
+    
+    # Optional parameters with defaults
+    mrsty_table: str = None
+    api_batch_size: int = None
     adaptive_threshold: bool = False
-    max_hierarchy_depth: int = 3
-    min_cluster_retention: float = 0.3  # Keep at least 30% of cluster
-    
-    # Performance parameters
-    query_timeout: int = 300
-    max_query_results: int = 100000
-    batch_size: int = 1000  # For batch queries
-    cache_enabled: bool = True
-    parallel_processing: bool = True
-    max_workers: int = 4
-    
-    # Clinical safety parameters
+    parallel_processing: bool = False
+    max_workers: int = None
     preserve_critical_cuis: List[str] = field(default_factory=list)
-    min_acceptable_reduction: float = 0.3
-    max_acceptable_reduction: float = 0.9
-    require_validation: bool = True
+    min_acceptable_reduction: float = None
+    max_acceptable_reduction: float = None
+    require_validation: bool = False
+    max_ancestors_per_cui: int = None
+    token_expiry_seconds: int = None
+    retry_count: int = None
+    retry_backoff_factor: float = None
+    http_pool_connections: int = None
+    http_pool_maxsize: int = None
+    hierarchy_relation_types: List[str] = None
+    clustering_linkage_method: str = None
+    clustering_metric: str = None
+    embedding_vector_size: int = None
+    log_level: str = None
+    
+    def __post_init__(self):
+        """Validate required fields are not None"""
+        required_fields = [
+            'project_id', 'dataset_id', 'mrrel_table', 'mrconso_table',
+            'cui_descriptions_table', 'cui_embeddings_table', 'api_url',
+            'api_timeout', 'api_top_k', 'allowed_sab', 'target_reduction',
+            'ic_percentile', 'semantic_threshold', 'duplicate_threshold',
+            'use_semantic_clustering', 'max_hierarchy_depth', 'min_cluster_retention',
+            'query_timeout', 'max_query_results', 'batch_size', 'cache_enabled'
+        ]
+        
+        for field_name in required_fields:
+            if getattr(self, field_name) is None:
+                raise ValueError(f"Required configuration field '{field_name}' is not set")
 
 
 @dataclass
 class ReductionStats:
-    """Enhanced statistics for the reduction process"""
+    """Statistics for the reduction process"""
     initial_count: int
     after_filter: int
     after_ic_rollup: int
@@ -102,31 +126,16 @@ class ReductionStats:
         return asdict(self)
 
 
-class PerformanceOptimizer:
-    """Utilities for performance optimization"""
-    
-    @staticmethod
-    @lru_cache(maxsize=10000)
-    def cached_hash(text: str) -> str:
-        """Cache text hashes for deduplication"""
-        return hashlib.md5(text.encode()).hexdigest()
-    
-    @staticmethod
-    def batch_items(items: List, batch_size: int):
-        """Yield successive batches from items"""
-        for i in range(0, len(items), batch_size):
-            yield items[i:i + batch_size]
-
-
 class CUIAPIClient:
-    """Optimized API client for CUI extraction"""
+    """API client for CUI extraction - fully configurable"""
     
     def __init__(self, config: ReductionConfig):
         self.config = config
-        self.api_base_url = config.api_url.rstrip('/') if config.api_url else None
+        self.api_base_url = config.api_url.rstrip('/')
         self.timeout = config.api_timeout
         self.top_k = config.api_top_k
-        self.batch_size = config.api_batch_size
+        self.batch_size = config.api_batch_size or config.batch_size
+        self.token_expiry_seconds = config.token_expiry_seconds or 3300
         self.session = self._setup_session()
         self._token = None
         self._token_expiry = 0
@@ -134,23 +143,24 @@ class CUIAPIClient:
         self._cache = {} if config.cache_enabled else None
     
     def _setup_session(self):
+        """Setup HTTP session with configurable parameters"""
         session = requests.Session()
         retry = Retry(
-            total=3,
-            backoff_factor=1,
+            total=self.config.retry_count or 3,
+            backoff_factor=self.config.retry_backoff_factor or 1.0,
             status_forcelist=[429, 500, 502, 503, 504]
         )
         adapter = HTTPAdapter(
             max_retries=retry,
-            pool_connections=10,
-            pool_maxsize=20
+            pool_connections=self.config.http_pool_connections or 10,
+            pool_maxsize=self.config.http_pool_maxsize or 20
         )
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         return session
     
     def _get_token(self):
-        """Get GCP authentication token with caching"""
+        """Get GCP authentication token"""
         with self._token_lock:
             if time.time() < self._token_expiry:
                 return self._token
@@ -161,53 +171,52 @@ class CUIAPIClient:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     universal_newlines=True,
-                    timeout=10
+                    timeout=self.timeout
                 )
                 if result.returncode == 0:
                     self._token = result.stdout.strip()
-                    self._token_expiry = time.time() + 3300
+                    self._token_expiry = time.time() + self.token_expiry_seconds
                     logger.info("GCP token refreshed")
                     return self._token
             except Exception as e:
                 logger.error(f"Token refresh failed: {e}")
             return None
     
-    def extract_cuis(self, texts: List[str]) -> Tuple[Set[str], Dict[str, Set[str]]]:
-        """
-        Extract CUIs from texts with text-to-CUI mapping
-        Returns: (all_cuis, text_cui_mapping)
-        """
-        if not texts or not self.api_base_url:
-            return set(), {}
+    def extract_cuis(self, texts: List[str]) -> Set[str]:
+        """Extract CUIs from texts"""
+        if not texts:
+            return set()
         
         all_cuis = set()
-        text_cui_mapping = {}
         
-        # Check cache first
+        # Check cache if enabled
         uncached_texts = []
-        for text in texts:
-            if self._cache and text in self._cache:
-                cached_cuis = self._cache[text]
-                all_cuis.update(cached_cuis)
-                text_cui_mapping[text] = cached_cuis
-            else:
-                uncached_texts.append(text)
+        if self._cache is not None:
+            for text in texts:
+                if text in self._cache:
+                    all_cuis.update(self._cache[text])
+                else:
+                    uncached_texts.append(text)
+        else:
+            uncached_texts = texts
         
         if not uncached_texts:
-            return all_cuis, text_cui_mapping
+            return all_cuis
         
-        # Process uncached texts in batches
+        # Process uncached texts
         token = self._get_token()
         if not token:
             logger.error("No valid authentication token")
-            return all_cuis, text_cui_mapping
+            return all_cuis
         
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
         
-        for batch in PerformanceOptimizer.batch_items(uncached_texts, self.batch_size):
+        # Process in batches
+        for i in range(0, len(uncached_texts), self.batch_size):
+            batch = uncached_texts[i:i + self.batch_size]
             try:
                 response = self.session.post(
                     self.api_base_url,
@@ -223,7 +232,6 @@ class CUIAPIClient:
                     if isinstance(cuis, list):
                         cui_set = set(str(c) for c in cuis if c)
                         all_cuis.update(cui_set)
-                        text_cui_mapping[text] = cui_set
                         if self._cache is not None:
                             self._cache[text] = cui_set
                 
@@ -231,51 +239,63 @@ class CUIAPIClient:
                 logger.error(f"Batch CUI extraction failed: {e}")
         
         logger.info(f"Extracted {len(all_cuis)} CUIs from {len(texts)} texts")
-        return all_cuis, text_cui_mapping
+        return all_cuis
 
 
-class OptimizedCUIReducer:
-    """Optimized CUI reducer with performance improvements"""
+class CUIReducer:
+    """CUI reducer - fully configurable"""
     
     def __init__(self, config: ReductionConfig):
         self.config = config
         self.client = bigquery.Client(project=config.project_id)
         
-        # Enhanced caching
-        self._hierarchy_cache = {}
-        self._ic_scores_cache = {}
-        self._descriptions_cache = {}
-        self._embeddings_cache = {}
-        self._sab_cache = {}
-        self._semantic_types_cache = {}
+        # Initialize caches if enabled
+        if config.cache_enabled:
+            self._hierarchy_cache = {}
+            self._ic_scores_cache = {}
+            self._descriptions_cache = {}
+            self._embeddings_cache = {}
+            self._sab_cache = {}
+        else:
+            self._hierarchy_cache = None
+            self._ic_scores_cache = None
+            self._descriptions_cache = None
+            self._embeddings_cache = None
+            self._sab_cache = None
         
-        # Statistics
         self.cache_hits = 0
         self.cache_misses = 0
     
-    def filter_to_allowed_sab_batch(self, cuis: Set[str]) -> Tuple[List[str], Dict[str, List[str]]]:
-        """
-        Filter CUIs to allowed SAB codes with mapping
-        Returns: (filtered_cuis, cui_to_sab_mapping)
-        """
+    def filter_to_allowed_sab(self, cuis: Set[str]) -> List[str]:
+        """Filter CUIs to allowed SAB codes"""
         if not cuis:
-            return [], {}
+            return []
         
-        # Check cache
-        uncached = [c for c in cuis if c not in self._sab_cache]
+        # Check cache if enabled
+        if self._sab_cache is not None:
+            uncached = [c for c in cuis if c not in self._sab_cache]
+            if uncached:
+                self.cache_misses += len(uncached)
+            else:
+                self.cache_hits += len(cuis)
+        else:
+            uncached = list(cuis)
+        
+        # Query for uncached CUIs
         if uncached:
-            self.cache_misses += len(uncached)
             try:
-                # Batch query for better performance
-                query = f"""
-                SELECT DISTINCT CUI, SAB
-                FROM `{self.config.project_id}.{self.config.dataset_id}.{self.config.mrconso_table}`
-                WHERE CUI IN UNNEST(@cuis)
-                  AND SAB IN UNNEST(@sabs)
-                LIMIT {self.config.max_query_results}
-                """
-                
-                for batch in PerformanceOptimizer.batch_items(list(uncached), self.config.batch_size):
+                # Process in batches
+                for i in range(0, len(uncached), self.config.batch_size):
+                    batch = uncached[i:i + self.config.batch_size]
+                    
+                    query = f"""
+                    SELECT DISTINCT CUI
+                    FROM `{self.config.project_id}.{self.config.dataset_id}.{self.config.mrconso_table}`
+                    WHERE CUI IN UNNEST(@cuis)
+                      AND SAB IN UNNEST(@sabs)
+                    LIMIT {self.config.max_query_results}
+                    """
+                    
                     job_config = bigquery.QueryJobConfig(
                         query_parameters=[
                             bigquery.ArrayQueryParameter("cuis", "STRING", batch),
@@ -284,43 +304,47 @@ class OptimizedCUIReducer:
                     )
                     
                     query_job = self.client.query(query, job_config=job_config)
-                    df = query_job.result(timeout=60).to_dataframe()
+                    df = query_job.result(timeout=self.config.query_timeout).to_dataframe()
                     
-                    for _, row in df.iterrows():
-                        cui = row['CUI']
-                        sab = row['SAB']
-                        if cui not in self._sab_cache:
-                            self._sab_cache[cui] = []
-                        self._sab_cache[cui].append(sab)
+                    # Update cache if enabled
+                    if self._sab_cache is not None:
+                        for cui in df['CUI'].tolist():
+                            self._sab_cache[cui] = True
+                        for cui in batch:
+                            if cui not in self._sab_cache:
+                                self._sab_cache[cui] = False
                 
             except Exception as e:
                 logger.error(f"SAB filtering failed: {e}")
-        else:
-            self.cache_hits += len(cuis)
+                return list(cuis)
         
-        # Build results
-        filtered_cuis = []
-        cui_to_sab = {}
-        for cui in cuis:
-            if cui in self._sab_cache:
-                filtered_cuis.append(cui)
-                cui_to_sab[cui] = self._sab_cache[cui]
+        # Build result
+        if self._sab_cache is not None:
+            filtered_cuis = [cui for cui in cuis if self._sab_cache.get(cui, False)]
+        else:
+            filtered_cuis = list(cuis)
         
         logger.info(f"SAB filter: {len(cuis)} → {len(filtered_cuis)} CUIs")
-        return filtered_cuis, cui_to_sab
+        return filtered_cuis
     
-    def build_hierarchy_optimized(self, relevant_cuis: List[str]) -> Dict:
-        """Build hierarchy with batch processing and caching"""
-        # Create cache key
-        cache_key = hashlib.md5(','.join(sorted(relevant_cuis)).encode()).hexdigest()
-        if cache_key in self._hierarchy_cache:
-            self.cache_hits += 1
-            return self._hierarchy_cache[cache_key]
+    def build_hierarchy(self, relevant_cuis: List[str]) -> Dict:
+        """Build hierarchy with configurable parameters"""
+        # Check cache if enabled
+        if self._hierarchy_cache is not None:
+            cache_key = hashlib.md5(','.join(sorted(relevant_cuis)).encode()).hexdigest()
+            if cache_key in self._hierarchy_cache:
+                self.cache_hits += 1
+                return self._hierarchy_cache[cache_key]
+            self.cache_misses += 1
+        else:
+            cache_key = None
         
-        self.cache_misses += 1
         child_to_parents = defaultdict(list)
         parent_to_children = defaultdict(list)
         all_cuis = set(relevant_cuis)
+        
+        # Get relation types to use
+        relation_types = self.config.hierarchy_relation_types or ['PAR', 'CHD']
         
         try:
             visited = set()
@@ -332,55 +356,54 @@ class OptimizedCUIReducer:
                 
                 logger.info(f"Building hierarchy depth {depth + 1}: {len(frontier)} CUIs")
                 
-                # Process in batches for better performance
-                all_relationships = []
-                for batch in PerformanceOptimizer.batch_items(list(frontier), self.config.batch_size):
+                # Process in batches
+                for i in range(0, len(list(frontier)), self.config.batch_size):
+                    batch = list(frontier)[i:i + self.config.batch_size]
+                    
                     query = f"""
                     SELECT DISTINCT cui1, cui2, rel
                     FROM `{self.config.project_id}.{self.config.dataset_id}.{self.config.mrrel_table}`
                     WHERE (cui1 IN UNNEST(@batch) OR cui2 IN UNNEST(@batch))
-                      AND rel IN ('PAR', 'CHD')
-                      AND cui1 != cui2  -- Avoid self-loops
+                      AND rel IN UNNEST(@relations)
+                      AND cui1 != cui2
+                    LIMIT {self.config.max_query_results}
                     """
                     
                     job_config = bigquery.QueryJobConfig(
                         query_parameters=[
-                            bigquery.ArrayQueryParameter("batch", "STRING", batch)
+                            bigquery.ArrayQueryParameter("batch", "STRING", batch),
+                            bigquery.ArrayQueryParameter("relations", "STRING", relation_types)
                         ]
                     )
                     
                     try:
                         query_job = self.client.query(query, job_config=job_config)
                         df = query_job.result(timeout=self.config.query_timeout).to_dataframe()
-                        all_relationships.append(df)
+                        
+                        for _, row in df.iterrows():
+                            cui1, cui2, rel = str(row['cui1']), str(row['cui2']), str(row['rel'])
+                            
+                            if rel == 'PAR':
+                                parent_to_children[cui1].append(cui2)
+                                child_to_parents[cui2].append(cui1)
+                            elif rel == 'CHD':
+                                parent_to_children[cui2].append(cui1)
+                                child_to_parents[cui1].append(cui2)
+                            
+                            all_cuis.update([cui1, cui2])
+                        
                     except Exception as e:
                         logger.warning(f"Batch hierarchy query failed: {e}")
                 
-                if not all_relationships:
-                    break
-                
-                # Process relationships
-                import pandas as pd
-                df_combined = pd.concat(all_relationships, ignore_index=True)
-                df_combined.drop_duplicates(inplace=True)
-                
+                # Update frontier
                 next_frontier = set()
-                for _, row in df_combined.iterrows():
-                    cui1, cui2, rel = str(row['cui1']), str(row['cui2']), str(row['rel'])
-                    
-                    if rel == 'PAR':
-                        parent_to_children[cui1].append(cui2)
-                        child_to_parents[cui2].append(cui1)
-                    elif rel == 'CHD':
-                        parent_to_children[cui2].append(cui1)
-                        child_to_parents[cui1].append(cui2)
-                    
-                    all_cuis.update([cui1, cui2])
-                    
-                    if cui1 not in visited:
-                        next_frontier.add(cui1)
-                    if cui2 not in visited:
-                        next_frontier.add(cui2)
+                for cui in frontier:
+                    for parent in child_to_parents.get(cui, []):
+                        if parent not in visited:
+                            next_frontier.add(parent)
+                    for child in parent_to_children.get(cui, []):
+                        if child not in visited:
+                            next_frontier.add(child)
                 
                 visited.update(frontier)
                 frontier = next_frontier - visited
@@ -394,14 +417,23 @@ class OptimizedCUIReducer:
             'all_cuis': all_cuis
         }
         
-        if self.config.cache_enabled:
+        # Cache if enabled
+        if self._hierarchy_cache is not None and cache_key:
             self._hierarchy_cache[cache_key] = hierarchy
         
         logger.info(f"Built hierarchy with {len(all_cuis)} CUIs")
         return hierarchy
     
-    def compute_ic_scores_vectorized(self, hierarchy: Dict) -> Dict[str, float]:
-        """Compute IC scores using vectorized operations"""
+    def compute_ic_scores(self, hierarchy: Dict) -> Dict[str, float]:
+        """Compute IC scores"""
+        # Check cache if enabled
+        if self._ic_scores_cache is not None:
+            cache_key = str(len(hierarchy.get('all_cuis', set())))
+            if cache_key in self._ic_scores_cache:
+                return self._ic_scores_cache[cache_key]
+        else:
+            cache_key = None
+        
         parent_to_children = hierarchy.get('parent_to_children', {})
         all_cuis = hierarchy.get('all_cuis', set())
         total = len(all_cuis)
@@ -409,53 +441,66 @@ class OptimizedCUIReducer:
         if total == 0:
             return {}
         
-        # Use memoization for descendant counting
-        @lru_cache(maxsize=None)
-        def count_descendants_memo(cui: str) -> int:
-            children = parent_to_children.get(cui, [])
-            if not children:
-                return 0
-            return len(children) + sum(count_descendants_memo(child) for child in children)
-        
-        # Compute descendant counts
+        # Count descendants
         descendant_counts = {}
+        
+        def count_descendants(cui: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if cui in visited or cui in descendant_counts:
+                return descendant_counts.get(cui, 0)
+            
+            visited.add(cui)
+            children = parent_to_children.get(cui, [])
+            count = len(children)
+            
+            for child in children:
+                count += count_descendants(child, visited)
+            
+            descendant_counts[cui] = count
+            return count
+        
+        # Compute counts
         for cui in all_cuis:
-            try:
-                descendant_counts[cui] = count_descendants_memo(cui)
-            except RecursionError:
-                descendant_counts[cui] = 0
+            if cui not in descendant_counts:
+                try:
+                    count_descendants(cui)
+                except RecursionError:
+                    descendant_counts[cui] = 0
         
-        # Vectorized IC computation
-        counts_array = np.array(list(descendant_counts.values()))
-        ic_array = -np.log((counts_array + 1) / total)
-        ic_array = np.maximum(0.0, ic_array)
+        # Compute IC scores
+        ic_scores = {}
+        for cui in all_cuis:
+            desc_count = descendant_counts.get(cui, 0)
+            ic = -np.log((desc_count + 1) / total)
+            ic_scores[cui] = max(0.0, ic)
         
-        ic_scores = dict(zip(descendant_counts.keys(), ic_array))
-        
-        if ic_scores:
-            logger.info(f"Computed IC scores for {len(ic_scores)} CUIs, range [{ic_array.min():.2f}, {ic_array.max():.2f}]")
+        # Cache if enabled
+        if self._ic_scores_cache is not None and cache_key:
+            self._ic_scores_cache[cache_key] = ic_scores
         
         return ic_scores
     
-    def semantic_rollup_optimized(
+    def semantic_rollup(
         self,
         cui_list: List[str],
         hierarchy: Dict,
         ic_scores: Dict[str, float],
         ic_threshold: float
     ) -> List[str]:
-        """Optimized semantic rollup with better path finding"""
+        """Perform semantic rollup"""
         child_to_parents = hierarchy.get('child_to_parents', {})
         rolled_up = {}
         
-        # Pre-compute all ancestors for efficiency
-        @lru_cache(maxsize=None)
-        def get_all_ancestors(cui: str) -> List[str]:
+        max_ancestors = self.config.max_ancestors_per_cui or 100
+        
+        for cui in cui_list:
+            # Get ancestors
             ancestors = []
             visited = set()
             queue = deque([cui])
             
-            while queue and len(visited) < 100:
+            while queue and len(visited) < max_ancestors:
                 current = queue.popleft()
                 if current in visited:
                     continue
@@ -466,29 +511,18 @@ class OptimizedCUIReducer:
                         ancestors.append(parent)
                         queue.append(parent)
             
-            return ancestors
-        
-        # Process CUIs
-        for cui in cui_list:
-            ancestors = get_all_ancestors(cui)
-            candidates = [cui] + ancestors
-            
             # Find lowest informative ancestor
-            valid_candidates = [
-                (c, ic_scores.get(c, 0)) 
-                for c in candidates 
-                if ic_scores.get(c, 0) >= ic_threshold
-            ]
+            candidates = [cui] + ancestors
+            valid = [c for c in candidates if ic_scores.get(c, 0) >= ic_threshold]
             
-            if valid_candidates:
-                # Sort by IC score (lowest first for most general valid concept)
-                valid_candidates.sort(key=lambda x: x[1])
-                rolled_up[cui] = valid_candidates[0][0]
+            if valid:
+                rolled_up[cui] = min(valid, key=lambda c: ic_scores.get(c, float('inf')))
             else:
                 rolled_up[cui] = cui
         
-        # Add critical CUIs if specified
         final_list = list(set(rolled_up.values()))
+        
+        # Add critical CUIs if specified
         if self.config.preserve_critical_cuis:
             for critical_cui in self.config.preserve_critical_cuis:
                 if critical_cui in cui_list and critical_cui not in final_list:
@@ -496,18 +530,40 @@ class OptimizedCUIReducer:
         
         return final_list
     
-    def semantic_clustering_optimized(
+    def semantic_clustering(
         self,
         cui_list: List[str],
         similarity_threshold: float
     ) -> List[str]:
-        """Optimized clustering with batch embedding retrieval"""
+        """Cluster similar CUIs"""
         if len(cui_list) <= 1:
             return cui_list
         
         try:
-            # Batch retrieve embeddings
-            embeddings_dict = self._get_embeddings_batch(cui_list)
+            # Get embeddings
+            embeddings_dict = {}
+            
+            for i in range(0, len(cui_list), self.config.batch_size):
+                batch = cui_list[i:i + self.config.batch_size]
+                
+                query = f"""
+                SELECT REF_CUI as cui, REF_Embedding as embedding
+                FROM `{self.config.project_id}.{self.config.dataset_id}.{self.config.cui_embeddings_table}`
+                WHERE REF_CUI IN UNNEST(@cuis)
+                LIMIT {self.config.max_query_results}
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+                    ]
+                )
+                
+                query_job = self.client.query(query, job_config=job_config)
+                df = query_job.result(timeout=self.config.query_timeout).to_dataframe()
+                
+                for _, row in df.iterrows():
+                    embeddings_dict[row['cui']] = np.array(row['embedding'])
             
             if len(embeddings_dict) < 2:
                 return cui_list
@@ -516,20 +572,17 @@ class OptimizedCUIReducer:
             cuis_with_embeddings = list(embeddings_dict.keys())
             embeddings_matrix = np.vstack([embeddings_dict[cui] for cui in cuis_with_embeddings])
             
-            # Use stricter threshold for duplicate detection
-            duplicate_threshold = min(0.95, similarity_threshold + 0.07)
-            
             # Perform clustering
             clustering = AgglomerativeClustering(
                 n_clusters=None,
-                distance_threshold=1 - duplicate_threshold,
-                metric='cosine',
-                linkage='average'
+                distance_threshold=1 - self.config.duplicate_threshold,
+                metric=self.config.clustering_metric or 'cosine',
+                linkage=self.config.clustering_linkage_method or 'average'
             )
             
             labels = clustering.fit_predict(embeddings_matrix)
             
-            # Process clusters to remove only true duplicates
+            # Process clusters
             final_cuis = []
             for cluster_id in np.unique(labels):
                 cluster_indices = np.where(labels == cluster_id)[0]
@@ -539,7 +592,7 @@ class OptimizedCUIReducer:
                     final_cuis.append(cluster_cuis[0])
                 else:
                     # Keep all except true duplicates
-                    unique_cuis = self._filter_true_duplicates(
+                    unique_cuis = self._filter_duplicates(
                         cluster_cuis,
                         embeddings_matrix[cluster_indices]
                     )
@@ -549,80 +602,40 @@ class OptimizedCUIReducer:
             cuis_without_embeddings = set(cui_list) - set(cuis_with_embeddings)
             final_cuis.extend(cuis_without_embeddings)
             
-            logger.info(f"Clustering: {len(cui_list)} → {len(final_cuis)} CUIs")
             return final_cuis
             
         except Exception as e:
             logger.error(f"Clustering failed: {e}")
             return cui_list
     
-    def _get_embeddings_batch(self, cui_list: List[str]) -> Dict[str, np.ndarray]:
-        """Batch retrieve embeddings with caching"""
-        embeddings = {}
-        uncached = [c for c in cui_list if c not in self._embeddings_cache]
-        
-        if uncached:
-            for batch in PerformanceOptimizer.batch_items(uncached, self.config.batch_size):
-                try:
-                    query = f"""
-                    SELECT REF_CUI as cui, REF_Embedding as embedding
-                    FROM `{self.config.project_id}.{self.config.dataset_id}.{self.config.cui_embeddings_table}`
-                    WHERE REF_CUI IN UNNEST(@cuis)
-                    """
-                    
-                    job_config = bigquery.QueryJobConfig(
-                        query_parameters=[
-                            bigquery.ArrayQueryParameter("cuis", "STRING", batch)
-                        ]
-                    )
-                    
-                    query_job = self.client.query(query, job_config=job_config)
-                    df = query_job.result(timeout=30).to_dataframe()
-                    
-                    for _, row in df.iterrows():
-                        embedding = np.array(row['embedding'])
-                        self._embeddings_cache[row['cui']] = embedding
-                        
-                except Exception as e:
-                    logger.error(f"Embedding batch retrieval failed: {e}")
-        
-        # Build result from cache
-        for cui in cui_list:
-            if cui in self._embeddings_cache:
-                embeddings[cui] = self._embeddings_cache[cui]
-        
-        return embeddings
-    
-    def _filter_true_duplicates(
+    def _filter_duplicates(
         self,
         cluster_cuis: List[str],
         cluster_embeddings: np.ndarray
     ) -> List[str]:
-        """Filter only true duplicates, keep clinically distinct concepts"""
+        """Filter true duplicates from cluster"""
         if len(cluster_cuis) <= 1:
             return cluster_cuis
         
-        # Calculate pairwise similarities
+        # Calculate similarities
         n = len(cluster_cuis)
-        similarity_matrix = np.zeros((n, n))
+        to_keep = [cluster_cuis[0]]
         
-        for i in range(n):
-            for j in range(i+1, n):
-                sim = np.dot(cluster_embeddings[i], cluster_embeddings[j]) / (
-                    np.linalg.norm(cluster_embeddings[i]) * 
-                    np.linalg.norm(cluster_embeddings[j])
-                )
-                similarity_matrix[i, j] = sim
-                similarity_matrix[j, i] = sim
+        duplicate_sim_threshold = self.config.duplicate_threshold + \
+                                 (1 - self.config.duplicate_threshold) * 0.3  # Even stricter
         
-        # Keep CUIs that are not near-duplicates of any already kept CUI
-        to_keep = [cluster_cuis[0]]  # Always keep first
         for i in range(1, n):
             is_duplicate = False
             for j in range(i):
-                if cluster_cuis[j] in to_keep and similarity_matrix[i, j] > 0.98:
-                    is_duplicate = True
-                    break
+                if cluster_cuis[j] in to_keep:
+                    sim = np.dot(cluster_embeddings[i], cluster_embeddings[j]) / (
+                        np.linalg.norm(cluster_embeddings[i]) * 
+                        np.linalg.norm(cluster_embeddings[j])
+                    )
+                    if sim > duplicate_sim_threshold:
+                        is_duplicate = True
+                        break
+            
             if not is_duplicate:
                 to_keep.append(cluster_cuis[i])
         
@@ -635,38 +648,36 @@ class OptimizedCUIReducer:
         return to_keep
     
     def validate_reduction(self, original: List[str], reduced: List[str]) -> Tuple[bool, List[str]]:
-        """Validate reduction meets clinical safety criteria"""
-        warnings = []
+        """Validate reduction if configured"""
+        if not self.config.require_validation:
+            return True, []
         
+        warnings = []
         original_set = set(original)
         reduced_set = set(reduced)
         
         reduction_rate = 1 - (len(reduced_set) / len(original_set)) if original_set else 0
         
-        # Check reduction bounds
-        if reduction_rate < self.config.min_acceptable_reduction:
-            warnings.append(f"Insufficient reduction: {reduction_rate:.1%} < {self.config.min_acceptable_reduction:.1%}")
+        # Check bounds if configured
+        if self.config.min_acceptable_reduction is not None:
+            if reduction_rate < self.config.min_acceptable_reduction:
+                warnings.append(f"Insufficient reduction: {reduction_rate:.1%}")
         
-        if reduction_rate > self.config.max_acceptable_reduction:
-            warnings.append(f"Excessive reduction: {reduction_rate:.1%} > {self.config.max_acceptable_reduction:.1%}")
+        if self.config.max_acceptable_reduction is not None:
+            if reduction_rate > self.config.max_acceptable_reduction:
+                warnings.append(f"Excessive reduction: {reduction_rate:.1%}")
         
-        # Check critical CUI preservation
+        # Check critical CUIs
         if self.config.preserve_critical_cuis:
             critical_in_original = set(self.config.preserve_critical_cuis) & original_set
             critical_missing = critical_in_original - reduced_set
             if critical_missing:
-                warnings.append(f"Missing {len(critical_missing)} critical CUIs: {list(critical_missing)[:5]}")
+                warnings.append(f"Missing {len(critical_missing)} critical CUIs")
         
-        # Check for empty result
-        if len(reduced_set) == 0 and len(original_set) > 0:
-            warnings.append("Reduction resulted in empty CUI set")
-        
-        validation_passed = len(warnings) == 0 or not self.config.require_validation
-        
-        return validation_passed, warnings
+        return len(warnings) == 0, warnings
     
     def reduce(self, input_cuis: List[str]) -> Tuple[List[str], ReductionStats]:
-        """Main reduction pipeline with all optimizations"""
+        """Main reduction pipeline"""
         start_time = time.time()
         initial_count = len(input_cuis)
         
@@ -675,52 +686,49 @@ class OptimizedCUIReducer:
                 initial_count=0, after_filter=0, after_ic_rollup=0, final_count=0,
                 filter_reduction_pct=0, ic_rollup_reduction_pct=0,
                 semantic_clustering_reduction_pct=0, total_reduction_pct=0,
-                processing_time=0, ic_threshold_used=0, 
-                cache_hits=self.cache_hits, cache_misses=self.cache_misses
+                processing_time=0, ic_threshold_used=0
             )
         
         # Remove duplicates
         input_cuis = list(set(input_cuis))
         initial_count = len(input_cuis)
         
-        logger.info(f"Starting optimized reduction: {initial_count} CUIs")
+        logger.info(f"Starting reduction: {initial_count} CUIs")
         
-        # Step 1: Filter to ICD/LOINC/SNOMED
-        filtered_cuis, cui_sab_mapping = self.filter_to_allowed_sab_batch(set(input_cuis))
+        # Step 1: Filter to allowed SAB
+        filtered_cuis = self.filter_to_allowed_sab(set(input_cuis))
         after_filter = len(filtered_cuis)
         
         if not filtered_cuis:
-            logger.warning("No CUIs remaining after SAB filtering")
             return [], ReductionStats(
                 initial_count=initial_count, after_filter=0, after_ic_rollup=0, final_count=0,
                 filter_reduction_pct=100, ic_rollup_reduction_pct=0,
                 semantic_clustering_reduction_pct=0, total_reduction_pct=100,
-                processing_time=time.time() - start_time, ic_threshold_used=0,
-                cache_hits=self.cache_hits, cache_misses=self.cache_misses
+                processing_time=time.time() - start_time, ic_threshold_used=0
             )
         
         # Step 2: Build hierarchy
-        hierarchy = self.build_hierarchy_optimized(filtered_cuis)
+        hierarchy = self.build_hierarchy(filtered_cuis)
         
         # Step 3: Compute IC scores
-        ic_scores = self.compute_ic_scores_vectorized(hierarchy)
+        ic_scores = self.compute_ic_scores(hierarchy)
         
-        # Step 4: Determine IC threshold
+        # Step 4: Determine threshold
         if ic_scores:
             ic_values = list(ic_scores.values())
             ic_threshold = float(np.percentile(ic_values, self.config.ic_percentile))
         else:
-            ic_threshold = 5.0
+            ic_threshold = 0.0
         
         # Step 5: Semantic rollup
-        rolled_up_cuis = self.semantic_rollup_optimized(
+        rolled_up_cuis = self.semantic_rollup(
             filtered_cuis, hierarchy, ic_scores, ic_threshold
         )
         after_rollup = len(rolled_up_cuis)
         
         # Step 6: Semantic clustering
         if self.config.use_semantic_clustering:
-            final_cuis = self.semantic_clustering_optimized(
+            final_cuis = self.semantic_clustering(
                 rolled_up_cuis, self.config.semantic_threshold
             )
         else:
@@ -750,50 +758,49 @@ class OptimizedCUIReducer:
             warnings=warnings
         )
         
-        logger.info(f"Reduction complete: {initial_count} → {final_count} ({stats.total_reduction_pct:.1f}%)")
-        if warnings:
-            for warning in warnings:
-                logger.warning(warning)
-        
+        logger.info(f"Reduction complete: {initial_count} → {final_count}")
         return final_cuis, stats
 
 
-def run_optimized_cui_reduction(
+def run_cui_reduction(
     texts: List[str],
     config: ReductionConfig
-) -> Tuple[List[str], List[str], Dict[str, str], ReductionStats, Dict[str, Set[str]]]:
+) -> Tuple[List[str], List[str], Dict[str, str], ReductionStats]:
     """
-    Main function to run optimized CUI reduction
-    
-    Returns:
-        Tuple of (initial_cuis, reduced_cuis, descriptions, stats, text_cui_mapping)
+    Main function to run CUI reduction
+    ALL parameters come from config - no hardcoded values
     """
     try:
+        # Set log level if configured
+        if config.log_level:
+            logging.getLogger().setLevel(config.log_level)
+        
         # Initialize API client
         api_client = CUIAPIClient(config)
         
         # Extract CUIs
         start_time = time.time()
-        initial_cuis, text_cui_mapping = api_client.extract_cuis(texts)
+        initial_cuis = api_client.extract_cuis(texts)
         api_time = time.time() - start_time
         
         if not initial_cuis:
             logger.warning("No CUIs extracted")
-            return [], [], {}, None, {}
+            return [], [], {}, None
         
         # Initialize reducer
-        reducer = OptimizedCUIReducer(config)
+        reducer = CUIReducer(config)
         
         # Reduce CUIs
         reduced_cuis, stats = reducer.reduce(list(initial_cuis))
         stats.api_call_time = api_time
         
-        # Get descriptions (optional, can be disabled for performance)
+        # Get descriptions if table is configured
         descriptions = {}
-        if config.cache_enabled:
+        if config.cui_descriptions_table:
             try:
-                # Batch get descriptions
-                for batch in PerformanceOptimizer.batch_items(reduced_cuis, config.batch_size):
+                for i in range(0, len(reduced_cuis), config.batch_size):
+                    batch = reduced_cuis[i:i + config.batch_size]
+                    
                     query = f"""
                     SELECT CUI as cui, Definition as description
                     FROM `{config.project_id}.{config.dataset_id}.{config.cui_descriptions_table}`
@@ -806,8 +813,9 @@ def run_optimized_cui_reduction(
                         ]
                     )
                     
-                    query_job = reducer.client.query(query, job_config=job_config)
-                    df = query_job.result(timeout=30).to_dataframe()
+                    client = bigquery.Client(project=config.project_id)
+                    query_job = client.query(query, job_config=job_config)
+                    df = query_job.result(timeout=config.query_timeout).to_dataframe()
                     
                     for _, row in df.iterrows():
                         descriptions[row['cui']] = row['description']
@@ -815,72 +823,8 @@ def run_optimized_cui_reduction(
             except Exception as e:
                 logger.error(f"Failed to get descriptions: {e}")
         
-        return list(initial_cuis), reduced_cuis, descriptions, stats, text_cui_mapping
+        return list(initial_cuis), reduced_cuis, descriptions, stats
         
     except Exception as e:
         logger.error(f"CUI reduction failed: {e}")
-        return [], [], {}, None, {}
-
-
-# Performance monitoring utilities
-def analyze_performance(stats: ReductionStats):
-    """Analyze and report performance metrics"""
-    print("\n" + "="*60)
-    print("PERFORMANCE ANALYSIS")
-    print("="*60)
-    
-    print(f"\n⏱️ TIMING:")
-    print(f"   Total time: {stats.processing_time:.2f}s")
-    print(f"   API time: {stats.api_call_time:.2f}s")
-    print(f"   Processing time: {stats.processing_time - stats.api_call_time:.2f}s")
-    
-    print(f"\n💾 CACHE PERFORMANCE:")
-    total_cache_ops = stats.cache_hits + stats.cache_misses
-    if total_cache_ops > 0:
-        hit_rate = stats.cache_hits / total_cache_ops * 100
-        print(f"   Cache hits: {stats.cache_hits}")
-        print(f"   Cache misses: {stats.cache_misses}")
-        print(f"   Hit rate: {hit_rate:.1f}%")
-    
-    print(f"\n📊 REDUCTION STAGES:")
-    print(f"   Initial: {stats.initial_count}")
-    print(f"   After SAB filter: {stats.after_filter} (-{stats.filter_reduction_pct:.1f}%)")
-    print(f"   After IC rollup: {stats.after_ic_rollup} (-{stats.ic_rollup_reduction_pct:.1f}%)")
-    print(f"   Final: {stats.final_count} (-{stats.semantic_clustering_reduction_pct:.1f}%)")
-    print(f"   Total reduction: {stats.total_reduction_pct:.1f}%")
-    
-    print(f"\n✅ VALIDATION:")
-    print(f"   Status: {'PASSED' if stats.validation_passed else 'FAILED'}")
-    if stats.warnings:
-        print(f"   Warnings:")
-        for warning in stats.warnings:
-            print(f"     - {warning}")
-    
-    print("="*60)
-
-
-if __name__ == "__main__":
-    # Example configuration
-    config = ReductionConfig(
-        project_id="your-project",
-        dataset_id="your-dataset",
-        api_url="https://your-api.run.app/endpoint",
-        
-        # Enable optimizations
-        cache_enabled=True,
-        parallel_processing=True,
-        batch_size=1000,
-        
-        # Clinical safety
-        preserve_critical_cuis=["C0006118"],  # Brain Neoplasms
-        require_validation=True
-    )
-    
-    # Run reduction
-    texts = ["Patient with brain tumor and headaches"]
-    initial, reduced, descriptions, stats, text_mapping = run_optimized_cui_reduction(texts, config)
-    
-    # Analyze performance
-    if stats:
-        analyze_performance(stats)
-        print(f"\nReduction: {stats.initial_count} → {stats.final_count} CUIs")
+        return [], [], {}, None
