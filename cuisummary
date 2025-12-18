@@ -5,11 +5,9 @@ import logging
 import time
 import threading
 import subprocess
-from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Set, Any
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import statistics
 
 # ============================================================
 # THIRD PARTY
@@ -18,11 +16,11 @@ import numpy as np
 import requests
 import pandas as pd
 from scipy import stats
-from scipy.spatial.distance import pdist, squareform
-from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import cdist
+from scipy.cluster.hierarchy import linkage, fcluster, dendrogram
+from sklearn.preprocessing import StandardScaler
 
 from google.cloud import bigquery
-from sklearn.metrics.pairwise import cosine_similarity
 
 # -------------------------
 # Logging
@@ -34,7 +32,7 @@ logger = logging.getLogger(__name__)
 # API CLIENTS
 # ============================================================
 class CUIAPIClient:
-    """Client for CUI extraction API with batching support"""
+    """Client for CUI extraction API"""
     _token_lock = threading.Lock()
     _cached_token = None
     _token_expiry = 0
@@ -66,7 +64,6 @@ class CUIAPIClient:
             return self._cached_token
 
     def extract_cuis_batch(self, texts: List[str]) -> Dict[str, Set[str]]:
-        """Extract CUIs for each text, maintaining text-CUI mapping"""
         payload = {"query_texts": texts, "top_k": self.top_k}
         headers = self._refresh_token()
 
@@ -86,11 +83,11 @@ class CUIAPIClient:
             text_to_cuis[text] = text_cuis
             all_cuis.update(text_cuis)
             
-        logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
+        logger.info(f"Extracted {len(all_cuis)} unique CUIs")
         return text_to_cuis
 
 class SubnetAPIClient:
-    """Enhanced Subnet API client with parallel processing"""
+    """Subnet API client - returns raw edges only"""
     def __init__(self, subnet_url: str):
         self.url = subnet_url.rstrip("/")
         self._session_cache = {}
@@ -105,13 +102,16 @@ class SubnetAPIClient:
         token = result.stdout.strip()
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    def get_subnet_single(self, cui: str) -> Dict:
-        """Get subnet for a single CUI with caching"""
-        if cui in self._session_cache:
-            return self._session_cache[cui]
+    def get_subnet_batch(self, cuis: List[str]) -> Tuple[Set[str], List[Tuple[str, str]]]:
+        """
+        Get subnet for CUIs - returns raw nodes and edges
+        No inference of transitive relationships
+        """
+        if not cuis:
+            return set(), []
             
         headers = self._get_token()
-        payload = {"cuis": [cui], "cross_context": False}
+        payload = {"cuis": cuis, "cross_context": False}
         
         try:
             response = requests.post(
@@ -123,61 +123,17 @@ class SubnetAPIClient:
             response.raise_for_status()
             nodes, edges = response.json().get("output", ([], []))
             
-            ancestors = set()
-            descendants = set()
-            
-            for parent, child in edges:
-                if parent == cui:
-                    descendants.add(child)
-                elif child == cui:
-                    ancestors.add(parent)
-                else:
-                    if parent in ancestors or child in descendants:
-                        ancestors.add(parent)
-                        descendants.add(child)
-            
-            result = {
-                "cui": cui,
-                "ancestors": ancestors,
-                "descendants": descendants
-            }
-            self._session_cache[cui] = result
-            return result
+            # Return raw data - no inference
+            return set(nodes), edges
             
         except Exception as e:
-            logger.error(f"Failed to get subnet for {cui}: {e}")
-            return {"cui": cui, "ancestors": set(), "descendants": set()}
-
-    def get_subnets_parallel(self, cuis: List[str]) -> Dict[str, Dict]:
-        """Get subnets for multiple CUIs in parallel"""
-        results = {}
-        
-        # Adaptive worker count based on number of CUIs
-        max_workers = min(20, max(5, len(cuis) // 10))
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_cui = {
-                executor.submit(self.get_subnet_single, cui): cui 
-                for cui in cuis
-            }
-            
-            for future in as_completed(future_to_cui):
-                cui = future_to_cui[future]
-                try:
-                    result = future.result(timeout=60)
-                    results[cui] = result
-                except Exception as e:
-                    logger.error(f"Failed to process {cui}: {e}")
-                    results[cui] = {"cui": cui, "ancestors": set(), "descendants": set()}
-                    
-        logger.info(f"Retrieved subnet data for {len(results)} CUIs")
-        return results
+            logger.error(f"Failed to get subnet: {e}")
+            return set(), []
 
 # ============================================================
 # BIGQUERY OPERATIONS
 # ============================================================
 def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
-    """Filter CUIs by allowed vocabularies"""
     if not cuis:
         return []
     try:
@@ -201,7 +157,6 @@ def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> Lis
 
 def group_cuis_by_semantic_type(client: bigquery.Client, project_id: str,
                                 dataset_id: str, cuis: List[str]) -> Dict[str, List[str]]:
-    """Group CUIs by semantic type"""
     groups = defaultdict(list)
     batch_size = 5000
     
@@ -225,7 +180,6 @@ def group_cuis_by_semantic_type(client: bigquery.Client, project_id: str,
 
 def load_embeddings_batch(client: bigquery.Client, project_id: str, 
                          embedding_table: str, cuis: List[str]) -> Dict[str, np.ndarray]:
-    """Load embeddings from BigQuery"""
     embeddings = {}
     batch_size = 1000
     
@@ -247,236 +201,294 @@ def load_embeddings_batch(client: bigquery.Client, project_id: str,
                 embedding = np.fromstring(row['embedding'].strip('[]'), sep=',')
             else:
                 embedding = np.array(row['embedding'])
-            embeddings[row['cui']] = embedding
+            embeddings[row['cui']] = embedding / (np.linalg.norm(embedding) + 1e-10)  # L2 normalize
     
     logger.info(f"Loaded {len(embeddings)} embeddings")
     return embeddings
 
 # ============================================================
-# ADAPTIVE ALGORITHMS
+# GRAPH OPERATIONS (CORRECT)
 # ============================================================
-def compute_adaptive_ic_scores(subnet_data: Dict[str, Dict], 
-                               cui_set: Set[str]) -> Dict[str, float]:
-    """Compute IC scores with adaptive normalization"""
-    ic_scores = {}
+def build_hierarchy_graph(nodes: Set[str], edges: List[Tuple[str, str]]) -> Dict[str, Dict]:
+    """
+    Build proper graph structure from edges
+    Only store direct relationships, no transitive inference
+    """
+    graph = defaultdict(lambda: {"parents": set(), "children": set()})
+    
+    for parent, child in edges:
+        if parent in nodes and child in nodes:
+            graph[child]["parents"].add(parent)
+            graph[parent]["children"].add(child)
+    
+    # Ensure all nodes are in graph
+    for node in nodes:
+        if node not in graph:
+            graph[node] = {"parents": set(), "children": set()}
+    
+    return dict(graph)
+
+def compute_proper_ic_scores(graph: Dict[str, Dict], cui_set: Set[str]) -> Dict[str, float]:
+    """
+    Proper Information Content calculation based on probability in corpus
+    IC(c) = -log(P(c)) where P(c) = freq(c)/N
+    Using graph structure for frequency estimation
+    """
+    # Count descendants for each node (including self)
+    def count_descendants(node):
+        visited = set()
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current not in visited:
+                visited.add(current)
+                children = graph.get(current, {}).get("children", set())
+                stack.extend(children)
+        return len(visited)
+    
+    # Calculate IC based on specificity in hierarchy
     descendant_counts = {}
-    
-    # Calculate descendant counts
     for cui in cui_set:
-        cui_data = subnet_data.get(cui, {})
-        descendants = cui_data.get("descendants", set())
-        relevant_descendants = descendants.intersection(cui_set)
-        descendant_counts[cui] = len(relevant_descendants)
+        descendant_counts[cui] = count_descendants(cui)
     
-    # Use adaptive binning to find natural groupings
-    if descendant_counts:
-        counts = list(descendant_counts.values())
-        
-        # Use Freedman-Diaconis rule for bin width
-        q75, q25 = np.percentile(counts, [75, 25])
-        iqr = q75 - q25
-        if iqr > 0:
-            bin_width = 2 * iqr / (len(counts) ** (1/3))
-            n_bins = max(2, int((max(counts) - min(counts)) / bin_width))
-        else:
-            n_bins = min(10, len(set(counts)))
-        
-        # Calculate IC with adaptive smoothing
-        for cui in cui_set:
-            count = descendant_counts[cui]
-            # Adaptive smoothing based on data distribution
-            smoothing = 1 + (statistics.stdev(counts) / (statistics.mean(counts) + 1) if len(counts) > 1 else 1)
-            probability = (count + smoothing) / (len(cui_set) + smoothing * n_bins)
-            ic_scores[cui] = -np.log(probability)
+    # Maximum possible descendants (for normalization)
+    max_descendants = max(descendant_counts.values()) if descendant_counts else 1
+    
+    ic_scores = {}
+    for cui in cui_set:
+        # Probability inversely related to number of descendants
+        # More descendants = more general = lower IC
+        p = descendant_counts[cui] / max_descendants
+        # Prevent log(0)
+        p = max(p, 1e-10)
+        ic_scores[cui] = -np.log(p)
     
     return ic_scores
 
-def find_natural_clusters_in_hierarchy(subnet_data: Dict[str, Dict], 
-                                      cuis: List[str],
+# ============================================================
+# HIERARCHICAL REDUCTION (PROPER)
+# ============================================================
+def hierarchical_reduction_by_coverage(graph: Dict[str, Dict], 
+                                      cuis: List[str], 
                                       ic_scores: Dict[str, float]) -> Set[str]:
-    """Find natural clustering points in the hierarchy using information theory"""
+    """
+    Select representatives based on coverage without arbitrary thresholds
+    Use greedy set cover approach
+    """
     if not cuis:
         return set()
     
     selected = set()
     covered = set()
+    cui_set = set(cuis)
     
-    # Build coverage matrix
-    coverage_relationships = []
-    
+    # Build coverage map: which CUIs does each CUI cover (including self)
+    coverage_map = {}
     for cui in cuis:
-        cui_data = subnet_data.get(cui, {})
-        ancestors = cui_data.get("ancestors", set())
-        descendants = cui_data.get("descendants", set())
+        covered_by_cui = {cui}  # Always covers itself
         
-        # Calculate information loss/gain for each potential representative
-        for ancestor in list(ancestors) + [cui]:
-            if ancestor not in ic_scores:
+        # Add all descendants
+        stack = [cui]
+        visited = set()
+        while stack:
+            current = stack.pop()
+            if current not in visited:
+                visited.add(current)
+                children = graph.get(current, {}).get("children", set())
+                covered_by_cui.update(children.intersection(cui_set))
+                stack.extend(children)
+        
+        coverage_map[cui] = covered_by_cui
+    
+    # Greedy set cover
+    while covered < cui_set:
+        best_cui = None
+        best_new_coverage = set()
+        best_efficiency = 0
+        
+        for cui in cui_set:
+            if cui in selected:
                 continue
                 
-            # How many CUIs does this ancestor cover?
-            anc_data = subnet_data.get(ancestor, {})
-            anc_descendants = anc_data.get("descendants", set())
-            coverage_set = anc_descendants.intersection(set(cuis))
-            
-            if not coverage_set:
+            new_coverage = coverage_map[cui] - covered
+            if not new_coverage:
                 continue
             
-            # Information preserved when using ancestor instead of all descendants
-            total_info = sum(ic_scores.get(c, 0) for c in coverage_set)
-            ancestor_info = ic_scores.get(ancestor, 0) * len(coverage_set)
+            # Efficiency = information preserved per CUI covered
+            ic = ic_scores.get(cui, 0)
+            efficiency = ic / len(coverage_map[cui]) if coverage_map[cui] else 0
             
-            # Information efficiency ratio
-            if total_info > 0:
-                efficiency = ancestor_info / total_info
-            else:
-                efficiency = 0
-            
-            coverage_relationships.append({
-                'ancestor': ancestor,
-                'covered': coverage_set,
-                'efficiency': efficiency,
-                'coverage_size': len(coverage_set)
-            })
+            # Prefer CUIs that cover more with higher information density
+            if len(new_coverage) > len(best_new_coverage) or \
+               (len(new_coverage) == len(best_new_coverage) and efficiency > best_efficiency):
+                best_cui = cui
+                best_new_coverage = new_coverage
+                best_efficiency = efficiency
+        
+        if best_cui:
+            selected.add(best_cui)
+            covered.update(coverage_map[best_cui])
+        else:
+            # No more coverage possible, add remaining uncovered
+            uncovered = cui_set - covered
+            selected.update(uncovered)
+            break
     
-    # Sort by efficiency and coverage size
-    coverage_relationships.sort(key=lambda x: (x['efficiency'], x['coverage_size']), reverse=True)
-    
-    # Greedily select ancestors that maximize coverage with minimal information loss
-    for rel in coverage_relationships:
-        # Check if this adds new coverage
-        new_coverage = rel['covered'] - covered
-        if new_coverage:
-            selected.add(rel['ancestor'])
-            covered.update(rel['covered'])
-    
-    # Add any uncovered CUIs
-    uncovered = set(cuis) - covered - selected
-    selected.update(uncovered)
-    
-    logger.info(f"Natural hierarchy clustering: {len(cuis)} -> {len(selected)}")
     return selected
 
-def adaptive_embedding_clustering(cuis: List[str],
-                                 embeddings: Dict[str, np.ndarray],
-                                 subnet_data: Dict[str, Dict],
-                                 ic_scores: Dict[str, float]) -> List[str]:
-    """Clustering with natural boundary detection"""
+# ============================================================
+# EMBEDDING CLUSTERING (PROPER)
+# ============================================================
+def embedding_based_clustering(cuis: List[str], 
+                              embeddings: Dict[str, np.ndarray],
+                              ic_scores: Dict[str, float]) -> List[str]:
+    """
+    Proper embedding clustering with statistically sound thresholding
+    """
     valid_cuis = [c for c in cuis if c in embeddings]
     
     if not valid_cuis:
         return cuis
     
-    if len(valid_cuis) <= 2:
+    if len(valid_cuis) <= 3:
         return valid_cuis
     
-    # Create embedding matrix
+    # Create normalized embedding matrix
     vectors = np.vstack([embeddings[c] for c in valid_cuis])
     
-    # Calculate pairwise distances
-    distances = pdist(vectors, metric='cosine')
+    # Compute pairwise cosine distances
+    distances = cdist(vectors, vectors, metric='cosine')
     
-    if len(distances) == 0:
-        return valid_cuis
-    
-    # Find natural gaps in distance distribution
-    sorted_distances = np.sort(distances)
-    
-    # Calculate gaps between consecutive distances
-    gaps = np.diff(sorted_distances)
-    
-    # Find significant gaps (using z-score)
-    if len(gaps) > 0:
-        gap_z_scores = stats.zscore(gaps)
-        significant_gaps = np.where(gap_z_scores > 1)[0]
-        
-        if len(significant_gaps) > 0:
-            # Use first significant gap as threshold
-            threshold_idx = significant_gaps[0]
-            threshold = sorted_distances[threshold_idx]
-        else:
-            # No significant gaps, use median
-            threshold = np.median(distances)
-    else:
-        threshold = 0.2
+    # Convert to condensed form for hierarchical clustering
+    from scipy.spatial.distance import squareform
+    condensed_distances = squareform(distances)
     
     # Perform hierarchical clustering
-    linkage_matrix = linkage(distances, method='average')
-    clusters = fcluster(linkage_matrix, threshold, criterion='distance')
+    linkage_matrix = linkage(condensed_distances, method='average')
     
-    # Select representatives based on natural importance
+    # Find optimal number of clusters using silhouette score
+    from sklearn.metrics import silhouette_score
+    
+    best_score = -1
+    best_clusters = None
+    
+    # Try different numbers of clusters
+    max_clusters = min(len(valid_cuis) - 1, 10)
+    for n_clusters in range(2, max_clusters + 1):
+        clusters = fcluster(linkage_matrix, n_clusters, criterion='maxclust')
+        
+        # Calculate silhouette score
+        if len(set(clusters)) > 1:
+            score = silhouette_score(distances, clusters, metric='precomputed')
+            if score > best_score:
+                best_score = score
+                best_clusters = clusters
+    
+    if best_clusters is None:
+        # Fallback: use distance threshold at median
+        threshold = np.median(condensed_distances)
+        best_clusters = fcluster(linkage_matrix, threshold, criterion='distance')
+    
+    # Select representatives from each cluster
     selected = []
     
-    for cluster_id in np.unique(clusters):
-        cluster_indices = np.where(clusters == cluster_id)[0]
+    for cluster_id in np.unique(best_clusters):
+        cluster_indices = np.where(best_clusters == cluster_id)[0]
         cluster_cuis = [valid_cuis[i] for i in cluster_indices]
         
         if len(cluster_cuis) == 1:
             selected.extend(cluster_cuis)
             continue
         
-        # Calculate natural importance for each CUI
-        importance_scores = []
-        for cui in cluster_cuis:
-            # Combine IC and descendant count
-            ic = ic_scores.get(cui, 0)
-            desc_count = len(subnet_data.get(cui, {}).get("descendants", set()))
-            
-            # Natural log scale for descendant contribution
-            importance = ic + np.log(desc_count + 1)
-            importance_scores.append(importance)
+        # Select medoid (most central point) weighted by IC scores
+        cluster_vectors = vectors[cluster_indices]
         
-        # Find natural breakpoints in importance scores
-        sorted_importance = sorted(enumerate(importance_scores), key=lambda x: x[1], reverse=True)
-        
-        if len(sorted_importance) > 1:
-            # Calculate gaps in importance
-            importance_gaps = [sorted_importance[i][1] - sorted_importance[i+1][1] 
-                              for i in range(len(sorted_importance)-1)]
-            
-            if importance_gaps:
-                # Find largest gap
-                max_gap_idx = np.argmax(importance_gaps)
-                # Keep all CUIs above the gap
-                n_representatives = max_gap_idx + 1
+        # Compute weighted centrality
+        centrality_scores = []
+        for i, cui in enumerate(cluster_cuis):
+            # Average distance to other points in cluster
+            if len(cluster_indices) > 1:
+                distances_to_others = distances[cluster_indices[i], cluster_indices]
+                avg_distance = np.mean(distances_to_others[distances_to_others > 0])
             else:
-                n_representatives = 1
-        else:
-            n_representatives = 1
+                avg_distance = 0
+            
+            # Weight by IC score (higher IC = more specific = better)
+            ic = ic_scores.get(cui, 0)
+            # Lower distance is better, higher IC is better
+            score = ic - avg_distance
+            centrality_scores.append(score)
         
-        # Select top CUIs by natural importance
-        top_indices = [idx for idx, _ in sorted_importance[:n_representatives]]
+        # Select top representative(s)
+        # Number based on cluster spread
+        cluster_spread = np.std(distances[np.ix_(cluster_indices, cluster_indices)])
+        if cluster_spread > 0.5:  # Loose cluster, keep more
+            n_reps = min(3, len(cluster_cuis))
+        else:  # Tight cluster
+            n_reps = 1
+        
+        top_indices = np.argsort(centrality_scores)[-n_reps:]
         selected.extend([cluster_cuis[i] for i in top_indices])
     
     return selected
 
-def calculate_information_coverage(original_cuis: Set[str], 
-                                  reduced_cuis: Set[str],
-                                  subnet_data: Dict[str, Dict],
-                                  ic_scores: Dict[str, float]) -> Dict[str, float]:
-    """Calculate information coverage metrics without targets"""
-    covered_by_hierarchy = set()
+# ============================================================
+# COMBINED SIGNAL INTEGRATION (PROPER)
+# ============================================================
+def integrate_hierarchy_and_embedding_signals(
+    hierarchy_selected: Set[str],
+    embedding_selected: Set[str],
+    ic_scores: Dict[str, float],
+    embeddings: Dict[str, np.ndarray]) -> Set[str]:
+    """
+    Properly integrate two signals with normalization
+    """
+    # Get union of both selections
+    all_candidates = hierarchy_selected.union(embedding_selected)
     
-    # Find what's covered by hierarchy
-    for reduced_cui in reduced_cuis:
-        covered_by_hierarchy.add(reduced_cui)
-        cui_data = subnet_data.get(reduced_cui, {})
-        descendants = cui_data.get("descendants", set())
-        covered_by_hierarchy.update(descendants.intersection(original_cuis))
+    if not all_candidates:
+        return set()
     
-    # Calculate information metrics
-    original_info = sum(ic_scores.get(cui, 0) for cui in original_cuis)
-    covered_info = sum(ic_scores.get(cui, 0) for cui in covered_by_hierarchy)
-    reduced_info = sum(ic_scores.get(cui, 0) for cui in reduced_cuis)
+    # Normalize IC scores to [0, 1]
+    ic_values = [ic_scores.get(cui, 0) for cui in all_candidates]
+    if ic_values:
+        min_ic = min(ic_values)
+        max_ic = max(ic_values)
+        ic_range = max_ic - min_ic if max_ic > min_ic else 1
+        normalized_ic = {cui: (ic_scores.get(cui, 0) - min_ic) / ic_range 
+                        for cui in all_candidates}
+    else:
+        normalized_ic = {cui: 0 for cui in all_candidates}
     
-    metrics = {
-        'cui_coverage': len(covered_by_hierarchy) / len(original_cuis) if original_cuis else 0,
-        'information_coverage': covered_info / original_info if original_info > 0 else 0,
-        'information_density': reduced_info / len(reduced_cuis) if reduced_cuis else 0,
-        'compression_ratio': len(reduced_cuis) / len(original_cuis) if original_cuis else 0
-    }
+    # Calculate selection confidence for each CUI
+    selection_scores = {}
     
-    return metrics
+    for cui in all_candidates:
+        score = 0
+        
+        # Hierarchy signal (binary)
+        if cui in hierarchy_selected:
+            score += 0.5
+        
+        # Embedding signal (binary)  
+        if cui in embedding_selected:
+            score += 0.5
+        
+        # IC bonus (normalized)
+        score += normalized_ic[cui] * 0.5
+        
+        selection_scores[cui] = score
+    
+    # Select CUIs above median score
+    threshold = np.median(list(selection_scores.values()))
+    final_selected = {cui for cui, score in selection_scores.items() 
+                     if score >= threshold}
+    
+    # Ensure we keep CUIs selected by both methods
+    both_selected = hierarchy_selected.intersection(embedding_selected)
+    final_selected.update(both_selected)
+    
+    return final_selected
 
 # ============================================================
 # MAIN PIPELINE
@@ -488,15 +500,12 @@ def reduce_cuis_pipeline(texts: List[str],
                         cui_api_url: str,
                         subnet_api_url: str) -> Dict[str, Any]:
     """
-    Fully adaptive CUI reduction pipeline - no targets or thresholds
-    
-    Returns:
-        Dictionary with reduction results and statistics
+    CUI reduction with proper implementations
     """
     start_time = time.time()
     
     # Step 1: Extract CUIs
-    logger.info("Step 1: Extracting CUIs from texts")
+    logger.info("Step 1: Extracting CUIs")
     extractor = CUIAPIClient(cui_api_url)
     text_to_cuis = extractor.extract_cuis_batch(texts)
     
@@ -505,26 +514,22 @@ def reduce_cuis_pipeline(texts: List[str],
         all_cuis.update(text_cuis)
     
     original_cui_count = len(all_cuis)
-    logger.info(f"Extracted {original_cui_count} unique CUIs")
     
     if not all_cuis:
         return {
             "original_cuis": set(),
             "reduced_cuis": set(),
-            "metrics": {},
             "statistics": {}
         }
     
     # Step 2: Filter by vocabularies
-    logger.info("Step 2: Filtering by allowed vocabularies")
+    logger.info("Step 2: Filtering by vocabularies")
     filtered_cuis = filter_allowed_cuis(all_cuis, project_id, dataset_id)
     
     if not filtered_cuis:
-        logger.warning("No CUIs after filtering")
         return {
             "original_cuis": all_cuis,
             "reduced_cuis": set(),
-            "metrics": {},
             "statistics": {}
         }
     
@@ -533,86 +538,76 @@ def reduce_cuis_pipeline(texts: List[str],
     client = bigquery.Client(project=project_id)
     grouped_cuis = group_cuis_by_semantic_type(client, project_id, dataset_id, filtered_cuis)
     
-    # Step 4: Get subnet data for all CUIs
-    logger.info("Step 4: Retrieving subnet data")
+    # Step 4: Get subnet data (single batch call)
+    logger.info("Step 4: Getting subnet data")
     subnet_client = SubnetAPIClient(subnet_api_url)
-    subnet_data = subnet_client.get_subnets_parallel(filtered_cuis)
+    nodes, edges = subnet_client.get_subnet_batch(filtered_cuis)
     
-    # Step 5: Compute adaptive IC scores
-    logger.info("Step 5: Computing adaptive IC scores")
-    ic_scores = compute_adaptive_ic_scores(subnet_data, set(filtered_cuis))
+    # Step 5: Build proper graph
+    logger.info("Step 5: Building hierarchy graph")
+    graph = build_hierarchy_graph(nodes, edges)
     
-    # Step 6: Find natural clusters in hierarchy
-    logger.info("Step 6: Finding natural hierarchy clusters")
-    hierarchically_reduced = set()
+    # Step 6: Compute proper IC scores
+    logger.info("Step 6: Computing IC scores")
+    ic_scores = compute_proper_ic_scores(graph, set(filtered_cuis))
+    
+    # Step 7: Hierarchical reduction per group
+    logger.info("Step 7: Hierarchical reduction")
+    hierarchy_selected = set()
     
     for tui, cuis in grouped_cuis.items():
-        group_reduced = find_natural_clusters_in_hierarchy(subnet_data, cuis, ic_scores)
-        hierarchically_reduced.update(group_reduced)
+        group_selected = hierarchical_reduction_by_coverage(graph, cuis, ic_scores)
+        hierarchy_selected.update(group_selected)
     
-    logger.info(f"Natural hierarchy clustering: {len(filtered_cuis)} -> {len(hierarchically_reduced)}")
+    # Step 8: Load embeddings
+    logger.info("Step 8: Loading embeddings")
+    embeddings = load_embeddings_batch(client, project_id, embedding_table, filtered_cuis)
     
-    # Step 7: Load embeddings
-    logger.info("Step 7: Loading embeddings")
-    embeddings = load_embeddings_batch(
-        client, project_id, embedding_table, list(hierarchically_reduced)
+    # Step 9: Embedding-based clustering per group
+    logger.info("Step 9: Embedding clustering")
+    embedding_selected = set()
+    
+    for tui, cuis in grouped_cuis.items():
+        group_selected = embedding_based_clustering(cuis, embeddings, ic_scores)
+        embedding_selected.update(group_selected)
+    
+    # Step 10: Integrate signals properly
+    logger.info("Step 10: Integrating signals")
+    final_cui_set = integrate_hierarchy_and_embedding_signals(
+        hierarchy_selected, embedding_selected, ic_scores, embeddings
     )
-    
-    # Step 8: Natural embedding-based clustering
-    logger.info("Step 8: Natural clustering in embedding space")
-    
-    final_cuis = []
-    for tui, original_cuis in grouped_cuis.items():
-        group_reduced = [cui for cui in original_cuis if cui in hierarchically_reduced]
-        
-        if group_reduced:
-            group_selected = adaptive_embedding_clustering(
-                group_reduced, embeddings, subnet_data, ic_scores
-            )
-            final_cuis.extend(group_selected)
-    
-    final_cui_set = set(final_cuis)
-    
-    # Calculate metrics (no targets, just report what emerged)
-    metrics = calculate_information_coverage(all_cuis, final_cui_set, subnet_data, ic_scores)
     
     elapsed_time = time.time() - start_time
     
-    # Results - what naturally emerged from the process
+    # Results
     results = {
         "original_cuis": all_cuis,
         "reduced_cuis": final_cui_set,
-        "metrics": metrics,
         "statistics": {
             "original_count": original_cui_count,
             "filtered_count": len(filtered_cuis),
+            "hierarchy_selected": len(hierarchy_selected),
+            "embedding_selected": len(embedding_selected),
             "final_count": len(final_cui_set),
-            "semantic_groups": len(grouped_cuis),
-            "processing_time": elapsed_time,
-            "api_calls_made": len(subnet_data),
-            "reduction_ratio": 1 - (len(final_cui_set) / original_cui_count) if original_cui_count > 0 else 0
+            "reduction_ratio": 1 - (len(final_cui_set) / original_cui_count) if original_cui_count > 0 else 0,
+            "processing_time": elapsed_time
         }
     }
     
     logger.info(f"""
-    ========== NATURAL REDUCTION COMPLETE ==========
-    Original CUIs: {original_cui_count}
-    Final CUIs: {len(final_cui_set)}
-    Natural Reduction: {results['statistics']['reduction_ratio']:.1%}
-    CUI Coverage: {metrics['cui_coverage']:.1%}
-    Information Coverage: {metrics['information_coverage']:.1%}
-    Information Density: {metrics['information_density']:.2f}
-    Processing time: {elapsed_time:.2f} seconds
-    ================================================
+    ========== REDUCTION COMPLETE ==========
+    Original: {original_cui_count}
+    Hierarchy selected: {len(hierarchy_selected)}
+    Embedding selected: {len(embedding_selected)}
+    Final: {len(final_cui_set)}
+    Reduction: {results['statistics']['reduction_ratio']:.1%}
+    Time: {elapsed_time:.2f}s
+    ========================================
     """)
     
     return results
 
-# ============================================================
-# MAIN EXECUTION
-# ============================================================
 def main():
-    """Example usage"""
     PROJECT_ID = "your_project_id"
     DATASET_ID = "your_dataset"
     EMBEDDING_TABLE = "your_embedding_table"
@@ -621,11 +616,9 @@ def main():
     
     texts = [
         "Patient presents with chest pain and shortness of breath",
-        "Diagnosed with type 2 diabetes mellitus", 
-        "Prescribed metformin 500mg twice daily"
+        "Diagnosed with type 2 diabetes mellitus"
     ]
     
-    # Run fully adaptive pipeline - no targets or thresholds
     results = reduce_cuis_pipeline(
         texts=texts,
         project_id=PROJECT_ID,
@@ -634,11 +627,6 @@ def main():
         cui_api_url=CUI_API_URL,
         subnet_api_url=SUBNET_API_URL
     )
-    
-    # Display what naturally emerged
-    print(f"Natural outcome: {len(results['original_cuis'])} -> {len(results['reduced_cuis'])} CUIs")
-    print(f"Information preserved: {results['metrics']['information_coverage']:.2%}")
-    print(f"Compression achieved: {results['statistics']['reduction_ratio']:.2%}")
 
 if __name__ == "__main__":
     main()
