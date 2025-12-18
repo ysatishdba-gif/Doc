@@ -1,34 +1,20 @@
-# ============================================================
-# STANDARD LIBRARIES
-# ============================================================
 import logging
 import time
 import threading
 import subprocess
-from typing import List, Dict, Tuple, Set, Any
+from typing import List, Dict, Set, Tuple
 from collections import defaultdict
-
-# ============================================================
-# THIRD PARTY
-# ============================================================
-import numpy as np
 import requests
-from scipy.spatial.distance import cdist, squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.metrics import silhouette_score
 from google.cloud import bigquery
+import numpy as np
 
-# -------------------------
-# Logging
-# -------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# API CLIENTS
+# CUI API CLIENT
 # ============================================================
 class CUIAPIClient:
-    """Client for CUI extraction API with token caching"""
     _token_lock = threading.Lock()
     _cached_token = None
     _token_expiry = 0
@@ -44,7 +30,6 @@ class CUIAPIClient:
             now = time.time()
             if self._cached_token and now < self._token_expiry:
                 return self._cached_token
-
             result = subprocess.run(
                 ["gcloud", "auth", "print-identity-token"],
                 stdout=subprocess.PIPE,
@@ -67,26 +52,28 @@ class CUIAPIClient:
         )
         response.raise_for_status()
         data = response.json()
-        return {text: set(map(str, data.get(text, []))) for text in texts}
+        result = {text: set(map(str, data.get(text, []))) for text in texts}
+        logger.info(f"[Step 1] Extracted CUIs per text: { {k: len(v) for k,v in result.items()} }")
+        return result
 
-
+# ============================================================
+# SUBNET API CLIENT WITH CACHING
+# ============================================================
 class SubnetAPIClient:
-    """Subnet API client with batching and fail-soft behavior"""
     _token_lock = threading.Lock()
     _cached_token = None
     _token_expiry = 0
 
-    def __init__(self, subnet_url: str, batch_size: int = 500, timeout: int = 30):
+    def __init__(self, subnet_url: str):
         self.url = subnet_url.rstrip("/")
-        self.batch_size = batch_size
-        self.timeout = timeout
+        self._cache_nodes: Dict[str, Set[str]] = {}
+        self._cache_edges: Dict[str, List[Tuple[str, str]]] = {}
 
     def _get_token(self):
         with self._token_lock:
             now = time.time()
             if self._cached_token and now < self._token_expiry:
                 return self._cached_token
-
             result = subprocess.run(
                 ["gcloud", "auth", "print-identity-token"],
                 stdout=subprocess.PIPE,
@@ -101,40 +88,37 @@ class SubnetAPIClient:
             self._token_expiry = now + 3300
             return self._cached_token
 
-    def _fetch_batch(self, cuis: List[str]) -> Tuple[Set[str], List[Tuple[str, str]]]:
-        headers = self._get_token()
-        payload = {"cuis": cuis, "cross_context": False}
-        try:
-            response = requests.post(
-                f"{self.url}/subnet/",
-                json=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            nodes, edges = response.json().get("output", ([], []))
-            return set(nodes), edges
-        except Exception as e:
-            logger.warning("Subnet batch failed (%s CUIs): %s", len(cuis), e)
-            return set(), []
-
     def get_subnet_batch(self, cuis: List[str]) -> Tuple[Set[str], List[Tuple[str, str]]]:
-        all_nodes: Set[str] = set()
-        all_edges: List[Tuple[str, str]] = []
+        uncached_cuis = [c for c in cuis if c not in self._cache_nodes]
+        nodes, edges = set(), []
 
-        for i in range(0, len(cuis), self.batch_size):
-            batch = cuis[i : i + self.batch_size]
-            nodes, edges = self._fetch_batch(batch)
-            all_nodes |= nodes
-            all_edges.extend(edges)
+        if uncached_cuis:
+            headers = self._get_token()
+            payload = {"cuis": uncached_cuis, "cross_context": False}
+            response = requests.post(f"{self.url}/subnet/", json=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            api_nodes, api_edges = response.json().get("output", ([], []))
+            api_nodes_set = set(api_nodes)
+            nodes.update(api_nodes_set)
+            edges.extend(api_edges)
+            for cui in uncached_cuis:
+                self._cache_nodes[cui] = api_nodes_set
+                self._cache_edges[cui] = api_edges
 
-        return all_nodes, all_edges
-
+        for cui in cuis:
+            if cui in self._cache_nodes:
+                nodes.update(self._cache_nodes[cui])
+                edges.extend(self._cache_edges[cui])
+        edges = list(set(edges))
+        logger.info(f"[Step 2] Subnet nodes: {len(nodes)}, edges: {len(edges)}")
+        return nodes, edges
 
 # ============================================================
-# BIGQUERY OPERATIONS
+# BIGQUERY UTILITIES
 # ============================================================
 def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
+    if not cuis:
+        return []
     client = bigquery.Client(project=project_id)
     query = f"""
     SELECT DISTINCT CUI
@@ -142,66 +126,24 @@ def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> Lis
     WHERE CUI IN UNNEST(@cuis)
       AND SAB IN ('ICD10', 'ICD10CM', 'ICD9CM', 'SNOMEDCT_US', 'LOINC', 'RXNORM')
     """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
-    )
+    job_config = bigquery.QueryJobConfig(query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))])
     df = client.query(query, job_config=job_config).result().to_dataframe()
+    logger.info(f"[Step 3] Allowed CUIs after filtering: {len(df)}")
     return df["CUI"].tolist()
 
-
-def group_cuis_by_semantic_type(
-    client: bigquery.Client, project_id: str, dataset_id: str, cuis: List[str]
-) -> Dict[str, List[str]]:
-    groups = defaultdict(list)
-    for i in range(0, len(cuis), 5000):
-        batch = cuis[i : i + 5000]
-        query = f"""
-        SELECT DISTINCT CUI, TUI
-        FROM `{project_id}.{dataset_id}.MRSTY`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)]
-        )
-        df = client.query(query, job_config=job_config).result().to_dataframe()
-        for _, row in df.iterrows():
-            groups[row["TUI"]].append(row["CUI"])
-    return groups
-
-
-def load_embeddings_batch(
-    client: bigquery.Client, project_id: str, embedding_table: str, cuis: List[str]
-) -> Dict[str, np.ndarray]:
-    embeddings = {}
-    for i in range(0, len(cuis), 1000):
-        batch = cuis[i : i + 1000]
-        query = f"""
-        SELECT cui, embedding
-        FROM `{project_id}.{embedding_table}`
-        WHERE cui IN UNNEST(@cuis)
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)]
-        )
-        df = client.query(query, job_config=job_config).result().to_dataframe()
-        for _, row in df.iterrows():
-            emb = np.array(row["embedding"], dtype=float)
-            embeddings[row["cui"]] = emb / (np.linalg.norm(emb) + 1e-10)
-    return embeddings
-
-
 # ============================================================
-# GRAPH + IC (SECO)
+# GRAPH + IC
 # ============================================================
-def build_hierarchy_graph(nodes: Set[str], edges: List[Tuple[str, str]]) -> Dict[str, Dict]:
+def build_graph(nodes: Set[str], edges: List[Tuple[str, str]]) -> Dict[str, Dict]:
     graph = defaultdict(lambda: {"parents": set(), "children": set()})
     for parent, child in edges:
-        graph[parent]["children"].add(child)
-        graph[child]["parents"].add(parent)
+        if parent in nodes and child in nodes:
+            graph[parent]["children"].add(child)
+            graph[child]["parents"].add(parent)
     for n in nodes:
         graph.setdefault(n, {"parents": set(), "children": set()})
+    logger.info(f"[Step 4] Built graph with {len(graph)} nodes")
     return dict(graph)
-
 
 def compute_descendants(graph: Dict[str, Dict]) -> Dict[str, Set[str]]:
     cache = {}
@@ -215,155 +157,92 @@ def compute_descendants(graph: Dict[str, Dict]) -> Dict[str, Set[str]]:
         return visited
     for node in graph:
         dfs(node)
+    logger.info(f"[Step 5] Computed descendants for {len(graph)} nodes")
     return cache
 
-
-def compute_seco_ic(descendants: Dict[str, Set[str]]) -> Dict[str, float]:
+def compute_ic(descendants: Dict[str, Set[str]]) -> Dict[str, float]:
     total = len(descendants)
-    return {
-        cui: 1.0 - (np.log(len(desc)) / np.log(total))
-        for cui, desc in descendants.items()
-    }
-
+    ic = {cui: 1.0 - (np.log(len(desc)) / np.log(total)) for cui, desc in descendants.items()}
+    logger.info(f"[Step 6] Computed IC scores for {len(ic)} CUIs")
+    return ic
 
 # ============================================================
-# REDUCTION
+# HIERARCHICAL REDUCTION
 # ============================================================
-def hierarchical_reduction_by_coverage(
-    cuis: List[str], descendants: Dict[str, Set[str]], ic_scores: Dict[str, float]
-) -> Set[str]:
-    remaining, covered, selected = set(cuis), set(), set()
+def hierarchical_reduction(cuis: List[str], descendants: Dict[str, Set[str]], ic_scores: Dict[str, float]) -> Set[str]:
+    remaining = set(cuis)
+    covered = set()
+    selected = set()
     while covered < remaining:
-        best, gain = None, 0.0
+        best_cui, best_gain = None, 0
         for cui in remaining - selected:
-            new = (descendants[cui] & remaining) - covered
-            score = sum(ic_scores[c] for c in new)
-            if score > gain:
-                best, gain = cui, score
-        if not best:
+            new_gain = sum(ic_scores.get(c, 0) for c in (descendants[cui] & remaining - covered))
+            if new_gain > best_gain:
+                best_cui, best_gain = cui, new_gain
+        if not best_cui:
             selected |= remaining - covered
             break
-        selected.add(best)
-        covered |= descendants[best]
+        selected.add(best_cui)
+        covered |= descendants[best_cui]
+    logger.info(f"[Step 7] Selected {len(selected)} CUIs after hierarchical reduction")
     return selected
 
-
-def embedding_based_clustering(
-    cuis: List[str], embeddings: Dict[str, np.ndarray], ic_scores: Dict[str, float]
-) -> Set[str]:
-    valid = [c for c in cuis if c in embeddings]
-    if len(valid) <= 2:
-        return set(valid)
-
-    vecs = np.vstack([embeddings[c] for c in valid])
-    dist = cdist(vecs, vecs, metric="cosine")
-    Z = linkage(squareform(dist), method="average")
-
-    best_score, labels = -1, None
-    for k in range(2, min(10, len(valid)) + 1):
-        labs = fcluster(Z, k, criterion="maxclust")
-        score = silhouette_score(dist, labs, metric="precomputed")
-        if score > best_score:
-            best_score, labels = score, labs
-
-    selected = set()
-    for cid in set(labels):
-        idx = np.where(labels == cid)[0]
-        cluster = [valid[i] for i in idx]
-        scores = {
-            cui: ic_scores.get(cui, 0) - np.mean(dist[idx[i], idx])
-            for i, cui in enumerate(cluster)
-        }
-        selected.add(max(scores, key=scores.get))
-    return selected
-
-
 # ============================================================
-# MAIN PIPELINE
+# PIPELINE
 # ============================================================
-def reduce_cuis_pipeline(
-    texts: List[str],
-    project_id: str,
-    dataset_id: str,
-    embedding_table: str,
-    cui_api_url: str,
-    subnet_api_url: str,
-) -> Dict[str, Any]:
-
+def reduce_cuis_pipeline(texts: List[str], project_id: str, dataset_id: str, cui_api_url: str, subnet_api_url: str) -> Dict[str, any]:
+    start_time = time.time()
+    
     extractor = CUIAPIClient(cui_api_url)
-    all_cuis = set().union(*extractor.extract_cuis_batch(texts).values())
-
-    filtered = filter_allowed_cuis(all_cuis, project_id, dataset_id)
-    client = bigquery.Client(project=project_id)
-    grouped = group_cuis_by_semantic_type(client, project_id, dataset_id, filtered)
-
+    text_to_cuis = extractor.extract_cuis_batch(texts)
+    all_cuis = set().union(*text_to_cuis.values())
+    logger.info(f"[Pipeline] Total extracted CUIs: {len(all_cuis)}")
+    
+    filtered_cuis = filter_allowed_cuis(all_cuis, project_id, dataset_id)
+    if not filtered_cuis:
+        return {"original_cuis": all_cuis, "reduced_cuis": set(), "statistics": {}}
+    
     subnet = SubnetAPIClient(subnet_api_url)
-    nodes, edges = subnet.get_subnet_batch(filtered)
-
-    if not nodes:
-        logger.warning("Subnet unavailable; using flat hierarchy")
-        nodes, edges = set(filtered), []
-
-    graph = build_hierarchy_graph(nodes, edges)
+    nodes, edges = subnet.get_subnet_batch(filtered_cuis)
+    
+    graph = build_graph(nodes, edges)
     descendants = compute_descendants(graph)
-    ic_scores = compute_seco_ic(descendants)
-
-    hierarchy_selected = set().union(
-        *[hierarchical_reduction_by_coverage(c, descendants, ic_scores) for c in grouped.values()]
-    )
-
-    embeddings = load_embeddings_batch(client, project_id, embedding_table, filtered)
-    embedding_selected = set().union(
-        *[embedding_based_clustering(c, embeddings, ic_scores) for c in grouped.values()]
-    )
-
-    final = hierarchy_selected | embedding_selected
-
+    ic_scores = compute_ic(descendants)
+    
+    final_cuis = hierarchical_reduction(filtered_cuis, descendants, ic_scores)
+    elapsed = time.time() - start_time
+    logger.info(f"[Pipeline] Reduced to {len(final_cuis)} CUIs in {elapsed:.2f}s")
+    
     return {
         "original_cuis": all_cuis,
-        "reduced_cuis": final,
+        "reduced_cuis": final_cuis,
         "statistics": {
-            "original": len(all_cuis),
-            "filtered": len(filtered),
-            "hierarchy": len(hierarchy_selected),
-            "embedding": len(embedding_selected),
-            "final": len(final),
-        },
+            "original_count": len(all_cuis),
+            "filtered_count": len(filtered_cuis),
+            "final_count": len(final_cuis),
+            "processing_time": elapsed
+        }
     }
 
-
 # ============================================================
-# ENTRY POINT
+# MAIN TEST
 # ============================================================
 def main():
     PROJECT_ID = "your_project_id"
-    DATASET_ID = "your_umls_dataset"
-    EMBEDDING_TABLE = "your_embedding_table"
-    CUI_API_URL = "https://your-cui-api"
-    SUBNET_API_URL = "https://your-subnet-api"
-
+    DATASET_ID = "your_dataset"
+    CUI_API_URL = "https://your_cui_api"
+    SUBNET_API_URL = "https://your_subnet_api"
+    
     texts = [
-        "Patient presents with chest pain and shortness of breath",
-        "Diagnosed with type 2 diabetes mellitus",
+        "Patient presents with brain tumor",
+        "Severe chest pain and shortness of breath",
+        "Type 2 diabetes mellitus diagnosis"
     ]
-
-    results = reduce_cuis_pipeline(
-        texts=texts,
-        project_id=PROJECT_ID,
-        dataset_id=DATASET_ID,
-        embedding_table=EMBEDDING_TABLE,
-        cui_api_url=CUI_API_URL,
-        subnet_api_url=SUBNET_API_URL,
-    )
-
-    print("\n===== CUI REDUCTION RESULTS =====")
-    for k, v in results["statistics"].items():
-        print(f"{k}: {v}")
-
-    print("\nSample reduced CUIs:")
-    for cui in list(results["reduced_cuis"])[:10]:
-        print(" ", cui)
-
+    
+    results = reduce_cuis_pipeline(texts, PROJECT_ID, DATASET_ID, CUI_API_URL, SUBNET_API_URL)
+    print("Original CUIs:", results["original_cuis"])
+    print("Reduced CUIs:", results["reduced_cuis"])
+    print("Statistics:", results["statistics"])
 
 if __name__ == "__main__":
     main()
