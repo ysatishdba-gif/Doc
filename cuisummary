@@ -1,241 +1,1548 @@
-# ============================================================
-# STANDARD LIBRARIES
-# ============================================================
+import subprocess
+import networkx as nx
+import requests
+import json
 import logging
 import time
+import asyncio
+import aiohttp
+from typing import Dict, List, Set, Tuple, Optional
+from dataclasses import dataclass, asdict
+from collections import defaultdict, deque
 import threading
-import subprocess
-from typing import List, Dict, Tuple, Set, Any
-from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# ============================================================
-# THIRD PARTY
-# ============================================================
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 import numpy as np
-import requests
-from scipy.spatial.distance import cdist, squareform
-from scipy.cluster.hierarchy import linkage, fcluster
-from sklearn.metrics import silhouette_score
 from google.cloud import bigquery
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_distances
+from functools import lru_cache, wraps
+import pickle
+import hashlib
+from datetime import datetime, timedelta
 
-# -------------------------
-# Logging
-# -------------------------
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# ============================================================
-# API CLIENTS
-# ============================================================
-class CUIAPIClient:
-    _token_lock = threading.Lock()
-    _cached_token = None
-    _token_expiry = 0
+# ----------------------------
+# Performance Configuration
+# ----------------------------
+class PerformanceConfig:
+    """Centralized performance configuration"""
+    
+    # API Settings
+    API_TIMEOUT = 30  # seconds per API call
+    API_MAX_RETRIES = 3
+    API_BATCH_SIZE = 100  # CUIs per batch
+    API_MAX_CONCURRENT_REQUESTS = 5
+    
+    # BigQuery Settings
+    BQ_TIMEOUT = 60  # seconds per query
+    BQ_MAX_BYTES_BILLED = 10 * 1024 * 1024 * 1024  # 10GB limit
+    BQ_BATCH_SIZE = 1000  # records per batch
+    BQ_MAX_CONCURRENT_QUERIES = 3
+    
+    # Cache Settings
+    CACHE_TTL = 3600  # 1 hour
+    CACHE_MAX_SIZE = 10000  # max items in memory
+    
+    # Circuit Breaker Settings
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+    CIRCUIT_BREAKER_RECOVERY_TIMEOUT = 60  # seconds
+    CIRCUIT_BREAKER_EXPECTED_EXCEPTION = (TimeoutError, requests.exceptions.Timeout)
 
-    def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 5):
-        self.api_base_url = api_base_url.rstrip('/')
-        self.timeout = timeout
-        self.top_k = top_k
-        self.session = requests.Session()
+# ----------------------------
+# Circuit Breaker Pattern
+# ----------------------------
+class CircuitBreaker:
+    """Circuit breaker to prevent cascading failures"""
+    
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: int = 60,
+        expected_exception: tuple = (Exception,)
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.expected_exception = expected_exception
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'closed'  # closed, open, half-open
+        self._lock = threading.Lock()
+    
+    def call(self, func, *args, **kwargs):
+        with self._lock:
+            if self.state == 'open':
+                if self._should_attempt_reset():
+                    self.state = 'half-open'
+                else:
+                    raise Exception(f"Circuit breaker is open for {func.__name__}")
+        
+        try:
+            result = func(*args, **kwargs)
+            self._on_success()
+            return result
+        except self.expected_exception as e:
+            self._on_failure()
+            raise e
+    
+    def _should_attempt_reset(self):
+        return (
+            self.last_failure_time and
+            time.time() - self.last_failure_time >= self.recovery_timeout
+        )
+    
+    def _on_success(self):
+        with self._lock:
+            self.failure_count = 0
+            self.state = 'closed'
+    
+    def _on_failure(self):
+        with self._lock:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            if self.failure_count >= self.failure_threshold:
+                self.state = 'open'
+                logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
 
-    def _refresh_token(self):
-        with self._token_lock:
-            now = time.time()
-            if self._cached_token and now < self._token_expiry:
-                return self._cached_token
-            result = subprocess.run(
-                ['gcloud', 'auth', 'print-identity-token'],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True
-            )
-            token = result.stdout.strip()
-            self._cached_token = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-            self._token_expiry = now + 3300
-            return self._cached_token
+# ----------------------------
+# Advanced Cache Implementation
+# ----------------------------
+class TTLCache:
+    """Time-based cache with size limits"""
+    
+    def __init__(self, ttl: int = 3600, max_size: int = 10000):
+        self.ttl = ttl
+        self.max_size = max_size
+        self.cache = {}
+        self.timestamps = {}
+        self._lock = threading.Lock()
+    
+    def get(self, key: str):
+        with self._lock:
+            if key in self.cache:
+                if time.time() - self.timestamps[key] < self.ttl:
+                    return self.cache[key]
+                else:
+                    del self.cache[key]
+                    del self.timestamps[key]
+            return None
+    
+    def set(self, key: str, value):
+        with self._lock:
+            # Evict oldest entries if cache is full
+            if len(self.cache) >= self.max_size:
+                oldest_key = min(self.timestamps, key=self.timestamps.get)
+                del self.cache[oldest_key]
+                del self.timestamps[oldest_key]
+            
+            self.cache[key] = value
+            self.timestamps[key] = time.time()
+    
+    def clear(self):
+        with self._lock:
+            self.cache.clear()
+            self.timestamps.clear()
 
-    def extract_cuis_batch(self, texts: List[str]) -> Dict[str, Set[str]]:
-        headers = self._refresh_token()
-        payload = {'query_texts': texts, 'top_k': self.top_k}
-        response = self.session.post(self.api_base_url, json=payload, headers=headers, timeout=self.timeout)
-        response.raise_for_status()
-        data = response.json()
-        return {text: set(map(str, data.get(text, []))) for text in texts}
+def cached_with_ttl(ttl: int = 3600, max_size: int = 128):
+    """Decorator for caching function results with TTL"""
+    cache = TTLCache(ttl=ttl, max_size=max_size)
+    
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Create cache key from function arguments
+            key = f"{func.__name__}:{str(args)}:{str(kwargs)}"
+            key_hash = hashlib.md5(key.encode()).hexdigest()
+            
+            # Check cache
+            result = cache.get(key_hash)
+            if result is not None:
+                logger.debug(f"Cache hit for {func.__name__}")
+                return result
+            
+            # Execute function and cache result
+            result = func(*args, **kwargs)
+            cache.set(key_hash, result)
+            return result
+        
+        wrapper.cache = cache
+        return wrapper
+    
+    return decorator
 
-
-class SubnetAPIClient:
-    _token_lock = threading.Lock()
-    _cached_token = None
-    _token_expiry = 0
-
-    def __init__(self, subnet_url: str, batch_size: int = 50, max_workers: int = 4):
-        self.url = subnet_url.rstrip('/')
-        self.batch_size = batch_size
-        self.max_workers = max_workers
-        self._cache_nodes = {}
-        self._cache_edges = {}
-
-    def _get_token(self):
-        with self._token_lock:
-            now = time.time()
-            if self._cached_token and now < self._token_expiry:
-                return self._cached_token
-            result = subprocess.run(
-                ['gcloud', 'auth', 'print-identity-token'],
-                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True
-            )
-            token = result.stdout.strip()
-            self._cached_token = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-            self._token_expiry = now + 3300
-            return self._cached_token
-
-    def _fetch_batch(self, batch: List[str]) -> Tuple[Set[str], List[Tuple[str, str]]]:
-        headers = self._get_token()
-        payload = {'cuis': batch, 'cross_context': False}
-        response = requests.post(f'{self.url}/subnet/', json=payload, headers=headers, timeout=60)
-        response.raise_for_status()
-        nodes, edges = response.json().get('output', ([], []))
-        return set(nodes), edges
-
-    def get_subnet_batch(self, cuis: List[str]) -> Tuple[Set[str], List[Tuple[str, str]]]:
-        all_nodes, all_edges = set(), []
-        batches = [cuis[i:i+self.batch_size] for i in range(0, len(cuis), self.batch_size)]
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(self._fetch_batch, batch): batch for batch in batches}
-            for future in as_completed(futures):
-                try:
-                    nodes, edges = future.result()
-                    all_nodes.update(nodes)
-                    all_edges.extend(edges)
-                except Exception as e:
-                    logger.error(f'Error fetching subnet batch: {e}')
-        all_edges = list(set(all_edges))
-        return all_nodes, all_edges
-
-# ============================================================
-# BIGQUERY OPERATIONS (unchanged)
-# ============================================================
-def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
+# ----------------------------
+# Optimized Filter Function
+# ----------------------------
+@cached_with_ttl(ttl=3600)
+def filter_allowed_cuis_optimized(
+    cuis: Set[str],
+    project_id: str,
+    dataset_id: str,
+    batch_size: int = 1000
+) -> List[str]:
+    """Optimized CUI filtering with batching and caching"""
+    
     if not cuis:
         return []
-    client = bigquery.Client(project=project_id)
-    query = f"""
-    SELECT DISTINCT CUI
-    FROM `{project_id}.{dataset_id}.MRCONSO`
-    WHERE CUI IN UNNEST(@cuis)
-      AND SAB IN ('ICD10', 'ICD10CM', 'ICD9CM', 'SNOMEDCT_US', 'LOINC', 'RXNORM')
-    """
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ArrayQueryParameter('cuis', 'STRING', list(cuis))]
-    )
-    df = client.query(query, job_config=job_config).result().to_dataframe()
-    return df['CUI'].tolist()
+    
+    cui_list = list(cuis)
+    allowed_cuis = []
+    
+    try:
+        client = bigquery.Client(project=project_id)
+        
+        # Process in batches to avoid query size limits
+        for i in range(0, len(cui_list), batch_size):
+            batch = cui_list[i:i + batch_size]
+            
+            query = f"""
+            SELECT DISTINCT CUI
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis)
+              AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE',
+                         'ICD10AM','ICD10AMAE','ICD10CM','ICD10DUT','ICD10PCS','ICD9CM',
+                         'ICPC2ICD10DUT','ICPC2ICD10ENG','SNOMEDCT_US', 'LOINC')
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)],
+                use_query_cache=True,
+                maximum_bytes_billed=PerformanceConfig.BQ_MAX_BYTES_BILLED
+            )
+            
+            try:
+                query_job = client.query(query, job_config=job_config)
+                df = query_job.result(timeout=PerformanceConfig.BQ_TIMEOUT).to_dataframe()
+                allowed_cuis.extend(df['CUI'].tolist())
+            except TimeoutError:
+                logger.warning(f"Batch {i//batch_size + 1} timed out, skipping")
+                continue
+        
+        logger.info(f"{len(allowed_cuis)} CUIs after filter")
+        return allowed_cuis
+        
+    except Exception as e:
+        logger.error(f"Failed to filter CUIs: {str(e)}")
+        return []
 
-# ============================================================
-# GRAPH + IC + REDUCTION (unchanged)
-# ============================================================
-# ... (all previous graph, IC, hierarchical reduction, embedding clustering code stays unchanged)
+# ----------------------------
+# Optimized Subnet API Client
+# ----------------------------
+class OptimizedSubnetAPIClient:
+    """Optimized subnet client with connection pooling and circuit breaker"""
+    
+    def __init__(
+        self,
+        api_base_url: str,
+        timeout: int = None,
+        max_retries: int = None
+    ):
+        self.api_base_url = api_base_url.rstrip('/')
+        self.timeout = timeout or PerformanceConfig.API_TIMEOUT
+        self.max_retries = max_retries or PerformanceConfig.API_MAX_RETRIES
+        
+        # Token management
+        self._token_lock = threading.Lock()
+        self._cached_token = None
+        self._token_expiry = 0
+        
+        # Circuit breaker
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=PerformanceConfig.CIRCUIT_BREAKER_FAILURE_THRESHOLD,
+            recovery_timeout=PerformanceConfig.CIRCUIT_BREAKER_RECOVERY_TIMEOUT,
+            expected_exception=PerformanceConfig.CIRCUIT_BREAKER_EXPECTED_EXCEPTION
+        )
+        
+        # Cache for subnetworks
+        self.cache = TTLCache(
+            ttl=PerformanceConfig.CACHE_TTL,
+            max_size=PerformanceConfig.CACHE_MAX_SIZE
+        )
+        
+        # Connection pool
+        self.session = self._create_session()
+    
+    def _create_session(self):
+        """Create session with connection pooling"""
+        session = requests.Session()
+        from requests.adapters import HTTPAdapter
+        from requests.packages.urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=self.max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=50
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+    
+    def _update_gcp_token(self, force: bool = False):
+        """Get GCP token with caching"""
+        with self._token_lock:
+            current_time = time.time()
+            
+            if not force and self._cached_token and current_time < self._token_expiry:
+                return self._cached_token
+            
+            try:
+                result = subprocess.run(
+                    ['gcloud', 'auth', 'print-identity-token'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    timeout=10,
+                    check=False
+                )
+                
+                if result.returncode != 0:
+                    raise Exception(f"gcloud auth failed: {result.stderr}")
+                
+                identity_token = result.stdout.strip()
+                self._cached_token = {
+                    "Authorization": f"Bearer {identity_token}",
+                    "Content-Type": "application/json"
+                }
+                self._token_expiry = current_time + 3300  # 55 minutes
+                
+                return self._cached_token
+                
+            except Exception as e:
+                raise Exception(f"Failed to get GCP token: {str(e)}")
+    
+    def get_subnetwork_batch(
+        self,
+        cui_batches: List[List[str]],
+        cross_context: bool = True
+    ) -> Dict[str, nx.DiGraph]:
+        """Process multiple CUI batches in parallel"""
+        
+        results = {}
+        
+        with ThreadPoolExecutor(max_workers=PerformanceConfig.API_MAX_CONCURRENT_REQUESTS) as executor:
+            future_to_batch = {
+                executor.submit(
+                    self._get_single_subnetwork,
+                    batch,
+                    cross_context
+                ): batch
+                for batch in cui_batches
+            }
+            
+            for future in as_completed(future_to_batch):
+                batch = future_to_batch[future]
+                try:
+                    graph = future.result(timeout=self.timeout)
+                    batch_key = "_".join(sorted(batch))
+                    results[batch_key] = graph
+                except Exception as e:
+                    logger.error(f"Failed to get subnetwork for batch: {str(e)}")
+                    results[batch_key] = nx.DiGraph()
+        
+        return results
+    
+    def _get_single_subnetwork(
+        self,
+        cuis: List[str],
+        cross_context: bool = True
+    ) -> nx.DiGraph:
+        """Get subnetwork with circuit breaker and caching"""
+        
+        # Check cache
+        cache_key = f"{sorted(cuis)}:{cross_context}"
+        cache_key_hash = hashlib.md5(str(cache_key).encode()).hexdigest()
+        
+        cached_result = self.cache.get(cache_key_hash)
+        if cached_result is not None:
+            logger.debug(f"Cache hit for subnetwork with {len(cuis)} CUIs")
+            return cached_result
+        
+        # Make API call with circuit breaker
+        try:
+            graph = self.circuit_breaker.call(
+                self._api_call_with_retry,
+                cuis,
+                cross_context
+            )
+            
+            # Cache result
+            self.cache.set(cache_key_hash, graph)
+            return graph
+            
+        except Exception as e:
+            logger.error(f"Subnetwork API failed after circuit breaker: {str(e)}")
+            return nx.DiGraph()
+    
+    def _api_call_with_retry(
+        self,
+        cuis: List[str],
+        cross_context: bool = True
+    ) -> nx.DiGraph:
+        """Make API call with retry logic"""
+        
+        payload = {"cuis": cuis, "cross_context": cross_context}
+        headers = self._update_gcp_token()
+        
+        for attempt in range(self.max_retries):
+            try:
+                response = self.session.post(
+                    f"{self.api_base_url}/subnet/",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout
+                )
+                
+                if response.status_code == 401:
+                    headers = self._update_gcp_token(force=True)
+                    continue
+                
+                response.raise_for_status()
+                data = response.json()
+                
+                # Build NetworkX graph
+                g = nx.DiGraph()
+                nodes, edges = data['output']
+                g.add_nodes_from(nodes)
+                g.add_edges_from(edges)
+                
+                logger.info(f"Retrieved subnetwork: {len(nodes)} nodes, {len(edges)} edges")
+                return g
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"API timeout on attempt {attempt + 1}/{self.max_retries}")
+                if attempt == self.max_retries - 1:
+                    raise TimeoutError("API call timed out after all retries")
+            except Exception as e:
+                if attempt == self.max_retries - 1:
+                    raise e
+                time.sleep(2 ** attempt)  # Exponential backoff
+        
+        return nx.DiGraph()
 
-# ============================================================
-# MAIN PIPELINE WITH LOGGING
-# ============================================================
-def reduce_cuis_pipeline(
+# ----------------------------
+# Optimized CUI API Client
+# ----------------------------
+class OptimizedCUIAPIClient:
+    """Optimized CUI extraction with batching and parallel processing"""
+    
+    def __init__(
+        self,
+        api_base_url: str,
+        timeout: int = None,
+        top_k: int = 3,
+        max_retries: int = None
+    ):
+        self.api_base_url = api_base_url.rstrip('/')
+        self.timeout = timeout or PerformanceConfig.API_TIMEOUT
+        self.top_k = top_k
+        self.max_retries = max_retries or PerformanceConfig.API_MAX_RETRIES
+        
+        # Token management
+        self._token_lock = threading.Lock()
+        self._cached_token = None
+        self._token_expiry = 0
+        
+        # Cache
+        self.cache = TTLCache(
+            ttl=PerformanceConfig.CACHE_TTL,
+            max_size=PerformanceConfig.CACHE_MAX_SIZE
+        )
+        
+        # Session with connection pooling
+        self.session = self._create_session()
+    
+    def _create_session(self):
+        """Create session with connection pooling"""
+        session = requests.Session()
+        from requests.adapters import HTTPAdapter
+        from requests.packages.urllib3.util.retry import Retry
+        
+        retry_strategy = Retry(
+            total=self.max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=20,
+            pool_maxsize=50
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+    
+    def _update_gcp_token(self, force: bool = False):
+        """Get GCP token with caching"""
+        with self._token_lock:
+            current_time = time.time()
+            
+            if not force and self._cached_token and current_time < self._token_expiry:
+                return self._cached_token
+            
+            try:
+                result = subprocess.run(
+                    ['gcloud', 'auth', 'print-identity-token'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    timeout=10,
+                    check=False
+                )
+                
+                if result.returncode != 0:
+                    raise Exception(f"gcloud auth failed: {result.stderr}")
+                
+                identity_token = result.stdout.strip()
+                self._cached_token = {
+                    "Authorization": f"Bearer {identity_token}",
+                    "Content-Type": "application/json"
+                }
+                self._token_expiry = current_time + 3300
+                
+                return self._cached_token
+                
+            except Exception as e:
+                raise Exception(f"Failed to get GCP token: {str(e)}")
+    
+    def extract_cuis_batch_parallel(
+        self,
+        texts: List[str],
+        batch_size: int = None
+    ) -> Set[str]:
+        """Extract CUIs in parallel batches"""
+        
+        if not texts:
+            return set()
+        
+        batch_size = batch_size or PerformanceConfig.API_BATCH_SIZE
+        all_cuis = set()
+        
+        # Split texts into batches
+        batches = [
+            texts[i:i + batch_size]
+            for i in range(0, len(texts), batch_size)
+        ]
+        
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=PerformanceConfig.API_MAX_CONCURRENT_REQUESTS) as executor:
+            future_to_batch = {
+                executor.submit(self._extract_single_batch, batch): batch
+                for batch in batches
+            }
+            
+            for future in as_completed(future_to_batch):
+                try:
+                    cuis = future.result(timeout=self.timeout * 2)
+                    all_cuis.update(cuis)
+                except Exception as e:
+                    logger.error(f"Batch extraction failed: {str(e)}")
+        
+        logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
+        return all_cuis
+    
+    def _extract_single_batch(self, texts: List[str]) -> Set[str]:
+        """Extract CUIs from a single batch with caching"""
+        
+        # Check cache for individual texts
+        uncached_texts = []
+        cached_cuis = set()
+        
+        for text in texts:
+            cache_key = hashlib.md5(text.encode()).hexdigest()
+            cached = self.cache.get(cache_key)
+            if cached:
+                cached_cuis.update(cached)
+            else:
+                uncached_texts.append(text)
+        
+        if not uncached_texts:
+            return cached_cuis
+        
+        # Make API call for uncached texts
+        payload = {"query_texts": uncached_texts, "top_k": self.top_k}
+        headers = self._update_gcp_token()
+        
+        try:
+            response = self.session.post(
+                self.api_base_url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            
+            if response.status_code == 401:
+                headers = self._update_gcp_token(force=True)
+                response = self.session.post(
+                    self.api_base_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout
+                )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            # Process and cache results
+            new_cuis = set()
+            for text in uncached_texts:
+                cuis = data.get(text, [])
+                if isinstance(cuis, list):
+                    text_cuis = set(str(c) for c in cuis if c)
+                    new_cuis.update(text_cuis)
+                    
+                    # Cache result
+                    cache_key = hashlib.md5(text.encode()).hexdigest()
+                    self.cache.set(cache_key, text_cuis)
+            
+            return cached_cuis.union(new_cuis)
+            
+        except Exception as e:
+            logger.error(f"API call failed: {str(e)}")
+            return cached_cuis
+
+# ----------------------------
+# Optimized Enhanced CUI Reducer
+# ----------------------------
+class OptimizedEnhancedCUIReducer:
+    """Optimized CUI reducer with parallel processing and caching"""
+    
+    def __init__(
+        self,
+        project_id: str,
+        dataset_id: str,
+        subnet_api_url: str,
+        cui_description_table: str = "cui_descriptions",
+        cui_embeddings_table: str = "cui_embeddings",
+        cui_narrower_table: str = "cui_narrower_concepts",
+        max_hierarchy_depth: int = 1,
+        query_timeout: int = None
+    ):
+        try:
+            self.client = bigquery.Client(project=project_id)
+        except Exception as e:
+            raise Exception(f"Failed to initialize BigQuery client: {str(e)}")
+        
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.cui_description_table = cui_description_table
+        self.cui_embeddings_table = cui_embeddings_table
+        self.cui_narrower_table = cui_narrower_table
+        self.max_hierarchy_depth = max_hierarchy_depth
+        self.query_timeout = query_timeout or PerformanceConfig.BQ_TIMEOUT
+        
+        # Initialize optimized subnet client
+        self.subnet_client = OptimizedSubnetAPIClient(subnet_api_url)
+        
+        # Advanced caching
+        self._hierarchy_cache = TTLCache(ttl=PerformanceConfig.CACHE_TTL)
+        self._ic_scores_cache = TTLCache(ttl=PerformanceConfig.CACHE_TTL)
+        self._description_cache = TTLCache(ttl=PerformanceConfig.CACHE_TTL * 2)
+        self._embeddings_cache = TTLCache(ttl=PerformanceConfig.CACHE_TTL * 2)
+        
+        # Thread pool for parallel processing
+        self.executor = ThreadPoolExecutor(max_workers=10)
+    
+    def reduce(
+        self,
+        input_cuis: List[str],
+        target_reduction: float = 0.85,
+        ic_threshold: Optional[float] = None,
+        ic_percentile: float = 50.0,
+        semantic_threshold: float = 0.88,
+        use_semantic_clustering: bool = True,
+        adaptive_threshold: bool = False,
+        use_parallel: bool = True
+    ) -> Tuple[List[str], ReductionStats]:
+        """Main reduction pipeline with parallel processing option"""
+        
+        start_time = time.time()
+        initial_count = len(input_cuis)
+        
+        if initial_count == 0:
+            logger.warning("Empty input CUI list")
+            return [], self._create_empty_stats(start_time)
+        
+        # Remove duplicates
+        input_cuis = list(set(str(c).strip() for c in input_cuis if c and str(c).strip()))
+        initial_count = len(input_cuis)
+        
+        try:
+            # Build hierarchy with parallel processing
+            if use_parallel:
+                hierarchy = self._build_hierarchy_parallel(input_cuis)
+            else:
+                hierarchy = self._build_hierarchy_from_subnet(input_cuis)
+            
+            ic_scores = self._compute_ic_scores_optimized(hierarchy)
+            
+            # Determine IC threshold
+            ic_threshold = self._determine_threshold(
+                ic_scores, ic_threshold, ic_percentile,
+                adaptive_threshold, input_cuis, hierarchy, target_reduction
+            )
+            
+            # Stage 1: IC-based rollup
+            rolled_up_cuis = self._semantic_rollup_parallel(
+                input_cuis, hierarchy, ic_scores, ic_threshold
+            ) if use_parallel else self._semantic_rollup_with_ic_safe(
+                input_cuis, hierarchy, ic_scores, ic_threshold
+            )
+            
+            after_rollup = len(rolled_up_cuis)
+            rollup_reduction = self._safe_percentage(initial_count - after_rollup, initial_count)
+            
+            logger.info(f"IC rollup complete: {after_rollup} CUIs ({rollup_reduction:.1f}% reduction)")
+            
+            # Stage 2: Semantic clustering
+            clustering_reduction = 0.0
+            if use_semantic_clustering and rollup_reduction < target_reduction * 100:
+                final_cuis = self._semantic_clustering_optimized(
+                    rolled_up_cuis, ic_scores, semantic_threshold
+                )
+                final_count = len(final_cuis)
+                clustering_reduction = self._safe_percentage(after_rollup - final_count, initial_count)
+                logger.info(f"Semantic clustering complete: {final_count} CUIs ({clustering_reduction:.1f}% additional)")
+            else:
+                final_cuis = rolled_up_cuis
+                final_count = after_rollup
+            
+            # Calculate stats
+            total_reduction = self._safe_percentage(initial_count - final_count, initial_count)
+            processing_time = time.time() - start_time
+            
+            stats = ReductionStats(
+                initial_count=initial_count,
+                after_ic_rollup=after_rollup,
+                final_count=final_count,
+                ic_rollup_reduction_pct=rollup_reduction,
+                semantic_clustering_reduction_pct=clustering_reduction,
+                total_reduction_pct=total_reduction,
+                processing_time=processing_time,
+                ic_threshold_used=ic_threshold,
+                hierarchy_size=len(hierarchy.get('all_cuis', set()))
+            )
+            
+            logger.info(f"Reduction complete: {initial_count} → {final_count} ({total_reduction:.1f}%)")
+            return final_cuis, stats
+            
+        except Exception as e:
+            logger.error(f"Critical error in reduction pipeline: {str(e)}")
+            return input_cuis, self._create_error_stats(initial_count, start_time, str(e))
+    
+    def _build_hierarchy_parallel(self, relevant_cuis: List[str]) -> Dict:
+        """Build hierarchy using parallel subnet API calls"""
+        
+        # Check cache
+        cache_key = hashlib.md5(str(sorted(relevant_cuis)).encode()).hexdigest()
+        cached = self._hierarchy_cache.get(cache_key)
+        if cached:
+            return cached
+        
+        # Split CUIs into batches for parallel processing
+        batch_size = PerformanceConfig.API_BATCH_SIZE
+        cui_batches = [
+            relevant_cuis[i:i + batch_size]
+            for i in range(0, len(relevant_cuis), batch_size)
+        ]
+        
+        # Get subnetworks in parallel
+        batch_graphs = self.subnet_client.get_subnetwork_batch(cui_batches)
+        
+        # Merge all graphs
+        merged_graph = nx.DiGraph()
+        for graph in batch_graphs.values():
+            merged_graph = nx.compose(merged_graph, graph)
+        
+        # Build hierarchy structure
+        child_to_parents = defaultdict(list)
+        parent_to_children = defaultdict(list)
+        all_cuis = set(relevant_cuis)
+        
+        for edge in merged_graph.edges():
+            parent, child = edge
+            parent_to_children[parent].append(child)
+            child_to_parents[child].append(parent)
+            all_cuis.update([parent, child])
+        
+        # Add ancestors and descendants
+        for cui in relevant_cuis:
+            if cui in merged_graph:
+                try:
+                    ancestors = nx.ancestors(merged_graph, cui)
+                    descendants = nx.descendants(merged_graph, cui)
+                    
+                    for ancestor in ancestors:
+                        if ancestor not in child_to_parents[cui]:
+                            child_to_parents[cui].append(ancestor)
+                        if cui not in parent_to_children[ancestor]:
+                            parent_to_children[ancestor].append(cui)
+                    
+                    for descendant in descendants:
+                        if descendant not in parent_to_children[cui]:
+                            parent_to_children[cui].append(descendant)
+                        if cui not in child_to_parents[descendant]:
+                            child_to_parents[descendant].append(cui)
+                    
+                    all_cuis.update(ancestors)
+                    all_cuis.update(descendants)
+                except nx.NetworkXError:
+                    continue
+        
+        hierarchy = {
+            'child_to_parents': dict(child_to_parents),
+            'parent_to_children': dict(parent_to_children),
+            'all_cuis': all_cuis,
+            'graph': merged_graph
+        }
+        
+        # Cache result
+        self._hierarchy_cache.set(cache_key, hierarchy)
+        
+        logger.info(f"Built parallel hierarchy: {len(all_cuis)} CUIs total")
+        return hierarchy
+    
+    def _build_hierarchy_from_subnet(self, relevant_cuis: List[str]) -> Dict:
+        """Build hierarchy using subnet API (single call)"""
+        
+        # Check cache
+        cache_key = hashlib.md5(str(sorted(relevant_cuis)).encode()).hexdigest()
+        cached = self._hierarchy_cache.get(cache_key)
+        if cached:
+            return cached
+        
+        child_to_parents = defaultdict(list)
+        parent_to_children = defaultdict(list)
+        all_cuis = set(relevant_cuis)
+        
+        try:
+            # Get subnetwork with timeout handling
+            graph = self.subnet_client._get_single_subnetwork(
+                relevant_cuis,
+                cross_context=True
+            )
+            
+            if not graph or graph.number_of_nodes() == 0:
+                logger.warning("No subnetwork data retrieved")
+                return {
+                    'child_to_parents': {},
+                    'parent_to_children': {},
+                    'all_cuis': set(relevant_cuis)
+                }
+            
+            # Extract relationships
+            for edge in graph.edges():
+                parent, child = edge
+                parent_to_children[parent].append(child)
+                child_to_parents[child].append(parent)
+                all_cuis.update([parent, child])
+            
+            # Add ancestors and descendants
+            for cui in relevant_cuis:
+                if cui in graph:
+                    try:
+                        ancestors = nx.ancestors(graph, cui)
+                        descendants = nx.descendants(graph, cui)
+                        
+                        for ancestor in ancestors:
+                            if ancestor not in child_to_parents[cui]:
+                                child_to_parents[cui].append(ancestor)
+                            if cui not in parent_to_children[ancestor]:
+                                parent_to_children[ancestor].append(cui)
+                        
+                        for descendant in descendants:
+                            if descendant not in parent_to_children[cui]:
+                                parent_to_children[cui].append(descendant)
+                            if cui not in child_to_parents[descendant]:
+                                child_to_parents[descendant].append(cui)
+                        
+                        all_cuis.update(ancestors)
+                        all_cuis.update(descendants)
+                    except nx.NetworkXError:
+                        continue
+            
+            hierarchy = {
+                'child_to_parents': dict(child_to_parents),
+                'parent_to_children': dict(parent_to_children),
+                'all_cuis': all_cuis,
+                'graph': graph
+            }
+            
+            # Cache result
+            self._hierarchy_cache.set(cache_key, hierarchy)
+            
+            logger.info(f"Built hierarchy from subnet: {len(all_cuis)} CUIs total")
+            return hierarchy
+            
+        except Exception as e:
+            logger.error(f"Failed to build hierarchy from subnet: {str(e)}")
+            return {
+                'child_to_parents': {},
+                'parent_to_children': {},
+                'all_cuis': set(relevant_cuis)
+            }
+    
+    def _compute_ic_scores_optimized(self, hierarchy: Dict) -> Dict[str, float]:
+        """Compute IC scores with caching and optimization"""
+        
+        # Check cache
+        cache_key = hashlib.md5(
+            str(sorted(hierarchy.get('all_cuis', [])))encode()
+        ).hexdigest()
+        
+        cached = self._ic_scores_cache.get(cache_key)
+        if cached:
+            return cached
+        
+        parent_to_children = hierarchy.get('parent_to_children', {})
+        all_cuis = hierarchy.get('all_cuis', set())
+        graph = hierarchy.get('graph', None)
+        total = len(all_cuis)
+        
+        if total == 0:
+            return {}
+        
+        try:
+            descendant_counts = {}
+            
+            # Use NetworkX for efficient computation
+            if graph and isinstance(graph, nx.DiGraph):
+                # Parallel computation for large graphs
+                if len(all_cuis) > 1000:
+                    with ThreadPoolExecutor(max_workers=10) as executor:
+                        future_to_cui = {
+                            executor.submit(self._count_descendants_nx, graph, cui): cui
+                            for cui in all_cuis
+                        }
+                        
+                        for future in as_completed(future_to_cui):
+                            cui = future_to_cui[future]
+                            try:
+                                count = future.result(timeout=5)
+                                descendant_counts[cui] = count
+                            except Exception:
+                                descendant_counts[cui] = 0
+                else:
+                    # Sequential for smaller graphs
+                    for cui in all_cuis:
+                        descendant_counts[cui] = self._count_descendants_nx(graph, cui)
+            else:
+                # Fallback to recursive counting
+                for cui in all_cuis:
+                    descendant_counts[cui] = self._count_descendants_recursive(
+                        cui, parent_to_children
+                    )
+            
+            # Compute IC scores
+            ic_scores = {}
+            for cui in all_cuis:
+                desc_count = descendant_counts.get(cui, 0)
+                ic = -np.log((desc_count + 1) / total)
+                ic_scores[cui] = max(0.0, ic)
+            
+            # Cache result
+            self._ic_scores_cache.set(cache_key, ic_scores)
+            
+            if ic_scores:
+                values = list(ic_scores.values())
+                logger.info(f"IC scores: {len(ic_scores)} CUIs, range [{min(values):.2f}, {max(values):.2f}]")
+            
+            return ic_scores
+            
+        except Exception as e:
+            logger.error(f"Failed to compute IC scores: {str(e)}")
+            return {cui: 5.0 for cui in all_cuis}
+    
+    def _count_descendants_nx(self, graph: nx.DiGraph, cui: str) -> int:
+        """Count descendants using NetworkX"""
+        try:
+            if cui in graph:
+                return len(nx.descendants(graph, cui))
+            return 0
+        except nx.NetworkXError:
+            return 0
+    
+    def _count_descendants_recursive(
+        self,
+        cui: str,
+        parent_to_children: Dict,
+        visited: Set[str] = None
+    ) -> int:
+        """Recursive descendant counting with memoization"""
+        if visited is None:
+            visited = set()
+        
+        if cui in visited:
+            return 0
+        
+        visited.add(cui)
+        children = parent_to_children.get(cui, [])
+        count = len(children)
+        
+        for child in children:
+            if child not in visited:
+                count += self._count_descendants_recursive(
+                    child, parent_to_children, visited
+                )
+        
+        return count
+    
+    def _semantic_rollup_parallel(
+        self,
+        cui_list: List[str],
+        hierarchy: Dict,
+        ic_scores: Dict[str, float],
+        ic_threshold: float
+    ) -> List[str]:
+        """Parallel semantic rollup"""
+        
+        graph = hierarchy.get('graph', None)
+        child_to_parents = hierarchy.get('child_to_parents', {})
+        
+        # Process CUIs in parallel
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_cui = {
+                executor.submit(
+                    self._rollup_single_cui,
+                    cui,
+                    graph,
+                    child_to_parents,
+                    ic_scores,
+                    ic_threshold
+                ): cui
+                for cui in cui_list
+            }
+            
+            rolled_up = {}
+            for future in as_completed(future_to_cui):
+                cui = future_to_cui[future]
+                try:
+                    result = future.result(timeout=5)
+                    rolled_up[cui] = result
+                except Exception:
+                    rolled_up[cui] = cui
+        
+        return list(set(rolled_up.values()))
+    
+    def _rollup_single_cui(
+        self,
+        cui: str,
+        graph: nx.DiGraph,
+        child_to_parents: Dict,
+        ic_scores: Dict[str, float],
+        ic_threshold: float
+    ) -> str:
+        """Rollup a single CUI"""
+        
+        try:
+            ancestors = []
+            
+            # Get ancestors using NetworkX if available
+            if graph and cui in graph:
+                try:
+                    ancestors = list(nx.ancestors(graph, cui))
+                except nx.NetworkXError:
+                    pass
+            
+            # Fallback to BFS
+            if not ancestors:
+                visited = set()
+                queue = deque([cui])
+                
+                while queue and len(visited) < 100:
+                    current = queue.popleft()
+                    if current in visited:
+                        continue
+                    visited.add(current)
+                    
+                    for parent in child_to_parents.get(current, []):
+                        if parent not in visited:
+                            ancestors.append(parent)
+                            queue.append(parent)
+            
+            # Find LIA
+            candidates = [cui] + ancestors
+            valid = [c for c in candidates if ic_scores.get(c, 0) >= ic_threshold]
+            
+            if valid:
+                return min(valid, key=lambda c: ic_scores.get(c, float('inf')))
+            return cui
+            
+        except Exception:
+            return cui
+    
+    def _semantic_clustering_optimized(
+        self,
+        cui_list: List[str],
+        ic_scores: Dict[str, float],
+        similarity_threshold: float,
+        min_intra_cluster_distance: float = 0.25
+    ) -> List[str]:
+        """Optimized semantic clustering with batch embedding fetching"""
+        
+        if len(cui_list) <= 1:
+            return cui_list
+        
+        try:
+            # Fetch embeddings with caching and batching
+            embeddings_dict = self._fetch_embeddings_batch(cui_list)
+            
+            if not embeddings_dict:
+                logger.warning("No embeddings found, skipping clustering")
+                return cui_list
+            
+            # Prepare data for clustering
+            available_cuis = [cui for cui in cui_list if cui in embeddings_dict]
+            if len(available_cuis) <= 1:
+                return cui_list
+            
+            embeddings = np.vstack([embeddings_dict[cui] for cui in available_cuis])
+            cuis = np.array(available_cuis)
+            
+            # Clustering
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=1 - similarity_threshold,
+                metric='cosine',
+                linkage='average'
+            )
+            
+            labels = clustering.fit_predict(embeddings)
+            
+            # Distance-based filtering within clusters
+            final_cuis = []
+            
+            for cluster_id in np.unique(labels):
+                idx = np.where(labels == cluster_id)[0]
+                cluster_cuis = cuis[idx]
+                cluster_embeddings = embeddings[idx]
+                
+                if len(cluster_cuis) == 1:
+                    final_cuis.append(cluster_cuis[0])
+                    continue
+                
+                # Pairwise distances
+                dist_matrix = cosine_distances(cluster_embeddings)
+                
+                # Sort by IC score
+                order = sorted(
+                    range(len(cluster_cuis)),
+                    key=lambda i: ic_scores.get(cluster_cuis[i], 0),
+                    reverse=True
+                )
+                
+                kept = []
+                for i in order:
+                    too_close = False
+                    for j in kept:
+                        if dist_matrix[i, j] < min_intra_cluster_distance:
+                            too_close = True
+                            break
+                    
+                    if not too_close:
+                        kept.append(i)
+                
+                final_cuis.extend(cluster_cuis[kept])
+            
+            # Add back CUIs without embeddings
+            missing_cuis = set(cui_list) - set(available_cuis)
+            final_cuis.extend(missing_cuis)
+            
+            logger.info(f"Clustering reduced {len(cui_list)} → {len(final_cuis)} CUIs")
+            return list(set(final_cuis))
+            
+        except Exception as e:
+            logger.error(f"Clustering failed: {str(e)}")
+            return cui_list
+    
+    def _fetch_embeddings_batch(self, cui_list: List[str]) -> Dict[str, np.ndarray]:
+        """Fetch embeddings with batching and caching"""
+        
+        embeddings_dict = {}
+        uncached_cuis = []
+        
+        # Check cache first
+        for cui in cui_list:
+            cached = self._embeddings_cache.get(cui)
+            if cached is not None:
+                embeddings_dict[cui] = cached
+            else:
+                uncached_cuis.append(cui)
+        
+        if not uncached_cuis:
+            return embeddings_dict
+        
+        # Fetch uncached embeddings in batches
+        batch_size = PerformanceConfig.BQ_BATCH_SIZE
+        
+        for i in range(0, len(uncached_cuis), batch_size):
+            batch = uncached_cuis[i:i + batch_size]
+            
+            try:
+                query = f"""
+                SELECT REF_CUI as cui, REF_Embedding as embedding
+                FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+                WHERE REF_CUI IN UNNEST(@cuis)
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+                    ],
+                    use_query_cache=True
+                )
+                
+                df = self.client.query(query, job_config=job_config).result(
+                    timeout=self.query_timeout
+                ).to_dataframe()
+                
+                for _, row in df.iterrows():
+                    cui = row['cui']
+                    embedding = row['embedding']
+                    embeddings_dict[cui] = embedding
+                    self._embeddings_cache.set(cui, embedding)
+                
+            except TimeoutError:
+                logger.warning(f"Embedding batch {i//batch_size + 1} timed out")
+                continue
+            except Exception as e:
+                logger.error(f"Failed to fetch embeddings batch: {str(e)}")
+                continue
+        
+        return embeddings_dict
+    
+    def get_cui_descriptions_optimized(self, cui_list: List[str]) -> Dict[str, str]:
+        """Get descriptions with batching and caching"""
+        
+        if not cui_list:
+            return {}
+        
+        descriptions = {}
+        uncached_cuis = []
+        
+        # Check cache
+        for cui in cui_list:
+            cached = self._description_cache.get(cui)
+            if cached:
+                descriptions[cui] = cached
+            else:
+                uncached_cuis.append(cui)
+        
+        if not uncached_cuis:
+            return descriptions
+        
+        # Fetch in batches
+        batch_size = PerformanceConfig.BQ_BATCH_SIZE
+        
+        for i in range(0, len(uncached_cuis), batch_size):
+            batch = uncached_cuis[i:i + batch_size]
+            
+            try:
+                query = f"""
+                SELECT CUI as cui, Definition as description
+                FROM `{self.project_id}.{self.dataset_id}.{self.cui_description_table}`
+                WHERE CUI IN UNNEST(@cuis)
+                """
+                
+                job_config = bigquery.QueryJobConfig(
+                    query_parameters=[
+                        bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+                    ],
+                    use_query_cache=True
+                )
+                
+                df = self.client.query(query, job_config=job_config).result(
+                    timeout=self.query_timeout
+                ).to_dataframe()
+                
+                for _, row in df.iterrows():
+                    cui = row['cui']
+                    desc = row['description']
+                    descriptions[cui] = desc
+                    self._description_cache.set(cui, desc)
+                
+            except TimeoutError:
+                logger.warning(f"Description batch {i//batch_size + 1} timed out")
+                continue
+            except Exception as e:
+                logger.error(f"Failed to fetch descriptions batch: {str(e)}")
+                continue
+        
+        # Fill missing with default
+        for cui in cui_list:
+            if cui not in descriptions:
+                descriptions[cui] = "N/A"
+        
+        return descriptions
+    
+    def _determine_threshold(
+        self,
+        ic_scores: Dict,
+        ic_threshold: Optional[float],
+        ic_percentile: float,
+        adaptive: bool,
+        input_cuis: List[str],
+        hierarchy: Dict,
+        target_reduction: float
+    ) -> float:
+        try:
+            if ic_threshold is not None:
+                return float(ic_threshold)
+            
+            ic_values = list(ic_scores.values())
+            if not ic_values:
+                return 5.0
+            
+            if adaptive:
+                return self._find_adaptive_threshold_safe(
+                    input_cuis, hierarchy, ic_scores, target_reduction
+                )
+            else:
+                return float(np.percentile(ic_values, ic_percentile))
+        except Exception as e:
+            logger.warning(f"Threshold determination failed: {str(e)}, using default 5.0")
+            return 5.0
+    
+    def _semantic_rollup_with_ic_safe(
+        self,
+        cui_list: List[str],
+        hierarchy: Dict,
+        ic_scores: Dict[str, float],
+        ic_threshold: float
+    ) -> List[str]:
+        """Safe semantic rollup (non-parallel version)"""
+        
+        try:
+            child_to_parents = hierarchy.get('child_to_parents', {})
+            graph = hierarchy.get('graph', None)
+            rolled_up = {}
+            
+            for cui in cui_list:
+                rolled_up[cui] = self._rollup_single_cui(
+                    cui, graph, child_to_parents, ic_scores, ic_threshold
+                )
+            
+            return list(set(rolled_up.values()))
+            
+        except Exception as e:
+            logger.error(f"Semantic rollup failed: {str(e)}")
+            return cui_list
+    
+    def _find_adaptive_threshold_safe(
+        self,
+        cui_list: List[str],
+        hierarchy: Dict,
+        ic_scores: Dict[str, float],
+        target_reduction: float
+    ) -> float:
+        try:
+            ic_values = sorted(ic_scores.values())
+            if not ic_values:
+                return 5.0
+            
+            for percentile in [50, 40, 30, 25, 20, 15, 10]:
+                try:
+                    threshold = float(np.percentile(ic_values, percentile))
+                    rolled_up = self._semantic_rollup_with_ic_safe(
+                        cui_list, hierarchy, ic_scores, threshold
+                    )
+                    reduction = 1 - len(rolled_up) / len(cui_list)
+                    
+                    if reduction >= target_reduction * 0.9:
+                        logger.info(f"Adaptive threshold: {threshold:.3f} (p{percentile})")
+                        return threshold
+                except Exception:
+                    continue
+            
+            return float(np.percentile(ic_values, 10))
+        except Exception as e:
+            logger.warning(f"Adaptive threshold failed: {str(e)}")
+            return 5.0
+    
+    @staticmethod
+    def _safe_percentage(numerator: float, denominator: float) -> float:
+        return (numerator / denominator * 100) if denominator > 0 else 0.0
+    
+    @staticmethod
+    def _create_empty_stats(start_time: float) -> ReductionStats:
+        return ReductionStats(
+            initial_count=0,
+            after_ic_rollup=0,
+            final_count=0,
+            ic_rollup_reduction_pct=0.0,
+            semantic_clustering_reduction_pct=0.0,
+            total_reduction_pct=0.0,
+            processing_time=time.time() - start_time,
+            ic_threshold_used=0.0
+        )
+    
+    @staticmethod
+    def _create_error_stats(initial_count: int, start_time: float, error: str) -> ReductionStats:
+        logger.error(f"Returning original CUIs due to error: {error}")
+        return ReductionStats(
+            initial_count=initial_count,
+            after_ic_rollup=initial_count,
+            final_count=initial_count,
+            ic_rollup_reduction_pct=0.0,
+            semantic_clustering_reduction_pct=0.0,
+            total_reduction_pct=0.0,
+            processing_time=time.time() - start_time,
+            ic_threshold_used=0.0
+        )
+    
+    def __del__(self):
+        """Cleanup thread pool on deletion"""
+        if hasattr(self, 'executor'):
+            self.executor.shutdown(wait=False)
+
+
+# ----------------------------
+# Main Pipeline Function
+# ----------------------------
+def run_optimized_cui_reduction(
     texts: List[str],
     project_id: str,
     dataset_id: str,
-    embedding_table: str,
-    cui_api_url: str,
-    subnet_api_url: str
-) -> Dict[str, Any]:
-    start_time = time.time()
+    api_url: str,
+    subnet_api_url: str,
+    cui_description_table: str = "cui_descriptions",
+    cui_embeddings_table: str = "cui_embeddings",
+    cui_narrower_table: str = "cui_narrower_concepts",
+    target_reduction: float = 0.70,
+    ic_percentile: float = 60.0,
+    semantic_threshold: float = 0.90,
+    use_semantic_clustering: bool = True,
+    adaptive_threshold: bool = False,
+    use_parallel: bool = True
+) -> Tuple[List[str], List[str], Dict[str, str], Optional[ReductionStats]]:
+    """
+    Optimized main pipeline with parallel processing and robust error handling
+    """
+    
+    try:
+        # Initialize optimized API client
+        api_client = OptimizedCUIAPIClient(
+            api_base_url=api_url,
+            timeout=PerformanceConfig.API_TIMEOUT,
+            top_k=3
+        )
+        
+        # Initialize optimized reducer
+        cui_reducer = OptimizedEnhancedCUIReducer(
+            project_id=project_id,
+            dataset_id=dataset_id,
+            subnet_api_url=subnet_api_url,
+            cui_description_table=cui_description_table,
+            cui_embeddings_table=cui_embeddings_table,
+            cui_narrower_table=cui_narrower_table,
+            max_hierarchy_depth=1,
+            query_timeout=PerformanceConfig.BQ_TIMEOUT
+        )
+        
+        # Extract CUIs in parallel
+        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
+        initial_cuis = api_client.extract_cuis_batch_parallel(texts)
+        
+        if not initial_cuis:
+            logger.warning("No CUIs extracted from texts")
+            return [], [], {}, None
+        
+        # Filter CUIs with optimization
+        logger.info(f"Filtering {len(initial_cuis)} CUIs...")
+        initial_cuis = filter_allowed_cuis_optimized(
+            initial_cuis,
+            project_id,
+            dataset_id
+        )
+        
+        if not initial_cuis:
+            logger.warning("No CUIs remain after filtering")
+            return [], [], {}, None
+        
+        # Reduce CUIs
+        start_time = time.time()
+        reduced_cuis, stats = cui_reducer.reduce(
+            list(initial_cuis),
+            target_reduction=target_reduction,
+            ic_percentile=ic_percentile,
+            semantic_threshold=semantic_threshold,
+            use_semantic_clustering=use_semantic_clustering,
+            adaptive_threshold=adaptive_threshold,
+            use_parallel=use_parallel
+        )
+        
+        # Add API call time to stats
+        stats.api_call_time = time.time() - start_time - stats.processing_time
+        
+        # Get descriptions with optimization
+        logger.info("Fetching descriptions...")
+        descriptions = cui_reducer.get_cui_descriptions_optimized(reduced_cuis)
+        
+        return list(initial_cuis), reduced_cuis, descriptions, stats
+        
+    except Exception as e:
+        logger.error(f"Pipeline error: {str(e)}")
+        return [], [], {}, None
+    finally:
+        # Cleanup
+        if 'cui_reducer' in locals():
+            del cui_reducer
 
-    logger.info('Step 1: Extracting CUIs')
-    extractor = CUIAPIClient(cui_api_url)
-    text_to_cuis = extractor.extract_cuis_batch(texts)
-    all_cuis = set().union(*text_to_cuis.values())
-    logger.info(f'Total CUIs extracted: {len(all_cuis)}')
 
-    logger.info('Step 2: Filtering allowed CUIs')
-    filtered = filter_allowed_cuis(all_cuis, project_id, dataset_id)
-    logger.info(f'Total CUIs after filtering: {len(filtered)}')
-
-    client = bigquery.Client(project=project_id)
-    grouped = group_cuis_by_semantic_type(client, project_id, dataset_id, filtered)
-    logger.info(f'CUIs grouped into semantic types: {len(grouped)}')
-
-    logger.info('Step 3: Fetching subnet relationships in batches')
-    subnet = SubnetAPIClient(subnet_api_url, batch_size=50, max_workers=4)
-    nodes, edges = subnet.get_subnet_batch(filtered)
-    logger.info(f'Fetched nodes: {len(nodes)}, edges: {len(edges)}')
-
-    # Build graph and IC
-    graph = build_hierarchy_graph(nodes, edges)
-    descendants = compute_descendants(graph)
-    ic_scores = compute_seco_ic(descendants)
-
-    logger.info('Step 4: Hierarchical reduction')
-    hierarchy_selected = set()
-    for cuis in grouped.values():
-        hierarchy_selected |= hierarchical_reduction_by_coverage(cuis, descendants, ic_scores)
-    logger.info(f'CUIs selected by hierarchy: {len(hierarchy_selected)}')
-
-    logger.info('Step 5: Loading embeddings')
-    embeddings = load_embeddings_batch(client, project_id, embedding_table, filtered)
-
-    logger.info('Step 6: Embedding clustering')
-    embedding_selected = set()
-    for cuis in grouped.values():
-        embedding_selected |= embedding_based_clustering(cuis, embeddings, ic_scores)
-    logger.info(f'CUIs selected by embeddings: {len(embedding_selected)}')
-
-    logger.info('Step 7: Integrating signals')
-    final = integrate_signals(hierarchy_selected, embedding_selected, ic_scores)
-    logger.info(f'Total CUIs after integration: {len(final)}')
-
-    elapsed = time.time() - start_time
-    logger.info(f'Total processing time: {elapsed:.2f}s')
-
-    return {
-        'original_cuis': all_cuis,
-        'reduced_cuis': final,
-        'statistics': {
-            'original': len(all_cuis),
-            'filtered': len(filtered),
-            'hierarchy': len(hierarchy_selected),
-            'embedding': len(embedding_selected),
-            'final': len(final),
-            'time_sec': elapsed
-        }
-    }
-
-# ============================================================
-# MAIN FUNCTION
-# ============================================================
-def main():
-    PROJECT_ID = 'your_project_id'
-    DATASET_ID = 'your_dataset'
-    EMBEDDING_TABLE = 'your_embedding_table'
-    CUI_API_URL = 'your_cui_api_url'
-    SUBNET_API_URL = 'your_subnet_api_url'
-
+# ----------------------------
+# Example Usage
+# ----------------------------
+if __name__ == "__main__":
+    
+    # Configuration
+    project_id = "your-project-id"
+    dataset = "your-dataset"
+    url = "your-cui-extraction-api-url"
+    subnet_url = "your-subnet-api-url"
+    
+    # Configure performance settings
+    PerformanceConfig.API_TIMEOUT = 30  # Adjust based on your needs
+    PerformanceConfig.BQ_TIMEOUT = 60
+    PerformanceConfig.API_BATCH_SIZE = 100
+    PerformanceConfig.API_MAX_CONCURRENT_REQUESTS = 5
+    
     texts = [
-        'Patient presents with chest pain',
-        'Diagnosed with type 2 diabetes mellitus',
-        'Brain tumor detected on MRI'
+        "antidepressants depression type 2 diabetes",
+        "SSRIs depression type 2 diabetes",
+        # ... your texts
     ]
-
-    results = reduce_cuis_pipeline(
+    
+    # Run optimized pipeline
+    initial_cuis, reduced_cuis, descriptions, stats = run_optimized_cui_reduction(
         texts=texts,
-        project_id=PROJECT_ID,
-        dataset_id=DATASET_ID,
-        embedding_table=EMBEDDING_TABLE,
-        cui_api_url=CUI_API_URL,
-        subnet_api_url=SUBNET_API_URL
+        project_id=project_id,
+        dataset_id=dataset,
+        api_url=url,
+        subnet_api_url=subnet_url,
+        cui_description_table="cui_descriptions",
+        cui_embeddings_table="cui_embeddings",
+        cui_narrower_table="cui_narrower_concepts",
+        target_reduction=0.70,
+        ic_percentile=60.0,
+        semantic_threshold=0.90,
+        use_semantic_clustering=True,
+        adaptive_threshold=False,
+        use_parallel=True  # Enable parallel processing
     )
-
-    logger.info('Final reduced CUIs:')
-    for cui in results['reduced_cuis']:
-        logger.info(cui)
-
-if __name__ == '__main__':
-    main()
+    
+    if stats:
+        print(f"Reduction complete: {stats.initial_count} → {stats.final_count}")
+        print(f"Total reduction: {stats.total_reduction_pct:.1f}%")
+        print(f"Processing time: {stats.processing_time:.2f}s")
+        print(f"API call time: {stats.api_call_time:.2f}s")
