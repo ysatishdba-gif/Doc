@@ -188,107 +188,7 @@ class CUIAPIClient:
             return set()
 
 # ============================================
-# SUBNET API HIERARCHY BUILDER (FROM CODE 2)
-# ============================================
-
-class SubnetAPIHierarchyBuilder:
-    """Build hierarchy using subnet API instead of MRREL"""
-    
-    def __init__(self, subnet_api_url: str, timeout: int = 60):
-        self.url = subnet_api_url.rstrip('/')
-        self.timeout = timeout
-        self._token = None
-        self._token_expiry = 0
-        self._token_lock = threading.Lock()
-        
-    def _get_auth_headers(self) -> Dict[str, str]:
-        """Get authentication headers"""
-        with self._token_lock:
-            current_time = time.time()
-            if self._token and current_time < self._token_expiry:
-                return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
-            
-            proc = subprocess.run(["gcloud", "auth", "print-identity-token"],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr)
-            
-            self._token = proc.stdout.strip()
-            self._token_expiry = current_time + 3300
-            return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
-    
-    def _normalize_cui(self, cui: str) -> Optional[str]:
-        """Normalize CUI format"""
-        if not cui:
-            return None
-        m = re.match(r"^(C\d{7})(?:-\d+)?$", str(cui))
-        return m.group(1) if m else None
-    
-    async def build_hierarchy_from_api(self, relevant_cuis: List[str], limit_context: List[str] = None) -> Dict:
-        """Build hierarchy using subnet API - REPLACES _build_hierarchy_safe"""
-        
-        if not limit_context:
-            limit_context = ['LNC.Empty', 'SNOMEDCT_US.Empty', 'SNOMEDCT_US.isa',
-                           'ICD10.Empty', 'ICD10AM.Empty', 'ICD10CM.Empty',
-                           'ICD10PCS.Empty', 'CCSR_ICD10PCS.Empty']
-        
-        child_to_parents = defaultdict(list)
-        parent_to_children = defaultdict(list)
-        all_cuis = set(relevant_cuis)
-        
-        try:
-            headers = self._get_auth_headers()
-            
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.timeout)) as session:
-                # Process CUIs in batches
-                batch_size = 50
-                for i in range(0, len(relevant_cuis), batch_size):
-                    batch = relevant_cuis[i:i+batch_size]
-                    
-                    payload = {"cuis": batch, "cross_context": False}
-                    if limit_context:
-                        payload["limit_context"] = limit_context
-                    
-                    try:
-                        async with session.post(f"{self.url}/subnet/", json=payload,
-                                              headers=headers) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                nodes, edges = data.get("output", ([], []))
-                                
-                                # Process nodes
-                                for node in nodes:
-                                    normalized = self._normalize_cui(node)
-                                    if normalized:
-                                        all_cuis.add(normalized)
-                                
-                                # Process edges (parent -> child relationships)
-                                for edge in edges:
-                                    if isinstance(edge, (list, tuple)) and len(edge) == 2:
-                                        parent = self._normalize_cui(edge[0])
-                                        child = self._normalize_cui(edge[1])
-                                        if parent and child:
-                                            parent_to_children[parent].append(child)
-                                            child_to_parents[child].append(parent)
-                                            all_cuis.update([parent, child])
-                    
-                    except Exception as e:
-                        logger.warning(f"API batch failed: {e}")
-        
-        except Exception as e:
-            logger.error(f"Failed to build hierarchy from API: {str(e)}")
-        
-        hierarchy = {
-            'child_to_parents': dict(child_to_parents),
-            'parent_to_children': dict(parent_to_children),
-            'all_cuis': all_cuis
-        }
-        
-        logger.info(f"Built hierarchy from API: {len(all_cuis)} CUIs total")
-        return hierarchy
-
-# ============================================
-# ENHANCED CUI REDUCER (MODIFIED FROM CODE 1)
+# ENHANCED CUI REDUCER (USING SUBNET API ONLY)
 # ============================================
 
 class EnhancedCUIReducer:
@@ -297,8 +197,7 @@ class EnhancedCUIReducer:
         self,
         project_id: str,
         dataset_id: str,
-        subnet_api_url: str = None,  # NEW: for subnet API
-        mrrel_table: str = "MRREL",
+        subnet_api_url: str,  # REQUIRED for subnet API
         cui_description_table: str = "cui_descriptions",
         cui_embeddings_table: str = "cui_embeddings",
         cui_narrower_table: str = "cui_narrower_concepts",
@@ -312,17 +211,12 @@ class EnhancedCUIReducer:
         
         self.project_id = project_id
         self.dataset_id = dataset_id
-        self.mrrel_table = mrrel_table
+        self.subnet_api_url = subnet_api_url
         self.cui_description_table = cui_description_table
         self.cui_embeddings_table = cui_embeddings_table
         self.cui_narrower_table = cui_narrower_table
         self.max_hierarchy_depth = max_hierarchy_depth
         self.query_timeout = query_timeout
-        
-        # NEW: Initialize subnet API builder if URL provided
-        self.subnet_api_url = subnet_api_url
-        if subnet_api_url:
-            self.hierarchy_builder = SubnetAPIHierarchyBuilder(subnet_api_url, query_timeout)
         
         # Cache
         self._hierarchy_cache = None
@@ -344,22 +238,19 @@ class EnhancedCUIReducer:
         input_cuis = list(set(input_cuis))
         initial_count = len(input_cuis)
 
-        # Use API or MRREL based on configuration
+        # Build hierarchy using SUBNET API (replaces MRREL)
         api_start = time.time()
-        if self.subnet_api_url:
-            # Use subnet API for hierarchy
-            hierarchy = asyncio.run(self.hierarchy_builder.build_hierarchy_from_api(input_cuis))
-        else:
-            # Use original MRREL method
-            hierarchy = self._build_hierarchy_safe(input_cuis)
+        hierarchy = self._build_hierarchy_safe(input_cuis)
         api_time = time.time() - api_start
         
         ic_scores = self._compute_ic_scores_safe(hierarchy)
 
         # MEDIAN IC THRESHOLD ONLY
-        if ic_threshold is None:
+        if ic_threshold is None and ic_scores:
             ic_threshold = float(np.median(list(ic_scores.values())))
             logger.info(f"Using MEDIAN IC threshold: {ic_threshold:.3f}")
+        elif ic_threshold is None:
+            ic_threshold = 5.0
 
         rolled_up = self._semantic_rollup_with_ic_safe(
             input_cuis, hierarchy, ic_scores, ic_threshold
@@ -388,91 +279,112 @@ class EnhancedCUIReducer:
             processing_time=time.time() - start_time,
             ic_threshold_used=ic_threshold,
             hierarchy_size=len(hierarchy.get("all_cuis", [])),
-            api_call_time=api_time if self.subnet_api_url else 0.0
+            api_call_time=api_time
         )
 
         return final_cuis, stats
     
     def _build_hierarchy_safe(self, relevant_cuis: List[str]) -> Dict:
-        """Original MRREL-based hierarchy building (fallback)"""
+        """Build hierarchy using SUBNET API (replaces MRREL completely)"""
         if self._hierarchy_cache is not None:
             return self._hierarchy_cache
+        
+        # Use async event loop to call the subnet API
+        hierarchy = asyncio.run(self._fetch_hierarchy_from_api(relevant_cuis))
+        
+        self._hierarchy_cache = hierarchy
+        logger.info(f"Built hierarchy from API: {len(hierarchy.get('all_cuis', []))} CUIs total")
+        
+        return hierarchy
+    
+    async def _fetch_hierarchy_from_api(self, relevant_cuis: List[str]) -> Dict:
+        """Fetch hierarchy using subnet API"""
         
         child_to_parents = defaultdict(list)
         parent_to_children = defaultdict(list)
         all_cuis = set(relevant_cuis)
         
-        try:
-            visited = set()
-            frontier = set(relevant_cuis)
-            
-            for depth in range(self.max_hierarchy_depth):
-                if not frontier:
-                    break
-                
-                logger.info(f"Fetching hierarchy depth {depth + 1}: {len(frontier)} CUIs")
-                
-                query = f"""
-                SELECT DISTINCT cui1, cui2, rel
-                FROM `{self.project_id}.{self.dataset_id}.{self.mrrel_table}`
-                WHERE (cui1 IN UNNEST(@frontier) OR cui2 IN UNNEST(@frontier))
-                  AND rel IN ('PAR','CHD')
-                """
-                
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ArrayQueryParameter("frontier", "STRING", list(frontier))
-                    ]
-                )
-                
-                try:
-                    query_job = self.client.query(query, job_config=job_config)
-                    df = query_job.result(timeout=self.query_timeout).to_dataframe()
-                    
-                    if len(df) == 0:
-                        logger.warning(f"No relationships found at depth {depth + 1}")
-                        break
-                    
-                    logger.info(f"Retrieved {len(df)} relationships")
-                    
-                    next_frontier = set()
-                    for _, row in df.iterrows():
-                        cui1, cui2, rel = str(row['cui1']), str(row['cui2']), str(row['rel'])
-                        
-                        if rel == 'PAR':
-                            parent_to_children[cui1].append(cui2)
-                            child_to_parents[cui2].append(cui1)
-                        elif rel == 'CHD':
-                            parent_to_children[cui2].append(cui1)
-                            child_to_parents[cui1].append(cui2)
-                        
-                        all_cuis.update([cui1, cui2])
-                        
-                        if cui1 not in visited:
-                            next_frontier.add(cui1)
-                        if cui2 not in visited:
-                            next_frontier.add(cui2)
-                    
-                    visited.update(frontier)
-                    frontier = next_frontier - visited
-                    
-                except Exception as e:
-                    logger.warning(f"MRREL query failed at depth {depth + 1}: {str(e)}")
-                    break
-            
-        except Exception as e:
-            logger.error(f"Failed to build hierarchy: {str(e)}")
+        # Get auth headers
+        headers = self._get_auth_headers()
         
-        hierarchy = {
+        # Default limit context
+        limit_context = ['LNC.Empty', 'SNOMEDCT_US.Empty', 'SNOMEDCT_US.isa',
+                        'ICD10.Empty', 'ICD10AM.Empty', 'ICD10CM.Empty',
+                        'ICD10PCS.Empty', 'CCSR_ICD10PCS.Empty']
+        
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.query_timeout)) as session:
+                # Process CUIs in batches
+                batch_size = 50
+                for i in range(0, len(relevant_cuis), batch_size):
+                    batch = relevant_cuis[i:i+batch_size]
+                    
+                    payload = {
+                        "cuis": batch,
+                        "cross_context": False,
+                        "limit_context": limit_context
+                    }
+                    
+                    try:
+                        async with session.post(
+                            f"{self.subnet_api_url}/subnet/",
+                            json=payload,
+                            headers=headers
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                nodes, edges = data.get("output", ([], []))
+                                
+                                # Process nodes
+                                for node in nodes:
+                                    normalized = self._normalize_cui(node)
+                                    if normalized:
+                                        all_cuis.add(normalized)
+                                
+                                # Process edges
+                                for edge in edges:
+                                    if isinstance(edge, (list, tuple)) and len(edge) == 2:
+                                        parent = self._normalize_cui(edge[0])
+                                        child = self._normalize_cui(edge[1])
+                                        if parent and child:
+                                            parent_to_children[parent].append(child)
+                                            child_to_parents[child].append(parent)
+                                            all_cuis.update([parent, child])
+                    
+                    except Exception as e:
+                        logger.warning(f"API batch failed: {e}")
+        
+        except Exception as e:
+            logger.error(f"Failed to build hierarchy from API: {str(e)}")
+        
+        return {
             'child_to_parents': dict(child_to_parents),
             'parent_to_children': dict(parent_to_children),
             'all_cuis': all_cuis
         }
+    
+    def _get_auth_headers(self) -> Dict[str, str]:
+        """Get authentication headers"""
+        proc = subprocess.run(
+            ["gcloud", "auth", "print-identity-token"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr)
         
-        self._hierarchy_cache = hierarchy
-        logger.info(f"Built hierarchy: {len(all_cuis)} CUIs total")
-        
-        return hierarchy
+        return {
+            "Authorization": f"Bearer {proc.stdout.strip()}",
+            "Content-Type": "application/json"
+        }
+    
+    def _normalize_cui(self, cui: str) -> Optional[str]:
+        """Normalize CUI format"""
+        if not cui:
+            return None
+        m = re.match(r"^(C\d{7})(?:-\d+)?$", str(cui))
+        return m.group(1) if m else None
     
     # ALL OTHER METHODS REMAIN EXACTLY THE SAME AS CODE 1
     def _compute_ic_scores_safe(self, hierarchy: Dict) -> Dict[str, float]:
@@ -704,7 +616,7 @@ class EnhancedCUIReducer:
         return (numerator / denominator * 100) if denominator > 0 else 0.0
 
 # ============================================
-# MAIN FUNCTION (MODIFIED FROM CODE 1)
+# MAIN FUNCTION
 # ============================================
 
 def run_cui_reduction(
@@ -712,8 +624,7 @@ def run_cui_reduction(
     project_id: str,
     dataset_id: str,
     api_url: str,
-    subnet_api_url: str = None,  # NEW: optional subnet API URL
-    mrrel_table: str = "MRREL",
+    subnet_api_url: str,  # REQUIRED - no fallback
     cui_description_table: str = "cui_descriptions",
     cui_embeddings_table: str = "cui_embeddings",
     cui_narrower_table: str = "cui_narrower_concepts",
@@ -732,12 +643,11 @@ def run_cui_reduction(
             top_k=3
         )
         
-        # Initialize reducer (will use subnet API if URL provided)
+        # Initialize reducer with subnet API URL (required)
         cui_reducer = EnhancedCUIReducer(
             project_id=project_id,
             dataset_id=dataset_id,
-            subnet_api_url=subnet_api_url,  # Pass subnet API URL
-            mrrel_table=mrrel_table,
+            subnet_api_url=subnet_api_url,  # Using subnet API for hierarchy
             cui_description_table=cui_description_table,
             cui_embeddings_table=cui_embeddings_table,
             cui_narrower_table=cui_narrower_table,
@@ -762,7 +672,6 @@ def run_cui_reduction(
             return [], [], {}, None
         
         # Reduce CUIs
-        start_time = time.time()
         reduced_cuis, stats = cui_reducer.reduce(
             filtered_cuis,
             target_reduction=target_reduction,
@@ -771,10 +680,6 @@ def run_cui_reduction(
             use_semantic_clustering=use_semantic_clustering,
             adaptive_threshold=adaptive_threshold
         )
-        
-        # Add API call time to stats if not using subnet API
-        if not subnet_api_url:
-            stats.api_call_time = time.time() - start_time - stats.processing_time
         
         # Get descriptions
         logger.info("Fetching descriptions...")
@@ -797,18 +702,17 @@ if __name__ == "__main__":
     project_id = "your_project"
     dataset_id = "your_dataset"
     api_url = "your_cui_extraction_api_url"
-    subnet_api_url = "your_subnet_api_url"  # Optional: set to None to use MRREL
+    subnet_api_url = "your_subnet_api_url"  # REQUIRED
     
     texts = ["pharmacotherapy depression type 2 diabetes"]
     
-    # Run with subnet API for hierarchy
+    # Run with subnet API for hierarchy (no MRREL fallback)
     initial_cuis, reduced_cuis, descriptions, stats = run_cui_reduction(
         texts=texts,
         project_id=project_id,
         dataset_id=dataset_id,
         api_url=api_url,
-        subnet_api_url=subnet_api_url,  # Use subnet API
-        mrrel_table="MRREL",
+        subnet_api_url=subnet_api_url,  # Must provide subnet API URL
         cui_description_table="cui_descriptions",
         cui_embeddings_table="cui_embeddings",
         cui_narrower_table="cui_narrower_concepts"
@@ -816,5 +720,4 @@ if __name__ == "__main__":
     
     if stats:
         print(f"Reduction complete: {stats.initial_count} → {stats.final_count} ({stats.total_reduction_pct:.1f}%)")
-        if stats.api_call_time > 0:
-            print(f"Hierarchy API time: {stats.api_call_time:.2f}s")
+        print(f"Hierarchy built via subnet API in {stats.api_call_time:.2f}s")
