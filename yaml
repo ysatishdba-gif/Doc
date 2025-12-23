@@ -5,8 +5,7 @@ import re
 import logging
 from pathlib import Path
 import json
-import pickle
-from typing import List, Dict, Set, Any, Optional, Tuple
+from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict, deque
 import time
 from dataclasses import dataclass, asdict
@@ -20,19 +19,49 @@ import requests
 from requests.adapters import HTTPAdapter, Retry
 import threading
 
-# Apply nest_asyncio for Jupyter compatibility
 nest_asyncio.apply()
 
-# Configure logging
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ============================================
-# DATA CLASSES (FROM CODE 1)
-# ============================================
+class GCPTokenProvider:
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def get_headers(cls, force: bool = False) -> Dict[str, str]:
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+
+            token = proc.stdout.strip()
+            if not token:
+                raise RuntimeError("Empty token from gcloud")
+
+            cls._token = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            cls._expiry = now + 3300  # ~55 minutes
+            return cls._token
+
+# Data Classes
 
 @dataclass
 class ReductionStats:
@@ -46,33 +75,32 @@ class ReductionStats:
     ic_threshold_used: float
     hierarchy_size: int = 0
     api_call_time: float = 0.0
-    
+    group_stats: Dict = None  # Added for semantic group statistics
+
     def to_dict(self):
         return asdict(self)
 
-# ============================================
-# FILTER FUNCTION (FROM CODE 1)
-# ============================================
+
+# Filter CUIs
 
 def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
-    """only ICD, LOINC, or SNOMED based on MRCONSO table."""
     if not cuis:
         return []
-
     try:
+        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
         client = bigquery.Client(project=project_id)
         query = f"""
         SELECT DISTINCT CUI
         FROM `{project_id}.{dataset_id}.MRCONSO`
         WHERE CUI IN UNNEST(@cuis)
-          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE','ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT',
-          'ICPC2ICD10ENG','SNOMEDCT_US', 'LOINC')
+          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE',
+                      'ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT','ICPC2ICD10ENG',
+                      'SNOMEDCT_US', 'LOINC')
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
         )
-        query_job = client.query(query, job_config=job_config)
-        df = query_job.result(timeout=60).to_dataframe()
+        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
         allowed_cuis = df['CUI'].tolist()
         logger.info(f"{len(allowed_cuis)} CUIs after filter")
         return allowed_cuis
@@ -80,23 +108,17 @@ def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> Lis
         logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
         return []
 
-# ============================================
-# CUI API CLIENT (FROM CODE 1)
-# ============================================
+
+# CUI API
 
 class CUIAPIClient:
-    
-    _token_lock = threading.Lock()
-    _cached_token = None
-    _token_expiry = 0
-    
+
     def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 3, max_retries: int = 3):
         self.api_base_url = api_base_url.rstrip('/')
         self.timeout = timeout
         self.top_k = top_k
         self.max_retries = max_retries
-        
-        # Configure session with connection pooling
+
         self.session = requests.Session()
         retry_strategy = Retry(
             total=max_retries,
@@ -111,53 +133,13 @@ class CUIAPIClient:
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
-        
-        # Get initial token
-        self._update_gcp_token()
-    
-    def _update_gcp_token(self, force: bool = False):
-        
-        with self._token_lock:
-            current_time = time.time()
-            
-            if not force and self._cached_token and current_time < self._token_expiry:
-                return self._cached_token
-            
-            try:
-                result = subprocess.run(
-                    ['gcloud', 'auth', 'print-identity-token'],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    timeout=10,
-                    check=False
-                )
-                
-                if result.returncode != 0:
-                    raise Exception(f"gcloud auth failed: {result.stderr}")
-                
-                identity_token = result.stdout.strip()
-                if not identity_token:
-                    raise Exception("Empty token received from gcloud")
-                
-                self._cached_token = {
-                    "Authorization": f"Bearer {identity_token}",
-                    "Content-Type": "application/json"
-                }
-                self._token_expiry = current_time + 3300  # 55 minutes
-                
-                return self._cached_token
-                
-            except Exception as e:
-                raise Exception(f"Failed to get GCP token: {str(e)}")
-    
+
     def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
         if not texts:
             return set()
-        
         payload = {"query_texts": texts, "top_k": self.top_k}
-        headers = self._update_gcp_token()
-        
+        headers = GCPTokenProvider.get_headers()
+        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
         try:
             response = self.session.post(
                 self.api_base_url,
@@ -165,31 +147,25 @@ class CUIAPIClient:
                 headers=headers,
                 timeout=self.timeout
             )
-            
             if response.status_code == 401 and retry_auth:
                 logger.warning("Token expired, refreshing...")
-                self._update_gcp_token(force=True)
+                GCPTokenProvider.get_headers(force=True)
                 return self.extract_cuis_batch(texts, retry_auth=False)
-            
             response.raise_for_status()
             data = response.json()
-            
             all_cuis = set()
             for text in texts:
                 cuis = data.get(text, [])
                 if isinstance(cuis, list):
                     all_cuis.update(str(c) for c in cuis if c)
-            
             logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
             return all_cuis
-            
         except Exception as e:
             logger.error(f"API call failed: {str(e)}")
             return set()
 
-# ============================================
-# ENHANCED CUI REDUCER (USING SUBNET API ONLY)
-# ============================================
+
+# Enhanced Reducer with Dynamic Semantic Type Grouping
 
 class EnhancedCUIReducer:
     
@@ -197,18 +173,14 @@ class EnhancedCUIReducer:
         self,
         project_id: str,
         dataset_id: str,
-        subnet_api_url: str,  # REQUIRED for subnet API
-        cui_description_table: str = "cui_descriptions",
-        cui_embeddings_table: str = "cui_embeddings",
-        cui_narrower_table: str = "cui_narrower_concepts",
-        max_hierarchy_depth: int = 1,
+        subnet_api_url: str,
+        cui_description_table: str,
+        cui_embeddings_table: str,
+        cui_narrower_table: str,
+        max_hierarchy_depth: int = 5,
         query_timeout: int = 300
     ):
-        try:
-            self.client = bigquery.Client(project=project_id)
-        except Exception as e:
-            raise Exception(f"Failed to initialize BigQuery client: {str(e)}")
-        
+        self.client = bigquery.Client(project=project_id)
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.subnet_api_url = subnet_api_url
@@ -217,294 +189,351 @@ class EnhancedCUIReducer:
         self.cui_narrower_table = cui_narrower_table
         self.max_hierarchy_depth = max_hierarchy_depth
         self.query_timeout = query_timeout
-        
-        # Cache
-        self._hierarchy_cache = None
-        self._ic_scores_cache = None
+
+        self._hierarchy_cache = {}
+        self._ic_scores_cache = {}  # Changed to dict for per-group caching
         self._description_cache = {}
-    
+     
+
+    # Public API - Modified for semantic grouping
     def reduce(
         self,
         input_cuis: List[str],
-        target_reduction: float = 0.85,
-        ic_threshold: Optional[float] = None,
-        ic_percentile: float = 50.0,
-        semantic_threshold: float = 0.88,
-        use_semantic_clustering: bool = True,
-        adaptive_threshold: bool = False
+        ic_percentile: int = 75,
+        similarity_threshold: float = 0.88,
+        distance_from_centroid_threshold: float = 0.3
     ) -> Tuple[List[str], ReductionStats]:
 
         start_time = time.time()
         input_cuis = list(set(input_cuis))
         initial_count = len(input_cuis)
-
-        # Build hierarchy using SUBNET API (replaces MRREL)
-        api_start = time.time()
-        hierarchy = self._build_hierarchy_safe(input_cuis)
-        api_time = time.time() - api_start
         
-        ic_scores = self._compute_ic_scores_safe(hierarchy)
+        logger.info(f"Starting semantic-group based reduction for {initial_count} CUIs")
 
-        # MEDIAN IC THRESHOLD ONLY
-        if ic_threshold is None and ic_scores:
-            ic_threshold = float(np.median(list(ic_scores.values())))
-            logger.info(f"Using MEDIAN IC threshold: {ic_threshold:.3f}")
-        elif ic_threshold is None:
-            ic_threshold = 5.0
-
-        rolled_up = self._semantic_rollup_with_ic_safe(
-            input_cuis, hierarchy, ic_scores, ic_threshold
-        )
-        after_rollup = len(rolled_up)
-
-        final_cuis = rolled_up
-        if use_semantic_clustering:
-            final_cuis = self._semantic_clustering_safe(rolled_up, ic_scores)
-
+        # Step 3: Group by semantic type (dynamically from MRSTY)
+        semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
+        
+        all_reduced_cuis = []
+        group_stats = {}
+        total_after_ic = 0
+        
+        for group_name, group_cuis in semantic_groups.items():
+            if not group_cuis:
+                continue
+                
+            logger.info(f"\nProcessing {group_name}: {len(group_cuis)} CUIs")
+            
+            # Step 4: Build hierarchy within group
+            hierarchy_start = time.time()
+            group_hierarchy = self._build_hierarchy_depthwise(group_cuis)
+            hierarchy_time = time.time() - hierarchy_start
+            
+            # Step 5: Compute IC scores within group
+            group_ic_scores = self._compute_ic_scores_within_group(
+                group_hierarchy, 
+                group_cuis,
+                group_name
+            )
+            
+            # Step 6: Keep only CUIs >= 75th percentile IC
+            if group_ic_scores:
+                ic_threshold = np.percentile(
+                    list(group_ic_scores.values()), 
+                    ic_percentile
+                )
+                logger.info(f"{group_name} - IC threshold (75th percentile): {ic_threshold:.3f}")
+                
+                high_ic_cuis = [
+                    cui for cui in group_cuis 
+                    if group_ic_scores.get(cui, 0) >= ic_threshold
+                ]
+            else:
+                # If no IC scores computed (e.g., single CUI), keep all
+                high_ic_cuis = group_cuis
+                
+            logger.info(f"{group_name} - After IC filter: {len(high_ic_cuis)} CUIs")
+            total_after_ic += len(high_ic_cuis)
+            
+            # Step 7-8: Semantic clustering and diversity selection
+            if len(high_ic_cuis) > 1:
+                group_reduced = self._cluster_and_select_diverse(
+                    high_ic_cuis,
+                    similarity_threshold,
+                    distance_from_centroid_threshold
+                )
+            else:
+                group_reduced = high_ic_cuis
+            
+            logger.info(f"{group_name} - After clustering: {len(group_reduced)} CUIs")
+            
+            all_reduced_cuis.extend(group_reduced)
+            
+            group_stats[group_name] = {
+                'original': len(group_cuis),
+                'after_ic_filter': len(high_ic_cuis),
+                'final': len(group_reduced),
+                'reduction_pct': (1 - len(group_reduced)/len(group_cuis)) * 100 if group_cuis else 0
+            }
+        
+        # Step 9: Remove duplicates
+        final_cuis = list(set(all_reduced_cuis))
         final_count = len(final_cuis)
+        
+        # Step 10: Validate coverage
+        coverage_score = self._calculate_coverage(input_cuis, final_cuis)
+        logger.info(f"Coverage score: {coverage_score:.2%} of original CUIs have representative")
 
+        # Fetch descriptions for final CUIs
+        self._fetch_descriptions(final_cuis)
+
+        # Stats
         stats = ReductionStats(
             initial_count=initial_count,
-            after_ic_rollup=after_rollup,
+            after_ic_rollup=total_after_ic,
             final_count=final_count,
-            ic_rollup_reduction_pct=self._safe_percentage(
-                initial_count - after_rollup, initial_count
-            ),
-            semantic_clustering_reduction_pct=self._safe_percentage(
-                after_rollup - final_count, initial_count
-            ),
-            total_reduction_pct=self._safe_percentage(
-                initial_count - final_count, initial_count
-            ),
+            ic_rollup_reduction_pct=self._safe_percentage(initial_count - total_after_ic, initial_count),
+            semantic_clustering_reduction_pct=self._safe_percentage(total_after_ic - final_count, initial_count),
+            total_reduction_pct=self._safe_percentage(initial_count - final_count, initial_count),
             processing_time=time.time() - start_time,
-            ic_threshold_used=ic_threshold,
-            hierarchy_size=len(hierarchy.get("all_cuis", [])),
-            api_call_time=api_time
+            ic_threshold_used=ic_percentile,
+            hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
+            api_call_time=0.0,
+            group_stats=group_stats
         )
 
         return final_cuis, stats
-    
-    def _build_hierarchy_safe(self, relevant_cuis: List[str]) -> Dict:
-        """Build hierarchy using SUBNET API (replaces MRREL completely)"""
-        if self._hierarchy_cache is not None:
-            return self._hierarchy_cache
+
+    # New method: Dynamic grouping by STY (Semantic Type Name)
+    def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
+        """
+        Dynamically group CUIs by their semantic type names (STY) from MRSTY table
+        This creates natural groupings based on the actual semantic types present
+        """
         
-        # Use async event loop to call the subnet API
-        hierarchy = asyncio.run(self._fetch_hierarchy_from_api(relevant_cuis))
+        logger.info("Dynamically fetching semantic types for CUIs...")
         
-        self._hierarchy_cache = hierarchy
-        logger.info(f"Built hierarchy from API: {len(hierarchy.get('all_cuis', []))} CUIs total")
-        
-        return hierarchy
-    
-    async def _fetch_hierarchy_from_api(self, relevant_cuis: List[str]) -> Dict:
-        """Fetch hierarchy using subnet API"""
-        
-        child_to_parents = defaultdict(list)
-        parent_to_children = defaultdict(list)
-        all_cuis = set(relevant_cuis)
-        
-        # Get auth headers
-        headers = self._get_auth_headers()
-        
-        # Default limit context
-        limit_context = ['LNC.Empty', 'SNOMEDCT_US.Empty', 'SNOMEDCT_US.isa',
-                        'ICD10.Empty', 'ICD10AM.Empty', 'ICD10CM.Empty',
-                        'ICD10PCS.Empty', 'CCSR_ICD10PCS.Empty']
-        
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self.query_timeout)) as session:
-                # Process CUIs in batches
-                batch_size = 50
-                for i in range(0, len(relevant_cuis), batch_size):
-                    batch = relevant_cuis[i:i+batch_size]
-                    
-                    payload = {
-                        "cuis": batch,
-                        "cross_context": False,
-                        "limit_context": limit_context
-                    }
-                    
-                    try:
-                        async with session.post(
-                            f"{self.subnet_api_url}/subnet/",
-                            json=payload,
-                            headers=headers
-                        ) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                nodes, edges = data.get("output", ([], []))
-                                
-                                # Process nodes
-                                for node in nodes:
-                                    normalized = self._normalize_cui(node)
-                                    if normalized:
-                                        all_cuis.add(normalized)
-                                
-                                # Process edges
-                                for edge in edges:
-                                    if isinstance(edge, (list, tuple)) and len(edge) == 2:
-                                        parent = self._normalize_cui(edge[0])
-                                        child = self._normalize_cui(edge[1])
-                                        if parent and child:
-                                            parent_to_children[parent].append(child)
-                                            child_to_parents[child].append(parent)
-                                            all_cuis.update([parent, child])
-                    
-                    except Exception as e:
-                        logger.warning(f"API batch failed: {e}")
-        
-        except Exception as e:
-            logger.error(f"Failed to build hierarchy from API: {str(e)}")
-        
-        return {
-            'child_to_parents': dict(child_to_parents),
-            'parent_to_children': dict(parent_to_children),
-            'all_cuis': all_cuis
-        }
-    
-    def _get_auth_headers(self) -> Dict[str, str]:
-        """Get authentication headers"""
-        proc = subprocess.run(
-            ["gcloud", "auth", "print-identity-token"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+        # Query to get all CUI-STY mappings for input CUIs
+        query = f"""
+        WITH cui_types AS (
+            SELECT DISTINCT 
+                CUI,
+                TUI,
+                STY  -- Semantic Type Name
+            FROM `{self.project_id}.{self.dataset_id}.MRSTY`
+            WHERE CUI IN UNNEST(@cuis)
         )
-        if proc.returncode != 0:
-            raise RuntimeError(proc.stderr)
+        SELECT * FROM cui_types
+        ORDER BY STY, CUI
+        """
         
-        return {
-            "Authorization": f"Bearer {proc.stdout.strip()}",
-            "Content-Type": "application/json"
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
+            ]
+        )
+        
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        if df.empty:
+            logger.warning("No semantic type information found in MRSTY")
+            return {'UNKNOWN': cuis}
+        
+        # Group CUIs by STY (Semantic Type Name)
+        semantic_groups = defaultdict(set)
+        cui_to_types = defaultdict(set)
+        
+        for _, row in df.iterrows():
+            cui = row['CUI']
+            sty = row['STY']  # Using STY (semantic type name) as group key
+            
+            semantic_groups[sty].add(cui)
+            cui_to_types[cui].add(sty)
+        
+        # Handle CUIs with multiple semantic types
+        # Assign each CUI to only one group (the most specific or first alphabetically)
+        final_groups = defaultdict(list)
+        
+        for cui in cuis:
+            if cui not in cui_to_types:
+                # CUI not found in MRSTY
+                final_groups['UNKNOWN'].append(cui)
+            else:
+                types = cui_to_types[cui]
+                if len(types) == 1:
+                    # Single semantic type - straightforward assignment
+                    final_groups[list(types)[0]].append(cui)
+                else:
+                    # Multiple types - choose based on priority
+                    # Priority: More specific types (longer names) over general ones
+                    sorted_types = sorted(types, key=lambda x: (-len(x), x))
+                    final_groups[sorted_types[0]].append(cui)
+        
+        # Convert to regular dict and log distribution
+        result = dict(final_groups)
+        
+        logger.info(f"Created {len(result)} semantic groups dynamically:")
+        for group, group_cuis in sorted(result.items(), key=lambda x: -len(x[1]))[:10]:
+            logger.info(f"  {group}: {len(group_cuis)} CUIs")
+        
+        if len(result) > 10:
+            logger.info(f"  ... and {len(result) - 10} more groups")
+        
+        return result
+
+    # Alternative method using TUI-based grouping with automatic categorization
+    def _group_by_tui_categories(self, cuis: List[str]) -> Dict[str, List[str]]:
+        """
+        Alternative grouping method that groups TUIs into broader categories
+        based on TUI prefixes (T0xx patterns)
+        """
+        
+        logger.info("Fetching TUI-based semantic groupings...")
+        
+        # TUI prefix categories (based on UMLS semantic network structure)
+        TUI_CATEGORIES = {
+            'T001-T016': 'Organisms',
+            'T017-T031': 'Anatomical_Structures',
+            'T032-T037': 'Functions',
+            'T038-T046': 'Physiological_Phenomena',
+            'T047-T058': 'Pathological_Phenomena',
+            'T059-T063': 'Procedures',
+            'T064-T072': 'Activities',
+            'T073-T075': 'Manufactured_Objects',
+            'T077-T089': 'Conceptual_Entities',
+            'T090-T108': 'Occupations_Disciplines',
+            'T109-T125': 'Chemical_Substances',
+            'T126-T131': 'Genes_Molecular',
+            'T167-T171': 'Organizations',
+            'T184-T197': 'Clinical_Attributes',
+            'T200-T204': 'Device_Components'
         }
-    
-    def _normalize_cui(self, cui: str) -> Optional[str]:
-        """Normalize CUI format"""
-        if not cui:
-            return None
-        m = re.match(r"^(C\d{7})(?:-\d+)?$", str(cui))
-        return m.group(1) if m else None
-    
-    # ALL OTHER METHODS REMAIN EXACTLY THE SAME AS CODE 1
-    def _compute_ic_scores_safe(self, hierarchy: Dict) -> Dict[str, float]:
-        if self._ic_scores_cache is not None:
-            return self._ic_scores_cache
         
-        parent_to_children = hierarchy.get('parent_to_children', {})
-        all_cuis = hierarchy.get('all_cuis', set())
-        total = len(all_cuis)
+        query = f"""
+        WITH cui_types AS (
+            SELECT DISTINCT 
+                CUI,
+                TUI,
+                STY
+            FROM `{self.project_id}.{self.dataset_id}.MRSTY`
+            WHERE CUI IN UNNEST(@cuis)
+        )
+        SELECT * FROM cui_types
+        """
         
-        if total == 0:
-            return {}
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
+            ]
+        )
         
-        try:
-            descendant_counts = {}
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        # Map TUIs to categories
+        def get_tui_category(tui):
+            tui_num = int(tui[1:])  # Extract number from TUI (e.g., T047 -> 47)
+            for range_str, category in TUI_CATEGORIES.items():
+                start, end = range_str.split('-')
+                start_num = int(start[1:])
+                end_num = int(end[1:])
+                if start_num <= tui_num <= end_num:
+                    return category
+            return 'Other'
+        
+        # Group CUIs by TUI category
+        final_groups = defaultdict(list)
+        cui_to_categories = defaultdict(set)
+        
+        for _, row in df.iterrows():
+            cui = row['CUI']
+            tui = row['TUI']
+            category = get_tui_category(tui)
+            cui_to_categories[cui].add(category)
+        
+        # Assign each CUI to primary category
+        for cui in cuis:
+            if cui not in cui_to_categories:
+                final_groups['UNKNOWN'].append(cui)
+            else:
+                categories = cui_to_categories[cui]
+                # Choose first category (could implement priority logic here)
+                primary_category = sorted(categories)[0]
+                final_groups[primary_category].append(cui)
+        
+        return dict(final_groups)
+
+    # Modified IC computation for within-group
+    def _compute_ic_scores_within_group(
+        self, 
+        hierarchy: Dict, 
+        group_cuis: List[str],
+        group_name: str
+    ) -> Dict[str, float]:
+        """Compute IC scores relative to the group, not global hierarchy"""
+        
+        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
+        if cache_key in self._ic_scores_cache:
+            return self._ic_scores_cache[cache_key]
+        
+        parent_to_children = hierarchy.get("parent_to_children", {})
+        group_set = set(group_cuis)
+        
+        # Count descendants ONLY within this semantic group
+        descendant_counts = {}
+        
+        def count_group_descendants(cui: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if cui in visited or cui not in group_set:
+                return 0
+            visited.add(cui)
             
-            def count_descendants(cui: str, visited: Set[str] = None) -> int:
-                if visited is None:
-                    visited = set()
-                if cui in visited or cui in descendant_counts:
-                    return descendant_counts.get(cui, 0)
-                
-                visited.add(cui)
-                children = parent_to_children.get(cui, [])
-                count = len(children)
-                
-                for child in children:
-                    count += count_descendants(child, visited)
-                
-                descendant_counts[cui] = count
-                return count
+            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
+            count = len(children)
+            for child in children:
+                count += count_group_descendants(child, visited)
             
-            logger.info("Computing IC scores...")
-            for cui in all_cuis:
-                if cui not in descendant_counts:
-                    try:
-                        count_descendants(cui)
-                    except RecursionError:
-                        logger.warning(f"Recursion limit for {cui}")
-                        descendant_counts[cui] = 0
-            
-            ic_scores = {}
-            for cui in all_cuis:
-                desc_count = descendant_counts.get(cui, 0)
-                ic = -np.log((desc_count + 1) / total)
-                ic_scores[cui] = max(0.0, ic)
-            
-            self._ic_scores_cache = ic_scores
-            
-            if ic_scores:
-                values = list(ic_scores.values())
-                logger.info(f"IC scores: {len(ic_scores)} CUIs, range [{min(values):.2f}, {max(values):.2f}]")
-            
-            return ic_scores
-            
-        except Exception as e:
-            logger.error(f"Failed to compute IC scores: {str(e)}")
-            return {cui: 5.0 for cui in all_cuis}
-    
-    def _semantic_rollup_with_ic_safe(
-        self,
-        cui_list: List[str],
-        hierarchy: Dict,
-        ic_scores: Dict[str, float],
-        ic_threshold: float
-    ) -> List[str]:
-        try:
-            child_to_parents = hierarchy.get('child_to_parents', {})
-            rolled_up = {}
-            
-            for cui in cui_list:
+            descendant_counts[cui] = count
+            return count
+        
+        logger.info(f"Computing IC scores for {group_name}...")
+        for cui in group_cuis:
+            if cui not in descendant_counts:
                 try:
-                    ancestors = []
-                    visited = set()
-                    queue = deque([cui])
-                    
-                    while queue and len(visited) < 100:
-                        current = queue.popleft()
-                        if current in visited:
-                            continue
-                        visited.add(current)
-                        
-                        for parent in child_to_parents.get(current, []):
-                            if parent not in visited:
-                                ancestors.append(parent)
-                                queue.append(parent)
-                    
-                    candidates = [cui] + ancestors
-                    valid = [c for c in candidates if ic_scores.get(c, 0) >= ic_threshold]
-                    
-                    if valid:
-                        rolled_up[cui] = min(valid, key=lambda c: ic_scores.get(c, float('inf')))
-                    else:
-                        rolled_up[cui] = cui
-                        
-                except Exception as e:
-                    logger.debug(f"Rollup failed for {cui}: {str(e)}")
-                    rolled_up[cui] = cui
-            
-            return list(set(rolled_up.values()))
-            
-        except Exception as e:
-            logger.error(f"Semantic rollup failed: {str(e)}")
-            return cui_list
-    
-    def _semantic_clustering_safe(
+                    count_group_descendants(cui)
+                except RecursionError:
+                    descendant_counts[cui] = 0
+        
+        # Calculate IC scores normalized by group size
+        group_size = len(group_cuis)
+        ic_scores = {}
+        for cui in group_cuis:
+            desc_count = descendant_counts.get(cui, 0)
+            # IC = -log(P) where P = (descendants + 1) / group_size
+            ic_scores[cui] = max(0.0, -np.log((desc_count + 1) / group_size))
+        
+        if ic_scores:
+            values = list(ic_scores.values())
+            logger.info(f"{group_name} IC scores: range [{min(values):.2f}, {max(values):.2f}]")
+        
+        self._ic_scores_cache[cache_key] = ic_scores
+        return ic_scores
+
+    # New method: Cluster and select diverse CUIs
+    def _cluster_and_select_diverse(
         self,
         cui_list: List[str],
-        ic_scores: Dict[str, float],
-        similarity_threshold: float = None,
-        min_intra_cluster_distance: float = 0.25
+        similarity_threshold: float,
+        distance_threshold: float
     ) -> List[str]:
-        """Clusters CUIs, then prunes CLOSE CUIs within each cluster"""
+        """
+        Clusters CUIs and selects all CUIs that are far from cluster centroids
+        """
         
         if len(cui_list) <= 1:
             return cui_list
         
         try:
-            logger.info(f"Fetching embeddings for {len(cui_list)} CUIs...")
-            
+            # Fetch embeddings
             query = f"""
             SELECT REF_CUI as cui, REF_Embedding as embedding
             FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
@@ -523,27 +552,25 @@ class EnhancedCUIReducer:
                 logger.warning("No embeddings found, skipping clustering")
                 return cui_list
             
+            # Ensure we have embeddings for all CUIs
+            missing_cuis = set(cui_list) - set(df['cui'].values)
+            if missing_cuis:
+                logger.warning(f"Missing embeddings for {len(missing_cuis)} CUIs")
+            
             embeddings = np.vstack(df['embedding'].values)
             cuis = np.array(df['cui'].values)
             
-            # STEP 1: COMPUTE 95th PERCENTILE THRESHOLD
-            sim_matrix = 1 - cosine_distances(embeddings)
-            upper_tri = sim_matrix[np.triu_indices_from(sim_matrix, k=1)]
-            perc95 = np.percentile(upper_tri, 95)
-            
-            logger.info(f"Dynamic similarity threshold : {perc95:.4f}")
-            
-            # STEP 2: COARSE CLUSTERING
+            # Perform clustering
             clustering = AgglomerativeClustering(
                 n_clusters=None,
-                distance_threshold=1 - perc95,
+                distance_threshold=1 - similarity_threshold,
                 metric='cosine',
                 linkage='average'
             )
             
             labels = clustering.fit_predict(embeddings)
             
-            # STEP 3: INTRA-CLUSTER DISTANCE FILTERING
+            # Select diverse CUIs from each cluster
             final_cuis = []
             
             for cluster_id in np.unique(labels):
@@ -555,24 +582,27 @@ class EnhancedCUIReducer:
                     final_cuis.append(cluster_cuis[0])
                     continue
                 
-                dist_matrix = cosine_distances(cluster_embeddings)
+                # Calculate centroid
+                centroid = np.mean(cluster_embeddings, axis=0)
                 
-                order = sorted(
-                    range(len(cluster_cuis)),
-                    key=lambda i: ic_scores.get(cluster_cuis[i], 0),
-                    reverse=True
-                )
+                # Calculate distances from centroid
+                distances = cosine_distances([centroid], cluster_embeddings)[0]
                 
-                kept = []
-                for i in order:
-                    too_close = any(dist_matrix[i, j] < min_intra_cluster_distance for j in kept)
-                    if not too_close:
-                        kept.append(i)
+                # Keep ALL CUIs that are far enough from centroid
+                far_indices = np.where(distances > distance_threshold)[0]
                 
-                final_cuis.extend(cluster_cuis[kept])
+                if len(far_indices) > 0:
+                    final_cuis.extend(cluster_cuis[far_indices])
+                else:
+                    # If none are far enough, keep the farthest one
+                    farthest_idx = np.argmax(distances)
+                    final_cuis.append(cluster_cuis[farthest_idx])
+            
+            # Add back missing CUIs (those without embeddings)
+            final_cuis.extend(missing_cuis)
             
             logger.info(
-                f"Distance-based clustering reduced {len(cui_list)} → {len(final_cuis)} CUIs"
+                f"Clustering reduced {len(cui_list)} → {len(final_cuis)} CUIs"
             )
             
             return list(set(final_cuis))
@@ -580,144 +610,191 @@ class EnhancedCUIReducer:
         except Exception as e:
             logger.error(f"Clustering failed: {str(e)}")
             return cui_list
-    
-    def get_cui_descriptions(self, cui_list: List[str]) -> Dict[str, str]:
-        if not cui_list:
-            return {}
+
+    # New method: Calculate coverage
+    def _calculate_coverage(self, original_cuis: List[str], reduced_cuis: List[str]) -> float:
+        """Calculate what percentage of original CUIs have a representative in reduced set"""
         
-        uncached = [c for c in cui_list if c not in self._description_cache]
+        if not original_cuis or not reduced_cuis:
+            return 0.0
         
-        if uncached:
-            try:
-                query = f"""
-                SELECT CUI as cui, Definition as description
-                FROM `{self.project_id}.{self.dataset_id}.{self.cui_description_table}`
-                WHERE CUI IN UNNEST(@cuis)
-                """
+        try:
+            # Fetch embeddings for coverage calculation
+            all_cuis = list(set(original_cuis + reduced_cuis))
+            
+            query = f"""
+            SELECT REF_CUI as cui, REF_Embedding as embedding
+            FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+            WHERE REF_CUI IN UNNEST(@cuis)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", all_cuis)
+                ]
+            )
+            
+            df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+            
+            if df.empty:
+                return 0.0
+            
+            # Create embedding lookup
+            embedding_dict = {row['cui']: row['embedding'] for _, row in df.iterrows()}
+            
+            # Check coverage
+            covered_count = 0
+            coverage_threshold = 0.85
+            
+            for orig_cui in original_cuis:
+                if orig_cui in reduced_cuis:
+                    covered_count += 1
+                    continue
                 
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
-                    ]
-                )
+                if orig_cui not in embedding_dict:
+                    continue
                 
-                query_job = self.client.query(query, job_config=job_config)
-                df = query_job.result(timeout=30).to_dataframe()
-                new_descriptions = dict(zip(df['cui'], df['description']))
-                self._description_cache.update(new_descriptions)
+                orig_embedding = embedding_dict[orig_cui]
                 
-            except Exception as e:
-                logger.error(f"Failed to fetch descriptions: {str(e)}")
-        
-        return {cui: self._description_cache.get(cui, "N/A") for cui in cui_list}
-    
+                # Find if any reduced CUI is similar enough
+                for red_cui in reduced_cuis:
+                    if red_cui not in embedding_dict:
+                        continue
+                    
+                    red_embedding = embedding_dict[red_cui]
+                    similarity = 1 - cosine_distances([orig_embedding], [red_embedding])[0, 0]
+                    
+                    if similarity >= coverage_threshold:
+                        covered_count += 1
+                        break
+            
+            return covered_count / len(original_cuis)
+            
+        except Exception as e:
+            logger.error(f"Coverage calculation failed: {str(e)}")
+            return 0.0
+
+    # Existing methods remain the same
+    def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
+        key = tuple(sorted(cuis))
+        if key in self._hierarchy_cache:
+            return self._hierarchy_cache[key]
+
+        logger.info(f"Fetching hierarchy for {len(cuis)} CUIs")
+        hierarchy = asyncio.run(self._fetch_hierarchy(cuis))
+        self._hierarchy_cache[key] = hierarchy
+        return hierarchy
+
+    async def _fetch_hierarchy(self, cuis: List[str]) -> Dict:
+        child_to_parents = defaultdict(list)
+        parent_to_children = defaultdict(list)
+        all_cuis = set(cuis)
+
+        headers = GCPTokenProvider.get_headers()
+        batch_size = 50
+        timeout = aiohttp.ClientTimeout(total=self.query_timeout)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+
+            async def fetch_batch(batch):
+                async with session.post(
+                    f"{self.subnet_api_url}/subnet/",
+                    json={"cuis": batch, "cross_context": False},
+                    headers=headers
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"Batch failed: {resp.status}")
+                        return [], []
+                    data = await resp.json()
+                    return data.get("output", ([], []))
+
+            tasks = []
+            for i in range(0, len(cuis), batch_size):
+                batch = cuis[i:i + batch_size]
+                tasks.append(fetch_batch(batch))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                nodes, edges = result
+                for p, c in edges:
+                    p, c = self._normalize_cui(p), self._normalize_cui(c)
+                    if p and c:
+                        parent_to_children[p].append(c)
+                        child_to_parents[c].append(p)
+                        all_cuis.update([p, c])
+
+        logger.info(f"Retrieved {sum(len(v) for v in parent_to_children.values())} relationships")
+        return {
+            "child_to_parents": dict(child_to_parents),
+            "parent_to_children": dict(parent_to_children),
+            "all_cuis": all_cuis
+        }
+
+    def _fetch_descriptions(self, cuis: List[str]):
+        to_fetch = [c for c in cuis if c not in self._description_cache]
+        if not to_fetch:
+            return
+
+        logger.info(f"Fetching descriptions for {len(to_fetch)} CUIs...")
+        query = f"""
+            SELECT CUI AS cui, Definition AS description
+            FROM `{self.project_id}.{self.dataset_id}.{self.cui_description_table}`
+            WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", to_fetch)]
+        )
+
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+
+        for _, row in df.iterrows():
+            self._description_cache[row['cui']] = row['description']
+
+    @staticmethod
+    def _normalize_cui(cui: str) -> Optional[str]:
+        m = re.match(r"^(C\d{7})(?:-\d+)?$", str(cui))
+        return m.group(1) if m else None
+
     @staticmethod
     def _safe_percentage(numerator: float, denominator: float) -> float:
-        return (numerator / denominator * 100) if denominator > 0 else 0.0
+        return (numerator / denominator * 100) if denominator else 0.0
 
-# ============================================
-# MAIN FUNCTION
-# ============================================
 
-def run_cui_reduction(
-    texts: List[str],
-    project_id: str,
-    dataset_id: str,
-    api_url: str,
-    subnet_api_url: str,  # REQUIRED - no fallback
-    cui_description_table: str = "cui_descriptions",
-    cui_embeddings_table: str = "cui_embeddings",
-    cui_narrower_table: str = "cui_narrower_concepts",
-    target_reduction: float = 0.85,
-    ic_percentile: float = 50.0,
-    semantic_threshold: float = 0.88,
-    use_semantic_clustering: bool = True,
-    adaptive_threshold: bool = False
-) -> Tuple[List[str], List[str], Dict[str, str], Optional[ReductionStats]]:
-    
-    try:
-        # Initialize API client
-        api_client = CUIAPIClient(
-            api_base_url=api_url,
-            timeout=60,
-            top_k=3
-        )
-        
-        # Initialize reducer with subnet API URL (required)
-        cui_reducer = EnhancedCUIReducer(
-            project_id=project_id,
-            dataset_id=dataset_id,
-            subnet_api_url=subnet_api_url,  # Using subnet API for hierarchy
-            cui_description_table=cui_description_table,
-            cui_embeddings_table=cui_embeddings_table,
-            cui_narrower_table=cui_narrower_table,
-            max_hierarchy_depth=1,
-            query_timeout=300
-        )
-        
-        # Extract CUIs from texts
-        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
-        initial_cuis = api_client.extract_cuis_batch(texts)
-        
-        if not initial_cuis:
-            logger.warning("No CUIs extracted from texts")
-            return [], [], {}, None
-        
-        # Filter CUIs to only ICD, SNOMED, and LOINC
-        logger.info(f"Filtering {len(initial_cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
-        filtered_cuis = filter_allowed_cuis(initial_cuis, project_id, dataset_id)
-        
-        if not filtered_cuis:
-            logger.warning("No CUIs remain after filtering")
-            return [], [], {}, None
-        
-        # Reduce CUIs
-        reduced_cuis, stats = cui_reducer.reduce(
-            filtered_cuis,
-            target_reduction=target_reduction,
-            ic_percentile=ic_percentile,
-            semantic_threshold=semantic_threshold,
-            use_semantic_clustering=use_semantic_clustering,
-            adaptive_threshold=adaptive_threshold
-        )
-        
-        # Get descriptions
-        logger.info("Fetching descriptions...")
-        descriptions = cui_reducer.get_cui_descriptions(reduced_cuis)
-        
-        return list(initial_cuis), reduced_cuis, descriptions, stats
-        
-    except Exception as e:
-        logger.error(f"Pipeline error: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return [], [], {}, None
+# Main
 
-# ============================================
-# EXAMPLE USAGE
-# ============================================
+if __name__ == "__main__": 
+    project_id = project_id
+    dataset_id = dataset
+    api_url = url
+    subnet_api_url = url1
+    cui_desc_table = cui_desc_table
+    embedding_table = embedding_table
+    descendants_table = descendants_table
 
-if __name__ == "__main__":
-    # Configuration
-    project_id = "your_project"
-    dataset_id = "your_dataset"
-    api_url = "your_cui_extraction_api_url"
-    subnet_api_url = "your_subnet_api_url"  # REQUIRED
-    
-    texts = ["pharmacotherapy depression type 2 diabetes"]
-    
-    # Run with subnet API for hierarchy (no MRREL fallback)
-    initial_cuis, reduced_cuis, descriptions, stats = run_cui_reduction(
-        texts=texts,
-        project_id=project_id,
-        dataset_id=dataset_id,
-        api_url=api_url,
-        subnet_api_url=subnet_api_url,  # Must provide subnet API URL
-        cui_description_table="cui_descriptions",
-        cui_embeddings_table="cui_embeddings",
-        cui_narrower_table="cui_narrower_concepts"
+    texts = ["pharmacotherapy depression type 2 diabetes"] 
+    api_client = CUIAPIClient(api_base_url=api_url)
+    extracted_cuis = api_client.extract_cuis_batch(texts)
+
+    filtered_cuis = filter_allowed_cuis(extracted_cuis, project_id, dataset_id)
+
+    reducer = EnhancedCUIReducer(
+        project_id,
+        dataset_id,
+        subnet_api_url=subnet_api_url,
+        cui_description_table=cui_desc_table,
+        cui_embeddings_table=embedding_table,
+        cui_narrower_table=descendants_table
     )
-    
-    if stats:
-        print(f"Reduction complete: {stats.initial_count} → {stats.final_count} ({stats.total_reduction_pct:.1f}%)")
-        print(f"Hierarchy built via subnet API in {stats.api_call_time:.2f}s")
+
+    final_cuis, stats = reducer.reduce(
+        filtered_cuis,
+        ic_percentile=75,
+        similarity_threshold=0.88,
+        distance_from_centroid_threshold=0.3
+    )
+
+    # logger.info(f"Final CUIs ({len(final_cuis)}): {final_cuis}")
+    logger.info(f"Reduction Stats: {stats.to_dict()}")
