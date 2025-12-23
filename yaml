@@ -75,7 +75,8 @@ class ReductionStats:
     ic_threshold_used: float
     hierarchy_size: int = 0
     api_call_time: float = 0.0
-    group_stats: Dict = None  # Added for semantic group statistics
+    group_stats: Dict = None
+    missing_embeddings_count: int = 0
 
     def to_dict(self):
         return asdict(self)
@@ -191,8 +192,9 @@ class EnhancedCUIReducer:
         self.query_timeout = query_timeout
 
         self._hierarchy_cache = {}
-        self._ic_scores_cache = {}  # Changed to dict for per-group caching
+        self._ic_scores_cache = {}
         self._description_cache = {}
+        self._missing_embeddings_total = 0
      
 
     # Public API - Modified for semantic grouping
@@ -213,6 +215,8 @@ class EnhancedCUIReducer:
         # Step 3: Group by semantic type (dynamically from MRSTY)
         semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
         
+        logger.info(f"Created {len(semantic_groups)} semantic groups")
+        
         all_reduced_cuis = []
         group_stats = {}
         total_after_ic = 0
@@ -220,13 +224,9 @@ class EnhancedCUIReducer:
         for group_name, group_cuis in semantic_groups.items():
             if not group_cuis:
                 continue
-                
-            logger.info(f"\nProcessing {group_name}: {len(group_cuis)} CUIs")
             
             # Step 4: Build hierarchy within group
-            hierarchy_start = time.time()
             group_hierarchy = self._build_hierarchy_depthwise(group_cuis)
-            hierarchy_time = time.time() - hierarchy_start
             
             # Step 5: Compute IC scores within group
             group_ic_scores = self._compute_ic_scores_within_group(
@@ -241,7 +241,6 @@ class EnhancedCUIReducer:
                     list(group_ic_scores.values()), 
                     ic_percentile
                 )
-                logger.info(f"{group_name} - IC threshold (75th percentile): {ic_threshold:.3f}")
                 
                 high_ic_cuis = [
                     cui for cui in group_cuis 
@@ -250,8 +249,7 @@ class EnhancedCUIReducer:
             else:
                 # If no IC scores computed (e.g., single CUI), keep all
                 high_ic_cuis = group_cuis
-                
-            logger.info(f"{group_name} - After IC filter: {len(high_ic_cuis)} CUIs")
+            
             total_after_ic += len(high_ic_cuis)
             
             # Step 7-8: Semantic clustering and diversity selection
@@ -263,8 +261,6 @@ class EnhancedCUIReducer:
                 )
             else:
                 group_reduced = high_ic_cuis
-            
-            logger.info(f"{group_name} - After clustering: {len(group_reduced)} CUIs")
             
             all_reduced_cuis.extend(group_reduced)
             
@@ -287,6 +283,8 @@ class EnhancedCUIReducer:
         self._fetch_descriptions(final_cuis)
 
         # Stats
+        logger.info(f"Total missing embeddings: {self._missing_embeddings_total}")
+        
         stats = ReductionStats(
             initial_count=initial_count,
             after_ic_rollup=total_after_ic,
@@ -298,87 +296,79 @@ class EnhancedCUIReducer:
             ic_threshold_used=ic_percentile,
             hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
             api_call_time=0.0,
-            group_stats=group_stats
+            group_stats=group_stats,
+            missing_embeddings_count=self._missing_embeddings_total
         )
 
         return final_cuis, stats
 
-    # New method: Dynamic grouping by STY (Semantic Type Name)
+    # FIXED INDENTATION - This method was incorrectly indented
     def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
-    """
-    Dynamically group CUIs by their semantic type names (STY) from MRSTY table
-    This creates natural groupings based on the actual semantic types present
-    """
-    
-    logger.info("Dynamically fetching semantic types for CUIs...")
-    
-    # Query to get all CUI-STY mappings for input CUIs
-    query = f"""
-    WITH cui_types AS (
-        SELECT DISTINCT 
-            CUI,
-            TUI,
-            STY  -- Semantic Type Name
-        FROM `{self.project_id}.{self.dataset_id}.MRSTY`
-        WHERE CUI IN UNNEST(@cuis)
-    )
-    SELECT * FROM cui_types
-    ORDER BY STY, CUI
-    """
-    
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
-        ]
-    )
-    
-    df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-    
-    if df.empty:
-        logger.warning("No semantic type information found in MRSTY")
-        return {'UNKNOWN': cuis}
-    
-    # Group CUIs by STY (Semantic Type Name)
-    semantic_groups = defaultdict(set)
-    cui_to_types = defaultdict(set)
-    
-    for _, row in df.iterrows():
-        cui = row['CUI']
-        sty = row['STY']  # Using STY (semantic type name) as group key
+        """
+        Dynamically group CUIs by their semantic type names (STY) from MRSTY table
+        This creates natural groupings based on the actual semantic types present
+        """
         
-        semantic_groups[sty].add(cui)
-        cui_to_types[cui].add(sty)
-    
-    # Handle CUIs with multiple semantic types
-    # Assign each CUI to only one group (the most specific or first alphabetically)
-    final_groups = defaultdict(list)
-    
-    for cui in cuis:
-        if cui not in cui_to_types:
-            # CUI not found in MRSTY
-            final_groups['UNKNOWN'].append(cui)
-        else:
-            types = cui_to_types[cui]
-            if len(types) == 1:
-                # Single semantic type - straightforward assignment
-                final_groups[list(types)[0]].append(cui)
+        # Query to get all CUI-STY mappings for input CUIs
+        query = f"""
+        WITH cui_types AS (
+            SELECT DISTINCT 
+                CUI,
+                TUI,
+                STY  -- Semantic Type Name
+            FROM `{self.project_id}.{self.dataset_id}.MRSTY`
+            WHERE CUI IN UNNEST(@cuis)
+        )
+        SELECT * FROM cui_types
+        ORDER BY STY, CUI
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
+            ]
+        )
+        
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        if df.empty:
+            logger.warning("No semantic type information found in MRSTY")
+            return {'UNKNOWN': cuis}
+        
+        # Group CUIs by STY (Semantic Type Name)
+        semantic_groups = defaultdict(set)
+        cui_to_types = defaultdict(set)
+        
+        for _, row in df.iterrows():
+            cui = row['CUI']
+            sty = row['STY']  # Using STY (semantic type name) as group key
+            
+            semantic_groups[sty].add(cui)
+            cui_to_types[cui].add(sty)
+        
+        # Handle CUIs with multiple semantic types
+        # Assign each CUI to only one group (the most specific or first alphabetically)
+        final_groups = defaultdict(list)
+        
+        for cui in cuis:
+            if cui not in cui_to_types:
+                # CUI not found in MRSTY
+                final_groups['UNKNOWN'].append(cui)
             else:
-                # Multiple types - choose based on priority
-                # Priority: More specific types (longer names) over general ones
-                sorted_types = sorted(types, key=lambda x: (-len(x), x))
-                final_groups[sorted_types[0]].append(cui)
-    
-    # Convert to regular dict and log distribution
-    result = dict(final_groups)
-    
-    logger.info(f"Created {len(result)} semantic groups dynamically:")
-    for group, group_cuis in sorted(result.items(), key=lambda x: -len(x[1]))[:10]:
-        logger.info(f"  {group}: {len(group_cuis)} CUIs")
-    
-    if len(result) > 10:
-        logger.info(f"  ... and {len(result) - 10} more groups")
-    
-    return result
+                types = cui_to_types[cui]
+                if len(types) == 1:
+                    # Single semantic type - straightforward assignment
+                    final_groups[list(types)[0]].append(cui)
+                else:
+                    # Multiple types - choose based on priority
+                    # Priority: More specific types (longer names) over general ones
+                    sorted_types = sorted(types, key=lambda x: (-len(x), x))
+                    final_groups[sorted_types[0]].append(cui)
+        
+        # Convert to regular dict
+        result = dict(final_groups)
+        
+        return result
 
     # Modified IC computation for within-group
     def _compute_ic_scores_within_group(
@@ -414,7 +404,6 @@ class EnhancedCUIReducer:
             descendant_counts[cui] = count
             return count
         
-        logger.info(f"Computing IC scores for {group_name}...")
         for cui in group_cuis:
             if cui not in descendant_counts:
                 try:
@@ -430,14 +419,10 @@ class EnhancedCUIReducer:
             # IC = -log(P) where P = (descendants + 1) / group_size
             ic_scores[cui] = max(0.0, -np.log((desc_count + 1) / group_size))
         
-        if ic_scores:
-            values = list(ic_scores.values())
-            logger.info(f"{group_name} IC scores: range [{min(values):.2f}, {max(values):.2f}]")
-        
         self._ic_scores_cache[cache_key] = ic_scores
         return ic_scores
 
-    # New method: Cluster and select diverse CUIs
+    # Fixed: Better handling of missing embeddings
     def _cluster_and_select_diverse(
         self,
         cui_list: List[str],
@@ -468,13 +453,18 @@ class EnhancedCUIReducer:
             df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
             
             if df.empty:
-                logger.warning("No embeddings found, skipping clustering")
+                # No embeddings at all - return all CUIs
                 return cui_list
             
-            # Ensure we have embeddings for all CUIs
+            # Track missing CUIs without logging each one
             missing_cuis = set(cui_list) - set(df['cui'].values)
             if missing_cuis:
-                logger.warning(f"Missing embeddings for {len(missing_cuis)} CUIs")
+                self._missing_embeddings_total += len(missing_cuis)
+            
+            # Only cluster CUIs with embeddings
+            if len(df) < 2:
+                # Not enough CUIs with embeddings to cluster
+                return cui_list
             
             embeddings = np.vstack(df['embedding'].values)
             cuis = np.array(df['cui'].values)
@@ -520,17 +510,13 @@ class EnhancedCUIReducer:
             # Add back missing CUIs (those without embeddings)
             final_cuis.extend(missing_cuis)
             
-            logger.info(
-                f"Clustering reduced {len(cui_list)} → {len(final_cuis)} CUIs"
-            )
-            
             return list(set(final_cuis))
             
         except Exception as e:
             logger.error(f"Clustering failed: {str(e)}")
             return cui_list
 
-    # New method: Calculate coverage
+    # Calculate coverage - simplified logging
     def _calculate_coverage(self, original_cuis: List[str], reduced_cuis: List[str]) -> float:
         """Calculate what percentage of original CUIs have a representative in reduced set"""
         
@@ -599,7 +585,6 @@ class EnhancedCUIReducer:
         if key in self._hierarchy_cache:
             return self._hierarchy_cache[key]
 
-        logger.info(f"Fetching hierarchy for {len(cuis)} CUIs")
         hierarchy = asyncio.run(self._fetch_hierarchy(cuis))
         self._hierarchy_cache[key] = hierarchy
         return hierarchy
@@ -622,7 +607,6 @@ class EnhancedCUIReducer:
                     headers=headers
                 ) as resp:
                     if resp.status != 200:
-                        logger.warning(f"Batch failed: {resp.status}")
                         return [], []
                     data = await resp.json()
                     return data.get("output", ([], []))
@@ -645,7 +629,6 @@ class EnhancedCUIReducer:
                         child_to_parents[c].append(p)
                         all_cuis.update([p, c])
 
-        logger.info(f"Retrieved {sum(len(v) for v in parent_to_children.values())} relationships")
         return {
             "child_to_parents": dict(child_to_parents),
             "parent_to_children": dict(parent_to_children),
@@ -657,7 +640,6 @@ class EnhancedCUIReducer:
         if not to_fetch:
             return
 
-        logger.info(f"Fetching descriptions for {len(to_fetch)} CUIs...")
         query = f"""
             SELECT CUI AS cui, Definition AS description
             FROM `{self.project_id}.{self.dataset_id}.{self.cui_description_table}`
@@ -715,5 +697,4 @@ if __name__ == "__main__":
         distance_from_centroid_threshold=0.3
     )
 
-    # logger.info(f"Final CUIs ({len(final_cuis)}): {final_cuis}")
     logger.info(f"Reduction Stats: {stats.to_dict()}")
