@@ -1,60 +1,41 @@
-# ============================================================
-# FULL END-TO-END CUI REDUCTION PIPELINE (SINGLE CELL)
-# ============================================================
-
 import asyncio
 import aiohttp
 import subprocess
 import re
 import logging
-import time
-import threading
-from typing import List, Dict, Set, Tuple, Optional
+from pathlib import Path
+import json
+from typing import List, Dict, Set, Optional, Tuple
 from collections import defaultdict
+import time
 from dataclasses import dataclass, asdict
-
+import threading
+import pickle
 import numpy as np
-import pandas as pd
 from google.cloud import bigquery
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_distances
+import nest_asyncio
 import requests
 from requests.adapters import HTTPAdapter, Retry
-import nest_asyncio
 
 nest_asyncio.apply()
 
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
+# --------------------- Logging ---------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------
-def extract_base_cui(cui: str) -> Optional[str]:
-    if not cui:
-        return None
-    m = re.match(r"^(C\d{7})", cui.upper())
-    return m.group(1) if m else None
-
-def safe_percentage(n, d):
-    return (n / d * 100) if d else 0.0
-
-# ------------------------------------------------------------
-# GCP Token Provider
-# ------------------------------------------------------------
+# --------------------- GCP Token ---------------------
 class GCPTokenProvider:
     _lock = threading.Lock()
     _token = None
     _expiry = 0
 
     @classmethod
-    def get_headers(cls, force=False):
+    def get_headers(cls, force: bool = False) -> Dict[str, str]:
         with cls._lock:
             now = time.time()
             if not force and cls._token and now < cls._expiry:
@@ -71,409 +52,611 @@ class GCPTokenProvider:
                 raise RuntimeError(proc.stderr)
 
             token = proc.stdout.strip()
+            if not token:
+                raise RuntimeError("Empty token from gcloud")
+
             cls._token = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
             }
-            cls._expiry = now + 3300
+            cls._expiry = now + 3300  # ~55 minutes
             return cls._token
 
-# ------------------------------------------------------------
-# Stats
-# ------------------------------------------------------------
+# --------------------- Data Classes ---------------------
 @dataclass
 class ReductionStats:
     initial_count: int
-    after_ic: int
+    after_ic_rollup: int
+    after_similarity_stage1: int
+    after_similarity_stage2: int
+    after_similarity_stage3: int
     final_count: int
+    ic_rollup_reduction_pct: float
+    similarity_reduction_pct: float
     total_reduction_pct: float
     processing_time: float
+    ic_threshold_low: float
+    ic_threshold_high: float
+    hierarchy_size: int = 0
+    api_call_time: float = 0.0
+    group_stats: Dict = None
+    missing_embeddings_count: int = 0
+    coverage_score: float = 0.0
 
     def to_dict(self):
         return asdict(self)
 
-# ------------------------------------------------------------
-# CUI Extraction API Client
-# ------------------------------------------------------------
-class CUIAPIClient:
-    def __init__(self, api_url: str, top_k: int = 3):
-        self.api_url = api_url
-        self.top_k = top_k
-        self.session = requests.Session()
-        retry = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503]
-        )
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-
-    def extract_cuis(self, texts: List[str]) -> Set[str]:
-        logger.info("Extracting CUIs from input texts")
-        r = self.session.post(
-            self.api_url,
-            headers=GCPTokenProvider.get_headers(),
-            json={"query_texts": texts, "top_k": self.top_k},
-            timeout=60
-        )
-        r.raise_for_status()
-        out = set()
-        for v in r.json().values():
-            out.update(map(str, v))
-        logger.info(f"Extracted {len(out)} CUIs")
-        return out
-
-# ------------------------------------------------------------
-# ICD / SNOMED / LOINC Filter
-# ------------------------------------------------------------
-def filter_allowed_cuis(
-    cuis: Set[str],
-    project: str,
-    dataset: str
-) -> List[str]:
-
+# --------------------- Filter CUIs ---------------------
+def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
     if not cuis:
         return []
-
-    logger.info(f"Filtering {len(cuis)} CUIs to ICD/SNOMED/LOINC")
-    client = bigquery.Client(project=project)
-
-    variants = set()
-    for c in cuis:
-        c = c.upper()
-        variants.add(c)
-        base = extract_base_cui(c)
-        if base:
-            variants.add(base)
-
-    query = f"""
-    SELECT DISTINCT CUI
-    FROM `{project}.{dataset}.MRCONSO`
-    WHERE CUI IN UNNEST(@cuis)
-      AND SAB IN (
-        'ICD9CM','ICD10','ICD10CM',
-        'SNOMEDCT_US','LOINC'
-      )
-    """
-
-    job = client.query(
-        query,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", list(variants))
-            ]
+    try:
+        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
+        client = bigquery.Client(project=project_id)
+        query = f"""
+        SELECT DISTINCT CUI
+        FROM `{project_id}.{dataset_id}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis)
+          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE',
+                      'ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT','ICPC2ICD10ENG',
+                      'SNOMEDCT_US', 'LOINC')
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
         )
-    )
+        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        allowed_cuis = df['CUI'].tolist()
+        logger.info(f"{len(allowed_cuis)} CUIs after filter")
+        return allowed_cuis
+    except Exception as e:
+        logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
+        return []
 
-    allowed = set(job.to_dataframe()["CUI"])
-    filtered = [
-        c for c in cuis
-        if c.upper() in allowed or extract_base_cui(c) in allowed
-    ]
+# --------------------- CUI API Client ---------------------
+class CUIAPIClient:
+    def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 3, max_retries: int = 3):
+        self.api_base_url = api_base_url.rstrip('/')
+        self.timeout = timeout
+        self.top_k = top_k
+        self.max_retries = max_retries
 
-    logger.info(f"{len(filtered)} CUIs retained after vocabulary filter")
-    return filtered
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=20
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
-# ------------------------------------------------------------
-# Enhanced Reducer
-# ------------------------------------------------------------
+    def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
+        if not texts:
+            return set()
+        payload = {"query_texts": texts, "top_k": self.top_k}
+        headers = GCPTokenProvider.get_headers()
+        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
+        try:
+            response = self.session.post(
+                self.api_base_url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            if response.status_code == 401 and retry_auth:
+                logger.warning("Token expired, refreshing...")
+                GCPTokenProvider.get_headers(force=True)
+                return self.extract_cuis_batch(texts, retry_auth=False)
+            response.raise_for_status()
+            data = response.json()
+            all_cuis = set()
+            for text in texts:
+                cuis = data.get(text, [])
+                if isinstance(cuis, list):
+                    all_cuis.update(str(c) for c in cuis if c)
+            logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
+            return all_cuis
+        except Exception as e:
+            logger.error(f"API call failed: {str(e)}")
+            return set()
+
+# --------------------- Enhanced Reducer ---------------------
 class EnhancedCUIReducer:
-
     def __init__(
         self,
-        project: str,
-        dataset: str,
-        subnet_api_url: str,
+        project_id: str,
+        dataset_id: str,
+        cui_embeddings_table: str,
         mrsty_table: str,
-        embedding_table: str
+        umls_network_obj: dict,
+        # IC selection parameters
+        ic_low_percentile: int = 30,
+        ic_high_percentile: int = 70,
+        # Similarity thresholds for multi-stage reduction
+        similarity_stage1: float = 0.95,
+        similarity_stage2: float = 0.90,
+        similarity_stage3: float = 0.85
     ):
-        self.client = bigquery.Client(project=project)
-        self.project = project
-        self.dataset = dataset
-        self.subnet_api_url = subnet_api_url
+        self.client = bigquery.Client(project=project_id)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.cui_embeddings_table = cui_embeddings_table
         self.mrsty_table = mrsty_table
-        self.embedding_table = embedding_table
-        self.embedding_cache = {}
+        self._preloaded_network = umls_network_obj
+        
+        # Parameters
+        self.ic_low_percentile = ic_low_percentile
+        self.ic_high_percentile = ic_high_percentile
+        self.similarity_stage1 = similarity_stage1
+        self.similarity_stage2 = similarity_stage2
+        self.similarity_stage3 = similarity_stage3
 
-    # --------------------------------------------------------
-    # Hierarchy Expansion (FULL SET, ONCE)
-    # --------------------------------------------------------
-    async def _fetch_hierarchy(self, cuis: List[str], batch_size: int = 100, max_concurrent: int = 10) -> Dict:
-        """
-        Batched + parallel hierarchy expansion using the subnetwork API.
-        """
-        headers = GCPTokenProvider.get_headers()
-        parent_to_children = defaultdict(list)
-        child_to_parents = defaultdict(list)
-        all_cuis = set(cuis)
+        # Caches
+        self._hierarchy_cache = {}
+        self._ic_scores_cache = {}
+        self._embeddings_cache = {}
+        self._missing_embeddings_total = 0
 
-        # Normalize to base CUIs
-        normalized = [
-            extract_base_cui(c) for c in cuis if extract_base_cui(c)
+    # --------------------- Main Reduction Function ---------------------
+    def reduce(self, input_cuis: List[str]) -> Tuple[List[str], ReductionStats]:
+        start_time = time.time()
+        input_cuis = list(set(input_cuis))
+        initial_count = len(input_cuis)
+        logger.info(f"Starting reduction for {initial_count} CUIs")
+
+        # Group by semantic type
+        semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
+        logger.info(f"Created {len(semantic_groups)} semantic groups")
+
+        all_reduced_cuis = []
+        group_stats = {}
+        total_after_ic = 0
+        total_after_stage1 = 0
+        total_after_stage2 = 0
+        total_after_stage3 = 0
+
+        for group_name, group_cuis in semantic_groups.items():
+            if not group_cuis:
+                continue
+            
+            logger.info(f"\nProcessing {group_name}: {len(group_cuis)} CUIs")
+
+            # Build hierarchy
+            hierarchy = self._build_hierarchy_depthwise(group_cuis)
+
+            # Compute IC scores
+            ic_scores = self._compute_ic_scores_within_group(hierarchy, group_cuis, group_name)
+            
+            # Strategic IC selection
+            selected_cuis, covered_set = self._strategic_ic_selection(
+                group_cuis, ic_scores, hierarchy
+            )
+            total_after_ic += len(selected_cuis)
+            logger.info(f"  After IC selection: {len(group_cuis)} → {len(selected_cuis)}")
+            
+            # Fetch embeddings for selected CUIs
+            embeddings_dict = self._fetch_embeddings_batch(selected_cuis)
+            
+            # Multi-stage similarity reduction
+            stage1_cuis = self._remove_high_similarity(
+                selected_cuis, embeddings_dict, self.similarity_stage1, 'center'
+            )
+            total_after_stage1 += len(stage1_cuis)
+            logger.info(f"  After Stage 1 (0.95): {len(selected_cuis)} → {len(stage1_cuis)}")
+            
+            stage2_cuis = self._remove_high_similarity(
+                stage1_cuis, embeddings_dict, self.similarity_stage2, 'coverage'
+            )
+            total_after_stage2 += len(stage2_cuis)
+            logger.info(f"  After Stage 2 (0.90): {len(stage1_cuis)} → {len(stage2_cuis)}")
+            
+            stage3_cuis = self._remove_high_similarity(
+                stage2_cuis, embeddings_dict, self.similarity_stage3, 'diverse'
+            )
+            total_after_stage3 += len(stage3_cuis)
+            logger.info(f"  After Stage 3 (0.85): {len(stage2_cuis)} → {len(stage3_cuis)}")
+            
+            all_reduced_cuis.extend(stage3_cuis)
+            
+            group_stats[group_name] = {
+                'original': len(group_cuis),
+                'after_ic': len(selected_cuis),
+                'after_stage1': len(stage1_cuis),
+                'after_stage2': len(stage2_cuis),
+                'final': len(stage3_cuis),
+                'reduction_pct': (1 - len(stage3_cuis)/len(group_cuis)) * 100 if group_cuis else 0
+            }
+
+        # Final deduplication
+        final_cuis = list(set(all_reduced_cuis))
+        
+        # Calculate coverage
+        coverage_score = self._calculate_coverage(input_cuis, final_cuis, self._preloaded_network)
+        
+        stats = ReductionStats(
+            initial_count=initial_count,
+            after_ic_rollup=total_after_ic,
+            after_similarity_stage1=total_after_stage1,
+            after_similarity_stage2=total_after_stage2,
+            after_similarity_stage3=total_after_stage3,
+            final_count=len(final_cuis),
+            ic_rollup_reduction_pct=self._safe_percentage(initial_count - total_after_ic, initial_count),
+            similarity_reduction_pct=self._safe_percentage(total_after_ic - len(final_cuis), total_after_ic),
+            total_reduction_pct=self._safe_percentage(initial_count - len(final_cuis), initial_count),
+            processing_time=time.time() - start_time,
+            ic_threshold_low=self.ic_low_percentile,
+            ic_threshold_high=self.ic_high_percentile,
+            hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
+            group_stats=group_stats,
+            missing_embeddings_count=self._missing_embeddings_total,
+            coverage_score=coverage_score
+        )
+
+        logger.info(f"\nFinal: {initial_count} → {len(final_cuis)} ({stats.total_reduction_pct:.1f}% reduction)")
+        logger.info(f"Coverage: {coverage_score:.1%}")
+
+        return final_cuis, stats
+
+    # --------------------- Strategic IC Selection ---------------------
+    def _strategic_ic_selection(self, group_cuis: List[str], ic_scores: Dict[str, float], hierarchy: Dict) -> Tuple[List[str], Set[str]]:
+        """
+        Select CUIs strategically:
+        - LOW IC (general): Coverage anchors
+        - HIGH IC (specific): Only if not covered
+        """
+        if not ic_scores:
+            return group_cuis, set(group_cuis)
+        
+        # Calculate thresholds
+        ic_values = list(ic_scores.values())
+        low_threshold = np.percentile(ic_values, self.ic_low_percentile)
+        high_threshold = np.percentile(ic_values, self.ic_high_percentile)
+        
+        # 1. Get coverage anchors (LOW IC = general concepts with many descendants)
+        anchors = [cui for cui in group_cuis if ic_scores.get(cui, float('inf')) <= low_threshold]
+        
+        # 2. Calculate coverage
+        covered = set(anchors)
+        parent_to_children = hierarchy.get("parent_to_children", {})
+        
+        for anchor in anchors:
+            # Add all descendants
+            descendants = self._get_all_descendants(anchor, parent_to_children, group_cuis)
+            covered.update(descendants)
+        
+        # 3. Add specific essentials (HIGH IC, not covered)
+        essentials = [
+            cui for cui in group_cuis
+            if ic_scores.get(cui, 0) >= high_threshold and cui not in covered
         ]
+        
+        selected = anchors + essentials
+        
+        logger.info(f"    IC Selection: {len(anchors)} anchors + {len(essentials)} essentials = {len(selected)}")
+        
+        return selected, covered
 
-        timeout = aiohttp.ClientTimeout(total=30)
-        semaphore = asyncio.Semaphore(max_concurrent)
+    def _get_all_descendants(self, cui: str, parent_to_children: Dict, valid_cuis: List[str]) -> Set[str]:
+        """Get all descendants of a CUI within valid set"""
+        descendants = set()
+        to_process = [cui]
+        visited = set()
+        
+        while to_process:
+            current = to_process.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            
+            children = parent_to_children.get(current, [])
+            for child in children:
+                if child in valid_cuis and child not in visited:
+                    descendants.add(child)
+                    to_process.append(child)
+        
+        return descendants
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+    # --------------------- Similarity Reduction ---------------------
+    def _remove_high_similarity(self, cuis: List[str], embeddings_dict: Dict, 
+                                similarity_threshold: float, strategy: str) -> List[str]:
+        """Remove similar CUIs based on embedding similarity"""
+        if len(cuis) <= 1:
+            return cuis
+        
+        # Get embeddings for CUIs that have them
+        valid_cuis = []
+        embeddings = []
+        no_embedding_cuis = []
+        
+        for cui in cuis:
+            if cui in embeddings_dict and embeddings_dict[cui] is not None:
+                valid_cuis.append(cui)
+                embeddings.append(embeddings_dict[cui])
+            else:
+                no_embedding_cuis.append(cui)
+        
+        if len(embeddings) < 2:
+            return cuis
+        
+        embeddings = np.vstack(embeddings)
+        
+        # Compute similarity matrix
+        similarity_matrix = 1 - cosine_distances(embeddings, embeddings)
+        
+        # Find groups of similar CUIs
+        selected_indices = []
+        processed = set()
+        
+        for i in range(len(valid_cuis)):
+            if i in processed:
+                continue
+            
+            # Find all CUIs similar to this one
+            similar_indices = np.where(similarity_matrix[i] > similarity_threshold)[0]
+            
+            if len(similar_indices) == 1:
+                selected_indices.append(i)
+            else:
+                # Select representative based on strategy
+                if strategy == 'center':
+                    # Keep most central (highest avg similarity)
+                    sub_matrix = similarity_matrix[np.ix_(similar_indices, similar_indices)]
+                    avg_similarities = np.mean(sub_matrix, axis=1)
+                    best_local_idx = np.argmax(avg_similarities)
+                    best_idx = similar_indices[best_local_idx]
+                    
+                elif strategy == 'coverage':
+                    # Keep the one with most connections
+                    connections = np.sum(similarity_matrix[similar_indices] > 0.7, axis=1)
+                    best_local_idx = np.argmax(connections)
+                    best_idx = similar_indices[best_local_idx]
+                    
+                elif strategy == 'diverse':
+                    # Keep the most different from already selected
+                    if selected_indices:
+                        selected_embeddings = embeddings[selected_indices]
+                        max_distances = []
+                        for idx in similar_indices:
+                            distances = cosine_distances([embeddings[idx]], selected_embeddings)[0]
+                            max_distances.append(np.max(distances))
+                        best_local_idx = np.argmax(max_distances)
+                        best_idx = similar_indices[best_local_idx]
+                    else:
+                        best_idx = similar_indices[0]
+                else:
+                    best_idx = similar_indices[0]
+                
+                selected_indices.append(best_idx)
+            
+            processed.update(similar_indices)
+        
+        # Combine selected with CUIs without embeddings
+        selected_cuis = [valid_cuis[i] for i in selected_indices]
+        
+        return selected_cuis + no_embedding_cuis
 
-            async def fetch_batch(batch: List[str]):
-                async with semaphore:
-                    try:
-                        async with session.post(
-                            f"{self.subnet_api_url}/subnet/",
-                            headers=headers,
-                            json={"cuis": batch, "cross_context": False}
-                        ) as resp:
-                            if resp.status != 200:
-                                logger.warning(f"Subnetwork API returned {resp.status}")
-                                return [], []
-                            data = await resp.json()
-                            return data.get("output", [[], []])
-                    except Exception as e:
-                        logger.error(f"Subnetwork batch failed: {e}")
-                        return [], []
+    # --------------------- Fetch Embeddings ---------------------
+    def _fetch_embeddings_batch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        """Fetch embeddings for CUIs"""
+        if not cuis:
+            return {}
+        
+        # Check cache first
+        uncached_cuis = [cui for cui in cuis if cui not in self._embeddings_cache]
+        
+        if uncached_cuis:
+            query = f"""
+            SELECT CUI AS cui, embedding
+            FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+            WHERE CUI IN UNNEST(@cuis)
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", uncached_cuis)]
+            )
+            df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+            
+            for _, row in df.iterrows():
+                if row["embedding"] is not None:
+                    emb_array = np.asarray(row["embedding"], dtype=np.float32)
+                    if emb_array.ndim == 1 and emb_array.size > 0:
+                        self._embeddings_cache[row["cui"]] = emb_array
+            
+            # Track missing
+            found_cuis = set(df['cui'].tolist())
+            missing = set(uncached_cuis) - found_cuis
+            self._missing_embeddings_total += len(missing)
+        
+        # Return embeddings for requested CUIs
+        return {cui: self._embeddings_cache.get(cui) for cui in cuis}
 
-            # Create batches
-            tasks = []
-            for i in range(0, len(normalized), batch_size):
-                tasks.append(fetch_batch(normalized[i:i+batch_size]))
+    # --------------------- Coverage Calculation ---------------------
+    def _calculate_coverage(self, original_cuis: List[str], selected_cuis: List[str], network) -> float:
+        """Calculate what percentage of original CUIs are covered by selected CUIs"""
+        if not original_cuis:
+            return 0.0
+        
+        covered = set(selected_cuis)
+        
+        # Add all descendants of selected CUIs
+        for cui in selected_cuis:
+            if network.has_node(cui):
+                descendants = list(network.successors(cui))
+                covered.update(descendants)
+        
+        # Calculate coverage
+        original_set = set(original_cuis)
+        covered_count = len(original_set & covered)
+        
+        return covered_count / len(original_cuis)
 
-            logger.info(f"Fetching hierarchy in {len(tasks)} batches "
-                        f"(batch_size={batch_size}, concurrency={max_concurrent})")
-
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-
-            # Aggregate results
-            for nodes, edges in results:
-                for p, c in edges:
-                    p = extract_base_cui(str(p))
-                    c = extract_base_cui(str(c))
-                    if p and c:
-                        parent_to_children[p].append(c)
-                        child_to_parents[c].append(p)
-                        all_cuis.update([p, c])
-
-        logger.info(f"Hierarchy expansion complete: {len(cuis)} → {len(all_cuis)} CUIs")
-        return {
-            "all_cuis": all_cuis,
-            "parent_to_children": dict(parent_to_children),
-            "child_to_parents": dict(child_to_parents)
-        }
-
-    # --------------------------------------------------------
-    # Semantic Types (Multi-Group Membership)
-    # --------------------------------------------------------
-    def _semantic_groups(self, cuis: List[str]) -> Dict[str, Set[str]]:
+    # --------------------- Semantic Grouping ---------------------
+    def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
         query = f"""
-        SELECT CUI, STY
-        FROM `{self.project}.{self.dataset}.{self.mrsty_table}`
+        SELECT DISTINCT CUI, STY
+        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
         WHERE CUI IN UNNEST(@cuis)
         """
-        df = self.client.query(
-            query,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
-                ]
-            )
-        ).to_dataframe()
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
+        )
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        if df.empty:
+            return {'UNKNOWN': cuis}
 
-        groups = defaultdict(set)
-        for _, r in df.iterrows():
-            groups[r.STY].add(r.CUI)
+        cui_to_types = defaultdict(set)
+        for _, row in df.iterrows():
+            cui_to_types[row['CUI']].add(row['STY'])
 
-        logger.info(f"Created {len(groups)} semantic groups")
-        return groups
+        final_groups = defaultdict(list)
+        for cui in cuis:
+            types = cui_to_types.get(cui, {'UNKNOWN'})
+            # Assign to most specific type (longest name)
+            best_type = max(types, key=lambda x: len(x))
+            final_groups[best_type].append(cui)
+            
+        return dict(final_groups)
 
-    # --------------------------------------------------------
-    # IC Computation (Semantic Subgraph)
-    # --------------------------------------------------------
-    def _compute_ic(self, group: Set[str], hierarchy: Dict) -> Dict[str, float]:
-        p2c = hierarchy["parent_to_children"]
+    # --------------------- Hierarchy from Network ---------------------
+    def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
+        key = tuple(sorted(cuis))
+        if key in self._hierarchy_cache:
+            return self._hierarchy_cache[key]
 
-        def dfs(cui, seen):
-            if cui in seen:
+        all_cuis = set()
+        parent_to_children = defaultdict(list)
+        child_to_parents = defaultdict(list)
+
+        for cui in cuis:
+            if not self._preloaded_network.has_node(cui):
+                continue
+            
+            # Get children and parents
+            for child in self._preloaded_network.successors(cui):
+                if child in cuis:  # Only consider within group
+                    parent_to_children[cui].append(child)
+                    child_to_parents[child].append(cui)
+                    all_cuis.update([cui, child])
+            
+            for parent in self._preloaded_network.predecessors(cui):
+                if parent in cuis:  # Only consider within group
+                    child_to_parents[cui].append(parent)
+                    parent_to_children[parent].append(cui)
+                    all_cuis.update([cui, parent])
+
+        hierarchy = {
+            "parent_to_children": dict(parent_to_children),
+            "child_to_parents": dict(child_to_parents),
+            "all_cuis": all_cuis
+        }
+        self._hierarchy_cache[key] = hierarchy
+        return hierarchy
+
+    # --------------------- IC Scores ---------------------
+    def _compute_ic_scores_within_group(self, hierarchy: Dict, group_cuis: List[str], 
+                                        group_name: str) -> Dict[str, float]:
+        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
+        if cache_key in self._ic_scores_cache:
+            return self._ic_scores_cache[cache_key]
+
+        parent_to_children = hierarchy.get("parent_to_children", {})
+        group_set = set(group_cuis)
+        descendant_counts = {}
+
+        def count_descendants(cui: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if cui in visited or cui not in group_set:
                 return 0
-            seen.add(cui)
-            children = [c for c in p2c.get(cui, []) if c in group]
-            return len(children) + sum(dfs(ch, seen) for ch in children)
+            visited.add(cui)
+            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
+            count = len(children)
+            for child in children:
+                count += count_descendants(child, visited)
+            descendant_counts[cui] = count
+            return count
 
-        desc = {c: dfs(c, set()) for c in group}
-        N = len(group) if len(group) > 0 else 1
-        return {c: -np.log((desc[c] + 1) / N) for c in group}
+        for cui in group_cuis:
+            if cui not in descendant_counts:
+                try:
+                    count_descendants(cui)
+                except RecursionError:
+                    descendant_counts[cui] = 0
 
-    # --------------------------------------------------------
-    # Embedding Fetch
-    # --------------------------------------------------------
-    def _fetch_embeddings(self, cuis: List[str]):
-        bases = list({extract_base_cui(c) for c in cuis if extract_base_cui(c)})
+        group_size = len(group_cuis)
+        ic_scores = {}
+        for cui in group_cuis:
+            desc_count = descendant_counts.get(cui, 0)
+            # IC = -log((descendants + 1) / group_size)
+            # Higher IC = fewer descendants (more specific)
+            # Lower IC = more descendants (more general)
+            ic_scores[cui] = max(0.0, -np.log((desc_count + 1) / group_size))
+        
+        self._ic_scores_cache[cache_key] = ic_scores
+        return ic_scores
 
-        query = f"""
-        SELECT REF_CUI, REF_Embedding
-        FROM `{self.project}.{self.dataset}.{self.embedding_table}`
-        WHERE REF_CUI IN UNNEST(@cuis)
-        """
-        df = self.client.query(
-            query,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", bases)
-                ]
-            )
-        ).to_dataframe()
+    @staticmethod
+    def _safe_percentage(numerator: float, denominator: float) -> float:
+        return (numerator / denominator * 100) if denominator else 0.0
 
-        base_map = {}
-        for _, r in df.iterrows():
-            emb = r.REF_Embedding
-            if isinstance(emb, list):
-                base_map[r.REF_CUI] = np.asarray(emb, dtype=np.float32)
-
-        for c in cuis:
-            b = extract_base_cui(c)
-            if b in base_map:
-                self.embedding_cache[c] = base_map[b]
-
-        logger.info(f"Fetched embeddings for {len(self.embedding_cache)} CUIs")
-
-    # --------------------------------------------------------
-    # Clustering + Selection
-    # --------------------------------------------------------
-    def _cluster_and_select(self, cuis: List[str], similarity=0.88, distance_thr=0.3) -> List[str]:
-        X, labels = [], []
-        for c in cuis:
-            if c in self.embedding_cache:
-                X.append(self.embedding_cache[c])
-                labels.append(c)
-
-        if len(X) < 2:
-            return cuis
-
-        X = np.vstack(X)
-        clustering = AgglomerativeClustering(
-            n_clusters=None,
-            distance_threshold=1 - similarity,
-            linkage="average",
-            metric="cosine"
-        )
-        cluster_ids = clustering.fit_predict(X)
-
-        selected = []
-        for cid in np.unique(cluster_ids):
-            idx = np.where(cluster_ids == cid)[0]
-            centroid = X[idx].mean(axis=0)
-            dists = cosine_distances([centroid], X[idx])[0]
-            keep = idx[dists < distance_thr]
-            if len(keep) == 0:
-                keep = [idx[np.argmin(dists)]]
-            selected.extend(labels[i] for i in keep)
-
-        return list(set(selected))
-
-    # --------------------------------------------------------
-    # FULL REDUCTION PIPELINE
-    # --------------------------------------------------------
-    def reduce(self, input_cuis: List[str]) -> Tuple[List[str], ReductionStats]:
-        start = time.time()
-        input_cuis = list(set(input_cuis))
-
-        hierarchy = asyncio.run(self._fetch_hierarchy(input_cuis))
-        all_nodes = list(hierarchy["all_cuis"])
-
-        semantic_groups = self._semantic_groups(all_nodes)
-
-        retained = []
-        for sty, cuis in semantic_groups.items():
-            subgraph = {
-                "parent_to_children": {
-                    p: [c for c in cs if c in cuis]
-                    for p, cs in hierarchy["parent_to_children"].items()
-                    if p in cuis
-                }
-            }
-            ic = self._compute_ic(cuis, subgraph)
-            threshold = np.percentile(list(ic.values()), 50)
-            retained.extend(c for c, v in ic.items() if v >= threshold)
-
-        retained = list(set(retained))
-        self._fetch_embeddings(retained)
-        final = self._cluster_and_select(retained)
-
-        stats = ReductionStats(
-            initial_count=len(input_cuis),
-            after_ic=len(retained),
-            final_count=len(final),
-            total_reduction_pct=safe_percentage(len(input_cuis) - len(final), len(input_cuis)),
-            processing_time=time.time() - start
-        )
-
-        return final, stats
-
-# ------------------------------------------------------------
-# MAIN FUNCTION
-# ------------------------------------------------------------
-def main():
-    # -------- CONFIG --------
-    PROJECT_ID = "your_project_id"
-    DATASET_ID = "your_dataset"
-    CUI_API_URL = "your_cui_extraction_api_url"
-    SUBNET_API_URL = "your_subnet_api_url"
-    MRSTY_TABLE = "MRSTY"
-    EMBEDDING_TABLE = "your_embedding_table"
-
-    TEXTS = ["grams"]
-
-    # -------- EXECUTION --------
-    api_client = CUIAPIClient(CUI_API_URL)
-    extracted = api_client.extract_cuis(TEXTS)
-
-    filtered = filter_allowed_cuis(
-        extracted,
-        PROJECT_ID,
-        DATASET_ID
-    )
-
-    reducer = EnhancedCUIReducer(
-        project=PROJECT_ID,
-        dataset=DATASET_ID,
-        subnet_api_url=SUBNET_API_URL,
-        mrsty_table=MRSTY_TABLE,
-        embedding_table=EMBEDDING_TABLE
-    )
-
-    final_cuis, stats = reducer.reduce(filtered)
-
-    logger.info("=" * 80)
-    logger.info("FINAL RESULTS")
-    logger.info("=" * 80)
-    logger.info(f"Final CUIs ({len(final_cuis)}): {final_cuis}")
-    logger.info(f"Stats: {stats.to_dict()}")
-
-# ------------------------------------------------------------
-# ENTRY POINT
-# ------------------------------------------------------------
+# --------------------- Main Pipeline ---------------------
 if __name__ == "__main__":
-    main()
------------------------
-Extract CUIs from input text(s)
+    
+    # Load network pickle
+    NETWORK_PKL = "/path/to/networkx_cui_context.pkl"
+    with open(NETWORK_PKL, "rb") as f:
+        UMLS_NETWORK_OBJ = pickle.load(f)
+    logger.info(f"Network loaded with {len(UMLS_NETWORK_OBJ.nodes())} nodes")
 
-Filter to ICD / SNOMED / LOINC
+    # Configuration
+    project_id = "your_project_id"
+    dataset_id = "your_dataset"
+    cui_embeddings_table = "cui_embeddings"
+    mrsty_table = "MRSTY"
+    api_url = "your_api_url"
+    
+    texts = ["diabetes cancer treatment"]
 
-Build hierarchy using subnetwork API on the full filtered CUI set
+    # Extract CUIs
+    api_client = CUIAPIClient(api_url)
+    extracted_cuis = api_client.extract_cuis_batch(texts)
 
-Assign semantic types (MRSTY) to all hierarchy-expanded CUIs
+    # Filter CUIs
+    filtered_cuis = filter_allowed_cuis(extracted_cuis, project_id, dataset_id)
 
-Group CUIs by semantic type and Allow multi-group membership
+    # Reduce CUIs with aggressive parameters
+    reducer = EnhancedCUIReducer(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        cui_embeddings_table=cui_embeddings_table,
+        mrsty_table=mrsty_table,
+        umls_network_obj=UMLS_NETWORK_OBJ,
+        # Strategic IC selection
+        ic_low_percentile=30,   # Keep general concepts below this
+        ic_high_percentile=70,  # Keep specific concepts above this (if not covered)
+        # Multi-stage similarity reduction
+        similarity_stage1=0.95,  # Remove near-duplicates
+        similarity_stage2=0.90,  # Remove close variants
+        similarity_stage3=0.85   # Aggressive final reduction
+    )
+    
+    final_cuis, stats = reducer.reduce(filtered_cuis)
 
-Compute IC scores within each semantic-type subgraph
-
-Generate IC scores per group
-
-Keep CUIs with IC > 50th percentile within each group
-
-Ungroup all retained CUIs and remove duplicates
-
-Fetch embeddings and cluster by similarity
-
-From each cluster, pick CUIs far from the centroid
-
-Collate all CUIs and remove duplicates
+    # Print results
+    logger.info("\n" + "="*60)
+    logger.info("FINAL RESULTS")
+    logger.info("="*60)
+    logger.info(f"Reduction Stats: {json.dumps(stats.to_dict(), indent=2)}")
+    logger.info(f"\nStage-by-stage reduction:")
+    logger.info(f"  Initial: {stats.initial_count}")
+    logger.info(f"  After IC: {stats.after_ic_rollup} ({stats.ic_rollup_reduction_pct:.1f}% reduction)")
+    logger.info(f"  After Stage 1: {stats.after_similarity_stage1}")
+    logger.info(f"  After Stage 2: {stats.after_similarity_stage2}")
+    logger.info(f"  After Stage 3: {stats.after_similarity_stage3}")
+    logger.info(f"  Final: {stats.final_count} ({stats.total_reduction_pct:.1f}% total reduction)")
+    logger.info(f"  Coverage: {stats.coverage_score:.1%}")
