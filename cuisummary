@@ -18,6 +18,7 @@ from sklearn.metrics.pairwise import cosine_distances
 import requests
 from requests.adapters import HTTPAdapter, Retry
 import threading
+import pandas as pd
 
 nest_asyncio.apply()
 
@@ -75,6 +76,7 @@ class ReductionStats:
     api_call_time: float = 0.0
     group_stats: Dict = None
     missing_embeddings_count: int = 0
+    found_embeddings_count: int = 0
     embedding_fetch_time: float = 0.0
     hierarchy_fetch_time: float = 0.0
 
@@ -87,21 +89,37 @@ def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> Lis
         return []
     
     try:
-        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"FILTERING CUIs BY SAB")
+        logger.info(f"{'='*60}")
+        logger.info(f"Input: {len(cuis)} CUIs to filter")
+        
+        # Sample of input CUIs
+        sample_cuis = list(cuis)[:20]
+        logger.info(f"Sample input CUIs:")
+        for i, cui in enumerate(sample_cuis):
+            logger.info(f"  {i+1:2d}. {cui}")
+        
         client = bigquery.Client(project=project_id)
         
-        # Normalize CUIs for the query (remove suffixes)
-        normalized_map = {}
+        # For filtering, check both raw and normalized formats
+        all_cui_variants = set()
+        cui_mapping = defaultdict(set)
+        
         for cui in cuis:
-            # Extract base CUI (C + 7 digits)
-            match = re.match(r'^(C\d{7})', str(cui).upper())
+            cui_upper = str(cui).upper()
+            all_cui_variants.add(cui_upper)
+            
+            # Extract base CUI if it has a suffix
+            match = re.match(r'^(C\d{7})', cui_upper)
             if match:
                 base_cui = match.group(1)
-                if base_cui not in normalized_map:
-                    normalized_map[base_cui] = []
-                normalized_map[base_cui].append(cui)
+                all_cui_variants.add(base_cui)
+                cui_mapping[base_cui].add(cui)
         
-        # Query using base CUIs
+        logger.info(f"Created {len(all_cui_variants)} variants for lookup")
+        
+        # Query using all variants
         query = f"""
         SELECT DISTINCT CUI
         FROM `{project_id}.{dataset_id}.MRCONSO`
@@ -113,23 +131,31 @@ def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> Lis
         
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", list(normalized_map.keys()))
+                bigquery.ArrayQueryParameter("cuis", "STRING", list(all_cui_variants))
             ]
         )
         
         df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
         
-        # Map back to original CUIs with suffixes
         allowed_base = set(df['CUI'].tolist())
-        allowed_with_suffix = []
+        allowed_final = set()
         
-        for base_cui in allowed_base:
-            if base_cui in normalized_map:
-                # Include all original CUIs (with suffixes) that map to this base
-                allowed_with_suffix.extend(normalized_map[base_cui])
+        # Include original CUIs that match or whose base matches
+        for cui in cuis:
+            cui_upper = cui.upper()
+            if cui_upper in allowed_base:
+                allowed_final.add(cui)
+            else:
+                match = re.match(r'^(C\d{7})', cui_upper)
+                if match and match.group(1) in allowed_base:
+                    allowed_final.add(cui)
         
-        logger.info(f"{len(allowed_with_suffix)} CUIs after filter (including suffixes)")
-        return allowed_with_suffix
+        logger.info(f"Filter results: {len(allowed_final)} CUIs retained")
+        logger.info(f"Sample retained CUIs (first 20):")
+        for i, cui in enumerate(list(allowed_final)[:20]):
+            logger.info(f"  {i+1:2d}. {cui}")
+        
+        return list(allowed_final)
         
     except Exception as e:
         logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
@@ -161,9 +187,15 @@ class CUIAPIClient:
     def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
         if not texts:
             return set()
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"EXTRACTING CUIs FROM TEXT")
+        logger.info(f"{'='*60}")
+        
         payload = {"query_texts": texts, "top_k": self.top_k}
         headers = GCPTokenProvider.get_headers()
         logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
+        
         try:
             response = self.session.post(
                 self.api_base_url,
@@ -182,7 +214,12 @@ class CUIAPIClient:
                 cuis = data.get(text, [])
                 if isinstance(cuis, list):
                     all_cuis.update(str(c) for c in cuis if c)
-            logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
+            
+            logger.info(f"Extracted {len(all_cuis)} unique CUIs")
+            logger.info(f"Sample extracted CUIs (first 20):")
+            for i, cui in enumerate(list(all_cuis)[:20]):
+                logger.info(f"  {i+1:2d}. {cui}")
+            
             return all_cuis
         except Exception as e:
             logger.error(f"API call failed: {str(e)}")
@@ -215,11 +252,9 @@ class EnhancedCUIReducer:
         self._hierarchy_cache = {}
         self._ic_scores_cache = {}
         self._description_cache = {}
-        self._embedding_batch_cache = {}
+        self._embedding_cache = {}
         self._missing_embeddings_total = 0
-        
-        # Pre-compile regex for better performance
-        self._cui_regex = re.compile(r'^(C\d{7})')
+        self._found_embeddings_total = 0
 
     def reduce(
         self,
@@ -233,27 +268,38 @@ class EnhancedCUIReducer:
         input_cuis = list(set(input_cuis))
         initial_count = len(input_cuis)
         
-        logger.info(f"Starting semantic-group based reduction for {initial_count} CUIs")
+        logger.info("\n" + "="*80)
+        logger.info(f"STARTING REDUCTION PIPELINE")
+        logger.info("="*80)
+        logger.info(f"Initial CUI count: {initial_count}")
+        logger.info(f"First 20 input CUIs:")
+        for i, cui in enumerate(input_cuis[:20]):
+            logger.info(f"  {i+1:2d}. {cui}")
 
-        # Pre-fetch ALL embeddings in one query for better performance
-        logger.info("Pre-fetching all embeddings...")
+        # Pre-fetch ALL embeddings
+        logger.info("\nPre-fetching all embeddings...")
         embedding_fetch_start = time.time()
-        self._prefetch_all_embeddings(input_cuis)
+        self._smart_embedding_fetch(input_cuis)
         embedding_fetch_time = time.time() - embedding_fetch_start
-        logger.info(f"Embedding fetch completed in {embedding_fetch_time:.2f}s")
 
         # Group by semantic type
         semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
-        logger.info(f"Created {len(semantic_groups)} semantic groups")
+        logger.info(f"\nCreated {len(semantic_groups)} semantic groups")
+        for group_name, group_cuis in list(semantic_groups.items())[:5]:
+            logger.info(f"  - {group_name}: {len(group_cuis)} CUIs")
         
         all_reduced_cuis = []
         group_stats = {}
         total_after_ic = 0
         hierarchy_fetch_start = time.time()
         
-        for group_name, group_cuis in semantic_groups.items():
+        for group_idx, (group_name, group_cuis) in enumerate(semantic_groups.items()):
             if not group_cuis:
                 continue
+            
+            logger.info(f"\n{'='*40}")
+            logger.info(f"Processing Group {group_idx+1}/{len(semantic_groups)}: {group_name} ({len(group_cuis)} CUIs)")
+            logger.info(f"{'='*40}")
             
             # Build hierarchy within group
             group_hierarchy = self._build_hierarchy_depthwise(group_cuis)
@@ -276,8 +322,11 @@ class EnhancedCUIReducer:
                     cui for cui in group_cuis 
                     if group_ic_scores.get(cui, 0) >= ic_threshold
                 ]
+                
+                logger.info(f"  IC filtering: {len(group_cuis)} -> {len(high_ic_cuis)} (threshold: {ic_threshold:.2f})")
             else:
                 high_ic_cuis = group_cuis
+                logger.info(f"  No IC scores computed, keeping all {len(group_cuis)} CUIs")
             
             total_after_ic += len(high_ic_cuis)
             
@@ -288,8 +337,10 @@ class EnhancedCUIReducer:
                     similarity_threshold,
                     distance_from_centroid_threshold
                 )
+                logger.info(f"  Clustering: {len(high_ic_cuis)} -> {len(group_reduced)}")
             else:
                 group_reduced = high_ic_cuis
+                logger.info(f"  Single CUI, no clustering needed")
             
             all_reduced_cuis.extend(group_reduced)
             
@@ -306,14 +357,20 @@ class EnhancedCUIReducer:
         final_cuis = list(set(all_reduced_cuis))
         final_count = len(final_cuis)
         
+        logger.info(f"\n{'='*60}")
+        logger.info(f"FINAL RESULTS")
+        logger.info(f"{'='*60}")
+        logger.info(f"Final CUI count: {final_count}")
+        logger.info(f"First 20 final CUIs:")
+        for i, cui in enumerate(final_cuis[:20]):
+            logger.info(f"  {i+1:2d}. {cui}")
+        
         # Validate coverage
         coverage_score = self._calculate_coverage_fast(input_cuis, final_cuis)
-        logger.info(f"Coverage score: {coverage_score:.2%} of original CUIs have representative")
+        logger.info(f"\nCoverage score: {coverage_score:.2%} of original CUIs have representative")
 
         # Fetch descriptions for final CUIs
         self._fetch_descriptions(final_cuis)
-
-        logger.info(f"Total missing embeddings: {self._missing_embeddings_total}")
         
         stats = ReductionStats(
             initial_count=initial_count,
@@ -328,28 +385,74 @@ class EnhancedCUIReducer:
             api_call_time=0.0,
             group_stats=group_stats,
             missing_embeddings_count=self._missing_embeddings_total,
+            found_embeddings_count=self._found_embeddings_total,
             embedding_fetch_time=embedding_fetch_time,
             hierarchy_fetch_time=hierarchy_fetch_time
         )
 
         return final_cuis, stats
 
-    def _prefetch_all_embeddings(self, all_cuis: List[str]) -> None:
-        """Pre-fetch all embeddings in a single query for performance"""
+    def _smart_embedding_fetch(self, all_cuis: List[str]) -> None:
+        """
+        Fetch embeddings with detailed logging - embeddings table has CUIs WITHOUT suffixes
+        """
         
-        # Normalize all CUIs
-        normalized_set = set()
+        logger.info("="*80)
+        logger.info("EMBEDDING FETCH DIAGNOSTIC")
+        logger.info("="*80)
+        
+        # Step 1: Log sample of input CUIs
+        logger.info(f"\n1. INPUT CUIs (first 20 of {len(all_cuis)}):")
+        for i, cui in enumerate(all_cuis[:20]):
+            logger.info(f"   {i+1:2d}. {cui}")
+        
+        # Step 2: Create normalization mapping
+        cui_to_normalized = {}
+        normalized_to_originals = defaultdict(list)
+        
         for cui in all_cuis:
-            norm = self._normalize_cui(cui)
-            if norm:
-                normalized_set.add(norm)
+            # Extract base CUI (C + 7 digits)
+            match = re.match(r'^(C\d{7})', str(cui).upper())
+            if match:
+                normalized = match.group(1)
+                cui_to_normalized[cui] = normalized
+                normalized_to_originals[normalized].append(cui)
+            else:
+                logger.warning(f"   Could not normalize: {cui}")
         
-        normalized_list = list(normalized_set)
+        unique_normalized = list(normalized_to_originals.keys())
         
-        if not normalized_list:
-            return
+        logger.info(f"\n2. NORMALIZATION:")
+        logger.info(f"   - Original CUIs: {len(all_cuis)}")
+        logger.info(f"   - Unique normalized CUIs: {len(unique_normalized)}")
+        logger.info(f"   - First 20 normalized CUIs:")
+        for i, norm_cui in enumerate(unique_normalized[:20]):
+            originals = normalized_to_originals[norm_cui]
+            logger.info(f"   {i+1:2d}. {norm_cui} <- {originals[:3]}{'...' if len(originals) > 3 else ''}")
         
-        # Fetch all embeddings in one query
+        # Step 3: Check what's actually in the embedding table
+        sample_query = f"""
+        SELECT REF_CUI 
+        FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+        WHERE REF_CUI IN UNNEST(@sample_cuis)
+        LIMIT 20
+        """
+        
+        sample_cuis = unique_normalized[:100]
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("sample_cuis", "STRING", sample_cuis)
+            ]
+        )
+        
+        sample_df = self.client.query(sample_query, job_config=job_config).result().to_dataframe()
+        
+        logger.info(f"\n3. EMBEDDING TABLE CHECK (found {len(sample_df)} of first 100):")
+        logger.info(f"   Sample CUIs found in embedding table:")
+        for i, cui in enumerate(sample_df['REF_CUI'].tolist()[:20]):
+            logger.info(f"   {i+1:2d}. {cui}")
+        
+        # Step 4: Fetch all embeddings
         query = f"""
         SELECT 
             REF_CUI AS cui,
@@ -358,39 +461,206 @@ class EnhancedCUIReducer:
         WHERE REF_CUI IN UNNEST(@cuis)
         """
         
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", normalized_list)
-            ]
-        )
+        batch_size = 5000
+        all_embeddings = {}
+        total_null_embeddings = 0
+        total_invalid_embeddings = 0
         
-        df = self.client.query(query, job_config=job_config).result(timeout=120).to_dataframe()
-        
-        # Cache embeddings
-        for _, row in df.iterrows():
-            cui = row['cui']
-            emb = row['embedding']
+        for batch_idx, i in enumerate(range(0, len(unique_normalized), batch_size)):
+            batch = unique_normalized[i:i + batch_size]
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+                ]
+            )
             
-            if emb is not None:
-                arr = np.asarray(emb, dtype=np.float32)
-                if arr.ndim == 1 and arr.size > 0:
-                    self._embedding_batch_cache[cui] = arr
+            df = self.client.query(query, job_config=job_config).result(timeout=120).to_dataframe()
+            
+            logger.info(f"   Batch {batch_idx + 1}: Queried {len(batch)} CUIs, Got {len(df)} results")
+            
+            for _, row in df.iterrows():
+                base_cui = row['cui']
+                emb = row['embedding']
+                
+                if emb is None:
+                    total_null_embeddings += 1
+                else:
+                    arr = np.asarray(emb, dtype=np.float32)
+                    if arr.ndim == 1 and arr.size > 0:
+                        all_embeddings[base_cui] = arr
+                    else:
+                        total_invalid_embeddings += 1
         
-        logger.info(f"Pre-fetched {len(self._embedding_batch_cache)} embeddings")
+        logger.info(f"\n4. EMBEDDING FETCH RESULTS:")
+        logger.info(f"   - Requested: {len(unique_normalized)} unique normalized CUIs")
+        logger.info(f"   - Found valid embeddings: {len(all_embeddings)}")
+        logger.info(f"   - NULL embeddings: {total_null_embeddings}")
+        logger.info(f"   - Invalid embeddings: {total_invalid_embeddings}")
+        logger.info(f"   - Missing completely: {len(unique_normalized) - len(all_embeddings) - total_null_embeddings - total_invalid_embeddings}")
+        
+        # Step 5: Map to original CUIs
+        mapped_count = 0
+        for normalized_cui, embedding in all_embeddings.items():
+            for original_cui in normalized_to_originals[normalized_cui]:
+                self._embedding_cache[original_cui] = embedding
+                mapped_count += 1
+        
+        logger.info(f"\n5. MAPPING TO ORIGINAL CUIs:")
+        logger.info(f"   - Mapped {len(all_embeddings)} embeddings to {mapped_count} original CUIs")
+        
+        # Step 6: Calculate final statistics
+        self._found_embeddings_total = sum(1 for cui in all_cuis if cui in self._embedding_cache)
+        self._missing_embeddings_total = len(all_cuis) - self._found_embeddings_total
+        
+        # Detailed missing analysis
+        missing_originals = [cui for cui in all_cuis if cui not in self._embedding_cache]
+        missing_normalized = set()
+        for cui in missing_originals:
+            if cui in cui_to_normalized:
+                missing_normalized.add(cui_to_normalized[cui])
+        
+        logger.info(f"\n6. FINAL STATISTICS:")
+        logger.info(f"   - Total input CUIs: {len(all_cuis)}")
+        logger.info(f"   - CUIs with embeddings: {self._found_embeddings_total}")
+        logger.info(f"   - CUIs missing embeddings: {self._missing_embeddings_total}")
+        logger.info(f"   - Unique normalized CUIs missing: {len(missing_normalized)}")
+        
+        if missing_normalized:
+            logger.info(f"\n   First 20 missing normalized CUIs:")
+            for i, norm_cui in enumerate(list(missing_normalized)[:20]):
+                originals = [c for c in normalized_to_originals[norm_cui] if c not in self._embedding_cache]
+                logger.info(f"   {i+1:2d}. {norm_cui} (originals: {originals[:3]})")
+        
+        logger.info("="*80)
+
+    def _cluster_and_select_diverse(
+        self,
+        cui_list: List[str],
+        similarity_threshold: float,
+        distance_threshold: float
+    ) -> List[str]:
+        
+        logger.info(f"\n  {'='*50}")
+        logger.info(f"  CLUSTERING {len(cui_list)} CUIs")
+        logger.info(f"  {'='*50}")
+        
+        if len(cui_list) <= 1:
+            return cui_list
+        
+        try:
+            # Log input CUIs
+            logger.info(f"  Input CUIs (first 20):")
+            for i, cui in enumerate(cui_list[:20]):
+                has_emb = cui in self._embedding_cache
+                logger.info(f"    {i+1:2d}. {cui} - Embedding: {'YES' if has_emb else 'NO'}")
+            
+            # Collect embeddings
+            embeddings_list = []
+            cuis_with_embeddings = []
+            cuis_without_embeddings = []
+            
+            for cui in cui_list:
+                if cui in self._embedding_cache:
+                    embeddings_list.append(self._embedding_cache[cui])
+                    cuis_with_embeddings.append(cui)
+                else:
+                    cuis_without_embeddings.append(cui)
+            
+            logger.info(f"\n  Embedding Status:")
+            logger.info(f"    - With embeddings: {len(cuis_with_embeddings)}")
+            logger.info(f"    - Without embeddings: {len(cuis_without_embeddings)}")
+            
+            if cuis_without_embeddings and len(cuis_without_embeddings) <= 20:
+                logger.info(f"    - CUIs without embeddings: {cuis_without_embeddings}")
+            elif cuis_without_embeddings:
+                logger.info(f"    - First 20 CUIs without embeddings: {cuis_without_embeddings[:20]}")
+            
+            if len(embeddings_list) < 2:
+                logger.warning(f"  Insufficient embeddings for clustering, returning all {len(cui_list)} CUIs")
+                return cui_list
+            
+            embeddings = np.vstack(embeddings_list)
+            logger.info(f"\n  Clustering {len(embeddings)} CUIs with embeddings...")
+            
+            # Perform clustering
+            clustering = AgglomerativeClustering(
+                n_clusters=None,
+                distance_threshold=1 - similarity_threshold,
+                metric="cosine",
+                linkage="average"
+            )
+            
+            labels = clustering.fit_predict(embeddings)
+            unique_clusters = np.unique(labels)
+            logger.info(f"    - Found {len(unique_clusters)} clusters")
+            
+            # Select diverse CUIs
+            selected_cuis = []
+            
+            for cluster_id in unique_clusters:
+                cluster_indices = np.where(labels == cluster_id)[0]
+                cluster_size = len(cluster_indices)
+                
+                if cluster_size == 1:
+                    selected_cuis.append(cuis_with_embeddings[cluster_indices[0]])
+                else:
+                    cluster_embeddings = embeddings[cluster_indices]
+                    centroid = np.mean(cluster_embeddings, axis=0)
+                    distances = cosine_distances([centroid], cluster_embeddings)[0]
+                    
+                    far_indices = cluster_indices[distances > distance_threshold]
+                    
+                    if len(far_indices) > 0:
+                        for idx in far_indices:
+                            selected_cuis.append(cuis_with_embeddings[idx])
+                    else:
+                        farthest_idx = cluster_indices[np.argmax(distances)]
+                        selected_cuis.append(cuis_with_embeddings[farthest_idx])
+            
+            # Add CUIs without embeddings
+            selected_cuis.extend(cuis_without_embeddings)
+            
+            logger.info(f"\n  Clustering Results:")
+            logger.info(f"    - Selected from clustering: {len(selected_cuis) - len(cuis_without_embeddings)}")
+            logger.info(f"    - Added without embeddings: {len(cuis_without_embeddings)}")
+            logger.info(f"    - Total selected: {len(selected_cuis)}")
+            logger.info(f"    - Reduction: {len(cui_list)} -> {len(selected_cuis)} ({100*(1-len(selected_cuis)/len(cui_list)):.1f}% reduced)")
+            
+            logger.info(f"\n  Selected CUIs (first 20):")
+            for i, cui in enumerate(selected_cuis[:20]):
+                logger.info(f"    {i+1:2d}. {cui}")
+            
+            return selected_cuis
+            
+        except Exception as e:
+            logger.error(f"  Clustering failed: {str(e)}", exc_info=True)
+            return cui_list
 
     def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
-        """Dynamically group CUIs by their semantic type names (STY) from MRSTY table"""
+        """Group CUIs by semantic type"""
         
-        # Normalize CUIs for query
-        normalized_map = {}
+        logger.info(f"\n{'='*60}")
+        logger.info(f"GROUPING BY SEMANTIC TYPE")
+        logger.info(f"{'='*60}")
+        
+        # Create mapping for normalization
+        cui_variants = set()
+        variant_to_original = {}
+        
         for cui in cuis:
-            norm = self._normalize_cui(cui)
-            if norm:
-                if norm not in normalized_map:
-                    normalized_map[norm] = []
-                normalized_map[norm].append(cui)
+            cui_upper = cui.upper()
+            cui_variants.add(cui_upper)
+            variant_to_original[cui_upper] = cui
+            
+            # Also add base CUI
+            match = re.match(r'^(C\d{7})', cui_upper)
+            if match:
+                base_cui = match.group(1)
+                cui_variants.add(base_cui)
+                if base_cui not in variant_to_original:
+                    variant_to_original[base_cui] = cui
         
-        # Query to get all CUI-STY mappings
+        # Query semantic types
         query = f"""
         WITH cui_types AS (
             SELECT DISTINCT 
@@ -406,7 +676,7 @@ class EnhancedCUIReducer:
         
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", list(normalized_map.keys()))
+                bigquery.ArrayQueryParameter("cuis", "STRING", list(cui_variants))
             ]
         )
         
@@ -416,21 +686,20 @@ class EnhancedCUIReducer:
             logger.warning("No semantic type information found in MRSTY")
             return {'UNKNOWN': cuis}
         
-        # Group by semantic type
-        semantic_groups = defaultdict(set)
+        # Build semantic groups
         cui_to_types = defaultdict(set)
         
         for _, row in df.iterrows():
-            base_cui = row['CUI']
+            cui_in_table = row['CUI']
             sty = row['STY']
             
-            # Map back to original CUIs with suffixes
-            if base_cui in normalized_map:
-                for original_cui in normalized_map[base_cui]:
-                    semantic_groups[sty].add(original_cui)
-                    cui_to_types[original_cui].add(sty)
+            # Map back to all original CUIs that match this base
+            for orig_cui in cuis:
+                orig_upper = orig_cui.upper()
+                if orig_upper == cui_in_table or orig_upper.startswith(cui_in_table + '-'):
+                    cui_to_types[orig_cui].add(sty)
         
-        # Handle CUIs with multiple or no semantic types
+        # Assign each CUI to a group
         final_groups = defaultdict(list)
         
         for cui in cuis:
@@ -441,9 +710,13 @@ class EnhancedCUIReducer:
                 if len(types) == 1:
                     final_groups[list(types)[0]].append(cui)
                 else:
-                    # Choose most specific type (longer name)
+                    # Choose most specific type
                     sorted_types = sorted(types, key=lambda x: (-len(x), x))
                     final_groups[sorted_types[0]].append(cui)
+        
+        logger.info(f"Created {len(final_groups)} semantic groups")
+        for group_name, group_cuis in list(final_groups.items())[:10]:
+            logger.info(f"  - {group_name}: {len(group_cuis)} CUIs")
         
         return dict(final_groups)
 
@@ -497,150 +770,6 @@ class EnhancedCUIReducer:
         self._ic_scores_cache[cache_key] = ic_scores
         return ic_scores
 
-    def _cluster_and_select_diverse(
-        self,
-        cui_list: List[str],
-        similarity_threshold: float,
-        distance_threshold: float
-    ) -> List[str]:
-
-        if len(cui_list) <= 1:
-            return cui_list
-
-        try:
-            # Normalize CUIs - Remove suffixes
-            raw_to_norm = {}
-            norm_to_raw = defaultdict(list)
-            
-            for raw_cui in cui_list:
-                normalized = self._normalize_cui(raw_cui)
-                if normalized:
-                    raw_to_norm[raw_cui] = normalized
-                    norm_to_raw[normalized].append(raw_cui)
-            
-            normalized_cuis = list(set(raw_to_norm.values()))
-            
-            if len(normalized_cuis) < 2:
-                return cui_list
-            
-            # Use pre-fetched embeddings
-            valid_embeddings = []
-            valid_cuis = []
-            missing_norms = []
-            
-            for norm_cui in normalized_cuis:
-                if norm_cui in self._embedding_batch_cache:
-                    valid_embeddings.append(self._embedding_batch_cache[norm_cui])
-                    valid_cuis.append(norm_cui)
-                else:
-                    missing_norms.append(norm_cui)
-            
-            if missing_norms:
-                self._missing_embeddings_total += len(missing_norms)
-                if len(missing_norms) <= 5:
-                    logger.debug(f"Missing embeddings for: {missing_norms}")
-            
-            if len(valid_embeddings) < 2:
-                logger.warning(f"Only {len(valid_embeddings)} valid embeddings found")
-                return cui_list
-            
-            embeddings = np.vstack(valid_embeddings)
-            cuis = np.array(valid_cuis)
-            
-            # Clustering
-            clustering = AgglomerativeClustering(
-                n_clusters=None,
-                distance_threshold=1 - similarity_threshold,
-                metric="cosine",
-                linkage="average"
-            )
-            
-            labels = clustering.fit_predict(embeddings)
-            
-            # Select diverse CUIs from each cluster
-            selected_normalized = set()
-            
-            for cluster_id in np.unique(labels):
-                cluster_indices = np.where(labels == cluster_id)[0]
-                
-                if len(cluster_indices) == 1:
-                    selected_normalized.add(cuis[cluster_indices[0]])
-                    continue
-                
-                cluster_embeddings = embeddings[cluster_indices]
-                centroid = np.mean(cluster_embeddings, axis=0)
-                distances = cosine_distances([centroid], cluster_embeddings)[0]
-                
-                far_indices = cluster_indices[distances > distance_threshold]
-                
-                if len(far_indices) > 0:
-                    selected_normalized.update(cuis[far_indices])
-                else:
-                    farthest_idx = cluster_indices[np.argmax(distances)]
-                    selected_normalized.add(cuis[farthest_idx])
-
-            # Map back to original CUIs with suffixes
-            final_cuis = []
-            
-            for norm_cui in selected_normalized:
-                if norm_cui in norm_to_raw:
-                    final_cuis.extend(norm_to_raw[norm_cui])
-            
-            for norm_cui in missing_norms:
-                if norm_cui in norm_to_raw:
-                    final_cuis.extend(norm_to_raw[norm_cui])
-            
-            # Remove duplicates while preserving order
-            seen = set()
-            final_cuis = [x for x in final_cuis if not (x in seen or seen.add(x))]
-            
-            return final_cuis
-
-        except Exception as e:
-            logger.error(f"Clustering failed: {str(e)}", exc_info=True)
-            return cui_list
-
-    def _calculate_coverage_fast(self, original_cuis: List[str], reduced_cuis: List[str]) -> float:
-        """Fast coverage calculation using pre-fetched embeddings"""
-        
-        if not original_cuis or not reduced_cuis:
-            return 0.0
-        
-        original_set = set(original_cuis)
-        reduced_set = set(reduced_cuis)
-        
-        # Direct matches
-        covered = original_set & reduced_set
-        covered_count = len(covered)
-        
-        # For non-direct matches, check similarity
-        remaining = original_set - covered
-        
-        if remaining and len(reduced_set) > 0:
-            # Normalize and get embeddings
-            reduced_embeddings = []
-            
-            for cui in reduced_set:
-                norm = self._normalize_cui(cui)
-                if norm and norm in self._embedding_batch_cache:
-                    reduced_embeddings.append(self._embedding_batch_cache[norm])
-            
-            if reduced_embeddings:
-                reduced_matrix = np.vstack(reduced_embeddings)
-                
-                for cui in remaining:
-                    norm = self._normalize_cui(cui)
-                    if norm and norm in self._embedding_batch_cache:
-                        similarities = 1 - cosine_distances(
-                            [self._embedding_batch_cache[norm]], 
-                            reduced_matrix
-                        )[0]
-                        
-                        if np.max(similarities) >= 0.85:
-                            covered_count += 1
-        
-        return covered_count / len(original_cuis)
-
     def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
         key = tuple(sorted(cuis))
         if key in self._hierarchy_cache:
@@ -651,23 +780,23 @@ class EnhancedCUIReducer:
         return hierarchy
 
     async def _fetch_hierarchy_parallel(self, cuis: List[str]) -> Dict:
-        """Fetch hierarchy with better parallelization"""
+        """Fetch hierarchy with parallelization"""
         
         child_to_parents = defaultdict(list)
         parent_to_children = defaultdict(list)
         all_cuis = set(cuis)
 
-        # Normalize CUIs for API call
-        normalized_cuis = []
+        # For hierarchy, normalize to base CUIs
+        normalized_cuis = set()
         for cui in cuis:
-            norm = self._normalize_cui(cui)
-            if norm:
-                normalized_cuis.append(norm)
+            match = re.match(r'^(C\d{7})', cui.upper())
+            if match:
+                normalized_cuis.add(match.group(1))
         
-        normalized_cuis = list(set(normalized_cuis))
+        normalized_list = list(normalized_cuis)
 
         headers = GCPTokenProvider.get_headers()
-        batch_size = 100  # Increased batch size
+        batch_size = 100
         max_concurrent = 10
         timeout = aiohttp.ClientTimeout(total=30)
 
@@ -694,8 +823,8 @@ class EnhancedCUIReducer:
                         return [], []
 
             tasks = []
-            for i in range(0, len(normalized_cuis), batch_size):
-                batch = normalized_cuis[i:i + batch_size]
+            for i in range(0, len(normalized_list), batch_size):
+                batch = normalized_list[i:i + batch_size]
                 tasks.append(fetch_batch_with_semaphore(batch))
 
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -705,9 +834,12 @@ class EnhancedCUIReducer:
                     continue
                 nodes, edges = result
                 for p, c in edges:
-                    p_norm = self._normalize_cui(p)
-                    c_norm = self._normalize_cui(c)
-                    if p_norm and c_norm:
+                    # Normalize to base CUI
+                    p_match = re.match(r'^(C\d{7})', str(p).upper())
+                    c_match = re.match(r'^(C\d{7})', str(c).upper())
+                    if p_match and c_match:
+                        p_norm = p_match.group(1)
+                        c_norm = c_match.group(1)
                         parent_to_children[p_norm].append(c_norm)
                         child_to_parents[c_norm].append(p_norm)
                         all_cuis.update([p_norm, c_norm])
@@ -718,16 +850,58 @@ class EnhancedCUIReducer:
             "all_cuis": all_cuis
         }
 
+    def _calculate_coverage_fast(self, original_cuis: List[str], reduced_cuis: List[str]) -> float:
+        """Fast coverage calculation"""
+        
+        if not original_cuis or not reduced_cuis:
+            return 0.0
+        
+        original_set = set(original_cuis)
+        reduced_set = set(reduced_cuis)
+        
+        # Direct matches
+        covered = original_set & reduced_set
+        covered_count = len(covered)
+        
+        # For non-direct matches, check similarity
+        remaining = original_set - covered
+        
+        if remaining and len(reduced_set) > 0:
+            # Get embeddings for reduced set
+            reduced_embeddings = []
+            
+            for cui in reduced_set:
+                if cui in self._embedding_cache:
+                    reduced_embeddings.append(self._embedding_cache[cui])
+            
+            if reduced_embeddings:
+                reduced_matrix = np.vstack(reduced_embeddings)
+                
+                for cui in remaining:
+                    if cui in self._embedding_cache:
+                        similarities = 1 - cosine_distances(
+                            [self._embedding_cache[cui]], 
+                            reduced_matrix
+                        )[0]
+                        
+                        if np.max(similarities) >= 0.85:
+                            covered_count += 1
+        
+        return covered_count / len(original_cuis)
+
     def _fetch_descriptions(self, cuis: List[str]):
         """Fetch descriptions for CUIs"""
-        normalized_to_fetch = set()
+        cui_variants = set()
         
         for cui in cuis:
-            norm = self._normalize_cui(cui)
-            if norm and norm not in self._description_cache:
-                normalized_to_fetch.add(norm)
+            cui_variants.add(cui.upper())
+            match = re.match(r'^(C\d{7})', cui.upper())
+            if match:
+                cui_variants.add(match.group(1))
         
-        if not normalized_to_fetch:
+        to_fetch = [c for c in cui_variants if c not in self._description_cache]
+        
+        if not to_fetch:
             return
 
         query = f"""
@@ -737,7 +911,7 @@ class EnhancedCUIReducer:
         """
         job_config = bigquery.QueryJobConfig(
             query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", list(normalized_to_fetch))
+                bigquery.ArrayQueryParameter("cuis", "STRING", to_fetch)
             ]
         )
 
@@ -748,11 +922,9 @@ class EnhancedCUIReducer:
 
     @staticmethod
     def _normalize_cui(cui: str) -> Optional[str]:
-        """Extract the base CUI (C + 7 digits) from formats like C0000000-1, C0000000-12"""
+        """Extract the base CUI (C + 7 digits)"""
         if not cui:
             return None
-        
-        # Match C followed by exactly 7 digits (total 8 characters)
         match = re.match(r'^(C\d{7})', str(cui).upper())
         return match.group(1) if match else None
 
@@ -800,18 +972,29 @@ if __name__ == "__main__":
         distance_from_centroid_threshold=0.3
     )
 
-    # Print results
+    # Print detailed results
+    logger.info("\n" + "="*80)
+    logger.info("FINAL SUMMARY")
+    logger.info("="*80)
     logger.info(f"Reduction Stats: {stats.to_dict()}")
-    logger.info(f"Final CUI count: {len(final_cuis)}")
+    logger.info(f"\nCUI Counts:")
+    logger.info(f"  - Initial: {stats.initial_count}")
+    logger.info(f"  - After IC filter: {stats.after_ic_rollup}")
+    logger.info(f"  - Final: {stats.final_count}")
+    logger.info(f"  - Total reduction: {stats.total_reduction_pct:.1f}%")
     
-    # Display timing breakdown
-    logger.info(f"\nTiming Breakdown:")
+    logger.info(f"\nEmbeddings:")
+    logger.info(f"  - Found: {stats.found_embeddings_count}")
+    logger.info(f"  - Missing: {stats.missing_embeddings_count}")
+    logger.info(f"  - Coverage: {(stats.found_embeddings_count / (stats.found_embeddings_count + stats.missing_embeddings_count) * 100):.1f}%")
+    
+    logger.info(f"\nTiming:")
     logger.info(f"  - Embedding fetch: {stats.embedding_fetch_time:.2f}s")
     logger.info(f"  - Hierarchy fetch: {stats.hierarchy_fetch_time:.2f}s")
     logger.info(f"  - Total processing: {stats.processing_time:.2f}s")
     
-    # Display group statistics
     if stats.group_stats:
-        logger.info(f"\nGroup Statistics:")
-        for group, group_stat in stats.group_stats.items():
-            logger.info(f"  {group}: {group_stat['original']} → {group_stat['final']} ({group_stat['reduction_pct']:.1f}% reduction)")
+        logger.info(f"\nTop 5 Semantic Groups by Size:")
+        sorted_groups = sorted(stats.group_stats.items(), key=lambda x: x[1]['original'], reverse=True)[:5]
+        for group, group_stat in sorted_groups:
+            logger.info(f"  - {group}: {group_stat['original']} → {group_stat['final']} ({group_stat['reduction_pct']:.1f}% reduction)")
