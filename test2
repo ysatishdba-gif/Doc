@@ -1,708 +1,406 @@
-"""
-CUI Reduction Validation Framework
-Validates the accuracy and quality of CUI reduction
-"""
+# ============================================================
+# FINAL CLINICALLY SAFE CUI ABSTRACTION PIPELINE
+# ============================================================
+
+import asyncio
+import aiohttp
+import subprocess
+import re
+import time
+import threading
+import logging
+import math
+from typing import List, Dict, Set, Tuple
+from collections import defaultdict
+from dataclasses import dataclass, asdict
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Set, Tuple, Optional
-from collections import defaultdict, Counter
-import logging
-from sklearn.metrics import precision_recall_curve, auc
+import networkx as nx
+import requests
+from requests.adapters import HTTPAdapter, Retry
 from google.cloud import bigquery
-import json
-import time
+from sklearn.metrics.pairwise import cosine_distances
+import nest_asyncio
 
-logging.basicConfig(level=logging.INFO)
+nest_asyncio.apply()
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------
+def extract_base_cui(cui: str) -> str | None:
+    if not cui:
+        return None
+    m = re.match(r"^(C\d{7})", cui.upper())
+    return m.group(1) if m else None
 
-class CUIReductionValidator:
+def safe_percentage(n, d):
+    return (n / d * 100) if d else 0.0
+
+# ------------------------------------------------------------
+# GCP Token Provider
+# ------------------------------------------------------------
+class GCPTokenProvider:
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def get_headers(cls, force=False):
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+
+            token = proc.stdout.strip()
+            cls._token = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            cls._expiry = now + 3300
+            return cls._token
+
+# ------------------------------------------------------------
+# Stats
+# ------------------------------------------------------------
+@dataclass
+class ReductionStats:
+    initial_count: int
+    after_ic: int
+    final_count: int
+    total_reduction_pct: float
+    coverage_score: float
+    processing_time: float
+
+    def to_dict(self):
+        return asdict(self)
+
+# ------------------------------------------------------------
+# CUI Extraction API Client
+# ------------------------------------------------------------
+class CUIAPIClient:
+    def __init__(self, api_url: str, top_k: int = 3):
+        self.api_url = api_url
+        self.top_k = top_k
+        self.session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503])
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_cuis(self, texts: List[str]) -> Set[str]:
+        r = self.session.post(
+            self.api_url,
+            headers=GCPTokenProvider.get_headers(),
+            json={"query_texts": texts, "top_k": self.top_k},
+            timeout=60
+        )
+        r.raise_for_status()
+        out = set()
+        for v in r.json().values():
+            out.update(map(str, v))
+        return out
+
+# ------------------------------------------------------------
+# Vocabulary Filter
+# ------------------------------------------------------------
+def filter_allowed_cuis(cuis: Set[str], project: str, dataset: str) -> Set[str]:
+    if not cuis:
+        return set()
+
+    client = bigquery.Client(project=project)
+    bases = list({extract_base_cui(c) for c in cuis if extract_base_cui(c)})
+
+    query = f"""
+    SELECT DISTINCT CUI
+    FROM `{project}.{dataset}.MRCONSO`
+    WHERE CUI IN UNNEST(@cuis)
+      AND SAB IN ('ICD9CM','ICD10','ICD10CM','SNOMEDCT_US','LOINC')
     """
-    Comprehensive validation framework for CUI reduction
-    Measures semantic preservation, information retention, and reduction quality
+
+    df = client.query(
+        query,
+        job_config=bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", bases)
+            ]
+        )
+    ).to_dataframe()
+
+    allowed = set(df["CUI"])
+    return {c for c in cuis if extract_base_cui(c) in allowed}
+
+# ------------------------------------------------------------
+# Clinical Reducer
+# ------------------------------------------------------------
+class ClinicalCUIReducer:
     """
-    
+    TEXT-FAITHFUL CLINICAL ABSTRACTION ENGINE
+    """
+
     def __init__(
         self,
-        project_id: str,
-        dataset_id: str,
-        cui_description_table: str = "cui_descriptions",
-        cui_embeddings_table: str = "cui_embeddings",
-        semantic_types_table: str = "MRSTY",  # UMLS semantic types
-        cui_relations_table: str = "MRREL"
+        project: str,
+        dataset: str,
+        subnet_api_url: str,
+        mrsty_table: str,
+        embedding_table: str
     ):
-        """Initialize validator with BigQuery access"""
-        self.client = bigquery.Client(project=project_id)
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.cui_description_table = cui_description_table
-        self.cui_embeddings_table = cui_embeddings_table
-        self.semantic_types_table = semantic_types_table
-        self.cui_relations_table = cui_relations_table
-        
-        # Cache for efficiency
-        self._embeddings_cache = {}
-        self._semantic_types_cache = {}
-        self._descriptions_cache = {}
-    
-    def validate_reduction(
-        self,
-        original_cuis: List[str],
-        reduced_cuis: List[str],
-        text: str = None,
-        verbose: bool = True
-    ) -> Dict:
+        self.client = bigquery.Client(project=project)
+        self.project = project
+        self.dataset = dataset
+        self.subnet_api_url = subnet_api_url
+        self.mrsty_table = mrsty_table
+        self.embedding_table = embedding_table
+
+        self.embedding_cache = {}
+        self.hierarchy_cache = {}
+
+    # --------------------------------------------------------
+    # Semantic grouping (MRSTY, deterministic)
+    # --------------------------------------------------------
+    def _semantic_groups(self, cuis: Set[str]) -> Dict[str, Set[str]]:
+        query = f"""
+        SELECT CUI, STY
+        FROM `{self.project}.{self.dataset}.{self.mrsty_table}`
+        WHERE CUI IN UNNEST(@cuis)
         """
-        Comprehensive validation of CUI reduction
-        
-        Returns:
-            Dictionary with validation metrics
-        """
-        logger.info(f"Validating reduction: {len(original_cuis)} → {len(reduced_cuis)} CUIs")
-        
-        validation_results = {
-            'basic_metrics': self._calculate_basic_metrics(original_cuis, reduced_cuis),
-            'semantic_coverage': self._validate_semantic_coverage(original_cuis, reduced_cuis),
-            'information_preservation': self._validate_information_preservation(original_cuis, reduced_cuis),
-            'hierarchy_validity': self._validate_hierarchy_correctness(original_cuis, reduced_cuis),
-            'semantic_coherence': self._calculate_semantic_coherence(reduced_cuis),
-            'redundancy_check': self._check_redundancy(reduced_cuis),
-            'domain_coverage': self._validate_domain_coverage(original_cuis, reduced_cuis)
-        }
-        
-        # Calculate overall quality score
-        validation_results['quality_score'] = self._calculate_quality_score(validation_results)
-        
-        if verbose:
-            self._print_validation_report(validation_results, text)
-        
-        return validation_results
-    
-    def _calculate_basic_metrics(self, original: List[str], reduced: List[str]) -> Dict:
-        """Calculate basic reduction metrics"""
-        original_set = set(original)
-        reduced_set = set(reduced)
-        
-        return {
-            'original_count': len(original_set),
-            'reduced_count': len(reduced_set),
-            'reduction_rate': 1 - (len(reduced_set) / len(original_set)) if original_set else 0,
-            'cuis_retained': len(reduced_set & original_set),
-            'cuis_rolled_up': len(original_set - reduced_set),
-            'new_cuis_introduced': len(reduced_set - original_set)
-        }
-    
-    def _validate_semantic_coverage(self, original: List[str], reduced: List[str]) -> Dict:
-        """
-        Validate that reduced CUIs cover the semantic space of original CUIs
-        Uses semantic types and embeddings
-        """
-        try:
-            # Get semantic types for both sets
-            original_types = self._get_semantic_types(original)
-            reduced_types = self._get_semantic_types(reduced)
-            
-            # Get all unique semantic types
-            all_original_types = set()
-            for types in original_types.values():
-                all_original_types.update(types)
-            
-            all_reduced_types = set()
-            for types in reduced_types.values():
-                all_reduced_types.update(types)
-            
-            # Calculate coverage
-            type_coverage = len(all_reduced_types & all_original_types) / len(all_original_types) if all_original_types else 0
-            
-            # Calculate semantic similarity using embeddings
-            semantic_similarity = self._calculate_embedding_coverage(original, reduced)
-            
-            return {
-                'semantic_type_coverage': type_coverage,
-                'unique_types_original': len(all_original_types),
-                'unique_types_reduced': len(all_reduced_types),
-                'semantic_similarity_score': semantic_similarity,
-                'lost_semantic_types': list(all_original_types - all_reduced_types)[:10]  # Top 10
-            }
-            
-        except Exception as e:
-            logger.error(f"Semantic coverage validation failed: {str(e)}")
-            return {
-                'semantic_type_coverage': 0,
-                'error': str(e)
-            }
-    
-    def _validate_information_preservation(self, original: List[str], reduced: List[str]) -> Dict:
-        """
-        Validate that key medical information is preserved
-        Measures using Information Content (IC) and concept relationships
-        """
-        try:
-            # Get parent-child relationships
-            hierarchy_map = self._build_reduction_map(original, reduced)
-            
-            # Calculate information preservation ratio
-            preserved_concepts = 0
-            partial_preserved = 0
-            lost_concepts = 0
-            
-            for orig_cui in original:
-                if orig_cui in reduced:
-                    preserved_concepts += 1
-                elif orig_cui in hierarchy_map:
-                    partial_preserved += 1
-                else:
-                    lost_concepts += 1
-            
-            total = len(original)
-            
-            return {
-                'fully_preserved_ratio': preserved_concepts / total if total else 0,
-                'partially_preserved_ratio': partial_preserved / total if total else 0,
-                'lost_ratio': lost_concepts / total if total else 0,
-                'information_retention_score': (preserved_concepts + 0.5 * partial_preserved) / total if total else 0
-            }
-            
-        except Exception as e:
-            logger.error(f"Information preservation validation failed: {str(e)}")
-            return {'error': str(e)}
-    
-    def _validate_hierarchy_correctness(self, original: List[str], reduced: List[str]) -> Dict:
-        """
-        Validate that hierarchical relationships are maintained correctly
-        Checks for invalid rollups and hierarchy violations
-        """
-        try:
-            violations = []
-            correct_rollups = 0
-            total_rollups = 0
-            
-            # Get hierarchical relationships
-            query = f"""
-            WITH relationships AS (
-                SELECT DISTINCT 
-                    cui1 as child,
-                    cui2 as parent,
-                    rel
-                FROM `{self.project_id}.{self.dataset_id}.{self.cui_relations_table}`
-                WHERE cui1 IN UNNEST(@original_cuis)
-                  AND cui2 IN UNNEST(@reduced_cuis)
-                  AND rel IN ('PAR', 'CHD')
-            )
-            SELECT * FROM relationships
-            LIMIT 10000
-            """
-            
-            job_config = bigquery.QueryJobConfig(
+        df = self.client.query(
+            query,
+            job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ArrayQueryParameter("original_cuis", "STRING", original),
-                    bigquery.ArrayQueryParameter("reduced_cuis", "STRING", reduced)
+                    bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))
                 ]
             )
-            
-            df = self.client.query(query, job_config=job_config).result(timeout=30).to_dataframe()
-            
-            for _, row in df.iterrows():
-                total_rollups += 1
-                if row['rel'] == 'PAR':
-                    correct_rollups += 1
-                else:
-                    violations.append({
-                        'child': row['child'],
-                        'invalid_parent': row['parent'],
-                        'relationship': row['rel']
-                    })
-            
-            return {
-                'hierarchy_validity_score': correct_rollups / total_rollups if total_rollups else 1.0,
-                'total_hierarchical_mappings': total_rollups,
-                'correct_rollups': correct_rollups,
-                'violations_count': len(violations),
-                'sample_violations': violations[:5]
-            }
-            
-        except Exception as e:
-            logger.error(f"Hierarchy validation failed: {str(e)}")
-            return {'error': str(e)}
-    
-    def _calculate_semantic_coherence(self, reduced_cuis: List[str]) -> Dict:
+        ).to_dataframe()
+
+        groups = defaultdict(set)
+        for _, r in df.iterrows():
+            groups[r.STY].add(r.CUI)
+
+        return groups if groups else {"UNKNOWN": set(cuis)}
+
+    # --------------------------------------------------------
+    # Batched, parallel, unbounded hierarchy fetch (READ-ONLY)
+    # --------------------------------------------------------
+    async def _fetch_hierarchy(self, base_cuis: Set[str]) -> nx.DiGraph:
+        key = frozenset(base_cuis)
+        if key in self.hierarchy_cache:
+            return self.hierarchy_cache[key]
+
+        graph = nx.DiGraph()
+        headers = GCPTokenProvider.get_headers()
+        batch_size = 100
+        semaphore = asyncio.Semaphore(10)
+
+        async def fetch_batch(session, batch):
+            async with semaphore:
+                for attempt in range(3):
+                    try:
+                        async with session.post(
+                            f"{self.subnet_api_url}/subnet/",
+                            headers=headers,
+                            json={"cuis": batch, "cross_context": False}
+                        ) as resp:
+                            if resp.status == 401:
+                                headers.update(GCPTokenProvider.get_headers(force=True))
+                                continue
+                            resp.raise_for_status()
+                            data = await resp.json()
+                            return data.get("output", [[], []])[1]
+                    except Exception:
+                        await asyncio.sleep(2 ** attempt)
+                return []
+
+        timeout = aiohttp.ClientTimeout(total=120)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            tasks = []
+            bases = list(base_cuis)
+            for i in range(0, len(bases), batch_size):
+                tasks.append(fetch_batch(session, bases[i:i + batch_size]))
+            results = await asyncio.gather(*tasks)
+
+        for edges in results:
+            for p, c in edges:
+                p = extract_base_cui(str(p))
+                c = extract_base_cui(str(c))
+                if p and c:
+                    graph.add_edge(p, c)
+
+        self.hierarchy_cache[key] = graph
+        return graph
+
+    # --------------------------------------------------------
+    # IC computation (FULL TRANSITIVE CLOSURE)
+    # --------------------------------------------------------
+    def _compute_ic(self, group_cuis: Set[str], graph: nx.DiGraph) -> Dict[str, float]:
+        N = len(group_cuis)
+        ic = {}
+        for c in group_cuis:
+            descendants = nx.descendants(graph, c) & group_cuis
+            ic[c] = -math.log((len(descendants) + 1) / N)
+        return ic
+
+    # --------------------------------------------------------
+    # Embedding fetch (OBSERVED ONLY)
+    # --------------------------------------------------------
+    def _fetch_embeddings(self, cuis: Set[str]):
+        assert cuis, "Embedding fetch called with empty set"
+
+        bases = list({extract_base_cui(c) for c in cuis})
+        query = f"""
+        SELECT REF_CUI, REF_Embedding
+        FROM `{self.project}.{self.dataset}.{self.embedding_table}`
+        WHERE REF_CUI IN UNNEST(@cuis)
         """
-        Calculate semantic coherence of reduced set
-        High coherence means concepts are semantically related
-        """
-        try:
-            if len(reduced_cuis) < 2:
-                return {'coherence_score': 1.0}
-            
-            # Get embeddings
-            embeddings = self._get_embeddings(reduced_cuis)
-            
-            if len(embeddings) < 2:
-                return {'coherence_score': 0.0}
-            
-            # Calculate pairwise similarities
-            embedding_matrix = np.array(list(embeddings.values()))
-            
-            # Compute cosine similarity matrix
-            norms = np.linalg.norm(embedding_matrix, axis=1, keepdims=True)
-            normalized = embedding_matrix / (norms + 1e-8)
-            similarity_matrix = np.dot(normalized, normalized.T)
-            
-            # Get upper triangle (excluding diagonal)
-            upper_triangle = similarity_matrix[np.triu_indices_from(similarity_matrix, k=1)]
-            
-            return {
-                'coherence_score': float(np.mean(upper_triangle)),
-                'min_similarity': float(np.min(upper_triangle)),
-                'max_similarity': float(np.max(upper_triangle)),
-                'std_similarity': float(np.std(upper_triangle))
-            }
-            
-        except Exception as e:
-            logger.error(f"Coherence calculation failed: {str(e)}")
-            return {'coherence_score': 0.0, 'error': str(e)}
-    
-    def _check_redundancy(self, reduced_cuis: List[str]) -> Dict:
-        """
-        Check for redundancy in reduced set
-        Identifies concepts that might be too similar
-        """
-        try:
-            # Get semantic types
-            semantic_types = self._get_semantic_types(reduced_cuis)
-            
-            # Find CUIs with identical semantic types
-            type_signatures = defaultdict(list)
-            for cui, types in semantic_types.items():
-                signature = tuple(sorted(types))
-                type_signatures[signature].append(cui)
-            
-            # Find potential redundancies
-            redundant_groups = []
-            for signature, cuis in type_signatures.items():
-                if len(cuis) > 1:
-                    # Check embedding similarity
-                    embeddings = self._get_embeddings(cuis)
-                    if len(embeddings) > 1:
-                        # Calculate pairwise similarities
-                        emb_list = [embeddings[cui] for cui in cuis if cui in embeddings]
-                        if len(emb_list) > 1:
-                            similarities = []
-                            for i in range(len(emb_list)):
-                                for j in range(i+1, len(emb_list)):
-                                    sim = np.dot(emb_list[i], emb_list[j]) / (
-                                        np.linalg.norm(emb_list[i]) * np.linalg.norm(emb_list[j])
-                                    )
-                                    similarities.append(sim)
-                            
-                            avg_similarity = np.mean(similarities)
-                            if avg_similarity > 0.9:  # High similarity threshold
-                                redundant_groups.append({
-                                    'cuis': cuis,
-                                    'similarity': float(avg_similarity),
-                                    'semantic_types': list(signature)
-                                })
-            
-            redundancy_score = 1 - (len(redundant_groups) / len(reduced_cuis)) if reduced_cuis else 1.0
-            
-            return {
-                'redundancy_score': redundancy_score,
-                'redundant_groups_count': len(redundant_groups),
-                'sample_redundant_groups': redundant_groups[:3]
-            }
-            
-        except Exception as e:
-            logger.error(f"Redundancy check failed: {str(e)}")
-            return {'redundancy_score': 1.0, 'error': str(e)}
-    
-    def _validate_domain_coverage(self, original: List[str], reduced: List[str]) -> Dict:
-        """
-        Validate coverage across different medical domains
-        """
-        try:
-            # Define major medical domain semantic types
-            domain_map = {
-                'Anatomy': ['T017', 'T029', 'T023', 'T030', 'T031'],
-                'Disorders': ['T020', 'T190', 'T049', 'T019', 'T047', 'T050', 'T033', 'T037', 'T048', 'T191', 'T046', 'T184'],
-                'Chemicals_Drugs': ['T116', 'T195', 'T123', 'T122', 'T103', 'T120', 'T104', 'T200', 'T126', 'T131', 'T125', 'T129', 'T130', 'T197', 'T114', 'T109', 'T121', 'T192', 'T127'],
-                'Procedures': ['T060', 'T065', 'T058', 'T059', 'T063', 'T062', 'T061'],
-                'Concepts': ['T078', 'T170', 'T080', 'T081', 'T089', 'T082', 'T079']
-            }
-            
-            original_types = self._get_semantic_types(original)
-            reduced_types = self._get_semantic_types(reduced)
-            
-            domain_coverage = {}
-            for domain, type_codes in domain_map.items():
-                original_domain_cuis = set()
-                reduced_domain_cuis = set()
-                
-                for cui, types in original_types.items():
-                    if any(t in type_codes for t in types):
-                        original_domain_cuis.add(cui)
-                
-                for cui, types in reduced_types.items():
-                    if any(t in type_codes for t in types):
-                        reduced_domain_cuis.add(cui)
-                
-                if original_domain_cuis:
-                    coverage = len(reduced_domain_cuis) / len(original_domain_cuis)
-                    domain_coverage[domain] = {
-                        'coverage': coverage,
-                        'original_count': len(original_domain_cuis),
-                        'reduced_count': len(reduced_domain_cuis)
-                    }
-            
-            avg_coverage = np.mean([d['coverage'] for d in domain_coverage.values()]) if domain_coverage else 0
-            
-            return {
-                'average_domain_coverage': avg_coverage,
-                'domain_specific_coverage': domain_coverage
-            }
-            
-        except Exception as e:
-            logger.error(f"Domain coverage validation failed: {str(e)}")
-            return {'average_domain_coverage': 0, 'error': str(e)}
-    
-    def _calculate_quality_score(self, validation_results: Dict) -> float:
-        """
-        Calculate overall quality score based on all metrics
-        """
-        weights = {
-            'semantic_coverage': 0.25,
-            'information_preservation': 0.25,
-            'hierarchy_validity': 0.20,
-            'coherence': 0.15,
-            'redundancy': 0.10,
-            'domain_coverage': 0.05
-        }
-        
-        scores = {}
-        
-        # Extract individual scores
-        if 'semantic_coverage' in validation_results:
-            scores['semantic_coverage'] = validation_results['semantic_coverage'].get('semantic_type_coverage', 0)
-        
-        if 'information_preservation' in validation_results:
-            scores['information_preservation'] = validation_results['information_preservation'].get('information_retention_score', 0)
-        
-        if 'hierarchy_validity' in validation_results:
-            scores['hierarchy_validity'] = validation_results['hierarchy_validity'].get('hierarchy_validity_score', 1.0)
-        
-        if 'semantic_coherence' in validation_results:
-            scores['coherence'] = validation_results['semantic_coherence'].get('coherence_score', 0)
-        
-        if 'redundancy_check' in validation_results:
-            scores['redundancy'] = validation_results['redundancy_check'].get('redundancy_score', 1.0)
-        
-        if 'domain_coverage' in validation_results:
-            scores['domain_coverage'] = validation_results['domain_coverage'].get('average_domain_coverage', 0)
-        
-        # Calculate weighted average
-        total_score = sum(scores.get(k, 0) * w for k, w in weights.items())
-        
-        return total_score
-    
-    def _get_semantic_types(self, cui_list: List[str]) -> Dict[str, List[str]]:
-        """Get semantic types for CUIs"""
-        uncached = [c for c in cui_list if c not in self._semantic_types_cache]
-        
-        if uncached:
-            try:
-                query = f"""
-                SELECT DISTINCT CUI, TUI
-                FROM `{self.project_id}.{self.dataset_id}.{self.semantic_types_table}`
-                WHERE CUI IN UNNEST(@cuis)
-                """
-                
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
-                    ]
-                )
-                
-                df = self.client.query(query, job_config=job_config).result(timeout=30).to_dataframe()
-                
-                for cui in uncached:
-                    cui_types = df[df['CUI'] == cui]['TUI'].tolist()
-                    self._semantic_types_cache[cui] = cui_types
-                    
-            except Exception as e:
-                logger.error(f"Failed to get semantic types: {str(e)}")
-        
-        return {cui: self._semantic_types_cache.get(cui, []) for cui in cui_list}
-    
-    def _get_embeddings(self, cui_list: List[str]) -> Dict[str, np.ndarray]:
-        """Get embeddings for CUIs"""
-        uncached = [c for c in cui_list if c not in self._embeddings_cache]
-        
-        if uncached:
-            try:
-                query = f"""
-                SELECT REF_CUI as cui, REF_Embedding as embedding
-                FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
-                WHERE REF_CUI IN UNNEST(@cuis)
-                """
-                
-                job_config = bigquery.QueryJobConfig(
-                    query_parameters=[
-                        bigquery.ArrayQueryParameter("cuis", "STRING", uncached[:1000])  # Limit
-                    ]
-                )
-                
-                df = self.client.query(query, job_config=job_config).result(timeout=30).to_dataframe()
-                
-                for _, row in df.iterrows():
-                    self._embeddings_cache[row['cui']] = np.array(row['embedding'])
-                    
-            except Exception as e:
-                logger.error(f"Failed to get embeddings: {str(e)}")
-        
-        return {cui: self._embeddings_cache.get(cui) for cui in cui_list if cui in self._embeddings_cache}
-    
-    def _calculate_embedding_coverage(self, original: List[str], reduced: List[str]) -> float:
-        """Calculate semantic coverage using embeddings"""
-        try:
-            original_emb = self._get_embeddings(original[:500])  # Limit for performance
-            reduced_emb = self._get_embeddings(reduced[:500])
-            
-            if not original_emb or not reduced_emb:
-                return 0.0
-            
-            # For each original embedding, find closest reduced embedding
-            coverage_scores = []
-            
-            for orig_cui, orig_vec in original_emb.items():
-                if orig_vec is None:
-                    continue
-                    
-                max_similarity = 0
-                for red_cui, red_vec in reduced_emb.items():
-                    if red_vec is None:
-                        continue
-                    
-                    similarity = np.dot(orig_vec, red_vec) / (
-                        np.linalg.norm(orig_vec) * np.linalg.norm(red_vec)
-                    )
-                    max_similarity = max(max_similarity, similarity)
-                
-                coverage_scores.append(max_similarity)
-            
-            return float(np.mean(coverage_scores)) if coverage_scores else 0.0
-            
-        except Exception as e:
-            logger.error(f"Embedding coverage calculation failed: {str(e)}")
-            return 0.0
-    
-    def _build_reduction_map(self, original: List[str], reduced: List[str]) -> Dict[str, str]:
-        """Build mapping from original to reduced CUIs"""
-        # This would ideally come from your reduction algorithm
-        # For now, we'll try to infer it from hierarchical relationships
-        reduction_map = {}
-        
-        try:
-            query = f"""
-            SELECT DISTINCT cui1 as original, cui2 as reduced
-            FROM `{self.project_id}.{self.dataset_id}.{self.cui_relations_table}`
-            WHERE cui1 IN UNNEST(@original)
-              AND cui2 IN UNNEST(@reduced)
-              AND rel = 'PAR'
-            """
-            
-            job_config = bigquery.QueryJobConfig(
+
+        df = self.client.query(
+            query,
+            job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ArrayQueryParameter("original", "STRING", original),
-                    bigquery.ArrayQueryParameter("reduced", "STRING", reduced)
+                    bigquery.ArrayQueryParameter("cuis", "STRING", bases)
                 ]
             )
-            
-            df = self.client.query(query, job_config=job_config).result(timeout=30).to_dataframe()
-            
-            for _, row in df.iterrows():
-                reduction_map[row['original']] = row['reduced']
-                
-        except Exception as e:
-            logger.error(f"Failed to build reduction map: {str(e)}")
-        
-        return reduction_map
-    
-    def _print_validation_report(self, results: Dict, text: str = None):
-        """Print formatted validation report"""
-        print("\n" + "="*80)
-        print("CUI REDUCTION VALIDATION REPORT")
-        print("="*80)
-        
-        if text:
-            print(f"Text: {text[:100]}...")
-        
-        # Basic metrics
-        basic = results.get('basic_metrics', {})
-        print(f"\n📊 BASIC METRICS:")
-        print(f"   Original CUIs: {basic.get('original_count', 0)}")
-        print(f"   Reduced CUIs: {basic.get('reduced_count', 0)}")
-        print(f"   Reduction Rate: {basic.get('reduction_rate', 0)*100:.1f}%")
-        print(f"   Retained: {basic.get('cuis_retained', 0)}")
-        print(f"   Rolled Up: {basic.get('cuis_rolled_up', 0)}")
-        print(f"   New CUIs: {basic.get('new_cuis_introduced', 0)}")
-        
-        # Semantic coverage
-        semantic = results.get('semantic_coverage', {})
-        print(f"\n🎯 SEMANTIC COVERAGE:")
-        print(f"   Type Coverage: {semantic.get('semantic_type_coverage', 0)*100:.1f}%")
-        print(f"   Semantic Similarity: {semantic.get('semantic_similarity_score', 0):.3f}")
-        print(f"   Original Types: {semantic.get('unique_types_original', 0)}")
-        print(f"   Reduced Types: {semantic.get('unique_types_reduced', 0)}")
-        
-        # Information preservation
-        info = results.get('information_preservation', {})
-        print(f"\n💾 INFORMATION PRESERVATION:")
-        print(f"   Retention Score: {info.get('information_retention_score', 0)*100:.1f}%")
-        print(f"   Fully Preserved: {info.get('fully_preserved_ratio', 0)*100:.1f}%")
-        print(f"   Partially Preserved: {info.get('partially_preserved_ratio', 0)*100:.1f}%")
-        print(f"   Lost: {info.get('lost_ratio', 0)*100:.1f}%")
-        
-        # Hierarchy validity
-        hierarchy = results.get('hierarchy_validity', {})
-        print(f"\n🌳 HIERARCHY VALIDITY:")
-        print(f"   Validity Score: {hierarchy.get('hierarchy_validity_score', 0)*100:.1f}%")
-        print(f"   Correct Rollups: {hierarchy.get('correct_rollups', 0)}")
-        print(f"   Violations: {hierarchy.get('violations_count', 0)}")
-        
-        # Coherence
-        coherence = results.get('semantic_coherence', {})
-        print(f"\n🔗 SEMANTIC COHERENCE:")
-        print(f"   Coherence Score: {coherence.get('coherence_score', 0):.3f}")
-        print(f"   Min Similarity: {coherence.get('min_similarity', 0):.3f}")
-        print(f"   Max Similarity: {coherence.get('max_similarity', 0):.3f}")
-        
-        # Redundancy
-        redundancy = results.get('redundancy_check', {})
-        print(f"\n🔄 REDUNDANCY CHECK:")
-        print(f"   Redundancy Score: {redundancy.get('redundancy_score', 0)*100:.1f}%")
-        print(f"   Redundant Groups: {redundancy.get('redundant_groups_count', 0)}")
-        
-        # Domain coverage
-        domain = results.get('domain_coverage', {})
-        print(f"\n🏥 DOMAIN COVERAGE:")
-        print(f"   Average Coverage: {domain.get('average_domain_coverage', 0)*100:.1f}%")
-        if 'domain_specific_coverage' in domain:
-            for dom, cov in domain['domain_specific_coverage'].items():
-                print(f"   {dom}: {cov['coverage']*100:.1f}% ({cov['reduced_count']}/{cov['original_count']})")
-        
-        # Overall quality
-        print(f"\n⭐ OVERALL QUALITY SCORE: {results.get('quality_score', 0)*100:.1f}%")
-        
-        # Interpretation
-        quality = results.get('quality_score', 0)
-        print(f"\n📋 INTERPRETATION:")
-        if quality >= 0.9:
-            print("   ✅ EXCELLENT: Reduction maintains high semantic integrity")
-        elif quality >= 0.75:
-            print("   ✅ GOOD: Reduction is effective with minor information loss")
-        elif quality >= 0.6:
-            print("   ⚠️ ACCEPTABLE: Some important information may be lost")
-        else:
-            print("   ❌ POOR: Significant information loss detected")
-        
-        print("="*80)
+        ).to_dataframe()
 
+        base_map = {
+            r.REF_CUI: np.asarray(r.REF_Embedding, dtype=np.float32)
+            for _, r in df.iterrows()
+        }
 
-def validate_cui_reduction_batch(
-    test_cases: List[Dict],
-    reducer_function,
-    validator: CUIReductionValidator
-) -> pd.DataFrame:
-    """
-    Validate CUI reduction across multiple test cases
-    
-    Args:
-        test_cases: List of dicts with 'text' and optionally 'expected_cuis'
-        reducer_function: Function that takes text and returns (original_cuis, reduced_cuis)
-        validator: CUIReductionValidator instance
-    
-    Returns:
-        DataFrame with validation results
-    """
-    results = []
-    
-    for i, case in enumerate(test_cases):
-        text = case['text']
-        expected = case.get('expected_cuis', [])
-        
-        print(f"\nProcessing test case {i+1}/{len(test_cases)}: {text[:50]}...")
-        
-        try:
-            # Get reduction
-            original_cuis, reduced_cuis = reducer_function(text)
-            
-            # Validate
-            validation = validator.validate_reduction(
-                original_cuis, 
-                reduced_cuis,
-                text=text,
-                verbose=False
-            )
-            
-            # Add to results
-            result = {
-                'test_case': i+1,
-                'text': text[:100],
-                'original_count': len(original_cuis),
-                'reduced_count': len(reduced_cuis),
-                'reduction_rate': validation['basic_metrics']['reduction_rate'],
-                'quality_score': validation['quality_score'],
-                'semantic_coverage': validation['semantic_coverage']['semantic_type_coverage'],
-                'info_retention': validation['information_preservation']['information_retention_score'],
-                'hierarchy_validity': validation['hierarchy_validity']['hierarchy_validity_score']
-            }
-            
-            results.append(result)
-            
-        except Exception as e:
-            logger.error(f"Test case {i+1} failed: {str(e)}")
-            results.append({
-                'test_case': i+1,
-                'text': text[:100],
-                'error': str(e)
-            })
-    
-    # Create summary DataFrame
-    df = pd.DataFrame(results)
-    
-    # Print summary statistics
-    print("\n" + "="*80)
-    print("BATCH VALIDATION SUMMARY")
-    print("="*80)
-    print(f"Total test cases: {len(test_cases)}")
-    print(f"Average reduction rate: {df['reduction_rate'].mean()*100:.1f}%")
-    print(f"Average quality score: {df['quality_score'].mean()*100:.1f}%")
-    print(f"Average semantic coverage: {df['semantic_coverage'].mean()*100:.1f}%")
-    print(f"Average info retention: {df['info_retention'].mean()*100:.1f}%")
-    print("="*80)
-    
-    return df
+        for c in cuis:
+            b = extract_base_cui(c)
+            if b in base_map:
+                self.embedding_cache[c] = base_map[b]
 
+    # --------------------------------------------------------
+    # Similarity pruning (HIERARCHY DOMINANT)
+    # --------------------------------------------------------
+    def _similarity_prune(self, cuis: Set[str], graph: nx.DiGraph) -> Set[str]:
+        X, labels = [], []
+        for c in cuis:
+            if c in self.embedding_cache:
+                X.append(self.embedding_cache[c])
+                labels.append(c)
 
-# Example usage
+        if len(X) < 2:
+            return set(cuis)
+
+        X = np.vstack(X)
+        sim = 1 - cosine_distances(X, X)
+
+        dropped = set()
+        for i, c1 in enumerate(labels):
+            for j in range(i + 1, len(labels)):
+                c2 = labels[j]
+                if sim[i, j] >= 0.88:
+                    if nx.has_path(graph, c1, c2):
+                        dropped.add(c2)
+                    elif nx.has_path(graph, c2, c1):
+                        dropped.add(c1)
+
+        return set(cuis) - dropped
+
+    # --------------------------------------------------------
+    # Coverage (OBSERVED ONLY)
+    # --------------------------------------------------------
+    def _coverage(self, observed: Set[str], retained: Set[str], graph: nx.DiGraph) -> float:
+        covered = set()
+        for c in retained:
+            covered |= nx.descendants(graph, c)
+        return len(covered & observed) / len(observed) if observed else 0.0
+
+    # --------------------------------------------------------
+    # FULL REDUCTION
+    # --------------------------------------------------------
+    def reduce(self, input_cuis: Set[str]) -> Tuple[List[str], ReductionStats]:
+        start = time.time()
+        observed_cuis = set(input_cuis)
+
+        semantic_groups = self._semantic_groups(observed_cuis)
+        retained_all = set()
+
+        for _, group_cuis in semantic_groups.items():
+            bases = {extract_base_cui(c) for c in group_cuis if extract_base_cui(c)}
+            graph = asyncio.run(self._fetch_hierarchy(bases))
+
+            ic = self._compute_ic(group_cuis, graph)
+            threshold = np.percentile(list(ic.values()), 50)
+            selected = {c for c, v in ic.items() if v >= threshold}
+
+            # 🔴 CLINICAL SAFETY GATE
+            selected &= observed_cuis
+
+            if not selected:
+                continue
+
+            self._fetch_embeddings(selected)
+            final_group = self._similarity_prune(selected, graph)
+
+            retained_all |= final_group
+
+        # 🔒 HARD SAFETY ASSERTION
+        assert retained_all.issubset(observed_cuis), \
+            "CLINICAL ERROR: non-observed CUI leaked"
+
+        stats = ReductionStats(
+            initial_count=len(observed_cuis),
+            after_ic=len(retained_all),
+            final_count=len(retained_all),
+            total_reduction_pct=safe_percentage(
+                len(observed_cuis) - len(retained_all), len(observed_cuis)
+            ),
+            coverage_score=self._coverage(observed_cuis, retained_all, graph),
+            processing_time=time.time() - start
+        )
+
+        return sorted(retained_all), stats
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+def main():
+    PROJECT_ID = "your_project"
+    DATASET_ID = "your_dataset"
+    CUI_API_URL = "your_cui_api"
+    SUBNET_API_URL = "your_subnet_api"
+    MRSTY_TABLE = "MRSTY"
+    EMBEDDING_TABLE = "EMBEDDINGS"
+
+    TEXTS = ["diabetes mellitus type 2 with complications"]
+
+    api = CUIAPIClient(CUI_API_URL)
+    extracted = api.extract_cuis(TEXTS)
+    filtered = filter_allowed_cuis(extracted, PROJECT_ID, DATASET_ID)
+
+    reducer = ClinicalCUIReducer(
+        project=PROJECT_ID,
+        dataset=DATASET_ID,
+        subnet_api_url=SUBNET_API_URL,
+        mrsty_table=MRSTY_TABLE,
+        embedding_table=EMBEDDING_TABLE
+    )
+
+    final_cuis, stats = reducer.reduce(filtered)
+    logger.info(f"FINAL CUIs: {final_cuis}")
+    logger.info(f"STATS: {stats.to_dict()}")
+
 if __name__ == "__main__":
-    # Initialize validator
-    validator = CUIReductionValidator(
-        project_id="your-project",
-        dataset_id="your-dataset"
-    )
-    
-    # Example: Validate a single reduction
-    original_cuis = ["C0006142", "C0678222", "C0011847", "..."]  # 10,000 CUIs
-    reduced_cuis = ["C0006142", "C0011847", "..."]  # 3,000 CUIs
-    
-    validation_results = validator.validate_reduction(
-        original_cuis,
-        reduced_cuis,
-        text="brain tumor",
-        verbose=True
-    )
-    
-    # Save results
-    with open('validation_results.json', 'w') as f:
-        json.dump(validation_results, f, indent=2, default=str)
+    main()
