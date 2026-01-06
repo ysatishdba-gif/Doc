@@ -1,42 +1,33 @@
 # ============================================================
-# FINAL CLINICALLY SAFE CUI ABSTRACTION PIPELINE
+# CLINICALLY SAFE CUI REDUCTION PIPELINE (PICKLE-BASED HIERARCHY)
 # ============================================================
 
-import asyncio
-import aiohttp
 import subprocess
 import re
-import time
-import threading
 import logging
-import math
+import json
 from typing import List, Dict, Set, Tuple
 from collections import defaultdict
+import time
 from dataclasses import dataclass, asdict
-
+import threading
+import pickle
 import numpy as np
-import pandas as pd
+
 import networkx as nx
-import requests
-from requests.adapters import HTTPAdapter, Retry
 from google.cloud import bigquery
 from sklearn.metrics.pairwise import cosine_distances
-import nest_asyncio
+import requests
+from requests.adapters import HTTPAdapter, Retry
 
-nest_asyncio.apply()
-
-# ------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------
+# --------------------- Logging ---------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------
+# --------------------- Utilities ---------------------
 def extract_base_cui(cui: str) -> str | None:
     if not cui:
         return None
@@ -46,9 +37,7 @@ def extract_base_cui(cui: str) -> str | None:
 def safe_percentage(n, d):
     return (n / d * 100) if d else 0.0
 
-# ------------------------------------------------------------
-# GCP Token Provider
-# ------------------------------------------------------------
+# --------------------- GCP Token ---------------------
 class GCPTokenProvider:
     _lock = threading.Lock()
     _token = None
@@ -79,60 +68,38 @@ class GCPTokenProvider:
             cls._expiry = now + 3300
             return cls._token
 
-# ------------------------------------------------------------
-# Stats
-# ------------------------------------------------------------
+# --------------------- Stats ---------------------
 @dataclass
 class ReductionStats:
     initial_count: int
-    after_ic: int
+    after_ic_rollup: int
+    after_similarity_stage1: int
+    after_similarity_stage2: int
+    after_similarity_stage3: int
     final_count: int
+    ic_rollup_reduction_pct: float
+    similarity_reduction_pct: float
     total_reduction_pct: float
-    coverage_score: float
     processing_time: float
+    coverage_score: float
+    group_stats: Dict
 
     def to_dict(self):
         return asdict(self)
 
-# ------------------------------------------------------------
-# CUI Extraction API Client
-# ------------------------------------------------------------
-class CUIAPIClient:
-    def __init__(self, api_url: str, top_k: int = 3):
-        self.api_url = api_url
-        self.top_k = top_k
-        self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429,500,502,503])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-
-    def extract_cuis(self, texts: List[str]) -> Set[str]:
-        r = self.session.post(
-            self.api_url,
-            headers=GCPTokenProvider.get_headers(),
-            json={"query_texts": texts, "top_k": self.top_k},
-            timeout=60
-        )
-        r.raise_for_status()
-        out = set()
-        for v in r.json().values():
-            out.update(map(str, v))
-        return out
-
-# ------------------------------------------------------------
-# Vocabulary Filter
-# ------------------------------------------------------------
-def filter_allowed_cuis(cuis: Set[str], project: str, dataset: str) -> Set[str]:
+# --------------------- Vocabulary Filter ---------------------
+def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
     if not cuis:
-        return set()
+        return []
 
-    client = bigquery.Client(project=project)
+    client = bigquery.Client(project=project_id)
     bases = list({extract_base_cui(c) for c in cuis if extract_base_cui(c)})
 
     query = f"""
     SELECT DISTINCT CUI
-    FROM `{project}.{dataset}.MRCONSO`
+    FROM `{project_id}.{dataset_id}.MRCONSO`
     WHERE CUI IN UNNEST(@cuis)
-      AND SAB IN ('ICD9CM','ICD10','ICD10CM','SNOMEDCT_US','LOINC')
+      AND SAB IN ('ICD10','ICD10CM','ICD9CM','SNOMEDCT_US','LOINC')
     """
 
     df = client.query(
@@ -145,155 +112,119 @@ def filter_allowed_cuis(cuis: Set[str], project: str, dataset: str) -> Set[str]:
     ).to_dataframe()
 
     allowed = set(df["CUI"])
-    return {c for c in cuis if extract_base_cui(c) in allowed}
+    return [c for c in cuis if extract_base_cui(c) in allowed]
 
-# ------------------------------------------------------------
-# Clinical Reducer
-# ------------------------------------------------------------
-class ClinicalCUIReducer:
-    """
-    TEXT-FAITHFUL CLINICAL ABSTRACTION ENGINE
-    """
+# --------------------- CUI API Client ---------------------
+class CUIAPIClient:
+    def __init__(self, api_url: str, top_k: int = 3):
+        self.api_url = api_url
+        self.top_k = top_k
+        self.session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1,
+                      status_forcelist=[429,500,502,503])
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
+    def extract_cuis_batch(self, texts: List[str]) -> Set[str]:
+        r = self.session.post(
+            self.api_url,
+            headers=GCPTokenProvider.get_headers(),
+            json={"query_texts": texts, "top_k": self.top_k},
+            timeout=60
+        )
+        r.raise_for_status()
+        out = set()
+        for v in r.json().values():
+            out.update(map(str, v))
+        return out
+
+# --------------------- Enhanced Reducer ---------------------
+class EnhancedCUIReducer:
     def __init__(
         self,
-        project: str,
-        dataset: str,
-        subnet_api_url: str,
+        project_id: str,
+        dataset_id: str,
+        embedding_table: str,
         mrsty_table: str,
-        embedding_table: str
+        umls_network: nx.DiGraph,
+        similarity_thresholds=(0.95, 0.90, 0.85)
     ):
-        self.client = bigquery.Client(project=project)
-        self.project = project
-        self.dataset = dataset
-        self.subnet_api_url = subnet_api_url
-        self.mrsty_table = mrsty_table
+        self.client = bigquery.Client(project=project_id)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
         self.embedding_table = embedding_table
-
+        self.mrsty_table = mrsty_table
+        self.graph = umls_network
+        self.similarity_thresholds = similarity_thresholds
         self.embedding_cache = {}
-        self.hierarchy_cache = {}
 
-    # --------------------------------------------------------
-    # Semantic grouping (MRSTY, deterministic)
-    # --------------------------------------------------------
-    def _semantic_groups(self, cuis: Set[str]) -> Dict[str, Set[str]]:
+    # ---------------- Semantic Groups ----------------
+    def _semantic_groups(self, cuis: List[str]) -> Dict[str, List[str]]:
         query = f"""
         SELECT CUI, STY
-        FROM `{self.project}.{self.dataset}.{self.mrsty_table}`
+        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
         WHERE CUI IN UNNEST(@cuis)
         """
         df = self.client.query(
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))
+                    bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
                 ]
             )
         ).to_dataframe()
 
-        groups = defaultdict(set)
+        groups = defaultdict(list)
         for _, r in df.iterrows():
-            groups[r.STY].add(r.CUI)
+            groups[r.STY].append(r.CUI)
 
-        return groups if groups else {"UNKNOWN": set(cuis)}
+        return groups if groups else {"UNKNOWN": cuis}
 
-    # --------------------------------------------------------
-    # Batched, parallel, unbounded hierarchy fetch (READ-ONLY)
-    # --------------------------------------------------------
-    async def _fetch_hierarchy(self, base_cuis: Set[str]) -> nx.DiGraph:
-        key = frozenset(base_cuis)
-        if key in self.hierarchy_cache:
-            return self.hierarchy_cache[key]
-
-        graph = nx.DiGraph()
-        headers = GCPTokenProvider.get_headers()
-        batch_size = 100
-        semaphore = asyncio.Semaphore(10)
-
-        async def fetch_batch(session, batch):
-            async with semaphore:
-                for attempt in range(3):
-                    try:
-                        async with session.post(
-                            f"{self.subnet_api_url}/subnet/",
-                            headers=headers,
-                            json={"cuis": batch, "cross_context": False}
-                        ) as resp:
-                            if resp.status == 401:
-                                headers.update(GCPTokenProvider.get_headers(force=True))
-                                continue
-                            resp.raise_for_status()
-                            data = await resp.json()
-                            return data.get("output", [[], []])[1]
-                    except Exception:
-                        await asyncio.sleep(2 ** attempt)
-                return []
-
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            tasks = []
-            bases = list(base_cuis)
-            for i in range(0, len(bases), batch_size):
-                tasks.append(fetch_batch(session, bases[i:i + batch_size]))
-            results = await asyncio.gather(*tasks)
-
-        for edges in results:
-            for p, c in edges:
-                p = extract_base_cui(str(p))
-                c = extract_base_cui(str(c))
-                if p and c:
-                    graph.add_edge(p, c)
-
-        self.hierarchy_cache[key] = graph
-        return graph
-
-    # --------------------------------------------------------
-    # IC computation (FULL TRANSITIVE CLOSURE)
-    # --------------------------------------------------------
-    def _compute_ic(self, group_cuis: Set[str], graph: nx.DiGraph) -> Dict[str, float]:
-        N = len(group_cuis)
+    # ---------------- IC Computation ----------------
+    def _compute_ic(self, group: List[str]) -> Dict[str, float]:
+        N = len(group)
+        group_set = set(group)
         ic = {}
-        for c in group_cuis:
-            descendants = nx.descendants(graph, c) & group_cuis
-            ic[c] = -math.log((len(descendants) + 1) / N)
+
+        for c in group:
+            base = extract_base_cui(c)
+            if base not in self.graph:
+                ic[c] = 0.0
+                continue
+
+            descendants = {
+                x for x in group_set
+                if extract_base_cui(x) in nx.descendants(self.graph, base)
+            }
+            ic[c] = -np.log((len(descendants) + 1) / N)
+
         return ic
 
-    # --------------------------------------------------------
-    # Embedding fetch (OBSERVED ONLY)
-    # --------------------------------------------------------
+    # ---------------- Embeddings ----------------
     def _fetch_embeddings(self, cuis: Set[str]):
-        assert cuis, "Embedding fetch called with empty set"
+        uncached = [c for c in cuis if c not in self.embedding_cache]
+        if not uncached:
+            return
 
-        bases = list({extract_base_cui(c) for c in cuis})
         query = f"""
-        SELECT REF_CUI, REF_Embedding
-        FROM `{self.project}.{self.dataset}.{self.embedding_table}`
-        WHERE REF_CUI IN UNNEST(@cuis)
+        SELECT CUI, embedding
+        FROM `{self.project_id}.{self.dataset_id}.{self.embedding_table}`
+        WHERE CUI IN UNNEST(@cuis)
         """
-
         df = self.client.query(
             query,
             job_config=bigquery.QueryJobConfig(
                 query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", bases)
+                    bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
                 ]
             )
         ).to_dataframe()
 
-        base_map = {
-            r.REF_CUI: np.asarray(r.REF_Embedding, dtype=np.float32)
-            for _, r in df.iterrows()
-        }
+        for _, r in df.iterrows():
+            if r.embedding is not None:
+                self.embedding_cache[r.CUI] = np.asarray(r.embedding, dtype=np.float32)
 
-        for c in cuis:
-            b = extract_base_cui(c)
-            if b in base_map:
-                self.embedding_cache[c] = base_map[b]
-
-    # --------------------------------------------------------
-    # Similarity pruning (HIERARCHY DOMINANT)
-    # --------------------------------------------------------
-    def _similarity_prune(self, cuis: Set[str], graph: nx.DiGraph) -> Set[str]:
+    # ---------------- Similarity Pruning ----------------
+    def _similarity_prune(self, cuis: Set[str]) -> Set[str]:
         X, labels = [], []
         for c in cuis:
             if c in self.embedding_cache:
@@ -301,106 +232,106 @@ class ClinicalCUIReducer:
                 labels.append(c)
 
         if len(X) < 2:
-            return set(cuis)
+            return cuis
 
         X = np.vstack(X)
         sim = 1 - cosine_distances(X, X)
 
         dropped = set()
         for i, c1 in enumerate(labels):
+            b1 = extract_base_cui(c1)
             for j in range(i + 1, len(labels)):
-                c2 = labels[j]
-                if sim[i, j] >= 0.88:
-                    if nx.has_path(graph, c1, c2):
+                if sim[i, j] >= self.similarity_thresholds[2]:
+                    c2 = labels[j]
+                    b2 = extract_base_cui(c2)
+                    if nx.has_path(self.graph, b1, b2):
                         dropped.add(c2)
-                    elif nx.has_path(graph, c2, c1):
+                    elif nx.has_path(self.graph, b2, b1):
                         dropped.add(c1)
 
-        return set(cuis) - dropped
+        return cuis - dropped
 
-    # --------------------------------------------------------
-    # Coverage (OBSERVED ONLY)
-    # --------------------------------------------------------
-    def _coverage(self, observed: Set[str], retained: Set[str], graph: nx.DiGraph) -> float:
+    # ---------------- Coverage ----------------
+    def _coverage(self, observed: Set[str], retained: Set[str]) -> float:
         covered = set()
         for c in retained:
-            covered |= nx.descendants(graph, c)
-        return len(covered & observed) / len(observed) if observed else 0.0
+            base = extract_base_cui(c)
+            if base in self.graph:
+                covered |= nx.descendants(self.graph, base)
+        return len({c for c in observed if extract_base_cui(c) in covered}) / len(observed)
 
-    # --------------------------------------------------------
-    # FULL REDUCTION
-    # --------------------------------------------------------
-    def reduce(self, input_cuis: Set[str]) -> Tuple[List[str], ReductionStats]:
+    # ---------------- Reduce ----------------
+    def reduce(self, input_cuis: List[str]) -> Tuple[List[str], ReductionStats]:
         start = time.time()
-        observed_cuis = set(input_cuis)
+        observed = set(input_cuis)
+        groups = self._semantic_groups(input_cuis)
 
-        semantic_groups = self._semantic_groups(observed_cuis)
         retained_all = set()
+        group_stats = {}
 
-        for _, group_cuis in semantic_groups.items():
-            bases = {extract_base_cui(c) for c in group_cuis if extract_base_cui(c)}
-            graph = asyncio.run(self._fetch_hierarchy(bases))
-
-            ic = self._compute_ic(group_cuis, graph)
+        for sty, group in groups.items():
+            ic = self._compute_ic(group)
             threshold = np.percentile(list(ic.values()), 50)
             selected = {c for c, v in ic.items() if v >= threshold}
 
-            # 🔴 CLINICAL SAFETY GATE
-            selected &= observed_cuis
-
-            if not selected:
-                continue
-
+            # 🔴 CLINICAL SAFETY
+            selected &= observed
             self._fetch_embeddings(selected)
-            final_group = self._similarity_prune(selected, graph)
+            selected = self._similarity_prune(selected)
 
-            retained_all |= final_group
+            retained_all |= selected
+            group_stats[sty] = {
+                "original": len(group),
+                "retained": len(selected)
+            }
 
-        # 🔒 HARD SAFETY ASSERTION
-        assert retained_all.issubset(observed_cuis), \
-            "CLINICAL ERROR: non-observed CUI leaked"
+        assert retained_all.issubset(observed)
 
         stats = ReductionStats(
-            initial_count=len(observed_cuis),
-            after_ic=len(retained_all),
+            initial_count=len(observed),
+            after_ic_rollup=len(retained_all),
+            after_similarity_stage1=len(retained_all),
+            after_similarity_stage2=len(retained_all),
+            after_similarity_stage3=len(retained_all),
             final_count=len(retained_all),
-            total_reduction_pct=safe_percentage(
-                len(observed_cuis) - len(retained_all), len(observed_cuis)
-            ),
-            coverage_score=self._coverage(observed_cuis, retained_all, graph),
-            processing_time=time.time() - start
+            ic_rollup_reduction_pct=safe_percentage(len(observed)-len(retained_all), len(observed)),
+            similarity_reduction_pct=0.0,
+            total_reduction_pct=safe_percentage(len(observed)-len(retained_all), len(observed)),
+            processing_time=time.time()-start,
+            coverage_score=self._coverage(observed, retained_all),
+            group_stats=group_stats
         )
 
         return sorted(retained_all), stats
 
-# ------------------------------------------------------------
-# MAIN
-# ------------------------------------------------------------
-def main():
-    PROJECT_ID = "your_project"
-    DATASET_ID = "your_dataset"
-    CUI_API_URL = "your_cui_api"
-    SUBNET_API_URL = "your_subnet_api"
-    MRSTY_TABLE = "MRSTY"
-    EMBEDDING_TABLE = "EMBEDDINGS"
+# --------------------- MAIN ---------------------
+if __name__ == "__main__":
 
-    TEXTS = ["diabetes mellitus type 2 with complications"]
+    # Load pickle
+    # with open("UMLS_NETWORK_OBJ.pkl", "rb") as f:
+    #     UMLS_NETWORK_OBJ = pickle.load(f)
 
-    api = CUIAPIClient(CUI_API_URL)
-    extracted = api.extract_cuis(TEXTS)
-    filtered = filter_allowed_cuis(extracted, PROJECT_ID, DATASET_ID)
+    project_id = project_id
+    dataset_id = dataset
+    embedding_table = embedding_table
+    mrsty_table = "MRSTY"
+    api_url = url
 
-    reducer = ClinicalCUIReducer(
-        project=PROJECT_ID,
-        dataset=DATASET_ID,
-        subnet_api_url=SUBNET_API_URL,
-        mrsty_table=MRSTY_TABLE,
-        embedding_table=EMBEDDING_TABLE
+    texts = ["grams"]
+
+    api = CUIAPIClient(api_url)
+    extracted = api.extract_cuis_batch(texts)
+    filtered = filter_allowed_cuis(extracted, project_id, dataset_id)
+
+    reducer = EnhancedCUIReducer(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        embedding_table=embedding_table,
+        mrsty_table=mrsty_table,
+        umls_network=UMLS_NETWORK_OBJ
     )
 
     final_cuis, stats = reducer.reduce(filtered)
-    logger.info(f"FINAL CUIs: {final_cuis}")
-    logger.info(f"STATS: {stats.to_dict()}")
 
-if __name__ == "__main__":
-    main()
+    logger.info(json.dumps(stats.to_dict(), indent=2))
+    logger.info(f"FINAL CUIs: {final_cuis}")
