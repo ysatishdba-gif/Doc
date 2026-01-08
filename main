@@ -1,0 +1,259 @@
+"""
+Clinical Intent Extraction API - Main Application.
+
+Supports comma-separated input texts and returns comma-separated results.
+"""
+
+import uuid
+from datetime import datetime
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from app.config import config
+from app.pipeline import get_pipeline
+from app.logging_config import (
+    logger, 
+    log_request, 
+    log_intents_detected, 
+    log_ambiguous_case,
+    log_error, 
+    log_response
+)
+from prompts.query_expansion_prompt import PROMPT_VERSION as EXPANSION_VERSION
+from prompts.intent_extraction_prompt import PROMPT_VERSION as EXTRACTION_VERSION
+
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS
+# =============================================================================
+
+class InputMetadata(BaseModel):
+    """Optional metadata for input."""
+    source: Optional[str] = Field(default=None, description="Source type")
+    source_id: Optional[str] = Field(default=None, description="Source identifier")
+    timestamp: Optional[str] = Field(default=None, description="Original timestamp")
+
+
+class IntentRequest(BaseModel):
+    """
+    Request model for intent extraction.
+    Supports comma-separated texts for batch processing.
+    """
+    text: str = Field(
+        ..., 
+        min_length=1, 
+        description="Input text(s) - comma-separated for multiple queries"
+    )
+    metadata: Optional[InputMetadata] = Field(default=None, description="Optional metadata")
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "text": "Pt with HTN and DM, SOB on exertion for 2 weeks, Family hx of heart disease",
+                "metadata": {"source": "clinical_note", "source_id": "NOTE-001"}
+            }]
+        }
+    }
+
+
+class SingleIntentResult(BaseModel):
+    """Result for a single input text."""
+    input_index: int
+    original_query: str
+    expanded_query: str
+    abbreviations_expanded: List[str]
+    concepts_added: List[str]
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    total_intents: int
+    intents: List[Dict[str, Any]]
+    processing_time_seconds: float
+
+
+class IntentResponse(BaseModel):
+    """
+    Response model for intent extraction.
+    Contains results for each comma-separated input.
+    """
+    request_id: str
+    total_inputs: int
+    results: List[SingleIntentResult]
+    total_intents_all: int
+    total_processing_time_seconds: float
+    timestamp: str
+    prompt_versions: Dict[str, str]
+
+
+# =============================================================================
+# FASTAPI APPLICATION
+# =============================================================================
+
+app = FastAPI(
+    title="Clinical Intent Extraction API",
+    description="""
+    Extract structured clinical intents from medical text.
+    
+    **Features:**
+    - Supports comma-separated input texts for batch processing
+    - Returns comma-separated results maintaining input order
+    - Expands medical abbreviations automatically
+    - Extracts hierarchical clinical intents with sub-natures
+    - Generates ontology-ready final queries for CUI mapping
+    
+    **Input Format:**
+    - Single text: `"Pt with HTN and DM"`
+    - Multiple texts: `"Pt with HTN, SOB on exertion, Family hx of CAD"`
+    """,
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+
+@app.get("/")
+def root():
+    """API root - basic info."""
+    return {
+        "name": "Clinical Intent Extraction API",
+        "version": "1.0.0",
+        "docs": "/docs",
+        "prompt_versions": {
+            "query_expansion": EXPANSION_VERSION,
+            "intent_extraction": EXTRACTION_VERSION
+        }
+    }
+
+
+@app.get("/health")
+def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "config": {
+            "project": config.GCP_PROJECT_ID,
+            "location": config.GCP_LOCATION,
+            "model": config.MODEL_VERSION
+        }
+    }
+
+
+@app.get("/version")
+def version():
+    """Get API and prompt versions."""
+    return {
+        "api_version": "1.0.0",
+        "prompt_versions": {
+            "query_expansion": EXPANSION_VERSION,
+            "intent_extraction": EXTRACTION_VERSION
+        },
+        "model_version": config.MODEL_VERSION
+    }
+
+
+@app.post("/extract", response_model=IntentResponse)
+def extract_intents(request: IntentRequest):
+    """
+    Extract clinical intents from input text(s).
+    
+    **Input:**
+    - Single text or comma-separated texts
+    - Example: `"Pt with HTN, SOB on exertion, Diabetes follow-up"`
+    
+    **Output:**
+    - Results for each input text in order
+    - Each result contains intents with descriptions, sub-natures, and final_queries
+    
+    **Logging:**
+    - Input received with text count
+    - Intents detected per text
+    - Ambiguous cases flagged
+    - Processing time
+    """
+    request_id = str(uuid.uuid4())
+    start_time = datetime.utcnow()
+    
+    try:
+        # Parse comma-separated texts
+        texts = [t.strip() for t in request.text.split(",") if t.strip()]
+        
+        if not texts:
+            raise HTTPException(status_code=400, detail="No valid texts provided")
+        
+        # Log request
+        source = request.metadata.source if request.metadata else None
+        log_request(logger, request_id, texts, source)
+        
+        # Get pipeline and process
+        pipeline = get_pipeline()
+        raw_results = pipeline.process_multiple(texts)
+        
+        # Build response
+        results = []
+        total_intents_all = 0
+        
+        for idx, raw in enumerate(raw_results):
+            intents_count = raw.get("total_intents", 0)
+            is_clinical = raw.get("is_clinical", True)
+            
+            # Log intents detected
+            log_intents_detected(logger, request_id, idx, intents_count, is_clinical)
+            
+            # Log ambiguous cases
+            if not is_clinical:
+                log_ambiguous_case(logger, request_id, idx, 
+                                   raw.get("rejected_reason", "Non-clinical"))
+            
+            result = SingleIntentResult(
+                input_index=idx,
+                original_query=raw.get("original_query", texts[idx]),
+                expanded_query=raw.get("expanded_query", texts[idx]),
+                abbreviations_expanded=raw.get("abbreviations_expanded", []),
+                concepts_added=raw.get("concepts_added", []),
+                is_clinical=is_clinical,
+                rejected_reason=raw.get("rejected_reason"),
+                total_intents=intents_count,
+                intents=raw.get("intents", []),
+                processing_time_seconds=raw.get("processing_time_seconds", 0)
+            )
+            results.append(result)
+            total_intents_all += intents_count
+        
+        total_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        # Log response
+        log_response(logger, request_id, total_intents_all, total_time)
+        
+        return IntentResponse(
+            request_id=request_id,
+            total_inputs=len(texts),
+            results=results,
+            total_intents_all=total_intents_all,
+            total_processing_time_seconds=total_time,
+            timestamp=datetime.utcnow().isoformat(),
+            prompt_versions={
+                "query_expansion": EXPANSION_VERSION,
+                "intent_extraction": EXTRACTION_VERSION
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_error(logger, request_id, str(e))
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+
+# =============================================================================
+# RUN SERVER
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host=config.API_HOST,
+        port=config.API_PORT,
+        reload=config.DEBUG
+    )
