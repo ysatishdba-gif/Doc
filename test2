@@ -1,337 +1,609 @@
-# ============================================================
-# CLINICALLY SAFE CUI REDUCTION PIPELINE (PICKLE-BASED HIERARCHY)
-# ============================================================
+"""
+Clinical Intent Extraction API - Minimal Version
+FastAPI wrapper around the working intent extraction pipeline.
+"""
 
-import subprocess
-import re
-import logging
 import json
-from typing import List, Dict, Set, Tuple
-from collections import defaultdict
-import time
-from dataclasses import dataclass, asdict
-import threading
-import pickle
-import numpy as np
+import re
+import os
+import uuid
+from datetime import datetime
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from google.cloud import aiplatform
+from vertexai.generative_models import GenerativeModel
 
-import networkx as nx
-from google.cloud import bigquery
-from sklearn.metrics.pairwise import cosine_distances
-import requests
-from requests.adapters import HTTPAdapter, Retry
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
-# --------------------- Logging ---------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id")
+LOCATION = os.getenv("GCP_LOCATION", "us-central1")
+MODEL_VERSION = os.getenv("MODEL_VERSION", "gemini-2.0-flash-001")
 
-# --------------------- Utilities ---------------------
-def extract_base_cui(cui: str) -> str | None:
-    if not cui:
-        return None
-    m = re.match(r"^(C\d{7})", cui.upper())
-    return m.group(1) if m else None
+# =============================================================================
+# PROMPTS (UNCHANGED FROM WORKING CODE)
+# =============================================================================
 
-def safe_percentage(n, d):
-    return (n / d * 100) if d else 0.0
+QUERY_EXPANSION_PROMPT = """
+You are an expert medical AI assistant specializing in clinical query expansion.
 
-# --------------------- GCP Token ---------------------
-class GCPTokenProvider:
-    _lock = threading.Lock()
-    _token = None
-    _expiry = 0
+TASK: Expand the user's query into a comprehensive, detailed clinical description.
 
-    @classmethod
-    def get_headers(cls, force=False):
-        with cls._lock:
-            now = time.time()
-            if not force and cls._token and now < cls._expiry:
-                return cls._token
+INSTRUCTIONS:
+1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
+2. Clarify vague medical terms with specific clinical language
+3. Add relevant medical context based on standard clinical practice
+4. Identify implicit clinical concepts that should be explicit
+5. DO NOT add assumptions beyond reasonable clinical interpretation
+6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
+7. DO NOT hallucinate information not implied by the query
+8. Maintain the original query's intent and scope
+9.Make sure the Temporal accept is relevant to the Query context
 
-            proc = subprocess.run(
-                ["gcloud", "auth", "print-identity-token"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10
+EXAMPLES:
+- "Pt with DM" → "Patient with Diabetes Mellitus"
+- "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
+- "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
+- "SOB on exertion" → "Shortness of breath on exertion"
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "expanded_query": "comprehensive expanded clinical description",
+  "abbreviations_expanded": ["list of abbreviations that were expanded"],
+  "concepts_added": ["list of medical concepts that were made explicit"]
+}}
+
+User Input: {query}
+"""
+
+INTENT_EXTRACTION_PROMPT = """
+You are a clinical intent extraction engine specialized in medical information retrieval, ontology alignment, and hierarchical taxonomy construction.
+
+====================================================
+STEP 1 — CLINICAL RELEVANCE VALIDATION
+====================================================
+
+Determine whether the query is CLINICAL.
+
+If the query is NOT related to healthcare, medical conditions, symptoms, diagnostics, treatments, medications, procedures, or clinical documentation, return EXACTLY:
+
+{{
+  "is_clinical": false,
+  "reason": "Query is not clinical in nature",
+  "intents": []
+}}
+
+Reject non-clinical topics such as:
+- Weather, sports, entertainment, general knowledge
+- Technical or IT support unrelated to medical systems
+- Travel, food, shopping (unless medically relevant)
+
+If the query IS clinical, proceed.
+
+====================================================
+STEP 2 — INTENT GENERATION (CLINICAL CONSTRAINT-BASED)
+====================================================
+
+Decompose the expanded query into the minimum set of clinically independent intents required to fully represent the patient's clinical narrative, based solely on explicitly stated information and clinical meaning.
+
+An intent represents a clinically independent information object that could reasonably be interpreted, documented, or acted upon independently in a real clinical encounter.
+
+Do NOT infer, assume, or extrapolate beyond what is explicitly stated.
+
+A single query may contain multiple intents if multiple clinically independent concepts are present.
+
+====================================================
+INTENT COMPLETENESS REQUIREMENT
+====================================================
+
+Once an intent is identified, it MUST be expanded into a clinically complete representation of that concept.
+
+All clinical dimensions that are explicitly present or clinically inseparable from the concept MUST be captured within that intent so downstream systems can extract structured data without cross-intent inference or recombination.
+
+=====================================================
+INTENT TITLE
+====================================================
+
+intent_title naming guidance:
+- Use a clinically descriptive noun phrase
+- Include relevant qualifiers when they clarify scope or role
+- Avoid abstract, analytical, or process-oriented language
+- The title should clearly represent the clinical or operational information object, not the method used to derive it.
+
+====================================================
+INTENT DEFINITION
+====================================================
+
+Each intent MUST include:
+
+1. intent_title
+- Concise, clinician-readable name of the core clinical concept
+- Represents the clinical object, not narrative context
+
+2. description
+- Provide a clear, comprehensive, and detailed clinical explanation of the information.
+- Write as a direct clinical statement without meta-phrases or self-referential language (e.g., avoid "this intent is," "the purpose is," or similar constructions).
+- Describe the clinical concept itself, including what the information represents, how it is clinically interpreted, and its relevance to patient care or decision-making.
+- Focus on the clinical attributes and significance of the concept, independent of any intent, query, or extraction framework.
+
+3. nature
+- Describes the PRIMARY clinical role of this information within a real clinical encounter
+- Reflects how the information is used in clinical reasoning
+- Broad enough to encompass all subordinate detail
+- Specific enough to distinguish this intent from others in the same query
+- Nature is a clinical role descriptor, not a fixed taxonomy label
+
+Examples (illustrative only):
+- Current Clinical Presentation / Symptom Assessment
+- Current Clinical Presentation / Associated Findings
+- Patient Perspective / Diagnostic Concern
+- Functional Status / Symptom Impact
+- Clinical History / Temporal Context
+- Diagnostic Evaluation / Test Results
+- Therapeutic Management / Medication Use
+
+Create new nature expressions when clinically appropriate.
+
+4. sub_nature
+- Represents the internal clinical dimensions of the intent
+- Each sub_nature captures ONE clinical dimension (not a separate intent)
+- Multiple sub_nature entries are expected for clinically rich concepts
+- Minimum depth: 3–4 hierarchical levels per dimension
+
+5. final_queries
+- Highly specific, ontology-searchable extraction targets
+- Generated ONLY from atomic elements
+- Minimum 5 queries per intent
+- No intent may be returned without final_queries
+
+====================================================
+SUB_NATURE STRUCTURE (CLINICAL DIMENSION MODEL)
+====================================================
+
+Each sub_nature MUST follow this structure:
+
+{{
+  "category": "Broad Clinical Dimension >> Specific Clinical Axis >> Focused Classification",
+  "elements": ["atomic clinical concepts"],
+  "entities": ["ontology-aligned medical entity types"]
+}}
+
+====================================================
+CATEGORY DEFINITION
+====================================================
+
+The category expresses the clinical dimension and its hierarchical refinement.
+
+It should reflect:
+- The axis of clinical interpretation (e.g., anatomy, time, severity, function, perception)
+- Progressive narrowing from general to specific
+- How clinicians mentally organize this information
+
+Examples:
+- Symptom Characteristics >> Temporal Pattern >> Onset
+- Symptom Characteristics >> Severity Assessment >> Functional Impact
+- Clinical Context >> Episode History >> Prior Occurrence
+- Patient Perspective >> Diagnostic Interpretation >> Suspected Condition
+
+====================================================
+ELEMENTS DEFINITION (ATOMICITY REQUIRED)
+====================================================
+
+Elements contain the most granular, clinically atomic concepts that are:
+- Explicitly stated or clinically inseparable from the intent
+- Directly documentable
+- Not further decomposable
+- Free of narrative or contextual wording
+
+Elements represent clinical facts or descriptors, not phrases or categories.
+
+Examples:
+- acute onset
+- no prior episodes
+- sleep disruption
+- impaired concentration
+- concern for appendicitis
+
+====================================================
+ENTITIES DEFINITION
+====================================================
+
+Entities describe the medical concept type represented by the elements and support ontology mapping.
+
+Examples:
+- Symptom
+- TemporalQualifier
+- SeverityDescriptor
+- FunctionalStatus
+- ClinicalFinding
+- PatientBelief
+- SuspectedDiagnosis
+
+====================================================
+FINAL_QUERIES GENERATION (EXTRACTION-OPTIMIZED)
+====================================================
+
+Final queries are extraction targets, not summaries.
+
+They MUST:
+- Be generated ONLY from atomic elements
+- Be short, precise, and clinically unambiguous
+- Reflect how information appears in real clinical documentation
+- Map cleanly to a small, focused CUI set (~2–15 CUIs)
+- Generate queries that can be directly searched in medical ontologies (SNOMED, UMLS, ICD)
+
+Remove:
+- "history of", "assessment", "measurement", "level"
+- Articles and unnecessary prepositions
+- Subject references (patient, user, individual)
+
+Preferred forms:
+- [Symptom] [descriptor]
+- [Symptom] [temporal qualifier]
+- [Symptom] [functional impact]
+- [Condition] suspected
+- [Finding] absent
+
+Examples:
+- abdominal pain acute onset
+- abdominal pain first episode
+- abdominal pain sleep disruption
+- abdominal pain impaired concentration
+- appendicitis suspected
+- Type 2 diabetes
+
+====================================================
+QUERY SELECTION PRINCIPLES
+====================================================
+
+Generate queries that:
+- Are commonly documented in clinical notes
+- Influence diagnosis, triage, or management
+- Represent clinically meaningful distinctions
+
+Avoid:
+- Exhaustive permutations
+- Redundant phrasing
+- Theoretical or speculative combinations
+
+====================================================
+FINAL VALIDATION CHECK
+====================================================
+
+Before returning output, ensure:
+- Each intent is a clinically complete information object
+- Each sub_nature represents a distinct clinical dimension
+- Elements are atomic and explicit
+- Final queries require no inference to extract
+- No clinical meaning is unnecessarily split across intents
+- JSON is valid and clean
+
+====================================================
+RESPONSE FORMAT (JSON ONLY)
+====================================================
+
+{{
+  "is_clinical": true,
+  "reason": "",
+  "original_query": "{original_query}",
+  "expanded_query": "{expanded_query}",
+  "total_intents_detected": number,
+  "intents": [
+    {{
+      "intent_title": "string",
+      "description": "string",
+      "nature": "string",
+      "sub_nature": [
+        {{
+          "category": "string",
+          "elements": ["string"],
+          "entities": ["string"]
+        }}
+      ],
+      "final_queries": [
+        "string",
+        "string"
+      ]
+    }}
+  ]
+}}
+
+User Input: {expanded_query}
+Timestamp: {timestamp}
+"""
+
+# =============================================================================
+# REQUEST/RESPONSE MODELS
+# =============================================================================
+
+class InputMetadata(BaseModel):
+    """Optional metadata for input text."""
+    source: Optional[str] = Field(default=None, description="Source type (e.g., clinical_note, patient_portal)")
+    source_id: Optional[str] = Field(default=None, description="Source system identifier")
+    timestamp: Optional[str] = Field(default=None, description="Original text timestamp")
+
+class IntentRequest(BaseModel):
+    """Request model for intent extraction."""
+    text: str = Field(..., min_length=1, description="Input text for intent extraction")
+    metadata: Optional[InputMetadata] = Field(default=None, description="Optional metadata")
+    
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{
+                "text": "Pt with HTN and DM. SOB on exertion for 2 weeks.",
+                "metadata": {"source": "clinical_note", "source_id": "NOTE-001"}
+            }]
+        }
+    }
+
+class IntentResponse(BaseModel):
+    """Response model for intent extraction."""
+    request_id: str
+    is_clinical: bool
+    original_query: str
+    expanded_query: str
+    abbreviations_expanded: List[str]
+    concepts_added: List[str]
+    total_intents: int
+    intents: List[Dict[str, Any]]
+    rejected_reason: Optional[str] = None
+    processing_time_seconds: float
+    timestamp: str
+
+# =============================================================================
+# PIPELINE (UNCHANGED LOGIC)
+# =============================================================================
+
+class ContextualIntentPipeline:
+    """Intent extraction pipeline - logic unchanged from working code."""
+    
+    def __init__(self, project: str, location: str = "us-central1", model: str = MODEL_VERSION):
+        aiplatform.init(project=project, location=location)
+        self.model = GenerativeModel(model)
+        
+    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096) -> str:
+        try:
+            if hasattr(self.model, "session") and self.model.session is not None:
+                self.model.session.reset()
+            
+            response = self.model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": 0.0,
+                    "max_output_tokens": max_tokens,
+                    "top_p": 1.0,
+                    "top_k": 1,
+                    "seed": 43
+                }
             )
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr)
-
-            token = proc.stdout.strip()
-            cls._token = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
+            return response.text.strip()
+        except Exception as e:
+            print(f"Error calling model: {str(e)}")
+            return "{}"
+    
+    def _safe_json(self, text: str) -> Dict[str, Any]:
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*', '', text)
+        text = text.strip()
+        
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            print(f"Failed to parse JSON from response: {text[:200]}")
+            return {}
+    
+    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
+        return all(key in data for key in required_keys)
+    
+    def expand_query(self, query: str) -> Dict[str, Any]:
+        prompt = QUERY_EXPANSION_PROMPT.format(query=query)
+        raw_response = self._call_model(prompt)
+        data = self._safe_json(raw_response)
+        
+        if not self._validate_json_structure(data, ["expanded_query"]):
+            return {
+                "expanded_query": query,
+                "abbreviations_expanded": [],
+                "concepts_added": []
             }
-            cls._expiry = now + 3300
-            return cls._token
-
-# --------------------- Stats ---------------------
-@dataclass
-class ReductionStats:
-    initial_count: int
-    after_ic_rollup: int
-    after_similarity_stage1: int
-    after_similarity_stage2: int
-    after_similarity_stage3: int
-    final_count: int
-    ic_rollup_reduction_pct: float
-    similarity_reduction_pct: float
-    total_reduction_pct: float
-    processing_time: float
-    coverage_score: float
-    group_stats: Dict
-
-    def to_dict(self):
-        return asdict(self)
-
-# --------------------- Vocabulary Filter ---------------------
-def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
-    if not cuis:
-        return []
-
-    client = bigquery.Client(project=project_id)
-    bases = list({extract_base_cui(c) for c in cuis if extract_base_cui(c)})
-
-    query = f"""
-    SELECT DISTINCT CUI
-    FROM `{project_id}.{dataset_id}.MRCONSO`
-    WHERE CUI IN UNNEST(@cuis)
-      AND SAB IN ('ICD10','ICD10CM','ICD9CM','SNOMEDCT_US','LOINC')
-    """
-
-    df = client.query(
-        query,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", bases)
-            ]
+        
+        return {
+            "expanded_query": data.get("expanded_query", query),
+            "abbreviations_expanded": data.get("abbreviations_expanded", []),
+            "concepts_added": data.get("concepts_added", [])
+        }
+    
+    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+        prompt = INTENT_EXTRACTION_PROMPT.format(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            timestamp=datetime.utcnow().isoformat()
         )
-    ).to_dataframe()
-
-    allowed = set(df["CUI"])
-    return [c for c in cuis if extract_base_cui(c) in allowed]
-
-# --------------------- CUI API Client ---------------------
-class CUIAPIClient:
-    def __init__(self, api_url: str, top_k: int = 3):
-        self.api_url = api_url
-        self.top_k = top_k
-        self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=1,
-                      status_forcelist=[429,500,502,503])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-
-    def extract_cuis_batch(self, texts: List[str]) -> Set[str]:
-        r = self.session.post(
-            self.api_url,
-            headers=GCPTokenProvider.get_headers(),
-            json={"query_texts": texts, "top_k": self.top_k},
-            timeout=60
-        )
-        r.raise_for_status()
-        out = set()
-        for v in r.json().values():
-            out.update(map(str, v))
-        return out
-
-# --------------------- Enhanced Reducer ---------------------
-class EnhancedCUIReducer:
-    def __init__(
-        self,
-        project_id: str,
-        dataset_id: str,
-        embedding_table: str,
-        mrsty_table: str,
-        umls_network: nx.DiGraph,
-        similarity_thresholds=(0.95, 0.90, 0.85)
-    ):
-        self.client = bigquery.Client(project=project_id)
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.embedding_table = embedding_table
-        self.mrsty_table = mrsty_table
-        self.graph = umls_network
-        self.similarity_thresholds = similarity_thresholds
-        self.embedding_cache = {}
-
-    # ---------------- Semantic Groups ----------------
-    def _semantic_groups(self, cuis: List[str]) -> Dict[str, List[str]]:
-        query = f"""
-        SELECT CUI, STY
-        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        df = self.client.query(
-            query,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
-                ]
-            )
-        ).to_dataframe()
-
-        groups = defaultdict(list)
-        for _, r in df.iterrows():
-            groups[r.STY].append(r.CUI)
-
-        return groups if groups else {"UNKNOWN": cuis}
-
-    # ---------------- IC Computation ----------------
-    def _compute_ic(self, group: List[str]) -> Dict[str, float]:
-        N = len(group)
-        group_set = set(group)
-        ic = {}
-
-        for c in group:
-            base = extract_base_cui(c)
-            if base not in self.graph:
-                ic[c] = 0.0
+        
+        raw_response = self._call_model(prompt, max_tokens=8096)
+        data = self._safe_json(raw_response)
+        
+        if not data.get("is_clinical", True):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "is_clinical": False,
+                "rejected_reason": data.get("reason", "Query is not clinical"),
+                "original_query": original_query,
+                "expanded_query": expanded_query
+            }
+        
+        if not self._validate_json_structure(data, ["intents"]):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "error": "Failed to extract intents"
+            }
+        
+        intents = data.get("intents", [])
+        validated_intents = []
+        
+        for idx, intent in enumerate(intents):
+            if "final_queries" not in intent or not intent["final_queries"]:
+                print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
                 continue
-
-            descendants = {
-                x for x in group_set
-                if extract_base_cui(x) in nx.descendants(self.graph, base)
+            validated_intents.append(intent)
+        
+        return {
+            "intents": validated_intents,
+            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
+            "is_clinical": True,
+            "original_query": data.get("original_query", original_query),
+            "expanded_query": data.get("expanded_query", expanded_query)
+        }
+    
+    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
+        start_time = datetime.utcnow()
+        
+        if verbose:
+            print(f"Original Query: {query}")
+        
+        expansion_result = self.expand_query(query)
+        expanded_query = expansion_result["expanded_query"]
+        
+        if verbose:
+            print(f"Expanded Query: {expanded_query}")
+        
+        intent_result = self.extract_intents(query, expanded_query)
+        
+        if not intent_result.get("is_clinical", True):
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
+            
+            if verbose:
+                print(f"Status: NON-CLINICAL (rejected)")
+                print(f"Processing Time: {processing_time:.2f}s\n")
+            
+            return {
+                "original_query": query,
+                "expanded_query": expanded_query,
+                "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
+                "concepts_added": expansion_result.get("concepts_added", []),
+                "intents": [],
+                "is_clinical": False,
+                "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
+                "timestamp": datetime.utcnow().isoformat(),
+                "processing_time_seconds": processing_time
             }
-            ic[c] = -np.log((len(descendants) + 1) / N)
+        
+        intents = intent_result.get("intents", [])
+        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
+        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        if verbose:
+            print(f"Status: CLINICAL")
+            print(f"Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
+            print(f"Processing Time: {processing_time:.2f}s\n")
+        
+        return {
+            "original_query": query,
+            "expanded_query": expanded_query,
+            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
+            "concepts_added": expansion_result.get("concepts_added", []),
+            "intents": intents,
+            "is_clinical": True,
+            "timestamp": datetime.utcnow().isoformat(),
+            "processing_time_seconds": processing_time
+        }
 
-        return ic
+# =============================================================================
+# FASTAPI APPLICATION
+# =============================================================================
 
-    # ---------------- Embeddings ----------------
-    def _fetch_embeddings(self, cuis: Set[str]):
-        uncached = [c for c in cuis if c not in self.embedding_cache]
-        if not uncached:
-            return
+app = FastAPI(
+    title="Clinical Intent Extraction API",
+    description="Extract structured clinical intents from medical text",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
-        query = f"""
-        SELECT CUI, embedding
-        FROM `{self.project_id}.{self.dataset_id}.{self.embedding_table}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        df = self.client.query(
-            query,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
-                ]
-            )
-        ).to_dataframe()
+# Initialize pipeline (lazy loading)
+_pipeline: Optional[ContextualIntentPipeline] = None
 
-        for _, r in df.iterrows():
-            if r.embedding is not None:
-                self.embedding_cache[r.CUI] = np.asarray(r.embedding, dtype=np.float32)
-
-    # ---------------- Similarity Pruning ----------------
-    def _similarity_prune(self, cuis: Set[str]) -> Set[str]:
-        X, labels = [], []
-        for c in cuis:
-            if c in self.embedding_cache:
-                X.append(self.embedding_cache[c])
-                labels.append(c)
-
-        if len(X) < 2:
-            return cuis
-
-        X = np.vstack(X)
-        sim = 1 - cosine_distances(X, X)
-
-        dropped = set()
-        for i, c1 in enumerate(labels):
-            b1 = extract_base_cui(c1)
-            for j in range(i + 1, len(labels)):
-                if sim[i, j] >= self.similarity_thresholds[2]:
-                    c2 = labels[j]
-                    b2 = extract_base_cui(c2)
-                    if nx.has_path(self.graph, b1, b2):
-                        dropped.add(c2)
-                    elif nx.has_path(self.graph, b2, b1):
-                        dropped.add(c1)
-
-        return cuis - dropped
-
-    # ---------------- Coverage ----------------
-    def _coverage(self, observed: Set[str], retained: Set[str]) -> float:
-        covered = set()
-        for c in retained:
-            base = extract_base_cui(c)
-            if base in self.graph:
-                covered |= nx.descendants(self.graph, base)
-        return len({c for c in observed if extract_base_cui(c) in covered}) / len(observed)
-
-    # ---------------- Reduce ----------------
-    def reduce(self, input_cuis: List[str]) -> Tuple[List[str], ReductionStats]:
-        start = time.time()
-        observed = set(input_cuis)
-        groups = self._semantic_groups(input_cuis)
-
-        retained_all = set()
-        group_stats = {}
-
-        for sty, group in groups.items():
-            ic = self._compute_ic(group)
-            threshold = np.percentile(list(ic.values()), 50)
-            selected = {c for c, v in ic.items() if v >= threshold}
-
-            # 🔴 CLINICAL SAFETY
-            selected &= observed
-            self._fetch_embeddings(selected)
-            selected = self._similarity_prune(selected)
-
-            retained_all |= selected
-            group_stats[sty] = {
-                "original": len(group),
-                "retained": len(selected)
-            }
-
-        assert retained_all.issubset(observed)
-
-        stats = ReductionStats(
-            initial_count=len(observed),
-            after_ic_rollup=len(retained_all),
-            after_similarity_stage1=len(retained_all),
-            after_similarity_stage2=len(retained_all),
-            after_similarity_stage3=len(retained_all),
-            final_count=len(retained_all),
-            ic_rollup_reduction_pct=safe_percentage(len(observed)-len(retained_all), len(observed)),
-            similarity_reduction_pct=0.0,
-            total_reduction_pct=safe_percentage(len(observed)-len(retained_all), len(observed)),
-            processing_time=time.time()-start,
-            coverage_score=self._coverage(observed, retained_all),
-            group_stats=group_stats
+def get_pipeline() -> ContextualIntentPipeline:
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = ContextualIntentPipeline(
+            project=PROJECT_ID,
+            location=LOCATION,
+            model=MODEL_VERSION
         )
+    return _pipeline
 
-        return sorted(retained_all), stats
+@app.get("/")
+def root():
+    """API root - basic info."""
+    return {
+        "name": "Clinical Intent Extraction API",
+        "version": "1.0.0",
+        "docs": "/docs"
+    }
 
-# --------------------- MAIN ---------------------
+@app.get("/health")
+def health():
+    """Health check endpoint."""
+    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+
+@app.post("/extract", response_model=IntentResponse)
+def extract_intents(request: IntentRequest):
+    """
+    Extract clinical intents from input text.
+    
+    - **text**: Input text (single or multi-paragraph)
+    - **metadata**: Optional source metadata
+    
+    Returns structured list of clinical intents with descriptions, 
+    sub-natures, and ontology-ready final queries.
+    """
+    request_id = str(uuid.uuid4())
+    
+    try:
+        pipeline = get_pipeline()
+        result = pipeline.run(request.text, verbose=False)
+        
+        return IntentResponse(
+            request_id=request_id,
+            is_clinical=result.get("is_clinical", True),
+            original_query=result.get("original_query", request.text),
+            expanded_query=result.get("expanded_query", request.text),
+            abbreviations_expanded=result.get("abbreviations_expanded", []),
+            concepts_added=result.get("concepts_added", []),
+            total_intents=len(result.get("intents", [])),
+            intents=result.get("intents", []),
+            rejected_reason=result.get("rejected_reason"),
+            processing_time_seconds=result.get("processing_time_seconds", 0),
+            timestamp=result.get("timestamp", datetime.utcnow().isoformat())
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+
+# =============================================================================
+# RUN SERVER
+# =============================================================================
+
 if __name__ == "__main__":
-
-    # Load pickle
-    # with open("UMLS_NETWORK_OBJ.pkl", "rb") as f:
-    #     UMLS_NETWORK_OBJ = pickle.load(f)
-
-    project_id = project_id
-    dataset_id = dataset
-    embedding_table = embedding_table
-    mrsty_table = "MRSTY"
-    api_url = url
-
-    texts = ["grams"]
-
-    api = CUIAPIClient(api_url)
-    extracted = api.extract_cuis_batch(texts)
-    filtered = filter_allowed_cuis(extracted, project_id, dataset_id)
-
-    reducer = EnhancedCUIReducer(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        embedding_table=embedding_table,
-        mrsty_table=mrsty_table,
-        umls_network=UMLS_NETWORK_OBJ
-    )
-
-    final_cuis, stats = reducer.reduce(filtered)
-
-    logger.info(json.dumps(stats.to_dict(), indent=2))
-    logger.info(f"FINAL CUIs: {final_cuis}")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
