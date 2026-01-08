@@ -1,0 +1,176 @@
+"""
+Clinical Intent Extraction Pipeline.
+Core processing logic for extracting intents from medical text.
+"""
+
+import json
+import re
+from datetime import datetime
+from typing import Dict, Any, List, Tuple
+
+from google.cloud import aiplatform
+from vertexai.generative_models import GenerativeModel
+
+from app.config import config
+from prompts.query_expansion_prompt import get_prompt as get_expansion_prompt
+from prompts.intent_extraction_prompt import get_prompt as get_extraction_prompt
+
+
+class IntentExtractionPipeline:
+    """Pipeline for extracting clinical intents from medical text."""
+    
+    def __init__(self):
+        """Initialize the pipeline with Vertex AI."""
+        aiplatform.init(project=config.GCP_PROJECT_ID, location=config.GCP_LOCATION)
+        self.model = GenerativeModel(config.MODEL_VERSION)
+    
+    def _call_model(self, prompt: str, max_tokens: int = None) -> str:
+        """Call the generative model."""
+        max_tokens = max_tokens or config.MODEL_MAX_TOKENS
+        
+        try:
+            if hasattr(self.model, "session") and self.model.session is not None:
+                self.model.session.reset()
+            
+            response = self.model.generate_content(
+                prompt,
+                generation_config={
+                    "temperature": config.MODEL_TEMPERATURE,
+                    "max_output_tokens": max_tokens,
+                    "top_p": config.MODEL_TOP_P,
+                    "top_k": config.MODEL_TOP_K,
+                    "seed": config.MODEL_SEED
+                }
+            )
+            return response.text.strip()
+        except Exception as e:
+            print(f"Error calling model: {str(e)}")
+            return "{}"
+    
+    def _safe_json_parse(self, text: str) -> Dict[str, Any]:
+        """Safely parse JSON from model response."""
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*', '', text)
+        text = text.strip()
+        
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r'\{.*\}', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    pass
+            
+            return {}
+    
+    def expand_query(self, query: str) -> Dict[str, Any]:
+        """Expand medical abbreviations and add clinical context."""
+        prompt = get_expansion_prompt(query)
+        raw_response = self._call_model(prompt)
+        data = self._safe_json_parse(raw_response)
+        
+        if "expanded_query" not in data:
+            return {
+                "expanded_query": query,
+                "abbreviations_expanded": [],
+                "concepts_added": []
+            }
+        
+        return {
+            "expanded_query": data.get("expanded_query", query),
+            "abbreviations_expanded": data.get("abbreviations_expanded", []),
+            "concepts_added": data.get("concepts_added", [])
+        }
+    
+    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+        """Extract clinical intents from expanded query."""
+        prompt = get_extraction_prompt(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        
+        raw_response = self._call_model(prompt)
+        data = self._safe_json_parse(raw_response)
+        
+        # Check if non-clinical
+        if not data.get("is_clinical", True):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "is_clinical": False,
+                "rejected_reason": data.get("reason", "Query is not clinical"),
+                "original_query": original_query,
+                "expanded_query": expanded_query
+            }
+        
+        # Validate intents
+        intents = data.get("intents", [])
+        validated_intents = []
+        
+        for idx, intent in enumerate(intents):
+            if "final_queries" not in intent or not intent["final_queries"]:
+                continue
+            validated_intents.append(intent)
+        
+        return {
+            "intents": validated_intents,
+            "total_intents_detected": len(validated_intents),
+            "is_clinical": True,
+            "original_query": original_query,
+            "expanded_query": expanded_query
+        }
+    
+    def process_single(self, text: str) -> Dict[str, Any]:
+        """Process a single text input."""
+        start_time = datetime.utcnow()
+        
+        # Step 1: Expand query
+        expansion_result = self.expand_query(text)
+        expanded_query = expansion_result["expanded_query"]
+        
+        # Step 2: Extract intents
+        intent_result = self.extract_intents(text, expanded_query)
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        return {
+            "original_query": text,
+            "expanded_query": expanded_query,
+            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
+            "concepts_added": expansion_result.get("concepts_added", []),
+            "is_clinical": intent_result.get("is_clinical", True),
+            "rejected_reason": intent_result.get("rejected_reason"),
+            "intents": intent_result.get("intents", []),
+            "total_intents": len(intent_result.get("intents", [])),
+            "processing_time_seconds": processing_time
+        }
+    
+    def process_multiple(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Process multiple text inputs."""
+        results = []
+        for text in texts:
+            result = self.process_single(text.strip())
+            results.append(result)
+        return results
+
+
+# Singleton instance
+_pipeline_instance = None
+
+
+def get_pipeline() -> IntentExtractionPipeline:
+    """Get pipeline singleton instance."""
+    global _pipeline_instance
+    if _pipeline_instance is None:
+        _pipeline_instance = IntentExtractionPipeline()
+    return _pipeline_instance
