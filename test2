@@ -1,30 +1,10 @@
-"""
-Clinical Intent Extraction API - Minimal Version
-FastAPI wrapper around the working intent extraction pipeline.
-"""
-
-import json
+Intent and final queries extraction   :import json
 import re
-import os
-import uuid
 from datetime import datetime
-from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from typing import Dict, Any, List
 from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-project-id")
-LOCATION = os.getenv("GCP_LOCATION", "us-central1")
-MODEL_VERSION = os.getenv("MODEL_VERSION", "gemini-2.0-flash-001")
-
-# =============================================================================
-# PROMPTS (UNCHANGED FROM WORKING CODE)
-# =============================================================================
 
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
@@ -51,237 +31,184 @@ EXAMPLES:
 Return ONLY valid JSON (no markdown, no explanation):
 {{
   "expanded_query": "comprehensive expanded clinical description",
-  "abbreviations_expanded": ["list of abbreviations that were expanded"],
-  "concepts_added": ["list of medical concepts that were made explicit"]
+  "abbreviations_expanded": ["list of abbreviations that were expanded"] 
 }}
 
 User Input: {query}
 """
 
 INTENT_EXTRACTION_PROMPT = """
-You are a clinical intent extraction engine specialized in medical information retrieval, ontology alignment, and hierarchical taxonomy construction.
+You are a clinical intent extraction engine for medical document retrieval.
 
 ====================================================
-STEP 1 — CLINICAL RELEVANCE VALIDATION
+CLINICAL VALIDATION
 ====================================================
 
-Determine whether the query is CLINICAL.
+Return this ONLY if query is non-clinical:
+{{"is_clinical": false, "reason": "Query is not clinical in nature", "intents": []}}
 
-If the query is NOT related to healthcare, medical conditions, symptoms, diagnostics, treatments, medications, procedures, or clinical documentation, return EXACTLY:
+====================================================
+CORE PRINCIPLES
+====================================================
 
+**Extraction Philosophy:**
+When someone requests clinical information, extract everything needed to fully understand, act upon, or make decisions about that information safely and effectively.
+
+**Guiding Questions:**
+1. What is being requested?
+2. What contextual information is inseparable from this concept?
+3. What would be incomplete or unsafe without?
+4. How is this information naturally organized?
+
+**Inseparability Concept:**
+Some information types are inherently connected for safety, understanding, or completeness. When extracting one, consider whether the other is contextually necessary.
+
+====================================================
+INTENT GENERATION
+====================================================
+
+**Analyze the expanded query and identify distinct clinical intents.**
+
+Each intent represents a clinically independent concept that could be documented or understood separately.
+
+Generate as many intents as the expanded query contains. Let the content guide the count.
+
+====================================================
+INTENT STRUCTURE
+====================================================
+
+For each intent:
+
+1. **intent_title** - What is this about?
+2. **description** - What does this represent and why does it matter?
+3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
+4. **sub_natures[]** - What are the distinct dimensions of this information?
+5. **final_queries[]** - How would this appear in clinical documents?
+
+====================================================
+SUB_NATURE DECOMPOSITION
+====================================================
+
+**Core Question: "What are the meaningful aspects of this clinical concept?"**
+
+Structure:
 {{
-  "is_clinical": false,
-  "reason": "Query is not clinical in nature",
-  "intents": []
+  "category_path": "Broad >> Specific >> Detail",
+  "atomic_concepts": ["terminal1", "terminal2"]
 }}
 
-Reject non-clinical topics such as:
-- Weather, sports, entertainment, general knowledge
-- Technical or IT support unrelated to medical systems
-- Travel, food, shopping (unless medically relevant)
+**CATEGORY_PATH:**
+Think of this as organizing information from general to specific. Each level adds meaningful distinction. Use " >> " as the separator.
 
-If the query IS clinical, proceed.
+Consider: "How would I navigate to this information?"
 
-====================================================
-STEP 2 — INTENT GENERATION (CLINICAL CONSTRAINT-BASED)
-====================================================
+**ATOMIC_CONCEPTS:**
+These are the actual data points - the most specific, granular elements at the end of the navigation path.
 
-Decompose the expanded query into the minimum set of clinically independent intents required to fully represent the patient's clinical narrative, based solely on explicitly stated information and clinical meaning.
+Consider: "What are the specific pieces of information needed?"
 
-An intent represents a clinically independent information object that could reasonably be interpreted, documented, or acted upon independently in a real clinical encounter.
+Include all specific details mentioned: exact values, names, dates, measurements, descriptors.
 
-Do NOT infer, assume, or extrapolate beyond what is explicitly stated.
+**Key Understanding:**
+- category_path = How to get there (the folders)
+- atomic_concepts = What's there (the files - be specific)
 
-A single query may contain multiple intents if multiple clinically independent concepts are present.
+**Dimension Identification:**
+Consider: "What different types of information exist for this concept?"
+- Names and identifiers?
+- Measurements and quantities?
+- Time-related information?
+- Location information?
+- Characteristics and qualities?
+- Relationships and connections?
+- Safety-related information?
+- People involved?
+- Current state or status?
+- Surrounding circumstances?
 
-====================================================
-INTENT COMPLETENESS REQUIREMENT
-====================================================
+Extract the dimensions that are present and relevant.
 
-Once an intent is identified, it MUST be expanded into a clinically complete representation of that concept.
-
-All clinical dimensions that are explicitly present or clinically inseparable from the concept MUST be captured within that intent so downstream systems can extract structured data without cross-intent inference or recombination.
-
-=====================================================
-INTENT TITLE
-====================================================
-
-intent_title naming guidance:
-- Use a clinically descriptive noun phrase
-- Include relevant qualifiers when they clarify scope or role
-- Avoid abstract, analytical, or process-oriented language
-- The title should clearly represent the clinical or operational information object, not the method used to derive it.
+**Grouping Logic:**
+If multiple pieces of information answer the same type of question, group them in one sub_nature. Build depth in the category_path rather than creating many shallow sub_natures.
 
 ====================================================
-INTENT DEFINITION
+FINAL_QUERIES: ATOMIC SPECIFICITY
 ====================================================
 
-Each intent MUST include:
+**Purpose:**
+Generate concise, atomic-level queries that map to precise clinical concepts without generating excessive CUIs.
 
-1. intent_title
-- Concise, clinician-readable name of the core clinical concept
-- Represents the clinical object, not narrative context
+**Core Insight:**
+Long verbose queries generate too many CUIs. Short atomic queries target specific concepts.
 
-2. description
-- Provide a clear, comprehensive, and detailed clinical explanation of the information.
-- Write as a direct clinical statement without meta-phrases or self-referential language (e.g., avoid "this intent is," "the purpose is," or similar constructions).
-- Describe the clinical concept itself, including what the information represents, how it is clinically interpreted, and its relevance to patient care or decision-making.
-- Focus on the clinical attributes and significance of the concept, independent of any intent, query, or extraction framework.
+Consider the difference:
+-  "metformin 500mg twice daily for diabetes management" → generates 10+ CUIs, which is not required
+- ✓ "metformin 500mg" → generates 2-3 focused CUIs
+- ✓ "twice daily dosing" → generates 1-2 CUIs
 
-3. nature
-- Describes the PRIMARY clinical role of this information within a real clinical encounter
-- Reflects how the information is used in clinical reasoning
-- Broad enough to encompass all subordinate detail
-- Specific enough to distinguish this intent from others in the same query
-- Nature is a clinical role descriptor, not a fixed taxonomy label
+**Atomic Query Principle:**
+Each query should represent ONE atomic clinical concept or a tight pairing of inseparable concepts.
 
-Examples (illustrative only):
-- Current Clinical Presentation / Symptom Assessment
-- Current Clinical Presentation / Associated Findings
-- Patient Perspective / Diagnostic Concern
-- Functional Status / Symptom Impact
-- Clinical History / Temporal Context
-- Diagnostic Evaluation / Test Results
-- Therapeutic Management / Medication Use
+Think: "What's the smallest meaningful unit?"
+- A specific medication + dose
+- A specific measurement + value
+- A specific condition + severity
+- A specific procedure + site
 
-Create new nature expressions when clinically appropriate.
+**Generation Approach:**
 
-4. sub_nature
-- Represents the internal clinical dimensions of the intent
-- Each sub_nature captures ONE clinical dimension (not a separate intent)
-- Multiple sub_nature entries are expected for clinically rich concepts
-- Minimum depth: 3–4 hierarchical levels per dimension
+Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
-5. final_queries
-- Highly specific, ontology-searchable extraction targets
-- Generated ONLY from atomic elements
-- Minimum 5 queries per intent
-- No intent may be returned without final_queries
+**Guiding Questions:**
+- What's the core medical term?
+- Is there ONE essential modifier (dose, site, severity)?
+- Can this be made shorter while staying meaningful?
+- Will this generate a focused set of CUIs?
 
-====================================================
-SUB_NATURE STRUCTURE (CLINICAL DIMENSION MODEL)
-====================================================
+**Query Characteristics:**
+- 2-4 words maximum
+- One clinical concept per query
+- Include only essential modifiers
+- Use standard medical terminology
+- Each query → 1-3 CUIs ideally
 
-Each sub_nature MUST follow this structure:
+**Natural Reasoning:**
+- Shorter = fewer CUIs = more precise matching
+- Atomic = focused = findable
+- Multiple short queries > one long query
+- Coverage through quantity, not length
 
-{{
-  "category": "Broad Clinical Dimension >> Specific Clinical Axis >> Focused Classification",
-  "elements": ["atomic clinical concepts"],
-  "entities": ["ontology-aligned medical entity types"]
-}}
+**Coverage:**
+Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
 
 ====================================================
-CATEGORY DEFINITION
+REASONING FRAMEWORK
 ====================================================
 
-The category expresses the clinical dimension and its hierarchical refinement.
+**Before finalizing, consider:**
 
-It should reflect:
-- The axis of clinical interpretation (e.g., anatomy, time, severity, function, perception)
-- Progressive narrowing from general to specific
-- How clinicians mentally organize this information
+On Completeness:
+- Have all distinct intents in the expanded query been identified?
+- For each intent, have all relevant dimensions been extracted?
+- Is there information that's inseparable from what was extracted?
 
-Examples:
-- Symptom Characteristics >> Temporal Pattern >> Onset
-- Symptom Characteristics >> Severity Assessment >> Functional Impact
-- Clinical Context >> Episode History >> Prior Occurrence
-- Patient Perspective >> Diagnostic Interpretation >> Suspected Condition
+On Specificity:
+- Are atomic_concepts as specific as possible?
+- Have actual values been included, not just categories?
+- Are queries detailed enough to be useful?
 
-====================================================
-ELEMENTS DEFINITION (ATOMICITY REQUIRED)
-====================================================
+On Structure:
+- Does each sub_nature represent a different type of information?
+- Are atomic_concepts truly the most granular elements?
+- Is information properly organized?
 
-Elements contain the most granular, clinically atomic concepts that are:
-- Explicitly stated or clinically inseparable from the intent
-- Directly documentable
-- Not further decomposable
-- Free of narrative or contextual wording
-
-Elements represent clinical facts or descriptors, not phrases or categories.
-
-Examples:
-- acute onset
-- no prior episodes
-- sleep disruption
-- impaired concentration
-- concern for appendicitis
+On Utility:
+- Would someone find what they need with these queries?
+- Are the queries realistic for clinical documentation?
+- Do the queries cover all the important atomic_concepts?
 
 ====================================================
-ENTITIES DEFINITION
-====================================================
-
-Entities describe the medical concept type represented by the elements and support ontology mapping.
-
-Examples:
-- Symptom
-- TemporalQualifier
-- SeverityDescriptor
-- FunctionalStatus
-- ClinicalFinding
-- PatientBelief
-- SuspectedDiagnosis
-
-====================================================
-FINAL_QUERIES GENERATION (EXTRACTION-OPTIMIZED)
-====================================================
-
-Final queries are extraction targets, not summaries.
-
-They MUST:
-- Be generated ONLY from atomic elements
-- Be short, precise, and clinically unambiguous
-- Reflect how information appears in real clinical documentation
-- Map cleanly to a small, focused CUI set (~2–15 CUIs)
-- Generate queries that can be directly searched in medical ontologies (SNOMED, UMLS, ICD)
-
-Remove:
-- "history of", "assessment", "measurement", "level"
-- Articles and unnecessary prepositions
-- Subject references (patient, user, individual)
-
-Preferred forms:
-- [Symptom] [descriptor]
-- [Symptom] [temporal qualifier]
-- [Symptom] [functional impact]
-- [Condition] suspected
-- [Finding] absent
-
-Examples:
-- abdominal pain acute onset
-- abdominal pain first episode
-- abdominal pain sleep disruption
-- abdominal pain impaired concentration
-- appendicitis suspected
-- Type 2 diabetes
-
-====================================================
-QUERY SELECTION PRINCIPLES
-====================================================
-
-Generate queries that:
-- Are commonly documented in clinical notes
-- Influence diagnosis, triage, or management
-- Represent clinically meaningful distinctions
-
-Avoid:
-- Exhaustive permutations
-- Redundant phrasing
-- Theoretical or speculative combinations
-
-====================================================
-FINAL VALIDATION CHECK
-====================================================
-
-Before returning output, ensure:
-- Each intent is a clinically complete information object
-- Each sub_nature represents a distinct clinical dimension
-- Elements are atomic and explicit
-- Final queries require no inference to extract
-- No clinical meaning is unnecessarily split across intents
-- JSON is valid and clean
-
-====================================================
-RESPONSE FORMAT (JSON ONLY)
+OUTPUT FORMAT
 ====================================================
 
 {{
@@ -289,23 +216,19 @@ RESPONSE FORMAT (JSON ONLY)
   "reason": "",
   "original_query": "{original_query}",
   "expanded_query": "{expanded_query}",
-  "total_intents_detected": number,
+  "total_intents_detected": <number>,
   "intents": [
     {{
-      "intent_title": "string",
-      "description": "string",
-      "nature": "string",
-      "sub_nature": [
+      "intent_title": "<string>",
+      "description": "<string>",
+      "nature": "<string>",
+      "sub_natures": [
         {{
-          "category": "string",
-          "elements": ["string"],
-          "entities": ["string"]
+          "category_path": "<Broad >> Specific >> Detail>",
+          "atomic_concepts": ["<concept1>", "<concept2>"]
         }}
       ],
-      "final_queries": [
-        "string",
-        "string"
-      ]
+      "final_queries": ["<query1>", "<query2>", "<query3>", "..."]
     }}
   ]
 }}
@@ -313,58 +236,20 @@ RESPONSE FORMAT (JSON ONLY)
 User Input: {expanded_query}
 Timestamp: {timestamp}
 """
+# Pipeline
 
-# =============================================================================
-# REQUEST/RESPONSE MODELS
-# =============================================================================
 
-class InputMetadata(BaseModel):
-    """Optional metadata for input text."""
-    source: Optional[str] = Field(default=None, description="Source type (e.g., clinical_note, patient_portal)")
-    source_id: Optional[str] = Field(default=None, description="Source system identifier")
-    timestamp: Optional[str] = Field(default=None, description="Original text timestamp")
+class ContextualIntentPipeline:    
+    def __init__(self, project: str, location: str = "us-central1", 
+                 model: str = MODEL_VERSION):
 
-class IntentRequest(BaseModel):
-    """Request model for intent extraction."""
-    text: str = Field(..., min_length=1, description="Input text for intent extraction")
-    metadata: Optional[InputMetadata] = Field(default=None, description="Optional metadata")
-    
-    model_config = {
-        "json_schema_extra": {
-            "examples": [{
-                "text": "Pt with HTN and DM. SOB on exertion for 2 weeks.",
-                "metadata": {"source": "clinical_note", "source_id": "NOTE-001"}
-            }]
-        }
-    }
-
-class IntentResponse(BaseModel):
-    """Response model for intent extraction."""
-    request_id: str
-    is_clinical: bool
-    original_query: str
-    expanded_query: str
-    abbreviations_expanded: List[str]
-    concepts_added: List[str]
-    total_intents: int
-    intents: List[Dict[str, Any]]
-    rejected_reason: Optional[str] = None
-    processing_time_seconds: float
-    timestamp: str
-
-# =============================================================================
-# PIPELINE (UNCHANGED LOGIC)
-# =============================================================================
-
-class ContextualIntentPipeline:
-    """Intent extraction pipeline - logic unchanged from working code."""
-    
-    def __init__(self, project: str, location: str = "us-central1", model: str = MODEL_VERSION):
         aiplatform.init(project=project, location=location)
-        self.model = GenerativeModel(model)
+        self.model = GenerativeModel(model)        
         
     def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096) -> str:
+
         try:
+            # Reset session to avoid context carryover
             if hasattr(self.model, "session") and self.model.session is not None:
                 self.model.session.reset()
             
@@ -375,7 +260,7 @@ class ContextualIntentPipeline:
                     "max_output_tokens": max_tokens,
                     "top_p": 1.0,
                     "top_k": 1,
-                    "seed": 43
+                    "seed":34
                 }
             )
             return response.text.strip()
@@ -384,6 +269,8 @@ class ContextualIntentPipeline:
             return "{}"
     
     def _safe_json(self, text: str) -> Dict[str, Any]:
+
+        # Remove markdown code blocks if present
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
         text = text.strip()
@@ -409,36 +296,46 @@ class ContextualIntentPipeline:
             return {}
     
     def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
+
         return all(key in data for key in required_keys)
     
+    # STEP 1: Query Expansion
+    
     def expand_query(self, query: str) -> Dict[str, Any]:
+
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
         raw_response = self._call_model(prompt)
         data = self._safe_json(raw_response)
         
         if not self._validate_json_structure(data, ["expanded_query"]):
+            # Fallback to original query if expansion fails
             return {
                 "expanded_query": query,
                 "abbreviations_expanded": [],
-                "concepts_added": []
+                # "concepts_added": []
             }
         
         return {
             "expanded_query": data.get("expanded_query", query),
             "abbreviations_expanded": data.get("abbreviations_expanded", []),
-            "concepts_added": data.get("concepts_added", [])
+            # "concepts_added": data.get("concepts_added", [])
         }
     
+    # STEP 2: Intent Extraction
+    
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
             timestamp=datetime.utcnow().isoformat()
         )
         
+        # Use higher token limit for complex queries
         raw_response = self._call_model(prompt, max_tokens=8096)
         data = self._safe_json(raw_response)
         
+        # Check if query was rejected as non-clinical
         if not data.get("is_clinical", True):
             return {
                 "intents": [],
@@ -456,6 +353,7 @@ class ContextualIntentPipeline:
                 "error": "Failed to extract intents"
             }
         
+        # Validate that all intents have final_queries
         intents = data.get("intents", [])
         validated_intents = []
         
@@ -463,6 +361,8 @@ class ContextualIntentPipeline:
             if "final_queries" not in intent or not intent["final_queries"]:
                 print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
                 continue
+            
+            # No minimum requirement - let LLM decide based on complexity
             validated_intents.append(intent)
         
         return {
@@ -471,22 +371,29 @@ class ContextualIntentPipeline:
             "is_clinical": True,
             "original_query": data.get("original_query", original_query),
             "expanded_query": data.get("expanded_query", expanded_query)
-        }
+        }    
+          
+    
+    # Pipeline exec
     
     def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
+
         start_time = datetime.utcnow()
         
         if verbose:
             print(f"Original Query: {query}")
         
+        # Step 1: Query Expansion
         expansion_result = self.expand_query(query)
         expanded_query = expansion_result["expanded_query"]
         
         if verbose:
             print(f"Expanded Query: {expanded_query}")
         
+        # Step 2: Intent Extraction
         intent_result = self.extract_intents(query, expanded_query)
         
+       
         if not intent_result.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             
@@ -497,8 +404,6 @@ class ContextualIntentPipeline:
             return {
                 "original_query": query,
                 "expanded_query": expanded_query,
-                "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-                "concepts_added": expansion_result.get("concepts_added", []),
                 "intents": [],
                 "is_clinical": False,
                 "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
@@ -506,7 +411,9 @@ class ContextualIntentPipeline:
                 "processing_time_seconds": processing_time
             }
         
-        intents = intent_result.get("intents", [])
+        intents = intent_result.get("intents", [])        
+        
+        # Calculate statistics
         total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
         total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
         processing_time = (datetime.utcnow() - start_time).total_seconds()
@@ -520,90 +427,510 @@ class ContextualIntentPipeline:
             "original_query": query,
             "expanded_query": expanded_query,
             "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            "concepts_added": expansion_result.get("concepts_added", []),
-            "intents": intents,
+            # "concepts_added": expansion_result.get("concepts_added", []),
             "is_clinical": True,
+            "intents": intents,            
             "timestamp": datetime.utcnow().isoformat(),
             "processing_time_seconds": processing_time
-        }
-
-# =============================================================================
-# FASTAPI APPLICATION
-# =============================================================================
-
-app = FastAPI(
-    title="Clinical Intent Extraction API",
-    description="Extract structured clinical intents from medical text",
-    version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc"
-)
-
-# Initialize pipeline (lazy loading)
-_pipeline: Optional[ContextualIntentPipeline] = None
-
-def get_pipeline() -> ContextualIntentPipeline:
-    global _pipeline
-    if _pipeline is None:
-        _pipeline = ContextualIntentPipeline(
-            project=PROJECT_ID,
-            location=LOCATION,
-            model=MODEL_VERSION
-        )
-    return _pipeline
-
-@app.get("/")
-def root():
-    """API root - basic info."""
-    return {
-        "name": "Clinical Intent Extraction API",
-        "version": "1.0.0",
-        "docs": "/docs"
-    }
-
-@app.get("/health")
-def health():
-    """Health check endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
-
-@app.post("/extract", response_model=IntentResponse)
-def extract_intents(request: IntentRequest):
-    """
-    Extract clinical intents from input text.
-    
-    - **text**: Input text (single or multi-paragraph)
-    - **metadata**: Optional source metadata
-    
-    Returns structured list of clinical intents with descriptions, 
-    sub-natures, and ontology-ready final queries.
-    """
-    request_id = str(uuid.uuid4())
-    
-    try:
-        pipeline = get_pipeline()
-        result = pipeline.run(request.text, verbose=False)
+            }
         
-        return IntentResponse(
-            request_id=request_id,
-            is_clinical=result.get("is_clinical", True),
-            original_query=result.get("original_query", request.text),
-            expanded_query=result.get("expanded_query", request.text),
-            abbreviations_expanded=result.get("abbreviations_expanded", []),
-            concepts_added=result.get("concepts_added", []),
-            total_intents=len(result.get("intents", [])),
-            intents=result.get("intents", []),
-            rejected_reason=result.get("rejected_reason"),
-            processing_time_seconds=result.get("processing_time_seconds", 0),
-            timestamp=result.get("timestamp", datetime.utcnow().isoformat())
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
-
-# =============================================================================
-# RUN SERVER
-# =============================================================================
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    PROJECT_ID = PROJECT_ID    
+    pipeline = ContextualIntentPipeline(
+        project=PROJECT_ID,
+        location="us-central1",
+        model=MODEL_VERSION
+
+    )
+    
+# Test queries
+    test_queries = [
+        "I am managing patient appointment requests submitted through an online portal.Patients describe their health concerns and health needs on the application forms. I need to list their primary health concerns, secondary health concerns, and their needs from the submitted texts.",
+        "current medication"        
+    ]
+    
+    for idx, query in enumerate(test_queries, 1):
+        print(f"\n{'='*80}")
+        print(f"Query {idx}/{len(test_queries)}")
+        print(f"{'='*80}")
+        
+        result = pipeline.run(query, verbose=True)
+        
+        output_filename = f"query_result_{idx}.json"
+        with open(output_filename, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        print(f"Saved to: {output_filename}")
+
+-----------------
+Cui redution:
+Load pickle file : import pickle
+import time
+import os
+
+# Path to your PKL
+NETWORK_PKL = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
+
+
+# Check file exists
+assert os.path.exists(NETWORK_PKL), f"PKL not found: {NETWORK_PKL}"
+
+# Load PKL and measure time
+start_time = time.time()
+with open(NETWORK_PKL, "rb") as f:
+    UMLS_NETWORK_OBJ = pickle.load(f)
+print(f"PKL loaded in {time.time() - start_time:.2f} seconds")
+
+# Optional: inspect type
+print("Loaded object type:", type(UMLS_NETWORK_OBJ))
+#cui reduction code   : 
+import asyncio
+import aiohttp
+import subprocess
+import re
+import logging
+from pathlib import Path
+import json
+from typing import List, Dict, Set, Optional, Tuple
+from collections import defaultdict
+import time
+from dataclasses import dataclass, asdict
+import threading
+import pickle
+import numpy as np
+from google.cloud import bigquery
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_distances
+import nest_asyncio
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+nest_asyncio.apply()
+
+# --------------------- Logging ---------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# --------------------- GCP Token ---------------------
+class GCPTokenProvider:
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def get_headers(cls, force: bool = False) -> Dict[str, str]:
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+
+            token = proc.stdout.strip()
+            if not token:
+                raise RuntimeError("Empty token from gcloud")
+
+            cls._token = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            cls._expiry = now + 3300  # ~55 minutes
+            return cls._token
+
+# --------------------- Data Classes ---------------------
+@dataclass
+class ReductionStats:
+    initial_count: int
+    after_ic_rollup: int
+    final_count: int
+    ic_rollup_reduction_pct: float
+    semantic_clustering_reduction_pct: float
+    total_reduction_pct: float
+    processing_time: float
+    ic_threshold_used: float
+    hierarchy_size: int = 0
+    api_call_time: float = 0.0
+    group_stats: Dict = None
+    missing_embeddings_count: int = 0
+
+    def to_dict(self):
+        return asdict(self)
+
+# --------------------- Filter CUIs ---------------------
+def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
+    if not cuis:
+        return []
+    try:
+        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
+        client = bigquery.Client(project=project_id)
+        query = f"""
+        SELECT DISTINCT CUI
+        FROM `{project_id}.{dataset_id}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis)
+          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE',
+                      'ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT','ICPC2ICD10ENG',
+                      'SNOMEDCT_US', 'LOINC')
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
+        )
+        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        allowed_cuis = df['CUI'].tolist()
+        logger.info(f"{len(allowed_cuis)} CUIs after filter")
+        return allowed_cuis
+    except Exception as e:
+        logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
+        return []
+
+# --------------------- CUI API Client ---------------------
+class CUIAPIClient:
+    def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 3, max_retries: int = 3):
+        self.api_base_url = api_base_url.rstrip('/')
+        self.timeout = timeout
+        self.top_k = top_k
+        self.max_retries = max_retries
+
+        self.session = requests.Session()
+        retry_strategy = Retry(
+            total=max_retries,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST"]
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=20
+        )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
+        if not texts:
+            return set()
+        payload = {"query_texts": texts, "top_k": self.top_k}
+        headers = GCPTokenProvider.get_headers()
+        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
+        try:
+            response = self.session.post(
+                self.api_base_url,
+                json=payload,
+                headers=headers,
+                timeout=self.timeout
+            )
+            if response.status_code == 401 and retry_auth:
+                logger.warning("Token expired, refreshing...")
+                GCPTokenProvider.get_headers(force=True)
+                return self.extract_cuis_batch(texts, retry_auth=False)
+            response.raise_for_status()
+            data = response.json()
+            all_cuis = set()
+            for text in texts:
+                cuis = data.get(text, [])
+                if isinstance(cuis, list):
+                    all_cuis.update(str(c) for c in cuis if c)
+            logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
+            return all_cuis
+        except Exception as e:
+            logger.error(f"API call failed: {str(e)}")
+            return set()
+
+# --------------------- Enhanced Reducer ---------------------
+class EnhancedCUIReducer:
+    def __init__(
+        self,
+        project_id: str,
+        dataset_id: str,
+        cui_embeddings_table: str,
+        mrsty_table: str,
+        umls_network_obj: dict
+    ):
+        self.client = bigquery.Client(project=project_id)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.cui_embeddings_table = cui_embeddings_table
+        self.mrsty_table = mrsty_table
+        self._preloaded_network = umls_network_obj
+
+        self._hierarchy_cache = {}
+        self._ic_scores_cache = {}
+        self._description_cache = {}
+        self._missing_embeddings_total = 0
+
+    # --------------------- Main Reduction Function ---------------------
+    def reduce(
+        self,
+        input_cuis: List[str],
+        ic_percentile: int = 25,
+        similarity_threshold: float = 0.95,
+        distance_from_centroid_threshold: float = 0.4
+    ) -> Tuple[List[str], ReductionStats]:
+
+        start_time = time.time()
+        input_cuis = list(set(input_cuis))
+        initial_count = len(input_cuis)
+        logger.info(f"Starting semantic-group based reduction for {initial_count} CUIs")
+
+        # --------------------- Semantic type grouping ---------------------
+        semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
+        logger.info(f"Created {len(semantic_groups)} semantic groups")
+
+        all_reduced_cuis = []
+        group_stats = {}
+        total_after_ic = 0
+
+        for group_name, group_cuis in semantic_groups.items():
+            if not group_cuis:
+                continue
+
+            # --------------------- Build hierarchy from pickle ---------------------
+            hierarchy = self._build_hierarchy_depthwise(group_cuis)
+
+            # --------------------- IC scores ---------------------
+            ic_scores = self._compute_ic_scores_within_group(hierarchy, group_cuis, group_name)
+            ic_threshold = np.percentile(list(ic_scores.values()), ic_percentile) if ic_scores else 0.0
+            high_ic_cuis = [cui for cui in group_cuis if ic_scores.get(cui, 0) >= ic_threshold]
+            total_after_ic += len(high_ic_cuis)
+
+            # --------------------- Embedding-based clustering ---------------------
+            if len(high_ic_cuis) > 1:
+                group_reduced = self._cluster_and_select_diverse(high_ic_cuis, similarity_threshold, distance_from_centroid_threshold)
+            else:
+                group_reduced = high_ic_cuis
+
+            all_reduced_cuis.extend(group_reduced)
+            group_stats[group_name] = {
+                'original': len(group_cuis),
+                'after_ic_filter': len(high_ic_cuis),
+                'final': len(group_reduced),
+                'reduction_pct': (1 - len(group_reduced)/len(group_cuis)) * 100 if group_cuis else 0
+            }
+
+        # --------------------- Final deduplication ---------------------
+        final_cuis = list(set(all_reduced_cuis))
+        # self._fetch_descriptions(final_cuis)
+
+        stats = ReductionStats(
+            initial_count=initial_count,
+            after_ic_rollup=total_after_ic,
+            final_count=len(final_cuis),
+            ic_rollup_reduction_pct=self._safe_percentage(initial_count - total_after_ic, initial_count),
+            semantic_clustering_reduction_pct=self._safe_percentage(total_after_ic - len(final_cuis), initial_count),
+            total_reduction_pct=self._safe_percentage(initial_count - len(final_cuis), initial_count),
+            processing_time=time.time() - start_time,
+            ic_threshold_used=ic_percentile,
+            hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
+            api_call_time=0.0,
+            group_stats=group_stats,
+            missing_embeddings_count=self._missing_embeddings_total
+        )
+
+        return final_cuis, stats
+
+    # --------------------- Semantic type grouping ---------------------
+    def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
+        query = f"""
+        SELECT DISTINCT CUI, STY
+        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
+        )
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        if df.empty:
+            return {'UNKNOWN': cuis}
+
+        semantic_groups = defaultdict(set)
+        cui_to_types = defaultdict(set)
+        for _, row in df.iterrows():
+            semantic_groups[row['STY']].add(row['CUI'])
+            cui_to_types[row['CUI']].add(row['STY'])
+
+        final_groups = defaultdict(list)
+        for cui in cuis:
+            types = cui_to_types.get(cui, {'UNKNOWN'})
+            sorted_types = sorted(types, key=lambda x: (-len(x), x))
+            for t in sorted_types:
+                final_groups[t].append(cui)
+        return dict(final_groups)
+
+    # --------------------- Hierarchy from pickle ---------------------
+    def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
+        key = tuple(sorted(cuis))
+        if key in self._hierarchy_cache:
+            return self._hierarchy_cache[key]
+
+        all_cuis = set()
+        parent_to_children = defaultdict(list)
+        child_to_parents = defaultdict(list)
+
+        for cui in cuis:
+            if not UMLS_NETWORK_OBJ.has_node(cui):
+                continue
+            # Children
+            for child in UMLS_NETWORK_OBJ.successors(cui):
+                parent_to_children[cui].append(child)
+                child_to_parents[child].append(cui)
+                all_cuis.update([cui, child])
+            # Parents
+            for parent in UMLS_NETWORK_OBJ.predecessors(cui):
+                child_to_parents[cui].append(parent)
+                parent_to_children[parent].append(cui)
+                all_cuis.update([cui, parent])
+
+        hierarchy = {
+            "parent_to_children": dict(parent_to_children),
+            "child_to_parents": dict(child_to_parents),
+            "all_cuis": all_cuis
+        }
+        self._hierarchy_cache[key] = hierarchy
+        return hierarchy
+
+    # --------------------- IC Scores ---------------------
+    def _compute_ic_scores_within_group(
+        self,
+        hierarchy: Dict,
+        group_cuis: List[str],
+        group_name: str
+    ) -> Dict[str, float]:
+        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
+        if cache_key in self._ic_scores_cache:
+            return self._ic_scores_cache[cache_key]
+
+        parent_to_children = hierarchy.get("parent_to_children", {})
+        group_set = set(group_cuis)
+        descendant_counts = {}
+
+        def count_descendants(cui: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if cui in visited or cui not in group_set:
+                return 0
+            visited.add(cui)
+            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
+            count = len(children)
+            for child in children:
+                count += count_descendants(child, visited)
+            descendant_counts[cui] = count
+            return count
+
+        for cui in group_cuis:
+            if cui not in descendant_counts:
+                try:
+                    count_descendants(cui)
+                except RecursionError:
+                    descendant_counts[cui] = 0
+
+        group_size = len(group_cuis)
+        ic_scores = {cui: max(0.0, -np.log((descendant_counts.get(cui,0)+1)/group_size)) for cui in group_cuis}
+        self._ic_scores_cache[cache_key] = ic_scores
+        return ic_scores
+
+    # --------------------- Embedding Clustering ---------------------
+    def _cluster_and_select_diverse(self, cui_list, similarity_threshold, distance_threshold):
+        if len(cui_list) <= 1:
+            return cui_list
+        query = f"""
+        SELECT CUI AS cui, embedding AS embedding
+        FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cui_list)]
+        )
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        if df.empty:
+            return cui_list
+        valid = [(row["cui"], np.asarray(row["embedding"], dtype=np.float32)) for _, row in df.iterrows() if row["embedding"] is not None]
+        if len(valid) < 2:
+            return cui_list
+        cuis, embeddings = zip(*valid)
+        embeddings = np.vstack(embeddings)
+        clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=1-similarity_threshold, metric="cosine", linkage="average")
+        labels = clustering.fit_predict(embeddings)
+        selected = set()
+        for label in np.unique(labels):
+            idx = np.where(labels == label)[0]
+            cluster_emb = embeddings[idx]
+            centroid = np.mean(cluster_emb, axis=0)
+            distances = cosine_distances([centroid], cluster_emb)[0]
+            far = idx[distances > distance_threshold]
+            if len(far):
+                selected.update([cuis[i] for i in far])
+            else:
+                selected.add(cuis[idx[np.argmax(distances)]])
+        return list(selected)
+
+    # --------------------- Fetch descriptions ---------------------
+    # def _fetch_descriptions(self, cuis: List[str]):
+    # to_fetch = [c for c in cuis if c not in self._description_cache]
+    # if not to_fetch:
+    #     return
+    # query = f"""
+    # SELECT CUI AS cui, DEF AS description
+    # FROM `{self.project_id}.{self.dataset_id}.MRDEF`
+    # WHERE CUI IN UNNEST(@cuis)
+    # """
+    # job_config = bigquery.QueryJobConfig(
+    #     query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", to_fetch)]
+    # )
+    # df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+    # for _, row in df.iterrows():
+    #     self._description_cache[row['cui']] = row['description']
+    # logger.info(f"Fetched {len(df)} definitions")
+
+    # --------------------- Utility ---------------------
+    @staticmethod
+    def _safe_percentage(numerator: float, denominator: float) -> float:
+        return (numerator / denominator * 100) if denominator else 0.0
+
+# --------------------- Main Pipeline ---------------------
+if __name__ == "__main__":
+
+    # # --------------------- Load Pickle ---------------------
+    # NETWORK_PKL = "/home/jupyter/NER/networkx_cui_context_v1_1_0.pkl"
+    # with open(NETWORK_PKL, "rb") as f:
+    #     UMLS_NETWORK_OBJ = pickle.load(f)
+    # logger.info(f"Pickle loaded. Type: {type(UMLS_NETWORK_OBJ)}")
+
+    # --------------------- Inputs ---------------------
+    project_id = project_id
+    dataset_id = dataset
+    cui_embeddings_table = embedding_table
+    mrsty_table = "MRSTY"
+    texts = ["grams"]
+
+    # --------------------- Extract CUIs ---------------------
+    api_url = url
+    api_client = CUIAPIClient(api_url)
+    extracted_cuis = api_client.extract_cuis_batch(texts)
+
+    # --------------------- Filter CUIs ---------------------
+    filtered_cuis = filter_allowed_cuis(extracted_cuis, project_id, dataset_id)
+
+    # --------------------- Reduce CUIs ---------------------
+    reducer = EnhancedCUIReducer(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        cui_embeddings_table=cui_embeddings_table,
+        mrsty_table=mrsty_table,
+        umls_network_obj=UMLS_NETWORK_OBJ
+    )
+    final_cuis, stats = reducer.reduce(filtered_cuis)
+
+    # logger.info(f"Final CUIs ({len(final_cuis)}): {final_cuis}")
+    logger.info(f"Reduction Stats: {stats.to_dict()}")
+
