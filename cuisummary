@@ -1,49 +1,708 @@
-# =============================================================================
-# CELL: Extract and Save Context for Reduced CUIs
-# =============================================================================
+"""
+Advanced CUI Mapper - Updated with Automatic Semantic Type Learning
+No manual compatibility rules needed - learns from your data!
+"""
 
-from reduced_cui_context import ReducedCUIContextExtractor, ReducedCUIContext
+import pickle
+import numpy as np
+import networkx as nx
+from typing import Dict, List, Tuple, Set, Optional, Union
+import pandas as pd
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+import json
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from functools import partial
+from dataclasses import dataclass, asdict
 
-# After reduction
-reducer = EnhancedCUIReducer(
-    project_id=project_id,
-    dataset_id=dataset_id,
-    cui_embeddings_table=cui_embeddings_table,
-    mrsty_table=mrsty_table,
-    umls_network_obj=UMLS_NETWORK_OBJ
-)
+# Import the automatic validator
+from auto_semantic_validator import AutoSemanticTypeValidator
 
-# Run reduction
-final_cuis, stats = reducer.reduce(filtered_cuis)
-logger.info(f"Reduced to {len(final_cuis)} CUIs")
 
-# Extract context for matching
-extractor = ReducedCUIContextExtractor(
-    project_id=project_id,
-    dataset_id=dataset_id,
-    umls_network=UMLS_NETWORK_OBJ,
-    embeddings_table=cui_embeddings_table,
-    mrsty_table=mrsty_table
-)
+@dataclass
+class MatchResult:
+    """Structured match result with full explainability"""
+    topic_cui: str
+    reduced_cui: str
+    match_method: str
+    confidence: float
+    similarity: Optional[float] = None
+    ancestor_depth: Optional[int] = None
+    ancestor_path: Optional[List[str]] = None
+    semantic_type_topic: Optional[str] = None
+    semantic_type_reduced: Optional[str] = None
+    semantic_compatibility_score: Optional[float] = None
+    hybrid_score: Optional[float] = None
+    num_candidates: Optional[int] = None
+    
+    def to_dict(self):
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
-# Extract graph + embeddings + metadata
-cui_context = extractor.extract_context(
-    reduced_cuis=final_cuis,
-    ic_scores=None,  # Or pass from stats if needed
-    max_ancestor_depth=3,
-    max_descendant_depth=2
-)
 
-# Save for later use in matching
-cui_context.save(f"reduced_cui_context_{len(final_cuis)}.pkl")
+class HybridScorer:
+    """Combines ancestor distance and embedding similarity into hybrid score"""
+    
+    def __init__(
+        self,
+        ancestor_weight: float = 0.4,
+        embedding_weight: float = 0.6,
+        max_ancestor_depth: int = 10
+    ):
+        """Initialize hybrid scorer"""
+        self.ancestor_weight = ancestor_weight
+        self.embedding_weight = embedding_weight
+        self.max_ancestor_depth = max_ancestor_depth
+    
+    def score_ancestor_match(self, depth: int) -> float:
+        """Score ancestor match based on depth (closer = better)"""
+        return np.exp(-depth / 3.0)
+    
+    def compute_hybrid_score(
+        self,
+        ancestor_depth: Optional[int] = None,
+        embedding_similarity: Optional[float] = None
+    ) -> float:
+        """Compute hybrid score combining ancestor and embedding"""
+        if ancestor_depth is None and embedding_similarity is None:
+            return 0.0
+        
+        ancestor_score = self.score_ancestor_match(ancestor_depth) if ancestor_depth is not None else 0.0
+        embedding_score = embedding_similarity if embedding_similarity is not None else 0.0
+        
+        if ancestor_depth is not None and embedding_similarity is not None:
+            hybrid = (self.ancestor_weight * ancestor_score + 
+                     self.embedding_weight * embedding_score)
+        elif ancestor_depth is not None:
+            hybrid = ancestor_score
+        else:
+            hybrid = embedding_score
+        
+        return float(hybrid)
 
-# Quick test
-if len(final_cuis) >= 2:
-    cui_a, cui_b = final_cuis[0], final_cuis[1]
-    score, rel_type = cui_context.compute_similarity(cui_a, cui_b)
-    logger.info(f"Test similarity: {cui_a} vs {cui_b} = {score:.3f} ({rel_type})")
---------------------------------
-# Matching logic will use:
-context.compute_similarity(query_cui, doc_cui)  # → (score, relationship)
-context.are_related(query_cui, doc_cui)  # → (True/False, relationship)
-context.get_embedding(cui)  # → np.array for custom similarity
+
+class EvaluationMetrics:
+    """Compute evaluation metrics against gold standard mappings"""
+    
+    def __init__(self, gold_mappings: Dict[str, str]):
+        """Initialize with gold standard mappings"""
+        self.gold_mappings = gold_mappings
+    
+    def evaluate(self, predicted_mappings: Dict[str, str]) -> Dict[str, float]:
+        """Compute precision, recall, F1 against gold standard"""
+        gold_cuis = set(self.gold_mappings.keys())
+        pred_cuis = set(predicted_mappings.keys())
+        
+        tp = sum(1 for cui in (gold_cuis & pred_cuis) 
+                if predicted_mappings[cui] == self.gold_mappings[cui])
+        fp = sum(1 for cui in (gold_cuis & pred_cuis)
+                if predicted_mappings[cui] != self.gold_mappings[cui])
+        fn = len(gold_cuis - pred_cuis)
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        accuracy = tp / len(gold_cuis & pred_cuis) if len(gold_cuis & pred_cuis) > 0 else 0.0
+        
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'accuracy': accuracy,
+            'true_positives': tp,
+            'false_positives': fp,
+            'false_negatives': fn,
+            'coverage': len(pred_cuis) / len(gold_cuis) if len(gold_cuis) > 0 else 0.0
+        }
+    
+    def evaluate_by_method(self, results_df: pd.DataFrame) -> pd.DataFrame:
+        """Evaluate performance by matching method"""
+        method_metrics = []
+        
+        for method in results_df['match_method'].unique():
+            method_results = results_df[results_df['match_method'] == method]
+            method_mappings = dict(zip(method_results['topic_cui'], 
+                                      method_results['reduced_cui']))
+            
+            metrics = self.evaluate(method_mappings)
+            metrics['method'] = method
+            metrics['count'] = len(method_results)
+            
+            method_metrics.append(metrics)
+        
+        return pd.DataFrame(method_metrics)
+
+
+class AdvancedCUIMapper:
+    """
+    Advanced CUI mapper with automatic semantic type learning
+    No manual compatibility rules needed!
+    """
+    
+    def __init__(
+        self,
+        reduced_cui_graph_path: str,
+        reduced_embeddings: Union[str, Dict],
+        topic_cui_graph_path: str,
+        topic_embeddings: Union[str, Dict],
+        semantic_types: Optional[Dict[str, Set[str]]] = None,
+        hybrid_scorer: Optional[HybridScorer] = None,
+        gold_mappings: Optional[Dict[str, str]] = None,
+        n_jobs: int = 1,
+        auto_learn_semantic_compatibility: bool = True,
+        semantic_similarity_threshold: float = 0.6,
+        semantic_min_cooccurrence: int = 5,
+        prelearned_compatibility_path: Optional[str] = None
+    ):
+        """
+        Initialize advanced mapper with automatic semantic learning
+        
+        Args:
+            reduced_cui_graph_path: Path to reduced CUI graph
+            reduced_embeddings: Embeddings dict or path
+            topic_cui_graph_path: Path to topic CUI graph
+            topic_embeddings: Embeddings dict or path
+            semantic_types: Dict of CUI -> semantic types (optional)
+            hybrid_scorer: Custom hybrid scorer (optional)
+            gold_mappings: Gold standard mappings (optional)
+            n_jobs: Number of parallel jobs
+            auto_learn_semantic_compatibility: Auto-learn compatibility from data
+            semantic_similarity_threshold: Threshold for embedding-based compatibility
+            semantic_min_cooccurrence: Min co-occurrences for graph-based compatibility
+            prelearned_compatibility_path: Path to prelearned compatibility (skip learning)
+        """
+        print("Loading graphs and embeddings...")
+        
+        # Load graphs
+        with open(reduced_cui_graph_path, 'rb') as f:
+            self.reduced_graph = pickle.load(f)
+        with open(topic_cui_graph_path, 'rb') as f:
+            self.topic_graph = pickle.load(f)
+        
+        # Load or use in-memory embeddings
+        self.reduced_embeddings = self._load_embeddings(reduced_embeddings, "reduced")
+        self.topic_embeddings = self._load_embeddings(topic_embeddings, "topic")
+        
+        self.reduced_cuis = set(self.reduced_graph.nodes())
+        self.topic_cuis = set(self.topic_graph.nodes())
+        
+        # Initialize components
+        self.hybrid_scorer = hybrid_scorer or HybridScorer()
+        self.evaluator = EvaluationMetrics(gold_mappings) if gold_mappings else None
+        
+        # Initialize semantic validator with AUTOMATIC learning
+        if semantic_types:
+            self.semantic_validator = AutoSemanticTypeValidator(
+                cui_semantic_types=semantic_types,
+                learn_from_graph=auto_learn_semantic_compatibility,
+                learn_from_embeddings=auto_learn_semantic_compatibility,
+                similarity_threshold=semantic_similarity_threshold,
+                min_cooccurrence=semantic_min_cooccurrence
+            )
+            
+            # Load prelearned compatibility or learn from data
+            if prelearned_compatibility_path:
+                print(f"\nLoading prelearned semantic compatibility...")
+                self.semantic_validator.load_learned_compatibility(prelearned_compatibility_path)
+            elif auto_learn_semantic_compatibility:
+                print(f"\nAuto-learning semantic type compatibility from data...")
+                all_embeddings = {**self.reduced_embeddings, **self.topic_embeddings}
+                self.semantic_validator.learn_compatibility(
+                    graphs=[self.reduced_graph, self.topic_graph],
+                    embeddings=all_embeddings
+                )
+        else:
+            self.semantic_validator = None
+            print("\nNo semantic types provided - semantic filtering disabled")
+        
+        # Parallel processing
+        self.n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        
+        # Statistics
+        self.match_stats = defaultdict(int)
+        
+        print(f"\nInitialized:")
+        print(f"  Reduced CUIs: {len(self.reduced_cuis)}")
+        print(f"  Topic CUIs: {len(self.topic_cuis)}")
+        if self.semantic_validator:
+            print(f"  Semantic types: {len(self.semantic_validator.cui_semantic_types)}")
+            print(f"  Compatibility learned: {self.semantic_validator.is_learned}")
+        print(f"  Parallel jobs: {self.n_jobs}")
+        print(f"  Evaluation: {'Enabled' if self.evaluator else 'Disabled'}")
+    
+    def _load_embeddings(self, embeddings: Union[str, Dict], label: str) -> Dict:
+        """Load embeddings from file or use in-memory dict"""
+        if isinstance(embeddings, str):
+            print(f"  Loading {label} embeddings from file...")
+            with open(embeddings, 'rb') as f:
+                return pickle.load(f)
+        elif isinstance(embeddings, dict):
+            print(f"  Using in-memory {label} embeddings...")
+            return embeddings
+        else:
+            raise ValueError(f"{label} embeddings must be file path or dict")
+    
+    def get_ancestor_path(self, graph: nx.DiGraph, source: str, target: str) -> Optional[List[str]]:
+        """Get shortest path from source to target"""
+        if source not in graph or target not in graph:
+            return None
+        
+        try:
+            if nx.has_path(graph, source, target):
+                return nx.shortest_path(graph, source, target)
+        except nx.NetworkXNoPath:
+            pass
+        
+        return None
+    
+    def get_all_ancestors_with_paths(
+        self,
+        graph: nx.DiGraph,
+        cui: str,
+        max_depth: int = 5
+    ) -> Dict[str, Tuple[int, List[str]]]:
+        """Get all ancestors with depths and paths"""
+        if cui not in graph:
+            return {}
+        
+        ancestor_info = {}
+        visited = {cui}
+        current_level = {cui: (0, [cui])}
+        
+        for depth in range(1, max_depth + 1):
+            next_level = {}
+            
+            for node, (node_depth, path) in current_level.items():
+                parents = set(graph.predecessors(node))
+                
+                for parent in parents:
+                    if parent not in visited:
+                        new_path = path + [parent]
+                        ancestor_info[parent] = (depth, new_path)
+                        next_level[parent] = (depth, new_path)
+                        visited.add(parent)
+            
+            if not next_level:
+                break
+            
+            current_level = next_level
+        
+        return ancestor_info
+    
+    def direct_match(self, topic_cuis: Set[str]) -> List[MatchResult]:
+        """Find direct matches"""
+        matches = []
+        
+        for topic_cui in topic_cuis:
+            if topic_cui in self.reduced_cuis:
+                # Get semantic compatibility score
+                semantic_score = None
+                if self.semantic_validator:
+                    semantic_score = self.semantic_validator.get_compatibility_score(topic_cui, topic_cui)
+                
+                match = MatchResult(
+                    topic_cui=topic_cui,
+                    reduced_cui=topic_cui,
+                    match_method='direct',
+                    confidence=1.0,
+                    similarity=1.0,
+                    semantic_type_topic=str(self.semantic_validator.get_semantic_types(topic_cui)) if self.semantic_validator else None,
+                    semantic_type_reduced=str(self.semantic_validator.get_semantic_types(topic_cui)) if self.semantic_validator else None,
+                    semantic_compatibility_score=semantic_score,
+                    hybrid_score=1.0
+                )
+                
+                matches.append(match)
+                self.match_stats['direct'] += 1
+        
+        return matches
+    
+    def ancestor_match(
+        self,
+        unmatched_topic_cuis: Set[str],
+        max_depth: int = 5,
+        selection_strategy: str = 'hybrid',
+        use_semantic_filter: bool = True,
+        semantic_strict: bool = False
+    ) -> List[MatchResult]:
+        """Find ancestor matches with auto-learned semantic filtering"""
+        matches = []
+        
+        for topic_cui in unmatched_topic_cuis:
+            ancestor_info = self.get_all_ancestors_with_paths(
+                self.topic_graph, topic_cui, max_depth
+            )
+            
+            matching_ancestors = set(ancestor_info.keys()) & self.reduced_cuis
+            
+            if not matching_ancestors:
+                continue
+            
+            # Apply automatic semantic filter
+            if use_semantic_filter and self.semantic_validator and self.semantic_validator.is_learned:
+                compatible_ancestors = set()
+                for anc in matching_ancestors:
+                    is_compatible = self.semantic_validator.are_compatible(
+                        topic_cui, anc, strict=semantic_strict
+                    )
+                    if is_compatible is None or is_compatible:
+                        compatible_ancestors.add(anc)
+                
+                if not compatible_ancestors and semantic_strict:
+                    # Try lenient filtering
+                    for anc in matching_ancestors:
+                        is_compatible = self.semantic_validator.are_compatible(
+                            topic_cui, anc, strict=False
+                        )
+                        if is_compatible is None or is_compatible:
+                            compatible_ancestors.add(anc)
+                
+                if compatible_ancestors != matching_ancestors:
+                    self.match_stats['semantic_filtered'] += (len(matching_ancestors) - len(compatible_ancestors))
+                
+                matching_ancestors = compatible_ancestors
+            
+            if not matching_ancestors:
+                continue
+            
+            # Select best ancestor with hybrid scoring
+            if selection_strategy == 'hybrid' and topic_cui in self.topic_embeddings:
+                topic_emb = self.topic_embeddings[topic_cui]
+                
+                candidate_scores = {}
+                for anc in matching_ancestors:
+                    depth, path = ancestor_info[anc]
+                    
+                    emb_sim = None
+                    if anc in self.reduced_embeddings:
+                        anc_emb = self.reduced_embeddings[anc]
+                        emb_sim = float(cosine_similarity([topic_emb], [anc_emb])[0][0])
+                    
+                    hybrid_score = self.hybrid_scorer.compute_hybrid_score(
+                        ancestor_depth=depth,
+                        embedding_similarity=emb_sim
+                    )
+                    
+                    # Boost score if semantically compatible
+                    if self.semantic_validator:
+                        sem_score = self.semantic_validator.get_compatibility_score(topic_cui, anc)
+                        hybrid_score = hybrid_score * (0.7 + 0.3 * sem_score)  # Up to 30% boost
+                    
+                    candidate_scores[anc] = (hybrid_score, depth, path, emb_sim)
+                
+                best_anc = max(candidate_scores.items(), key=lambda x: (x[1][0], -x[1][1]))[0]
+                hybrid_score, depth, path, emb_sim = candidate_scores[best_anc]
+            else:
+                if selection_strategy == 'closest':
+                    best_anc = min(matching_ancestors, 
+                                  key=lambda a: (ancestor_info[a][0], a))
+                else:
+                    best_anc = max(matching_ancestors,
+                                  key=lambda a: (len(list(self.reduced_graph.successors(a))), a))
+                
+                depth, path = ancestor_info[best_anc]
+                emb_sim = None
+                hybrid_score = self.hybrid_scorer.compute_hybrid_score(ancestor_depth=depth)
+            
+            confidence = max(0.5, 1.0 - (depth * 0.1))
+            
+            # Get semantic compatibility score
+            semantic_score = None
+            if self.semantic_validator:
+                semantic_score = self.semantic_validator.get_compatibility_score(topic_cui, best_anc)
+            
+            match = MatchResult(
+                topic_cui=topic_cui,
+                reduced_cui=best_anc,
+                match_method='ancestor',
+                confidence=confidence,
+                similarity=emb_sim,
+                ancestor_depth=depth,
+                ancestor_path=path,
+                semantic_type_topic=str(self.semantic_validator.get_semantic_types(topic_cui)) if self.semantic_validator else None,
+                semantic_type_reduced=str(self.semantic_validator.get_semantic_types(best_anc)) if self.semantic_validator else None,
+                semantic_compatibility_score=semantic_score,
+                hybrid_score=hybrid_score,
+                num_candidates=len(matching_ancestors)
+            )
+            
+            matches.append(match)
+            self.match_stats['ancestor'] += 1
+        
+        return matches
+    
+    def _embedding_match_batch(
+        self,
+        topic_cui_batch: List[str],
+        similarity_threshold: float,
+        top_k: int,
+        use_semantic_filter: bool,
+        semantic_strict: bool
+    ) -> List[MatchResult]:
+        """Process batch for embedding matching"""
+        matches = []
+        
+        reduced_cuis_with_emb = [
+            cui for cui in self.reduced_cuis
+            if cui in self.reduced_embeddings
+        ]
+        
+        if not reduced_cuis_with_emb:
+            return matches
+        
+        reduced_emb_matrix = np.array([
+            self.reduced_embeddings[cui] for cui in reduced_cuis_with_emb
+        ])
+        
+        for topic_cui in topic_cui_batch:
+            if topic_cui not in self.topic_embeddings:
+                continue
+            
+            topic_emb = self.topic_embeddings[topic_cui]
+            similarities = cosine_similarity([topic_emb], reduced_emb_matrix)[0]
+            
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            top_scores = similarities[top_indices]
+            
+            for idx, score in zip(top_indices, top_scores):
+                if score < similarity_threshold:
+                    break
+                
+                reduced_cui = reduced_cuis_with_emb[idx]
+                
+                # Apply auto-learned semantic filter
+                if use_semantic_filter and self.semantic_validator and self.semantic_validator.is_learned:
+                    is_compatible = self.semantic_validator.are_compatible(
+                        topic_cui, reduced_cui, strict=semantic_strict
+                    )
+                    if is_compatible is False:
+                        continue
+                
+                # Get semantic compatibility score
+                semantic_score = None
+                if self.semantic_validator:
+                    semantic_score = self.semantic_validator.get_compatibility_score(topic_cui, reduced_cui)
+                
+                match = MatchResult(
+                    topic_cui=topic_cui,
+                    reduced_cui=reduced_cui,
+                    match_method='embedding',
+                    confidence=float(score),
+                    similarity=float(score),
+                    semantic_type_topic=str(self.semantic_validator.get_semantic_types(topic_cui)) if self.semantic_validator else None,
+                    semantic_type_reduced=str(self.semantic_validator.get_semantic_types(reduced_cui)) if self.semantic_validator else None,
+                    semantic_compatibility_score=semantic_score,
+                    hybrid_score=float(score)
+                )
+                
+                matches.append(match)
+                break
+        
+        return matches
+    
+    def embedding_match(
+        self,
+        unmatched_topic_cuis: Set[str],
+        similarity_threshold: float = 0.7,
+        top_k: int = 3,
+        use_semantic_filter: bool = True,
+        semantic_strict: bool = False,
+        parallel: bool = True
+    ) -> List[MatchResult]:
+        """Find embedding matches with auto-learned semantic filtering"""
+        topic_cuis_with_emb = [
+            cui for cui in unmatched_topic_cuis 
+            if cui in self.topic_embeddings
+        ]
+        
+        if not topic_cuis_with_emb:
+            return []
+        
+        if parallel and self.n_jobs > 1 and len(topic_cuis_with_emb) > 100:
+            batch_size = max(10, len(topic_cuis_with_emb) // (self.n_jobs * 4))
+            batches = [topic_cuis_with_emb[i:i+batch_size] 
+                      for i in range(0, len(topic_cuis_with_emb), batch_size)]
+            
+            match_fn = partial(
+                self._embedding_match_batch,
+                similarity_threshold=similarity_threshold,
+                top_k=top_k,
+                use_semantic_filter=use_semantic_filter,
+                semantic_strict=semantic_strict
+            )
+            
+            with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                batch_results = list(executor.map(match_fn, batches))
+            
+            matches = [match for batch in batch_results for match in batch]
+        else:
+            matches = self._embedding_match_batch(
+                topic_cuis_with_emb,
+                similarity_threshold,
+                top_k,
+                use_semantic_filter,
+                semantic_strict
+            )
+        
+        self.match_stats['embedding'] += len(matches)
+        
+        return matches
+    
+    def match_all(
+        self,
+        topic_cuis: Optional[Set[str]] = None,
+        ancestor_max_depth: int = 5,
+        ancestor_strategy: str = 'hybrid',
+        embedding_threshold: float = 0.7,
+        embedding_top_k: int = 3,
+        use_semantic_filter: bool = True,
+        semantic_strict: bool = False,
+        parallel_embedding: bool = True
+    ) -> Tuple[pd.DataFrame, Set[str], Dict]:
+        """
+        Execute matching with automatic semantic type compatibility
+        
+        Args:
+            use_semantic_filter: Use auto-learned semantic compatibility
+            semantic_strict: Require strong semantic compatibility (score > 0.5)
+        """
+        if topic_cuis is None:
+            topic_cuis = self.topic_cuis
+        else:
+            topic_cuis = set(topic_cuis)
+        
+        self.match_stats = defaultdict(int)
+        
+        print(f"\n{'='*70}")
+        print("Advanced CUI Matching with Auto-Learned Semantic Compatibility")
+        print(f"{'='*70}")
+        print(f"Topic CUIs: {len(topic_cuis)}")
+        print(f"Semantic filtering: {use_semantic_filter} (auto-learned)")
+        if use_semantic_filter and self.semantic_validator:
+            print(f"  Compatibility learned: {self.semantic_validator.is_learned}")
+            print(f"  Strict mode: {semantic_strict}")
+        print(f"{'='*70}\n")
+        
+        # Step 1: Direct
+        print("Step 1: Direct Matching...")
+        direct_matches = self.direct_match(topic_cuis)
+        print(f"  ✓ Matches: {len(direct_matches)}")
+        
+        # Step 2: Ancestor
+        matched_cuis = {m.topic_cui for m in direct_matches}
+        unmatched = topic_cuis - matched_cuis
+        
+        print(f"\nStep 2: Ancestor Matching...")
+        print(f"  Remaining: {len(unmatched)}")
+        
+        ancestor_matches = self.ancestor_match(
+            unmatched,
+            max_depth=ancestor_max_depth,
+            selection_strategy=ancestor_strategy,
+            use_semantic_filter=use_semantic_filter,
+            semantic_strict=semantic_strict
+        )
+        print(f"  ✓ Matches: {len(ancestor_matches)}")
+        if use_semantic_filter and self.semantic_validator:
+            print(f"  Filtered by auto-learned semantics: {self.match_stats['semantic_filtered']}")
+        
+        # Step 3: Embedding
+        matched_cuis.update(m.topic_cui for m in ancestor_matches)
+        unmatched = topic_cuis - matched_cuis
+        
+        print(f"\nStep 3: Embedding Matching...")
+        print(f"  Remaining: {len(unmatched)}")
+        
+        embedding_matches = self.embedding_match(
+            unmatched,
+            similarity_threshold=embedding_threshold,
+            top_k=embedding_top_k,
+            use_semantic_filter=use_semantic_filter,
+            semantic_strict=semantic_strict,
+            parallel=parallel_embedding
+        )
+        print(f"  ✓ Matches: {len(embedding_matches)}")
+        
+        # Combine
+        all_matches = direct_matches + ancestor_matches + embedding_matches
+        df_results = pd.DataFrame([m.to_dict() for m in all_matches])
+        
+        matched_cuis.update(m.topic_cui for m in embedding_matches)
+        unmatched_cuis = topic_cuis - matched_cuis
+        
+        stats = {
+            'total_topic_cuis': len(topic_cuis),
+            'total_matched': len(df_results),
+            'total_unmatched': len(unmatched_cuis),
+            'match_rate': len(df_results) / len(topic_cuis) if topic_cuis else 0,
+            'by_method': dict(self.match_stats),
+            'avg_confidence': df_results['confidence'].mean() if len(df_results) > 0 else 0,
+            'avg_hybrid_score': df_results['hybrid_score'].mean() if 'hybrid_score' in df_results.columns else 0,
+            'semantic_filtering': use_semantic_filter,
+            'semantic_compatibility_learned': self.semantic_validator.is_learned if self.semantic_validator else False
+        }
+        
+        if self.evaluator:
+            pred_mappings = dict(zip(df_results['topic_cui'], df_results['reduced_cui']))
+            eval_metrics = self.evaluator.evaluate(pred_mappings)
+            stats['evaluation'] = eval_metrics
+            method_eval = self.evaluator.evaluate_by_method(df_results)
+            stats['evaluation_by_method'] = method_eval.to_dict('records')
+        
+        self._print_summary(stats, unmatched_cuis)
+        
+        return df_results, unmatched_cuis, stats
+    
+    def _print_summary(self, stats: Dict, unmatched: Set[str]):
+        """Print summary"""
+        print(f"\n{'='*70}")
+        print("Matching Summary")
+        print(f"{'='*70}")
+        print(f"Total: {stats['total_matched']}/{stats['total_topic_cuis']} ({stats['match_rate']*100:.1f}%)")
+        print(f"\nBy method:")
+        for method, count in stats['by_method'].items():
+            pct = (count / stats['total_matched'] * 100) if stats['total_matched'] > 0 else 0
+            print(f"  {method:15s}: {count:5d} ({pct:5.1f}%)")
+        
+        print(f"\nQuality:")
+        print(f"  Avg confidence:    {stats['avg_confidence']:.3f}")
+        print(f"  Avg hybrid score:  {stats['avg_hybrid_score']:.3f}")
+        
+        if 'evaluation' in stats:
+            print(f"\nEvaluation:")
+            for metric, value in stats['evaluation'].items():
+                if isinstance(value, float):
+                    print(f"  {metric:20s}: {value:.3f}")
+    
+    def save_results(
+        self,
+        df_results: pd.DataFrame,
+        output_path: str,
+        stats: Dict = None,
+        stats_path: str = None,
+        explainability_path: str = None
+    ):
+        """Save results"""
+        df_results.to_csv(output_path, index=False)
+        print(f"\n✓ Results: {output_path}")
+        
+        if stats and stats_path:
+            with open(stats_path, 'w') as f:
+                json.dump(stats, f, indent=2)
+            print(f"✓ Stats: {stats_path}")
+        
+        if explainability_path and 'ancestor_path' in df_results.columns:
+            explain_df = df_results[df_results['ancestor_path'].notna()][
+                ['topic_cui', 'reduced_cui', 'ancestor_path', 'ancestor_depth',
+                 'semantic_compatibility_score', 'hybrid_score']
+            ].copy()
+            explain_df.to_csv(explainability_path, index=False)
+            print(f"✓ Explainability: {explainability_path}")
+    
+    def save_learned_semantic_compatibility(self, output_path: str):
+        """Save learned semantic compatibility for reuse"""
+        if self.semantic_validator and self.semantic_validator.is_learned:
+            self.semantic_validator.save_learned_compatibility(output_path)
+            self.semantic_validator.export_compatibility_matrix(
+                output_path.replace('.pkl', '_matrix.csv')
+            )
