@@ -1,936 +1,440 @@
-Intent and final queries extraction   :import json
-import re
-from datetime import datetime
-from typing import Dict, Any, List
-from google.cloud import aiplatform
-from vertexai.generative_models import GenerativeModel
-
-
-QUERY_EXPANSION_PROMPT = """
-You are an expert medical AI assistant specializing in clinical query expansion.
-
-TASK: Expand the user's query into a comprehensive, detailed clinical description.
-
-INSTRUCTIONS:
-1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
-2. Clarify vague medical terms with specific clinical language
-3. Add relevant medical context based on standard clinical practice
-4. Identify implicit clinical concepts that should be explicit
-5. DO NOT add assumptions beyond reasonable clinical interpretation
-6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
-7. DO NOT hallucinate information not implied by the query
-8. Maintain the original query's intent and scope
-9.Make sure the Temporal accept is relevant to the Query context
-
-EXAMPLES:
-- "Pt with DM" → "Patient with Diabetes Mellitus"
-- "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
-- "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
-- "SOB on exertion" → "Shortness of breath on exertion"
-
-Return ONLY valid JSON (no markdown, no explanation):
-{{
-  "expanded_query": "comprehensive expanded clinical description",
-  "abbreviations_expanded": ["list of abbreviations that were expanded"] 
-}}
-
-User Input: {query}
+"""
+Automatic Semantic Type Compatibility Learning
+Discovers compatibility rules from data instead of manual definition
 """
 
-INTENT_EXTRACTION_PROMPT = """
-You are a clinical intent extraction engine for medical document retrieval.
-
-====================================================
-CLINICAL VALIDATION
-====================================================
-
-Return this ONLY if query is non-clinical:
-{{"is_clinical": false, "reason": "Query is not clinical in nature", "intents": []}}
-
-====================================================
-CORE PRINCIPLES
-====================================================
-
-**Extraction Philosophy:**
-When someone requests clinical information, extract everything needed to fully understand, act upon, or make decisions about that information safely and effectively.
-
-**Guiding Questions:**
-1. What is being requested?
-2. What contextual information is inseparable from this concept?
-3. What would be incomplete or unsafe without?
-4. How is this information naturally organized?
-
-**Inseparability Concept:**
-Some information types are inherently connected for safety, understanding, or completeness. When extracting one, consider whether the other is contextually necessary.
-
-====================================================
-INTENT GENERATION
-====================================================
-
-**Analyze the expanded query and identify distinct clinical intents.**
-
-Each intent represents a clinically independent concept that could be documented or understood separately.
-
-Generate as many intents as the expanded query contains. Let the content guide the count.
-
-====================================================
-INTENT STRUCTURE
-====================================================
-
-For each intent:
-
-1. **intent_title** - What is this about?
-2. **description** - What does this represent and why does it matter?
-3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
-4. **sub_natures[]** - What are the distinct dimensions of this information?
-5. **final_queries[]** - How would this appear in clinical documents?
-
-====================================================
-SUB_NATURE DECOMPOSITION
-====================================================
-
-**Core Question: "What are the meaningful aspects of this clinical concept?"**
-
-Structure:
-{{
-  "category_path": "Broad >> Specific >> Detail",
-  "atomic_concepts": ["terminal1", "terminal2"]
-}}
-
-**CATEGORY_PATH:**
-Think of this as organizing information from general to specific. Each level adds meaningful distinction. Use " >> " as the separator.
-
-Consider: "How would I navigate to this information?"
-
-**ATOMIC_CONCEPTS:**
-These are the actual data points - the most specific, granular elements at the end of the navigation path.
-
-Consider: "What are the specific pieces of information needed?"
-
-Include all specific details mentioned: exact values, names, dates, measurements, descriptors.
-
-**Key Understanding:**
-- category_path = How to get there (the folders)
-- atomic_concepts = What's there (the files - be specific)
-
-**Dimension Identification:**
-Consider: "What different types of information exist for this concept?"
-- Names and identifiers?
-- Measurements and quantities?
-- Time-related information?
-- Location information?
-- Characteristics and qualities?
-- Relationships and connections?
-- Safety-related information?
-- People involved?
-- Current state or status?
-- Surrounding circumstances?
-
-Extract the dimensions that are present and relevant.
-
-**Grouping Logic:**
-If multiple pieces of information answer the same type of question, group them in one sub_nature. Build depth in the category_path rather than creating many shallow sub_natures.
-
-====================================================
-FINAL_QUERIES: ATOMIC SPECIFICITY
-====================================================
-
-**Purpose:**
-Generate concise, atomic-level queries that map to precise clinical concepts without generating excessive CUIs.
-
-**Core Insight:**
-Long verbose queries generate too many CUIs. Short atomic queries target specific concepts.
-
-Consider the difference:
--  "metformin 500mg twice daily for diabetes management" → generates 10+ CUIs, which is not required
-- ✓ "metformin 500mg" → generates 2-3 focused CUIs
-- ✓ "twice daily dosing" → generates 1-2 CUIs
-
-**Atomic Query Principle:**
-Each query should represent ONE atomic clinical concept or a tight pairing of inseparable concepts.
-
-Think: "What's the smallest meaningful unit?"
-- A specific medication + dose
-- A specific measurement + value
-- A specific condition + severity
-- A specific procedure + site
-
-**Generation Approach:**
-
-Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
-
-**Guiding Questions:**
-- What's the core medical term?
-- Is there ONE essential modifier (dose, site, severity)?
-- Can this be made shorter while staying meaningful?
-- Will this generate a focused set of CUIs?
-
-**Query Characteristics:**
-- 2-4 words maximum
-- One clinical concept per query
-- Include only essential modifiers
-- Use standard medical terminology
-- Each query → 1-3 CUIs ideally
-
-**Natural Reasoning:**
-- Shorter = fewer CUIs = more precise matching
-- Atomic = focused = findable
-- Multiple short queries > one long query
-- Coverage through quantity, not length
-
-**Coverage:**
-Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
-
-====================================================
-REASONING FRAMEWORK
-====================================================
-
-**Before finalizing, consider:**
-
-On Completeness:
-- Have all distinct intents in the expanded query been identified?
-- For each intent, have all relevant dimensions been extracted?
-- Is there information that's inseparable from what was extracted?
-
-On Specificity:
-- Are atomic_concepts as specific as possible?
-- Have actual values been included, not just categories?
-- Are queries detailed enough to be useful?
-
-On Structure:
-- Does each sub_nature represent a different type of information?
-- Are atomic_concepts truly the most granular elements?
-- Is information properly organized?
-
-On Utility:
-- Would someone find what they need with these queries?
-- Are the queries realistic for clinical documentation?
-- Do the queries cover all the important atomic_concepts?
-
-====================================================
-OUTPUT FORMAT
-====================================================
-
-{{
-  "is_clinical": true,
-  "reason": "",
-  "original_query": "{original_query}",
-  "expanded_query": "{expanded_query}",
-  "total_intents_detected": <number>,
-  "intents": [
-    {{
-      "intent_title": "<string>",
-      "description": "<string>",
-      "nature": "<string>",
-      "sub_natures": [
-        {{
-          "category_path": "<Broad >> Specific >> Detail>",
-          "atomic_concepts": ["<concept1>", "<concept2>"]
-        }}
-      ],
-      "final_queries": ["<query1>", "<query2>", "<query3>", "..."]
-    }}
-  ]
-}}
-
-User Input: {expanded_query}
-Timestamp: {timestamp}
-"""
-# Pipeline
-
-
-class ContextualIntentPipeline:    
-    def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = MODEL_VERSION):
-
-        aiplatform.init(project=project, location=location)
-        self.model = GenerativeModel(model)        
-        
-    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096) -> str:
-
-        try:
-            # Reset session to avoid context carryover
-            if hasattr(self.model, "session") and self.model.session is not None:
-                self.model.session.reset()
-            
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.0,
-                    "max_output_tokens": max_tokens,
-                    "top_p": 1.0,
-                    "top_k": 1,
-                    "seed":34
-                }
-            )
-            return response.text.strip()
-        except Exception as e:
-            print(f"Error calling model: {str(e)}")
-            return "{}"
-    
-    def _safe_json(self, text: str) -> Dict[str, Any]:
-
-        # Remove markdown code blocks if present
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```\s*', '', text)
-        text = text.strip()
-        
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
-            
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
-            
-            print(f"Failed to parse JSON from response: {text[:200]}")
-            return {}
-    
-    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
-
-        return all(key in data for key in required_keys)
-    
-    # STEP 1: Query Expansion
-    
-    def expand_query(self, query: str) -> Dict[str, Any]:
-
-        prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        raw_response = self._call_model(prompt)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["expanded_query"]):
-            # Fallback to original query if expansion fails
-            return {
-                "expanded_query": query,
-                "abbreviations_expanded": [],
-                # "concepts_added": []
-            }
-        
-        return {
-            "expanded_query": data.get("expanded_query", query),
-            "abbreviations_expanded": data.get("abbreviations_expanded", []),
-            # "concepts_added": data.get("concepts_added", [])
-        }
-    
-    # STEP 2: Intent Extraction
-    
-    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-
-        prompt = INTENT_EXTRACTION_PROMPT.format(
-            original_query=original_query,
-            expanded_query=expanded_query,
-            timestamp=datetime.utcnow().isoformat()
-        )
-        
-        # Use higher token limit for complex queries
-        raw_response = self._call_model(prompt, max_tokens=8096)
-        data = self._safe_json(raw_response)
-        
-        # Check if query was rejected as non-clinical
-        if not data.get("is_clinical", True):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query is not clinical"),
-                "original_query": original_query,
-                "expanded_query": expanded_query
-            }
-        
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "error": "Failed to extract intents"
-            }
-        
-        # Validate that all intents have final_queries
-        intents = data.get("intents", [])
-        validated_intents = []
-        
-        for idx, intent in enumerate(intents):
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            
-            # No minimum requirement - let LLM decide based on complexity
-            validated_intents.append(intent)
-        
-        return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
-            "is_clinical": True,
-            "original_query": data.get("original_query", original_query),
-            "expanded_query": data.get("expanded_query", expanded_query)
-        }    
-          
-    
-    # Pipeline exec
-    
-    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
-
-        start_time = datetime.utcnow()
-        
-        if verbose:
-            print(f"Original Query: {query}")
-        
-        # Step 1: Query Expansion
-        expansion_result = self.expand_query(query)
-        expanded_query = expansion_result["expanded_query"]
-        
-        if verbose:
-            print(f"Expanded Query: {expanded_query}")
-        
-        # Step 2: Intent Extraction
-        intent_result = self.extract_intents(query, expanded_query)
-        
-       
-        if not intent_result.get("is_clinical", True):
-            processing_time = (datetime.utcnow() - start_time).total_seconds()
-            
-            if verbose:
-                print(f"Status: NON-CLINICAL (rejected)")
-                print(f"Processing Time: {processing_time:.2f}s\n")
-            
-            return {
-                "original_query": query,
-                "expanded_query": expanded_query,
-                "intents": [],
-                "is_clinical": False,
-                "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
-                "timestamp": datetime.utcnow().isoformat(),
-                "processing_time_seconds": processing_time
-            }
-        
-        intents = intent_result.get("intents", [])        
-        
-        # Calculate statistics
-        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
-        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
-        
-        if verbose:
-            print(f"Status: CLINICAL")
-            print(f"Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
-            print(f"Processing Time: {processing_time:.2f}s\n")
-        
-        return {
-            "original_query": query,
-            "expanded_query": expanded_query,
-            "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            # "concepts_added": expansion_result.get("concepts_added", []),
-            "is_clinical": True,
-            "intents": intents,            
-            "timestamp": datetime.utcnow().isoformat(),
-            "processing_time_seconds": processing_time
-            }
-        
-
-if __name__ == "__main__":
-    PROJECT_ID = PROJECT_ID    
-    pipeline = ContextualIntentPipeline(
-        project=PROJECT_ID,
-        location="us-central1",
-        model=MODEL_VERSION
-
-    )
-    
-# Test queries
-    test_queries = [
-        "I am managing patient appointment requests submitted through an online portal.Patients describe their health concerns and health needs on the application forms. I need to list their primary health concerns, secondary health concerns, and their needs from the submitted texts.",
-        "current medication"        
-    ]
-    
-    for idx, query in enumerate(test_queries, 1):
-        print(f"\n{'='*80}")
-        print(f"Query {idx}/{len(test_queries)}")
-        print(f"{'='*80}")
-        
-        result = pipeline.run(query, verbose=True)
-        
-        output_filename = f"query_result_{idx}.json"
-        with open(output_filename, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        print(f"Saved to: {output_filename}")
-
------------------
-Cui redution:
-Load pickle file : import pickle
-import time
-import os
-
-# Path to your PKL
-NETWORK_PKL = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
-
-
-# Check file exists
-assert os.path.exists(NETWORK_PKL), f"PKL not found: {NETWORK_PKL}"
-
-# Load PKL and measure time
-start_time = time.time()
-with open(NETWORK_PKL, "rb") as f:
-    UMLS_NETWORK_OBJ = pickle.load(f)
-print(f"PKL loaded in {time.time() - start_time:.2f} seconds")
-
-# Optional: inspect type
-print("Loaded object type:", type(UMLS_NETWORK_OBJ))
-#cui reduction code   : 
-import asyncio
-import aiohttp
-import subprocess
-import re
-import logging
-from pathlib import Path
-import json
-from typing import List, Dict, Set, Optional, Tuple
-from collections import defaultdict
-import time
-from dataclasses import dataclass, asdict
-import threading
 import pickle
 import numpy as np
-from google.cloud import bigquery
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.metrics.pairwise import cosine_distances
-import nest_asyncio
-import requests
-from requests.adapters import HTTPAdapter, Retry
+import networkx as nx
+from typing import Dict, List, Tuple, Set, Optional
+from collections import defaultdict
+from sklearn.metrics.pairwise import cosine_similarity
+import pandas as pd
 
-nest_asyncio.apply()
 
-# --------------------- Logging ---------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# --------------------- GCP Token ---------------------
-class GCPTokenProvider:
-    _lock = threading.Lock()
-    _token = None
-    _expiry = 0
-
-    @classmethod
-    def get_headers(cls, force: bool = False) -> Dict[str, str]:
-        with cls._lock:
-            now = time.time()
-            if not force and cls._token and now < cls._expiry:
-                return cls._token
-
-            proc = subprocess.run(
-                ["gcloud", "auth", "print-identity-token"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=10
-            )
-            if proc.returncode != 0:
-                raise RuntimeError(proc.stderr)
-
-            token = proc.stdout.strip()
-            if not token:
-                raise RuntimeError("Empty token from gcloud")
-
-            cls._token = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-            cls._expiry = now + 3300  # ~55 minutes
-            return cls._token
-
-# --------------------- Data Classes ---------------------
-@dataclass
-class ReductionStats:
-    initial_count: int
-    after_ic_rollup: int
-    final_count: int
-    ic_rollup_reduction_pct: float
-    semantic_clustering_reduction_pct: float
-    total_reduction_pct: float
-    processing_time: float
-    ic_threshold_used: float
-    hierarchy_size: int = 0
-    api_call_time: float = 0.0
-    group_stats: Dict = None
-    missing_embeddings_count: int = 0
-
-    def to_dict(self):
-        return asdict(self)
-
-# --------------------- Filter CUIs ---------------------
-def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
-    if not cuis:
-        return []
-    try:
-        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
-        client = bigquery.Client(project=project_id)
-        query = f"""
-        SELECT DISTINCT CUI
-        FROM `{project_id}.{dataset_id}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis)
-          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE',
-                      'ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT','ICPC2ICD10ENG',
-                      'SNOMEDCT_US', 'LOINC')
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
-        )
-        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        allowed_cuis = df['CUI'].tolist()
-        logger.info(f"{len(allowed_cuis)} CUIs after filter")
-        return allowed_cuis
-    except Exception as e:
-        logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
-        return []
-
-# --------------------- CUI API Client ---------------------
-class CUIAPIClient:
-    def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 3, max_retries: int = 3):
-        self.api_base_url = api_base_url.rstrip('/')
-        self.timeout = timeout
-        self.top_k = top_k
-        self.max_retries = max_retries
-
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["POST"]
-        )
-        adapter = HTTPAdapter(
-            max_retries=retry_strategy,
-            pool_connections=10,
-            pool_maxsize=20
-        )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-    def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
-        if not texts:
-            return set()
-        payload = {"query_texts": texts, "top_k": self.top_k}
-        headers = GCPTokenProvider.get_headers()
-        logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
-        try:
-            response = self.session.post(
-                self.api_base_url,
-                json=payload,
-                headers=headers,
-                timeout=self.timeout
-            )
-            if response.status_code == 401 and retry_auth:
-                logger.warning("Token expired, refreshing...")
-                GCPTokenProvider.get_headers(force=True)
-                return self.extract_cuis_batch(texts, retry_auth=False)
-            response.raise_for_status()
-            data = response.json()
-            all_cuis = set()
-            for text in texts:
-                cuis = data.get(text, [])
-                if isinstance(cuis, list):
-                    all_cuis.update(str(c) for c in cuis if c)
-            logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
-            return all_cuis
-        except Exception as e:
-            logger.error(f"API call failed: {str(e)}")
-            return set()
-
-# --------------------- Enhanced Reducer ---------------------
-class EnhancedCUIReducer:
+class AutoSemanticTypeValidator:
+    """
+    Automatically learns semantic type compatibility from data
+    Uses three strategies:
+    1. Graph co-occurrence (types appearing together in hierarchies)
+    2. Embedding similarity (types with similar embeddings are compatible)
+    3. Transitivity (if A->B and B->C compatible, then A->C compatible)
+    """
+    
     def __init__(
         self,
-        project_id: str,
-        dataset_id: str,
-        cui_embeddings_table: str,
-        mrsty_table: str,
-        umls_network_obj: dict
+        cui_semantic_types: Optional[Dict[str, Set[str]]] = None,
+        learn_from_graph: bool = True,
+        learn_from_embeddings: bool = True,
+        similarity_threshold: float = 0.6,
+        min_cooccurrence: int = 5
     ):
-        self.client = bigquery.Client(project=project_id)
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.cui_embeddings_table = cui_embeddings_table
-        self.mrsty_table = mrsty_table
-        self._preloaded_network = umls_network_obj
-
-        self._hierarchy_cache = {}
-        self._ic_scores_cache = {}
-        self._description_cache = {}
-        self._missing_embeddings_total = 0
-
-    # --------------------- Main Reduction Function ---------------------
-    def reduce(
-        self,
-        input_cuis: List[str],
-        ic_percentile: int = 25,
-        similarity_threshold: float = 0.95,
-        distance_from_centroid_threshold: float = 0.4
-    ) -> Tuple[List[str], ReductionStats]:
-
-        start_time = time.time()
-        input_cuis = list(set(input_cuis))
-        initial_count = len(input_cuis)
-        logger.info(f"Starting semantic-group based reduction for {initial_count} CUIs")
-
-        # --------------------- Semantic type grouping ---------------------
-        semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
-        logger.info(f"Created {len(semantic_groups)} semantic groups")
-
-        all_reduced_cuis = []
-        group_stats = {}
-        total_after_ic = 0
-
-        for group_name, group_cuis in semantic_groups.items():
-            if not group_cuis:
-                continue
-
-            # --------------------- Build hierarchy from pickle ---------------------
-            hierarchy = self._build_hierarchy_depthwise(group_cuis)
-
-            # --------------------- IC scores ---------------------
-            ic_scores = self._compute_ic_scores_within_group(hierarchy, group_cuis, group_name)
-            ic_threshold = np.percentile(list(ic_scores.values()), ic_percentile) if ic_scores else 0.0
-            high_ic_cuis = [cui for cui in group_cuis if ic_scores.get(cui, 0) >= ic_threshold]
-            total_after_ic += len(high_ic_cuis)
-
-            # --------------------- Embedding-based clustering ---------------------
-            if len(high_ic_cuis) > 1:
-                group_reduced = self._cluster_and_select_diverse(high_ic_cuis, similarity_threshold, distance_from_centroid_threshold)
-            else:
-                group_reduced = high_ic_cuis
-
-            all_reduced_cuis.extend(group_reduced)
-            group_stats[group_name] = {
-                'original': len(group_cuis),
-                'after_ic_filter': len(high_ic_cuis),
-                'final': len(group_reduced),
-                'reduction_pct': (1 - len(group_reduced)/len(group_cuis)) * 100 if group_cuis else 0
-            }
-
-        # --------------------- Final deduplication ---------------------
-        final_cuis = list(set(all_reduced_cuis))
-        # self._fetch_descriptions(final_cuis)
-
-        stats = ReductionStats(
-            initial_count=initial_count,
-            after_ic_rollup=total_after_ic,
-            final_count=len(final_cuis),
-            ic_rollup_reduction_pct=self._safe_percentage(initial_count - total_after_ic, initial_count),
-            semantic_clustering_reduction_pct=self._safe_percentage(total_after_ic - len(final_cuis), initial_count),
-            total_reduction_pct=self._safe_percentage(initial_count - len(final_cuis), initial_count),
-            processing_time=time.time() - start_time,
-            ic_threshold_used=ic_percentile,
-            hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
-            api_call_time=0.0,
-            group_stats=group_stats,
-            missing_embeddings_count=self._missing_embeddings_total
-        )
-
-        return final_cuis, stats
-
-    # --------------------- Semantic type grouping ---------------------
-    def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
-        query = f"""
-        SELECT DISTINCT CUI, STY
-        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
-        WHERE CUI IN UNNEST(@cuis)
         """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
-        )
-        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        if df.empty:
-            return {'UNKNOWN': cuis}
-
-        semantic_groups = defaultdict(set)
-        cui_to_types = defaultdict(set)
-        for _, row in df.iterrows():
-            semantic_groups[row['STY']].add(row['CUI'])
-            cui_to_types[row['CUI']].add(row['STY'])
-
-        final_groups = defaultdict(list)
-        for cui in cuis:
-            types = cui_to_types.get(cui, {'UNKNOWN'})
-            sorted_types = sorted(types, key=lambda x: (-len(x), x))
-            for t in sorted_types:
-                final_groups[t].append(cui)
-        return dict(final_groups)
-
-    # --------------------- Hierarchy from pickle ---------------------
-    def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
-        key = tuple(sorted(cuis))
-        if key in self._hierarchy_cache:
-            return self._hierarchy_cache[key]
-
-        all_cuis = set()
-        parent_to_children = defaultdict(list)
-        child_to_parents = defaultdict(list)
-
-        for cui in cuis:
-            if not UMLS_NETWORK_OBJ.has_node(cui):
+        Initialize automatic validator
+        
+        Args:
+            cui_semantic_types: Dict mapping CUI -> set of semantic types
+            learn_from_graph: Learn compatibility from graph structure
+            learn_from_embeddings: Learn compatibility from embedding similarity
+            similarity_threshold: Min embedding similarity to consider compatible
+            min_cooccurrence: Min co-occurrences to establish compatibility
+        """
+        self.cui_semantic_types = cui_semantic_types or {}
+        self.learn_from_graph = learn_from_graph
+        self.learn_from_embeddings = learn_from_embeddings
+        self.similarity_threshold = similarity_threshold
+        self.min_cooccurrence = min_cooccurrence
+        
+        # Learned compatibility
+        self.compatible_types = {}
+        self.compatibility_scores = defaultdict(lambda: defaultdict(float))
+        self.is_learned = False
+    
+    def learn_from_graph_structure(
+        self,
+        graph: nx.DiGraph,
+        max_depth: int = 3
+    ):
+        """
+        Learn compatibility from graph co-occurrence
+        If two types appear in parent-child relationships, they're compatible
+        """
+        print("Learning semantic type compatibility from graph structure...")
+        
+        cooccurrence = defaultdict(lambda: defaultdict(int))
+        
+        # For each CUI, look at its ancestors and descendants
+        for cui in graph.nodes():
+            if cui not in self.cui_semantic_types:
                 continue
-            # Children
-            for child in UMLS_NETWORK_OBJ.successors(cui):
-                parent_to_children[cui].append(child)
-                child_to_parents[child].append(cui)
-                all_cuis.update([cui, child])
-            # Parents
-            for parent in UMLS_NETWORK_OBJ.predecessors(cui):
-                child_to_parents[cui].append(parent)
-                parent_to_children[parent].append(cui)
-                all_cuis.update([cui, parent])
-
-        hierarchy = {
-            "parent_to_children": dict(parent_to_children),
-            "child_to_parents": dict(child_to_parents),
-            "all_cuis": all_cuis
+            
+            cui_types = self.cui_semantic_types[cui]
+            
+            # Get ancestors and descendants
+            neighbors = set()
+            
+            # Ancestors (up to max_depth)
+            try:
+                ancestors = nx.ancestors(graph, cui)
+                # Limit depth
+                close_ancestors = set()
+                for anc in ancestors:
+                    try:
+                        depth = nx.shortest_path_length(graph, cui, anc)
+                        if depth <= max_depth:
+                            close_ancestors.add(anc)
+                    except:
+                        pass
+                neighbors.update(close_ancestors)
+            except:
+                pass
+            
+            # Descendants (up to max_depth)
+            try:
+                descendants = nx.descendants(graph, cui)
+                close_descendants = set()
+                for desc in descendants:
+                    try:
+                        depth = nx.shortest_path_length(graph, desc, cui)
+                        if depth <= max_depth:
+                            close_descendants.add(desc)
+                    except:
+                        pass
+                neighbors.update(close_descendants)
+            except:
+                pass
+            
+            # Record co-occurrences
+            for neighbor in neighbors:
+                if neighbor not in self.cui_semantic_types:
+                    continue
+                
+                neighbor_types = self.cui_semantic_types[neighbor]
+                
+                # Record all type pairs
+                for t1 in cui_types:
+                    for t2 in neighbor_types:
+                        cooccurrence[t1][t2] += 1
+                        cooccurrence[t2][t1] += 1  # Symmetric
+        
+        # Convert to compatibility
+        for t1, t2_counts in cooccurrence.items():
+            compatible_set = set()
+            for t2, count in t2_counts.items():
+                if count >= self.min_cooccurrence:
+                    compatible_set.add(t2)
+                    # Store score (normalized by max count)
+                    max_count = max(t2_counts.values())
+                    self.compatibility_scores[t1][t2] = count / max_count
+            
+            if compatible_set:
+                self.compatible_types[t1] = compatible_set
+        
+        print(f"  Learned compatibility for {len(self.compatible_types)} semantic types")
+        print(f"  Average compatible types per type: {np.mean([len(v) for v in self.compatible_types.values()]):.1f}")
+    
+    def learn_from_embedding_similarity(
+        self,
+        embeddings: Dict[str, np.ndarray]
+    ):
+        """
+        Learn compatibility from embedding similarity
+        Types whose CUIs have similar embeddings are compatible
+        """
+        print("Learning semantic type compatibility from embeddings...")
+        
+        # Group CUIs by semantic type
+        type_to_cuis = defaultdict(list)
+        for cui, types in self.cui_semantic_types.items():
+            if cui in embeddings:
+                for t in types:
+                    type_to_cuis[t].append(cui)
+        
+        # Compute average embedding per type
+        type_embeddings = {}
+        for sem_type, cuis in type_to_cuis.items():
+            if len(cuis) > 0:
+                type_embs = [embeddings[cui] for cui in cuis if cui in embeddings]
+                if type_embs:
+                    type_embeddings[sem_type] = np.mean(type_embs, axis=0)
+        
+        # Compute pairwise similarities
+        types_list = list(type_embeddings.keys())
+        if len(types_list) < 2:
+            print("  Not enough semantic types with embeddings")
+            return
+        
+        emb_matrix = np.array([type_embeddings[t] for t in types_list])
+        similarities = cosine_similarity(emb_matrix)
+        
+        # Build compatibility based on similarity
+        for i, t1 in enumerate(types_list):
+            compatible_set = self.compatible_types.get(t1, set())
+            
+            for j, t2 in enumerate(types_list):
+                if similarities[i, j] >= self.similarity_threshold:
+                    compatible_set.add(t2)
+                    # Update score (take max of graph and embedding)
+                    current_score = self.compatibility_scores[t1][t2]
+                    self.compatibility_scores[t1][t2] = max(current_score, similarities[i, j])
+            
+            self.compatible_types[t1] = compatible_set
+        
+        print(f"  Updated compatibility for {len(self.compatible_types)} semantic types")
+    
+    def apply_transitivity(self, max_iterations: int = 3):
+        """
+        Apply transitivity: if A->B and B->C compatible, then A->C compatible
+        """
+        print("Applying transitivity to expand compatibility...")
+        
+        for iteration in range(max_iterations):
+            added = 0
+            
+            for t1 in list(self.compatible_types.keys()):
+                compatible_t1 = set(self.compatible_types[t1])
+                
+                # For each compatible type
+                for t2 in list(compatible_t1):
+                    if t2 in self.compatible_types:
+                        # Add transitive compatibilities
+                        new_compatible = self.compatible_types[t2] - compatible_t1 - {t1}
+                        
+                        for t3 in new_compatible:
+                            # Compute transitive score (min of the two paths)
+                            score_t1_t2 = self.compatibility_scores[t1][t2]
+                            score_t2_t3 = self.compatibility_scores[t2][t3]
+                            transitive_score = min(score_t1_t2, score_t2_t3) * 0.8  # Decay
+                            
+                            # Only add if score is reasonable
+                            if transitive_score >= 0.3:
+                                compatible_t1.add(t3)
+                                # Update score if better
+                                if self.compatibility_scores[t1][t3] < transitive_score:
+                                    self.compatibility_scores[t1][t3] = transitive_score
+                                added += 1
+                
+                self.compatible_types[t1] = compatible_t1
+            
+            print(f"  Iteration {iteration + 1}: Added {added} transitive compatibilities")
+            
+            if added == 0:
+                break
+    
+    def learn_compatibility(
+        self,
+        graphs: List[nx.DiGraph] = None,
+        embeddings: Dict[str, np.ndarray] = None
+    ):
+        """
+        Main method to learn compatibility from data
+        
+        Args:
+            graphs: List of graphs to learn from (e.g., [reduced_graph, topic_graph])
+            embeddings: Combined embeddings dict
+        """
+        print("\n" + "="*70)
+        print("AUTOMATIC SEMANTIC TYPE COMPATIBILITY LEARNING")
+        print("="*70)
+        
+        if not self.cui_semantic_types:
+            print("No semantic types provided - skipping compatibility learning")
+            return
+        
+        # Learn from graph structure
+        if self.learn_from_graph and graphs:
+            for i, graph in enumerate(graphs):
+                print(f"\nGraph {i+1}/{len(graphs)}:")
+                self.learn_from_graph_structure(graph, max_depth=3)
+        
+        # Learn from embeddings
+        if self.learn_from_embeddings and embeddings:
+            self.learn_from_embedding_similarity(embeddings)
+        
+        # Apply transitivity
+        if self.compatible_types:
+            self.apply_transitivity(max_iterations=2)
+        
+        self.is_learned = True
+        
+        # Summary
+        print("\n" + "="*70)
+        print("LEARNING SUMMARY")
+        print("="*70)
+        print(f"Total semantic types: {len(self.compatible_types)}")
+        if self.compatible_types:
+            avg_compatible = np.mean([len(v) for v in self.compatible_types.values()])
+            print(f"Avg compatible types per type: {avg_compatible:.1f}")
+            
+            # Show examples
+            print("\nExample compatibilities:")
+            for sem_type in list(self.compatible_types.keys())[:5]:
+                compatible = self.compatible_types[sem_type]
+                scores = [self.compatibility_scores[sem_type][t] for t in compatible]
+                avg_score = np.mean(scores) if scores else 0
+                print(f"  {sem_type}: {len(compatible)} compatible types (avg score: {avg_score:.3f})")
+    
+    def are_compatible(self, cui1: str, cui2: str, strict: bool = False) -> Optional[bool]:
+        """
+        Check if two CUIs are semantically compatible
+        
+        Args:
+            cui1: First CUI
+            cui2: Second CUI
+            strict: If True, require compatibility score > 0.5
+        
+        Returns:
+            True if compatible, False if incompatible, None if no info
+        """
+        if cui1 not in self.cui_semantic_types or cui2 not in self.cui_semantic_types:
+            return None  # No semantic type info
+        
+        types1 = self.cui_semantic_types[cui1]
+        types2 = self.cui_semantic_types[cui2]
+        
+        # If no learned compatibility, assume compatible (permissive)
+        if not self.is_learned or not self.compatible_types:
+            # Fallback: at least one common type
+            return len(types1 & types2) > 0 if strict else None
+        
+        # Check learned compatibility
+        max_score = 0.0
+        for t1 in types1:
+            if t1 not in self.compatible_types:
+                continue
+            
+            compatible_t1 = self.compatible_types[t1]
+            for t2 in types2:
+                if t2 in compatible_t1:
+                    score = self.compatibility_scores[t1][t2]
+                    max_score = max(max_score, score)
+        
+        if strict:
+            return max_score > 0.5
+        else:
+            return max_score > 0.0
+    
+    def get_compatibility_score(self, cui1: str, cui2: str) -> float:
+        """Get compatibility score between two CUIs"""
+        if cui1 not in self.cui_semantic_types or cui2 not in self.cui_semantic_types:
+            return 0.0
+        
+        types1 = self.cui_semantic_types[cui1]
+        types2 = self.cui_semantic_types[cui2]
+        
+        max_score = 0.0
+        for t1 in types1:
+            for t2 in types2:
+                score = self.compatibility_scores[t1].get(t2, 0.0)
+                max_score = max(max_score, score)
+        
+        return max_score
+    
+    def get_semantic_types(self, cui: str) -> Set[str]:
+        """Get semantic types for a CUI"""
+        return self.cui_semantic_types.get(cui, set())
+    
+    def export_compatibility_matrix(self, output_path: str):
+        """Export learned compatibility for inspection"""
+        rows = []
+        
+        for t1 in sorted(self.compatible_types.keys()):
+            for t2 in sorted(self.compatible_types[t1]):
+                score = self.compatibility_scores[t1][t2]
+                rows.append({
+                    'type1': t1,
+                    'type2': t2,
+                    'compatibility_score': score
+                })
+        
+        df = pd.DataFrame(rows)
+        df.to_csv(output_path, index=False)
+        print(f"\nExported compatibility matrix to: {output_path}")
+        
+        return df
+    
+    def save_learned_compatibility(self, output_path: str):
+        """Save learned compatibility for reuse"""
+        data = {
+            'compatible_types': {k: list(v) for k, v in self.compatible_types.items()},
+            'compatibility_scores': {
+                k: dict(v) for k, v in self.compatibility_scores.items()
+            },
+            'is_learned': self.is_learned
         }
-        self._hierarchy_cache[key] = hierarchy
-        return hierarchy
-
-    # --------------------- IC Scores ---------------------
-    def _compute_ic_scores_within_group(
-        self,
-        hierarchy: Dict,
-        group_cuis: List[str],
-        group_name: str
-    ) -> Dict[str, float]:
-        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
-        if cache_key in self._ic_scores_cache:
-            return self._ic_scores_cache[cache_key]
-
-        parent_to_children = hierarchy.get("parent_to_children", {})
-        group_set = set(group_cuis)
-        descendant_counts = {}
-
-        def count_descendants(cui: str, visited: Set[str] = None) -> int:
-            if visited is None:
-                visited = set()
-            if cui in visited or cui not in group_set:
-                return 0
-            visited.add(cui)
-            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
-            count = len(children)
-            for child in children:
-                count += count_descendants(child, visited)
-            descendant_counts[cui] = count
-            return count
-
-        for cui in group_cuis:
-            if cui not in descendant_counts:
-                try:
-                    count_descendants(cui)
-                except RecursionError:
-                    descendant_counts[cui] = 0
-
-        group_size = len(group_cuis)
-        ic_scores = {cui: max(0.0, -np.log((descendant_counts.get(cui,0)+1)/group_size)) for cui in group_cuis}
-        self._ic_scores_cache[cache_key] = ic_scores
-        return ic_scores
-
-    # --------------------- Embedding Clustering ---------------------
-    def _cluster_and_select_diverse(self, cui_list, similarity_threshold, distance_threshold):
-        if len(cui_list) <= 1:
-            return cui_list
-        query = f"""
-        SELECT CUI AS cui, embedding AS embedding
-        FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cui_list)]
+        
+        with open(output_path, 'wb') as f:
+            pickle.dump(data, f)
+        
+        print(f"Saved learned compatibility to: {output_path}")
+    
+    def load_learned_compatibility(self, input_path: str):
+        """Load previously learned compatibility"""
+        with open(input_path, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.compatible_types = {k: set(v) for k, v in data['compatible_types'].items()}
+        self.compatibility_scores = defaultdict(
+            lambda: defaultdict(float),
+            {k: defaultdict(float, v) for k, v in data['compatibility_scores'].items()}
         )
-        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        if df.empty:
-            return cui_list
-        valid = [(row["cui"], np.asarray(row["embedding"], dtype=np.float32)) for _, row in df.iterrows() if row["embedding"] is not None]
-        if len(valid) < 2:
-            return cui_list
-        cuis, embeddings = zip(*valid)
-        embeddings = np.vstack(embeddings)
-        clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=1-similarity_threshold, metric="cosine", linkage="average")
-        labels = clustering.fit_predict(embeddings)
-        selected = set()
-        for label in np.unique(labels):
-            idx = np.where(labels == label)[0]
-            cluster_emb = embeddings[idx]
-            centroid = np.mean(cluster_emb, axis=0)
-            distances = cosine_distances([centroid], cluster_emb)[0]
-            far = idx[distances > distance_threshold]
-            if len(far):
-                selected.update([cuis[i] for i in far])
-            else:
-                selected.add(cuis[idx[np.argmax(distances)]])
-        return list(selected)
+        self.is_learned = data['is_learned']
+        
+        print(f"Loaded learned compatibility from: {input_path}")
+        print(f"  {len(self.compatible_types)} semantic types with compatibility rules")
 
-    # --------------------- Fetch descriptions ---------------------
-    # def _fetch_descriptions(self, cuis: List[str]):
-    # to_fetch = [c for c in cuis if c not in self._description_cache]
-    # if not to_fetch:
-    #     return
-    # query = f"""
-    # SELECT CUI AS cui, DEF AS description
-    # FROM `{self.project_id}.{self.dataset_id}.MRDEF`
-    # WHERE CUI IN UNNEST(@cuis)
-    # """
-    # job_config = bigquery.QueryJobConfig(
-    #     query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", to_fetch)]
-    # )
-    # df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-    # for _, row in df.iterrows():
-    #     self._description_cache[row['cui']] = row['description']
-    # logger.info(f"Fetched {len(df)} definitions")
 
-    # --------------------- Utility ---------------------
-    @staticmethod
-    def _safe_percentage(numerator: float, denominator: float) -> float:
-        return (numerator / denominator * 100) if denominator else 0.0
-
-# --------------------- Main Pipeline ---------------------
-if __name__ == "__main__":
-
-    # # --------------------- Load Pickle ---------------------
-    # NETWORK_PKL = "/home/jupyter/NER/networkx_cui_context_v1_1_0.pkl"
-    # with open(NETWORK_PKL, "rb") as f:
-    #     UMLS_NETWORK_OBJ = pickle.load(f)
-    # logger.info(f"Pickle loaded. Type: {type(UMLS_NETWORK_OBJ)}")
-
-    # --------------------- Inputs ---------------------
-    project_id = project_id
-    dataset_id = dataset
-    cui_embeddings_table = embedding_table
-    mrsty_table = "MRSTY"
-    texts = ["grams"]
-
-    # --------------------- Extract CUIs ---------------------
-    api_url = url
-    api_client = CUIAPIClient(api_url)
-    extracted_cuis = api_client.extract_cuis_batch(texts)
-
-    # --------------------- Filter CUIs ---------------------
-    filtered_cuis = filter_allowed_cuis(extracted_cuis, project_id, dataset_id)
-
-    # --------------------- Reduce CUIs ---------------------
-    reducer = EnhancedCUIReducer(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        cui_embeddings_table=cui_embeddings_table,
-        mrsty_table=mrsty_table,
-        umls_network_obj=UMLS_NETWORK_OBJ
+def create_auto_validator_from_data(
+    cui_semantic_types: Dict[str, Set[str]],
+    reduced_graph: nx.DiGraph,
+    topic_graph: nx.DiGraph,
+    reduced_embeddings: Dict[str, np.ndarray],
+    topic_embeddings: Dict[str, np.ndarray],
+    similarity_threshold: float = 0.6,
+    min_cooccurrence: int = 5
+) -> AutoSemanticTypeValidator:
+    """
+    Convenience function to create and train validator from data
+    
+    Args:
+        cui_semantic_types: CUI to semantic types mapping
+        reduced_graph: Reduced CUI graph
+        topic_graph: Topic CUI graph
+        reduced_embeddings: Reduced embeddings
+        topic_embeddings: Topic embeddings
+        similarity_threshold: Min similarity for embedding-based compatibility
+        min_cooccurrence: Min co-occurrences for graph-based compatibility
+    
+    Returns:
+        Trained AutoSemanticTypeValidator
+    """
+    # Create validator
+    validator = AutoSemanticTypeValidator(
+        cui_semantic_types=cui_semantic_types,
+        learn_from_graph=True,
+        learn_from_embeddings=True,
+        similarity_threshold=similarity_threshold,
+        min_cooccurrence=min_cooccurrence
     )
-    final_cuis, stats = reducer.reduce(filtered_cuis)
+    
+    # Combine embeddings
+    all_embeddings = {**reduced_embeddings, **topic_embeddings}
+    
+    # Learn compatibility
+    validator.learn_compatibility(
+        graphs=[reduced_graph, topic_graph],
+        embeddings=all_embeddings
+    )
+    
+    return validator
 
-    # logger.info(f"Final CUIs ({len(final_cuis)}): {final_cuis}")
-    logger.info(f"Reduction Stats: {stats.to_dict()}")
 
+# Example usage
+if __name__ == "__main__":
+    print("Automatic Semantic Type Compatibility Learning")
+    print("="*70)
+    print("\nThis module automatically discovers semantic type compatibility from:")
+    print("  1. Graph structure (co-occurrence in hierarchies)")
+    print("  2. Embedding similarity (semantic similarity)")
+    print("  3. Transitivity (if A→B and B→C, then A→C)")
+    print("\nNo manual rules needed!")
