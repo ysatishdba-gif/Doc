@@ -1,5 +1,1210 @@
-# ============= STEP 1: Run LEFT HAND SIDE =============
-# File: lhs_pipeline.py
+#load graph pikcle file
+
+import pickle
+import time
+import os
+
+# Path to your PKL
+NETWORK_PKL = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
+
+
+# Check file exists
+assert os.path.exists(NETWORK_PKL), f"PKL not found: {NETWORK_PKL}"
+
+# Load PKL and measure time
+start_time = time.time()
+with open(NETWORK_PKL, "rb") as f:
+    UMLS_NETWORK_OBJ = pickle.load(f)
+print(f"PKL loaded in {time.time() - start_time:.2f} seconds")
+
+# Optional: inspect type
+print("Loaded object type:", type(UMLS_NETWORK_OBJ))
+
+
+# Left hand side
+
+
+import pickle
+import subprocess
+import logging
+import time
+import threading
+from typing import List, Dict, Set, Tuple
+from collections import defaultdict
+import numpy as np
+from google.cloud import bigquery
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics.pairwise import cosine_distances
+import requests
+from requests.adapters import HTTPAdapter, Retry
+import networkx as nx
+from dataclasses import dataclass, asdict
+
+#config
+
+CONFIG = {
+    'project_id': project_id,
+    'dataset_id': dataset,
+    'cui_embeddings_table': embedding_table,
+    'mrsty_table': MRSTY,
+    'api_url': url,
+    'network_pkl': '/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl',
+    'output_graph': 'lhs_reduced_graph.pkl',
+    'output_embeddings': 'lhs_embeddings.pkl',
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+
+class GCPTokenProvider:
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def get_headers(cls, force: bool = False) -> Dict[str, str]:
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+            
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+            
+            token = proc.stdout.strip()
+            cls._token = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            cls._expiry = now + 3300
+            return cls._token
+
+
+
+@dataclass
+class ReductionStats:
+    initial_count: int
+    final_count: int
+    reduction_pct: float
+    processing_time: float
+    group_stats: Dict = None
+
+# CUI API 
+
+class CUIAPIClient:
+    def __init__(self, api_url: str, timeout: int = 60, top_k: int = 3):
+        self.api_url = api_url.rstrip('/')
+        self.timeout = timeout
+        self.top_k = top_k
+        self.session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_cuis(self, texts: List[str]) -> Set[str]:
+        if not texts:
+            return set()
+        payload = {"query_texts": texts, "top_k": self.top_k}
+        headers = GCPTokenProvider.get_headers()
+        
+        try:
+            response = self.session.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
+            if response.status_code == 401:
+                GCPTokenProvider.get_headers(force=True)
+                response = self.session.post(self.api_url, json=payload, headers=GCPTokenProvider.get_headers(), timeout=self.timeout)
+            response.raise_for_status()
+            
+            data = response.json()
+            all_cuis = set()
+            for text in texts:
+                cuis = data.get(text, [])
+                if isinstance(cuis, list):
+                    all_cuis.update(str(c) for c in cuis if c)
+            return all_cuis
+        except Exception as e:
+            logger.error(f"API call failed: {e}")
+            return set()
+
+
+# HELPER FUNCTIONS
+
+
+def filter_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
+    """Filter CUIs to retain only ICD, SNOMED, LOINC"""
+    if not cuis:
+        return []
+    
+    client = bigquery.Client(project=project_id)
+    query = f"""
+    SELECT DISTINCT CUI
+    FROM `{project_id}.{dataset_id}.MRCONSO`
+    WHERE CUI IN UNNEST(@cuis)
+      AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM',
+                  'ICD10CM','ICD10PCS','ICD9CM','SNOMEDCT_US','LOINC')
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
+    )
+    df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+    return df['CUI'].tolist()
+
+
+# CUI REDUCER
+
+
+class EnhancedCUIReducer:
+    def __init__(self, project_id: str, dataset_id: str, cui_embeddings_table: str, 
+                 mrsty_table: str, umls_graph: nx.DiGraph):
+        self.client = bigquery.Client(project=project_id)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.cui_embeddings_table = cui_embeddings_table
+        self.mrsty_table = mrsty_table
+        self.umls_graph = umls_graph
+        self._hierarchy_cache = {}
+        self._ic_scores_cache = {}
+
+    def reduce(self, input_cuis: List[str], ic_percentile: int = 75, 
+               similarity_threshold: float = 0.75) -> Tuple[List[str], ReductionStats]:
+        
+        start_time = time.time()
+        input_cuis = list(set(input_cuis))
+        initial_count = len(input_cuis)
+        
+        # Semantic grouping
+        semantic_groups = self._group_by_semantic_type(input_cuis)
+        
+        all_reduced_cuis = []
+        group_stats = {}
+        
+        for group_name, group_cuis in semantic_groups.items():
+            if not group_cuis:
+                continue
+            
+            # Build hierarchy
+            hierarchy = self._build_hierarchy(group_cuis)
+            
+            # IC filtering
+            ic_scores = self._compute_ic_scores(hierarchy, group_cuis, group_name)
+            ic_threshold = np.percentile(list(ic_scores.values()), ic_percentile) if ic_scores else 0.0
+            high_ic_cuis = [cui for cui in group_cuis if ic_scores.get(cui, 0) >= ic_threshold]
+            
+            # Embedding clustering
+            if len(high_ic_cuis) > 1:
+                group_reduced = self._cluster_cuis(high_ic_cuis, similarity_threshold)
+            else:
+                group_reduced = high_ic_cuis
+            
+            all_reduced_cuis.extend(group_reduced)
+            group_stats[group_name] = {
+                'original': len(group_cuis),
+                'final': len(group_reduced),
+                'reduction_pct': (1 - len(group_reduced)/len(group_cuis)) * 100 if group_cuis else 0
+            }
+        
+        final_cuis = list(set(all_reduced_cuis))
+        
+        stats = ReductionStats(
+            initial_count=initial_count,
+            final_count=len(final_cuis),
+            reduction_pct=(1 - len(final_cuis)/initial_count) * 100 if initial_count else 0,
+            processing_time=time.time() - start_time,
+            group_stats=group_stats
+        )
+        
+        return final_cuis, stats
+
+    def _group_by_semantic_type(self, cuis: List[str]) -> Dict[str, List[str]]:
+        query = f"""
+        SELECT DISTINCT CUI, STY
+        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
+        )
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        if df.empty:
+            return {'UNKNOWN': cuis}
+        
+        cui_to_types = defaultdict(set)
+        for _, row in df.iterrows():
+            cui_to_types[row['CUI']].add(row['STY'])
+        
+        final_groups = defaultdict(list)
+        for cui in cuis:
+            types = cui_to_types.get(cui, {'UNKNOWN'})
+            primary_type = sorted(types, key=lambda x: (-len(x), x))[0]
+            final_groups[primary_type].append(cui)
+        
+        return dict(final_groups)
+
+    def _build_hierarchy(self, cuis: List[str]) -> Dict:
+        key = tuple(sorted(cuis))
+        if key in self._hierarchy_cache:
+            return self._hierarchy_cache[key]
+        
+        parent_to_children = defaultdict(list)
+        child_to_parents = defaultdict(list)
+        
+        for cui in cuis:
+            if not self.umls_graph.has_node(cui):
+                continue
+            for child in self.umls_graph.successors(cui):
+                parent_to_children[cui].append(child)
+                child_to_parents[child].append(cui)
+            for parent in self.umls_graph.predecessors(cui):
+                child_to_parents[cui].append(parent)
+                parent_to_children[parent].append(cui)
+        
+        hierarchy = {
+            "parent_to_children": dict(parent_to_children),
+            "child_to_parents": dict(child_to_parents)
+        }
+        self._hierarchy_cache[key] = hierarchy
+        return hierarchy
+
+    def _compute_ic_scores(self, hierarchy: Dict, group_cuis: List[str], group_name: str) -> Dict[str, float]:
+        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
+        if cache_key in self._ic_scores_cache:
+            return self._ic_scores_cache[cache_key]
+        
+        parent_to_children = hierarchy.get("parent_to_children", {})
+        group_set = set(group_cuis)
+        descendant_counts = {}
+        
+        def count_descendants(cui: str, visited: Set[str] = None) -> int:
+            if visited is None:
+                visited = set()
+            if cui in visited or cui not in group_set:
+                return 0
+            visited.add(cui)
+            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
+            count = len(children)
+            for child in children:
+                count += count_descendants(child, visited)
+            descendant_counts[cui] = count
+            return count
+        
+        for cui in group_cuis:
+            if cui not in descendant_counts:
+                try:
+                    count_descendants(cui)
+                except RecursionError:
+                    descendant_counts[cui] = 0
+        
+        group_size = len(group_cuis)
+        ic_scores = {
+            cui: max(0.0, -np.log((descendant_counts.get(cui, 0) + 1) / group_size))
+            for cui in group_cuis
+        }
+        self._ic_scores_cache[cache_key] = ic_scores
+        return ic_scores
+
+    def _cluster_cuis(self, cui_list: List[str], similarity_threshold: float) -> List[str]:
+        if len(cui_list) <= 1:
+            return cui_list
+        
+        query = f"""
+        SELECT CUI AS cui, embedding
+        FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cui_list)]
+        )
+        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        if df.empty:
+            return cui_list
+        
+        valid = [(row["cui"], np.asarray(row["embedding"], dtype=np.float32)) 
+                 for _, row in df.iterrows() if row["embedding"] is not None]
+        
+        if len(valid) < 2:
+            return cui_list
+        
+        cuis, embeddings = zip(*valid)
+        embeddings = np.vstack(embeddings)
+        
+        clustering = AgglomerativeClustering(
+            n_clusters=None, distance_threshold=1-similarity_threshold, 
+            metric="cosine", linkage="average"
+        )
+        labels = clustering.fit_predict(embeddings)
+        
+        selected = set()
+        for label in np.unique(labels):
+            idx = np.where(labels == label)[0]
+            cluster_emb = embeddings[idx]
+            centroid = np.mean(cluster_emb, axis=0)
+            distances = cosine_distances([centroid], cluster_emb)[0]
+            selected.add(cuis[idx[np.argmax(distances)]])
+        
+        return list(selected)
+
+
+# MAIN
+
+
+class LeftHandSide:
+    """Complete LHS pipeline: Query text → Reduced CUIs + Graph + Embeddings"""
+    
+    def __init__(self, config: Dict, umls_graph: nx.DiGraph = None):
+        self.config = config
+        
+        # Use preloaded graph if provided
+        if umls_graph is not None:
+            self.umls_graph = umls_graph
+            logger.info(f"Using preloaded UMLS graph with {self.umls_graph.number_of_nodes():,} nodes")
+        else:
+            # fallback: load from pickle
+            with open(config['network_pkl'], 'rb') as f:
+                self.umls_graph = pickle.load(f)
+            logger.info(f"Loaded UMLS graph from file with {self.umls_graph.number_of_nodes():,} nodes")
+        
+        # Initialize components
+        self.api_client = CUIAPIClient(config['api_url'])
+        self.bq_client = bigquery.Client(project=config['project_id'])
+        self.reducer = EnhancedCUIReducer(
+            project_id=config['project_id'],
+            dataset_id=config['dataset_id'],
+            cui_embeddings_table=config['cui_embeddings_table'],
+            mrsty_table=config['mrsty_table'],
+            umls_graph=self.umls_graph
+        )
+
+    
+    def process(self, query_text: str) -> Dict:
+     
+        print("\n" + "="*80)
+        print("LEFT HAND SIDE: QUERY CUI REDUCTION")
+        print("="*80)
+        print(f"Input Query: '{query_text}'")
+        print("-"*80)
+        
+        # Step 1: Extract CUIs
+        print("\n[1/5] Extracting CUIs from query...")
+        extracted_cuis = self.api_client.extract_cuis([query_text])
+        print(f"      Extracted: {len(extracted_cuis)} CUIs")
+        
+        # Step 2: Filter vocabularies
+        print("[2/5] Filtering to allowed vocabularies (ICD, SNOMED, LOINC)...")
+        filtered_cuis = filter_cuis(extracted_cuis, self.config['project_id'], self.config['dataset_id'])
+        print(f"      After filter: {len(filtered_cuis)} CUIs")
+        
+        # Step 3: Reduce CUIs
+        print("[3/5] Reducing CUIs (Semantic + IC + Clustering)...")
+        reduced_cuis, stats = self.reducer.reduce(filtered_cuis)
+        print(f"      Initial: {stats.initial_count} → Final: {stats.final_count}")
+        print(f"      Reduction: {stats.reduction_pct:.1f}%")
+        print(f"      Time: {stats.processing_time:.2f}s")
+        
+        # Step 4: Build graph
+        print("[4/5] Building reduced graph with parent anchors...")
+        reduced_graph = self._build_graph_with_parents(reduced_cuis)
+        print(f"      Nodes: {reduced_graph.number_of_nodes():,}")
+        print(f"      Edges: {reduced_graph.number_of_edges():,}")
+        
+        # Step 5: Fetch embeddings
+        print("[5/5] Fetching embeddings...")
+        embeddings = self._fetch_embeddings(reduced_cuis)
+        print(f"      Embeddings: {len(embeddings)}")
+        
+        # Save outputs
+        with open(self.config['output_graph'], 'wb') as f:
+            pickle.dump(reduced_graph, f)
+        with open(self.config['output_embeddings'], 'wb') as f:
+            pickle.dump(embeddings, f)
+        
+        print("\n LEFT HAND SIDE COMPLETE")
+        print(f"  Saved graph: {self.config['output_graph']}")
+        print(f"  Saved embeddings: {self.config['output_embeddings']}")
+        print("="*80 + "\n")
+        
+        return {
+            'reduced_cuis': reduced_cuis,
+            'reduced_graph': reduced_graph,
+            'embeddings': embeddings,
+            'stats': stats
+        }
+    
+    def _build_graph_with_parents(self, cuis: List[str]) -> nx.DiGraph:
+        G = nx.DiGraph()
+        G.add_nodes_from(cuis)
+        for cui in cuis:
+            if self.umls_graph.has_node(cui):
+                for parent in self.umls_graph.predecessors(cui):
+                    G.add_node(parent)
+                    G.add_edge(cui, parent)
+        return G
+    
+    def _fetch_embeddings(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        if not cuis:
+            return {}
+        query = f"""
+        SELECT CUI AS cui, embedding
+        FROM `{self.config['project_id']}.{self.config['dataset_id']}.{self.config['cui_embeddings_table']}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
+        )
+        df = self.bq_client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        embeddings = {}
+        for _, row in df.iterrows():
+            if row["embedding"] is not None:
+                embeddings[row["cui"]] = np.asarray(row["embedding"], dtype=np.float32)
+        return embeddings
+
+
+# USAGE
+
+
+if __name__ == "__main__":
+    # Initialize
+    lhs = LeftHandSide(CONFIG)
+    
+    # Process query
+    result = lhs.process("grams")
+    
+    # Display results
+    print("\n RESULTS:")
+    print(f"   Reduced CUIs: {len(result['reduced_cuis'])}")
+    print(f"   Graph nodes: {result['reduced_graph'].number_of_nodes()}")
+    print(f"   Embeddings: {len(result['embeddings'])}")
+    print(f"\n   Top 10 CUIs: {result['reduced_cuis'][:10]}")
+    
+"""
+RIGHT HAND SIDE: 
+Simple- just extraction, filtering, graph building
+"""
+
+import pickle
+import subprocess
+import logging
+import time
+import threading
+from typing import List, Dict, Set
+from collections import defaultdict
+import numpy as np
+from google.cloud import bigquery
+import requests
+from requests.adapters import HTTPAdapter, Retry
+import networkx as nx
+
+
+
+CONFIG = {
+    'project_id': project_id,
+    'dataset_id': dataset,
+    'cui_embeddings_table': embedding_table,
+    'mrsty_table': MRSTY,
+    'api_url': url,
+    'network_pkl': '/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl',
+    'output_graph': 'rhs_topic_graph.pkl',
+    'output_embeddings': 'rhs_embeddings.pkl',
+}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+
+class GCPTokenProvider:
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def get_headers(cls, force: bool = False) -> Dict[str, str]:
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+            
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr)
+            
+            token = proc.stdout.strip()
+            cls._token = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            cls._expiry = now + 3300
+            return cls._token
+
+
+# CUI API
+
+
+class CUIAPIClient:
+    def __init__(self, api_url: str, timeout: int = 60, top_k: int = 3):
+        self.api_url = api_url.rstrip('/')
+        self.timeout = timeout
+        self.top_k = top_k
+        self.session = requests.Session()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount("http://", HTTPAdapter(max_retries=retry))
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_cuis(self, texts: List[str]) -> Set[str]:
+        if not texts:
+            return set()
+        payload = {"query_texts": texts, "top_k": self.top_k}
+        headers = GCPTokenProvider.get_headers()
+        
+        try:
+            response = self.session.post(self.api_url, json=payload, headers=headers, timeout=self.timeout)
+            if response.status_code == 401:
+                GCPTokenProvider.get_headers(force=True)
+                response = self.session.post(self.api_url, json=payload, headers=GCPTokenProvider.get_headers(), timeout=self.timeout)
+            response.raise_for_status()
+            
+            data = response.json()
+            all_cuis = set()
+            for text in texts:
+                cuis = data.get(text, [])
+                if isinstance(cuis, list):
+                    all_cuis.update(str(c) for c in cuis if c)
+            return all_cuis
+        except Exception as e:
+            logger.error(f"API call failed: {e}")
+            return set()
+
+
+# HELPER
+
+
+def filter_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
+    """Filter CUIs to retain only ICD, SNOMED, LOINC"""
+    if not cuis:
+        return []
+    
+    client = bigquery.Client(project=project_id)
+    query = f"""
+    SELECT DISTINCT CUI
+    FROM `{project_id}.{dataset_id}.MRCONSO`
+    WHERE CUI IN UNNEST(@cuis)
+      AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM',
+                  'ICD10CM','ICD10PCS','ICD9CM','SNOMEDCT_US','LOINC')
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
+    )
+    df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+    return df['CUI'].tolist()
+
+
+# MAIN
+
+
+class RightHandSide:
+    """Complete RHS pipeline: Document topics → Topic CUIs + Graph + Embeddings"""
+    
+    def __init__(self, config: Dict, umls_network_obj=None):
+        self.config = config
+        
+        # Use preloaded graph if provided
+        if umls_network_obj is not None:
+            self.umls_graph = umls_network_obj
+            logger.info(f"Using preloaded UMLS graph with {self.umls_graph.number_of_nodes():,} nodes")
+        else:
+            logger.info(f"Loading UMLS graph from {config['network_pkl']}")
+            with open(config['network_pkl'], 'rb') as f:
+                self.umls_graph = pickle.load(f)
+            logger.info(f"Loaded graph: {self.umls_graph.number_of_nodes():,} nodes")
+        
+        # Initialize other components
+        self.api_client = CUIAPIClient(config['api_url'])
+        self.bq_client = bigquery.Client(project=config['project_id'])
+
+    
+    def process(self, document_topics: List[str]) -> Dict:
+    
+        print("\n" + "="*80)
+        print("RIGHT HAND SIDE: DOCUMENT TOPIC CUI EXTRACTION")
+        print("="*80)
+        print(f"Processing {len(document_topics)} document topics")
+        print("-"*80)
+        
+        # Step 1: Extract CUIs from all topics
+        print("\n[1/4] Extracting CUIs from topics...")
+        all_cuis = set()
+        cui_to_topics = defaultdict(list)
+        
+        for i, topic in enumerate(document_topics, 1):
+            topic_cuis = self.api_client.extract_cuis([topic])
+            all_cuis.update(topic_cuis)
+            for cui in topic_cuis:
+                cui_to_topics[cui].append(topic)
+            print(f"      Topic {i:2d}: {len(topic_cuis):3d} CUIs - '{topic[:60]}{'...' if len(topic) > 60 else ''}'")
+        
+        print(f"\n      Total unique CUIs: {len(all_cuis)}")
+        
+        # Step 2: Filter vocabularies
+        print("[2/4] Filtering to allowed vocabularies (ICD, SNOMED, LOINC)...")
+        filtered_cuis = filter_cuis(all_cuis, self.config['project_id'], self.config['dataset_id'])
+        print(f"      After filter: {len(filtered_cuis)} CUIs")
+        
+        # Step 3: Keep only valid CUIs in UMLS graph
+        valid_cuis = [cui for cui in filtered_cuis if self.umls_graph.has_node(cui)]
+        print(f"      Valid CUIs (in UMLS graph): {len(valid_cuis)}")
+        
+        # Step 4: Build topic graph
+        print("[3/4] Building topic graph with edges...")
+        topic_graph = self._build_graph_with_parents(valid_cuis)
+        print(f"      Nodes: {topic_graph.number_of_nodes():,}")
+        print(f"      Edges: {topic_graph.number_of_edges():,}")
+        
+        # Step 5: Fetch embeddings
+        print("[4/4] Fetching embeddings...")
+        embeddings = self._fetch_embeddings(valid_cuis)
+        print(f"      Embeddings: {len(embeddings)}")
+        
+        # Save outputs
+        with open(self.config['output_graph'], 'wb') as f:
+            pickle.dump(topic_graph, f)
+        with open(self.config['output_embeddings'], 'wb') as f:
+            pickle.dump(embeddings, f)
+        
+        print("\n RIGHT HAND SIDE COMPLETE")
+        print(f"  Saved graph: {self.config['output_graph']}")
+        print(f"  Saved embeddings: {self.config['output_embeddings']}")
+        print("="*80 + "\n")
+        
+        return {
+            'topic_cuis': valid_cuis,
+            'topic_graph': topic_graph,
+            'embeddings': embeddings,
+            'cui_to_topics': dict(cui_to_topics)
+        }
+    
+    def _build_graph_with_parents(self, cuis: List[str]) -> nx.DiGraph:
+        """Build graph including parent relationships"""
+        G = nx.DiGraph()
+        G.add_nodes_from(cuis)
+        
+        for cui in cuis:
+            if self.umls_graph.has_node(cui):
+                for parent in self.umls_graph.predecessors(cui):
+                    G.add_node(parent)
+                    G.add_edge(cui, parent)
+        
+        return G
+    
+    def _fetch_embeddings(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        """Fetch embeddings from BigQuery"""
+        if not cuis:
+            return {}
+        
+        query = f"""
+        SELECT CUI AS cui, embedding
+        FROM `{self.config['project_id']}.{self.config['dataset_id']}.{self.config['cui_embeddings_table']}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
+        )
+        df = self.bq_client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        
+        embeddings = {}
+        for _, row in df.iterrows():
+            if row["embedding"] is not None:
+                embeddings[row["cui"]] = np.asarray(row["embedding"], dtype=np.float32)
+        
+        return embeddings
+
+
+# USAGE
+
+
+if __name__ == "__main__":
+    # Initialize RHS pipeline
+    rhs = RightHandSide(CONFIG)
+    
+    # Example document topics
+    document_topics = [
+        "patient weight measured in grams",
+        "gram stain laboratory test result"     
+    ]
+    
+    # Process topics
+    result = rhs.process(document_topics)
+    
+    # Display results
+    print("\n RESULTS:")
+    print(f"   Topic CUIs: {len(result['topic_cuis'])}")
+    print(f"   Graph nodes: {result['topic_graph'].number_of_nodes()}")
+    print(f"   Embeddings: {len(result['embeddings'])}")
+    
+    print(f"\n   Sample CUIs and their source topics:")
+    for cui, topics in list(result['cui_to_topics'].items())[:5]:
+        print(f"     {cui}: {topics[0][:60]}...")
+
+"""
+MATCHING LOGIC: Match Query CUIs to Document Topic CUIs
+=======================================================
+INPUT:  LHS output (query CUIs + graph + embeddings)
+        RHS output (topic CUIs + graph + embeddings)
+OUTPUT: Matched CUIs with confidence scores + method breakdown
+
+Matching Strategy:
+1. Direct matches (confidence: 1.0)
+2. Ancestor matches with hybrid scoring (confidence: 0.5-0.9)
+3. Embedding matches (confidence: 0.7+)
+"""
+
+import pickle
+import numpy as np
+import networkx as nx
+import pandas as pd
+from typing import Dict, List, Tuple, Set, Optional
+from sklearn.metrics.pairwise import cosine_similarity
+import json
+
+
+
+CONFIG = {
+    # Input files from LHS and RHS
+    'lhs_graph': 'lhs_reduced_graph.pkl',
+    'lhs_embeddings': 'lhs_embeddings.pkl',
+    'rhs_graph': 'rhs_topic_graph.pkl',
+    'rhs_embeddings': 'rhs_embeddings.pkl',
+    
+    # Output files
+    'output_csv': 'cui_matches.csv',
+    'output_json': 'cui_stats.json',
+    'output_detailed': 'cui_matches_detailed.json',
+}
+
+
+# CUI MATCHER
+
+
+class CUIMapper:
+    """
+    3-Tier CUI Matching Strategy:
+    1. Direct matches
+    2. Ancestor matches (with hybrid scoring)
+    3. Embedding matches (conditional)
+    """
+    
+    def __init__(
+        self,
+        reduced_graph: nx.DiGraph,
+        reduced_embeddings: Dict[str, np.ndarray],
+        topic_graph: nx.DiGraph,
+        topic_embeddings: Dict[str, np.ndarray]
+    ):
+        self.reduced_graph = reduced_graph
+        self.reduced_embeddings = reduced_embeddings
+        self.topic_graph = topic_graph
+        self.topic_embeddings = topic_embeddings
+        
+        self.reduced_cuis = set(reduced_graph.nodes())
+        self.topic_cuis = set(topic_graph.nodes())
+        
+        print(f"\n{'='*80}")
+        print("CUI MATCHER INITIALIZED")
+        print(f"{'='*80}")
+        print(f"  Query CUIs (LHS):    {len(self.reduced_cuis):,}")
+        print(f"  Topic CUIs (RHS):    {len(self.topic_cuis):,}")
+        print(f"  Query embeddings:    {len(self.reduced_embeddings):,}")
+        print(f"  Topic embeddings:    {len(self.topic_embeddings):,}")
+        print(f"{'='*80}\n")
+    
+    def match_all(
+        self,
+        ancestor_max_depth: int = 5,
+        use_hybrid_scoring: bool = True,
+        embedding_threshold: float = 0.7,
+        skip_embedding_if_ratio_high: float = 0.9
+    ) -> Tuple[pd.DataFrame, Dict]:
+       
+        print(f"\n{'='*80}")
+        print("STARTING 3-TIER MATCHING PIPELINE")
+        print(f"{'='*80}")
+        print(f"Total topic CUIs to match: {len(self.topic_cuis):,}")
+        print(f"{'='*80}\n")
+        
+        all_results = []
+        matched_cuis = set()
+        
+       
+        # 1: Direct Matches
+       
+        print(f"{'='*80}")
+        print("TIER 1: DIRECT MATCHING")
+        print(f"{'='*80}")
+        
+        direct_matches = []
+        for topic_cui in self.topic_cuis:
+            if topic_cui in self.reduced_cuis:
+                direct_matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': topic_cui,
+                    'method': 'direct',
+                    'confidence': 1.0,
+                    'similarity': 1.0,
+                    'hybrid_score': 1.0
+                })
+        
+        direct_df = pd.DataFrame(direct_matches)
+        all_results.append(direct_df)
+        matched_cuis.update(set(direct_df['topic_cui']) if len(direct_df) > 0 else set())
+        
+        print(f" Direct matches found: {len(direct_df):,}")
+        print(f"  Remaining: {len(self.topic_cuis - matched_cuis):,} CUIs\n")
+        
+     
+        # 2: Ancestor Matches
+    
+        unmatched_after_direct = self.topic_cuis - matched_cuis
+        
+        print(f"{'='*80}")
+        print("TIER 2: ANCESTOR MATCHING")
+        print(f"{'='*80}")
+        print(f"Remaining CUIs: {len(unmatched_after_direct):,}")
+        
+        ancestor_matches = []
+        for topic_cui in unmatched_after_direct:
+            ancestor_info = self._get_ancestors(topic_cui, max_depth=ancestor_max_depth)
+            matching_ancestors = set(ancestor_info.keys()) & self.reduced_cuis
+            
+            if not matching_ancestors:
+                continue
+            
+            if use_hybrid_scoring and topic_cui in self.topic_embeddings:
+                # Hybrid scoring: ancestor depth + embedding similarity
+                topic_emb = self.topic_embeddings[topic_cui]
+                best_score = -1
+                best_ancestor = None
+                best_info = None
+                
+                for anc in matching_ancestors:
+                    depth, path = ancestor_info[anc]
+                    
+                    emb_sim = None
+                    if anc in self.reduced_embeddings:
+                        anc_emb = self.reduced_embeddings[anc]
+                        emb_sim = float(cosine_similarity([topic_emb], [anc_emb])[0][0])
+                    
+                    hybrid_score = self._compute_hybrid_score(depth, emb_sim)
+                    
+                    if hybrid_score > best_score:
+                        best_score = hybrid_score
+                        best_ancestor = anc
+                        best_info = (depth, path, emb_sim, hybrid_score)
+                
+                if best_ancestor:
+                    depth, path, emb_sim, hybrid_score = best_info
+                    confidence = max(0.5, 1.0 - (depth * 0.1))
+                    
+                    ancestor_matches.append({
+                        'topic_cui': topic_cui,
+                        'reduced_cui': best_ancestor,
+                        'method': 'ancestor',
+                        'confidence': confidence,
+                        'similarity': emb_sim,
+                        'ancestor_depth': depth,
+                        'ancestor_path': '→'.join(path),
+                        'hybrid_score': hybrid_score,
+                        'num_candidates': len(matching_ancestors)
+                    })
+            else:
+                # Simple closest ancestor
+                best_ancestor = min(matching_ancestors, key=lambda a: (ancestor_info[a][0], a))
+                depth, path = ancestor_info[best_ancestor]
+                confidence = max(0.5, 1.0 - (depth * 0.1))
+                
+                ancestor_matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': best_ancestor,
+                    'method': 'ancestor',
+                    'confidence': confidence,
+                    'ancestor_depth': depth,
+                    'ancestor_path': '→'.join(path),
+                    'num_candidates': len(matching_ancestors)
+                })
+        
+        ancestor_df = pd.DataFrame(ancestor_matches)
+        all_results.append(ancestor_df)
+        matched_cuis.update(set(ancestor_df['topic_cui']) if len(ancestor_df) > 0 else set())
+        
+        print(f" Ancestor matches found: {len(ancestor_df):,}")
+        print(f"  Remaining: {len(self.topic_cuis - matched_cuis):,} CUIs\n")
+        
+   
+        # 3: Embedding Matches (Conditional)
+    
+        unmatched_after_ancestor = self.topic_cuis - matched_cuis
+        current_match_rate = len(matched_cuis) / len(self.topic_cuis) if len(self.topic_cuis) > 0 else 0
+        
+        print(f"Current match rate: {current_match_rate*100:.1f}%")
+        
+        if len(unmatched_after_ancestor) > 0:
+            if current_match_rate >= skip_embedding_if_ratio_high:
+                print(f"Skipping embedding step (match rate {current_match_rate*100:.1f}% >= {skip_embedding_if_ratio_high*100:.1f}%)\n")
+                embedding_df = pd.DataFrame()
+            else:
+                print(f"\n{'='*80}")
+                print("TIER 3: EMBEDDING MATCHING")
+                print(f"{'='*80}")
+                print(f"Remaining CUIs: {len(unmatched_after_ancestor):,}")
+                
+                embedding_matches = self._embedding_match(
+                    unmatched_after_ancestor,
+                    similarity_threshold=embedding_threshold
+                )
+                
+                embedding_df = pd.DataFrame(embedding_matches)
+                all_results.append(embedding_df)
+                matched_cuis.update(set(embedding_df['topic_cui']) if len(embedding_df) > 0 else set())
+                
+                print(f" Embedding matches found: {len(embedding_df):,}\n")
+        else:
+            print("No unmatched CUIs - skipping embedding step\n")
+            embedding_df = pd.DataFrame()
+        
+      
+        # Combine Results and Generate Statistics
+      
+        results_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+        unmatched_cuis = self.topic_cuis - matched_cuis
+        
+        stats = {
+            'total_topic_cuis': len(self.topic_cuis),
+            'total_query_cuis': len(self.reduced_cuis),
+            'total_matched': len(matched_cuis),
+            'total_unmatched': len(unmatched_cuis),
+            'match_rate': len(matched_cuis) / len(self.topic_cuis) if len(self.topic_cuis) > 0 else 0,
+            'by_method': {
+                'direct': len(direct_df),
+                'ancestor': len(ancestor_df),
+                'embedding': len(embedding_df)
+            },
+            'avg_confidence': float(results_df['confidence'].mean()) if len(results_df) > 0 else 0,
+            'avg_hybrid_score': float(results_df['hybrid_score'].mean()) if 'hybrid_score' in results_df.columns and len(results_df) > 0 else 0
+        }
+        
+        # Print summary
+        self._print_summary(stats)
+        
+        return results_df, stats
+    
+    def _get_ancestors(self, cui: str, max_depth: int = 5) -> Dict[str, Tuple[int, List[str]]]:
+        """Get all ancestors with their depths and paths"""
+        if cui not in self.topic_graph:
+            return {}
+        
+        ancestor_info = {}
+        visited = {cui}
+        current_level = {cui: (0, [cui])}
+        
+        for depth in range(1, max_depth + 1):
+            next_level = {}
+            for node, (_, path) in current_level.items():
+                parents = set(self.topic_graph.predecessors(node))
+                for parent in parents:
+                    if parent not in visited:
+                        new_path = path + [parent]
+                        ancestor_info[parent] = (depth, new_path)
+                        next_level[parent] = (depth, new_path)
+                        visited.add(parent)
+            if not next_level:
+                break
+            current_level = next_level
+        
+        return ancestor_info
+    
+    def _compute_hybrid_score(
+        self,
+        ancestor_depth: Optional[int] = None,
+        embedding_similarity: Optional[float] = None,
+        ancestor_weight: float = 0.4,
+        embedding_weight: float = 0.6
+    ) -> float:
+        """Compute hybrid score"""
+        if ancestor_depth is None and embedding_similarity is None:
+            return 0.0
+        
+        ancestor_score = np.exp(-ancestor_depth / 3.0) if ancestor_depth is not None else 0.0
+        embedding_score = embedding_similarity if embedding_similarity is not None else 0.0
+        
+        if ancestor_depth is not None and embedding_similarity is not None:
+            return ancestor_weight * ancestor_score + embedding_weight * embedding_score
+        elif ancestor_depth is not None:
+            return ancestor_score
+        else:
+            return embedding_score
+    
+    def _embedding_match(
+        self,
+        unmatched_cuis: Set[str],
+        similarity_threshold: float = 0.7
+    ) -> List[Dict]:
+        """Find embedding-based matches"""
+        topic_cuis_with_emb = [cui for cui in unmatched_cuis if cui in self.topic_embeddings]
+        
+        if not topic_cuis_with_emb:
+            return []
+        
+        reduced_cuis_with_emb = [cui for cui in self.reduced_cuis if cui in self.reduced_embeddings]
+        
+        if not reduced_cuis_with_emb:
+            return []
+        
+        reduced_emb_matrix = np.array([self.reduced_embeddings[cui] for cui in reduced_cuis_with_emb])
+        
+        matches = []
+        for topic_cui in topic_cuis_with_emb:
+            topic_emb = self.topic_embeddings[topic_cui]
+            similarities = cosine_similarity([topic_emb], reduced_emb_matrix)[0]
+            best_idx = np.argmax(similarities)
+            best_score = similarities[best_idx]
+            
+            if best_score >= similarity_threshold:
+                matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': reduced_cuis_with_emb[best_idx],
+                    'method': 'embedding',
+                    'confidence': float(best_score),
+                    'similarity': float(best_score),
+                    'hybrid_score': float(best_score)
+                })
+        
+        return matches
+    
+    def _print_summary(self, stats: Dict):
+        """Print final summary"""
+        print(f"\n{'='*80}")
+        print("MATCHING SUMMARY")
+        print(f"{'='*80}")
+        print(f"Topic CUIs (RHS):    {stats['total_topic_cuis']:,}")
+        print(f"Query CUIs (LHS):    {stats['total_query_cuis']:,}")
+        print(f"Total matched:       {stats['total_matched']:,} ({stats['match_rate']*100:.1f}%)")
+        print(f"Total unmatched:     {stats['total_unmatched']:,}")
+        
+        print(f"\nBreakdown by method:")
+        for method, count in stats['by_method'].items():
+            pct = (count / stats['total_matched'] * 100) if stats['total_matched'] > 0 else 0
+            print(f"  {method:12s}: {count:6,} ({pct:5.1f}%)")
+        
+        print(f"\nQuality metrics:")
+        print(f"  Avg confidence:   {stats['avg_confidence']:.3f}")
+        print(f"  Avg hybrid score: {stats['avg_hybrid_score']:.3f}")
+        print(f"{'='*80}\n")
+
+
+# MAIN
+
+
+def run_matching(config: Dict = CONFIG):
+    """
+    Execute matching pipeline
+    
+    Loads LHS and RHS outputs, runs 3-tier matching, saves results
+    """
+    print("\n" + ""+"="*78+"")
+    print("" + " "*25 + "CUI MATCHING PIPELINE" + " "*32 + "")
+    print(""+"="*78+"")
+    
+    # Load LHS outputs
+    print("\n[1/4] Loading LEFT HAND SIDE outputs...")
+    with open(config['lhs_graph'], 'rb') as f:
+        lhs_graph = pickle.load(f)
+    with open(config['lhs_embeddings'], 'rb') as f:
+        lhs_embeddings = pickle.load(f)
+    print(f"      Query graph: {lhs_graph.number_of_nodes():,} nodes, {lhs_graph.number_of_edges():,} edges")
+    print(f"      Query embeddings: {len(lhs_embeddings):,}")
+    
+    # Load RHS outputs
+    print("\n[2/4] Loading RIGHT HAND SIDE outputs...")
+    with open(config['rhs_graph'], 'rb') as f:
+        rhs_graph = pickle.load(f)
+    with open(config['rhs_embeddings'], 'rb') as f:
+        rhs_embeddings = pickle.load(f)
+    print(f"      Topic graph: {rhs_graph.number_of_nodes():,} nodes, {rhs_graph.number_of_edges():,} edges")
+    print(f"      Topic embeddings: {len(rhs_embeddings):,}")
+    
+    # Initialize matcher
+    print("\n[3/4] Initializing matcher...")
+    matcher = CUIMapper(
+        reduced_graph=lhs_graph,
+        reduced_embeddings=lhs_embeddings,
+        topic_graph=rhs_graph,
+        topic_embeddings=rhs_embeddings
+    )
+    
+    # Run matching
+    print("[4/4] Running 3-tier matching...")
+    results_df, stats = matcher.match_all(
+        ancestor_max_depth=5,
+        use_hybrid_scoring=True,
+        embedding_threshold=0.7,
+        skip_embedding_if_ratio_high=0.9
+    )
+    
+    # Save results
+    print(f"{'='*80}")
+    print("SAVING RESULTS")
+    print(f"{'='*80}")
+    
+    # CSV output
+    results_df.to_csv(config['output_csv'], index=False)
+    print(f" Saved matches: {config['output_csv']}")
+    
+    # JSON stats
+    with open(config['output_json'], 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f" Saved stats: {config['output_json']}")
+    
+    # Detailed JSON (with match details)
+    detailed_output = {
+        'stats': stats,
+        'matches': results_df.to_dict('records')
+    }
+    with open(config['output_detailed'], 'w') as f:
+        json.dump(detailed_output, f, indent=2)
+    print(f" Saved detailed: {config['output_detailed']}")
+    
+    # Display sample results
+    print(f"\n{'='*80}")
+    print("SAMPLE MATCHES (Top 10)")
+    print(f"{'='*80}")
+    print(results_df.head(10).to_string(index=False))
+    
+    print(f"\n{'='*80}")
+    print("MATCHING COMPLETE!")
+    print(f"{'='*80}\n")
+    
+    return results_df, stats
+
+
+# USAGE
+
+
+if __name__ == "__main__":
+    results, stats = run_matching()
+    
+    # Additional analysis
+    print("\n MATCH DISTRIBUTION:")
+    print(results.groupby('method').size())
+    
+    print("\n CONFIDENCE DISTRIBUTION:")
+    print(results['confidence'].describe())
+
+# --------------------------------------------------------------   
+# run seperate:
+
+# LEFT HAND SIDE
+
 from lhs_pipeline import LeftHandSide, CONFIG as LHS_CONFIG
 
 lhs = LeftHandSide(LHS_CONFIG)
@@ -7,21 +1212,21 @@ lhs_result = lhs.process("grams")
 # Output: lhs_reduced_graph.pkl, lhs_embeddings.pkl
 
 
-# ============= STEP 2: Run RIGHT HAND SIDE =============
+# Run RIGHT HAND SIDE
 # File: rhs_pipeline.py
 from rhs_pipeline import RightHandSide, CONFIG as RHS_CONFIG
 
 rhs = RightHandSide(RHS_CONFIG)
 document_topics = [
     "patient weight measured in grams",
-    "gram stain laboratory test",
-    "medication dosage in grams"
+    "gram stain laboratory test"
+    
 ]
 rhs_result = rhs.process(document_topics)
 # Output: rhs_topic_graph.pkl, rhs_embeddings.pkl
 
 
-# ============= STEP 3: Run MATCHING =============
+# Run MATCHING 
 # File: matching_logic.py
 from matching_logic import run_matching
 
