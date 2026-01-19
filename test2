@@ -1,440 +1,597 @@
 """
-Automatic Semantic Type Compatibility Learning
-Discovers compatibility rules from data instead of manual definition
+Production-Grade CUI Matching System
+Single file, no manual rules, simple sequential flow
 """
 
 import pickle
 import numpy as np
 import networkx as nx
-from typing import Dict, List, Tuple, Set, Optional
-from collections import defaultdict
-from sklearn.metrics.pairwise import cosine_similarity
 import pandas as pd
+from typing import Dict, List, Tuple, Set, Optional, Union
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from functools import partial
+import json
 
 
-class AutoSemanticTypeValidator:
+class CUIMapper:
     """
-    Automatically learns semantic type compatibility from data
-    Uses three strategies:
-    1. Graph co-occurrence (types appearing together in hierarchies)
-    2. Embedding similarity (types with similar embeddings are compatible)
-    3. Transitivity (if A->B and B->C compatible, then A->C compatible)
+    Production-grade CUI matcher with simple sequential logic:
+    1. Direct matches
+    2. Ancestor matches (with hybrid scoring)
+    3. Embedding matches (only if needed)
     """
     
     def __init__(
         self,
-        cui_semantic_types: Optional[Dict[str, Set[str]]] = None,
-        learn_from_graph: bool = True,
-        learn_from_embeddings: bool = True,
-        similarity_threshold: float = 0.6,
-        min_cooccurrence: int = 5
+        reduced_cui_graph_path: str,
+        reduced_embeddings: Union[str, Dict],
+        topic_cui_graph_path: str,
+        topic_embeddings: Union[str, Dict],
+        gold_mappings: Optional[Dict[str, str]] = None,
+        n_jobs: int = -1
     ):
         """
-        Initialize automatic validator
+        Initialize CUI matcher
         
         Args:
-            cui_semantic_types: Dict mapping CUI -> set of semantic types
-            learn_from_graph: Learn compatibility from graph structure
-            learn_from_embeddings: Learn compatibility from embedding similarity
-            similarity_threshold: Min embedding similarity to consider compatible
-            min_cooccurrence: Min co-occurrences to establish compatibility
+            reduced_cui_graph_path: Path to reduced CUI graph pickle
+            reduced_embeddings: In-memory dict OR path to pickle
+            topic_cui_graph_path: Path to topic CUI graph pickle  
+            topic_embeddings: In-memory dict OR path to pickle
+            gold_mappings: Optional gold standard for evaluation
+            n_jobs: Number of parallel jobs (-1 = all cores)
         """
-        self.cui_semantic_types = cui_semantic_types or {}
-        self.learn_from_graph = learn_from_graph
-        self.learn_from_embeddings = learn_from_embeddings
-        self.similarity_threshold = similarity_threshold
-        self.min_cooccurrence = min_cooccurrence
+        print("Loading graphs and embeddings...")
         
-        # Learned compatibility
-        self.compatible_types = {}
-        self.compatibility_scores = defaultdict(lambda: defaultdict(float))
-        self.is_learned = False
+        # Load graphs
+        with open(reduced_cui_graph_path, 'rb') as f:
+            self.reduced_graph = pickle.load(f)
+        with open(topic_cui_graph_path, 'rb') as f:
+            self.topic_graph = pickle.load(f)
+        
+        # Load or use in-memory embeddings
+        if isinstance(reduced_embeddings, str):
+            with open(reduced_embeddings, 'rb') as f:
+                self.reduced_embeddings = pickle.load(f)
+        else:
+            self.reduced_embeddings = reduced_embeddings
+        
+        if isinstance(topic_embeddings, str):
+            with open(topic_embeddings, 'rb') as f:
+                self.topic_embeddings = pickle.load(f)
+        else:
+            self.topic_embeddings = topic_embeddings
+        
+        # Extract CUI lists
+        self.reduced_cuis = set(self.reduced_graph.nodes())
+        self.topic_cuis = set(self.topic_graph.nodes())
+        
+        # Evaluation
+        self.gold_mappings = gold_mappings
+        
+        # Parallel processing
+        self.n_jobs = mp.cpu_count() if n_jobs == -1 else n_jobs
+        
+        print(f"  Reduced CUIs: {len(self.reduced_cuis):,}")
+        print(f"  Topic CUIs: {len(self.topic_cuis):,}")
+        print(f"  Reduced embeddings: {len(self.reduced_embeddings):,}")
+        print(f"  Topic embeddings: {len(self.topic_embeddings):,}")
+        print(f"  Parallel workers: {self.n_jobs}")
+        if gold_mappings:
+            print(f"  Gold standard: {len(gold_mappings):,} mappings")
+        print()
     
-    def learn_from_graph_structure(
+    def _get_ancestors_with_paths(
         self,
         graph: nx.DiGraph,
-        max_depth: int = 3
-    ):
-        """
-        Learn compatibility from graph co-occurrence
-        If two types appear in parent-child relationships, they're compatible
-        """
-        print("Learning semantic type compatibility from graph structure...")
+        cui: str,
+        max_depth: int = 5
+    ) -> Dict[str, Tuple[int, List[str]]]:
+        """Get all ancestors with their depths and paths"""
+        if cui not in graph:
+            return {}
         
-        cooccurrence = defaultdict(lambda: defaultdict(int))
+        ancestor_info = {}
+        visited = {cui}
+        current_level = {cui: (0, [cui])}
         
-        # For each CUI, look at its ancestors and descendants
-        for cui in graph.nodes():
-            if cui not in self.cui_semantic_types:
-                continue
+        for depth in range(1, max_depth + 1):
+            next_level = {}
             
-            cui_types = self.cui_semantic_types[cui]
-            
-            # Get ancestors and descendants
-            neighbors = set()
-            
-            # Ancestors (up to max_depth)
-            try:
-                ancestors = nx.ancestors(graph, cui)
-                # Limit depth
-                close_ancestors = set()
-                for anc in ancestors:
-                    try:
-                        depth = nx.shortest_path_length(graph, cui, anc)
-                        if depth <= max_depth:
-                            close_ancestors.add(anc)
-                    except:
-                        pass
-                neighbors.update(close_ancestors)
-            except:
-                pass
-            
-            # Descendants (up to max_depth)
-            try:
-                descendants = nx.descendants(graph, cui)
-                close_descendants = set()
-                for desc in descendants:
-                    try:
-                        depth = nx.shortest_path_length(graph, desc, cui)
-                        if depth <= max_depth:
-                            close_descendants.add(desc)
-                    except:
-                        pass
-                neighbors.update(close_descendants)
-            except:
-                pass
-            
-            # Record co-occurrences
-            for neighbor in neighbors:
-                if neighbor not in self.cui_semantic_types:
-                    continue
+            for node, (node_depth, path) in current_level.items():
+                parents = set(graph.predecessors(node))
                 
-                neighbor_types = self.cui_semantic_types[neighbor]
-                
-                # Record all type pairs
-                for t1 in cui_types:
-                    for t2 in neighbor_types:
-                        cooccurrence[t1][t2] += 1
-                        cooccurrence[t2][t1] += 1  # Symmetric
-        
-        # Convert to compatibility
-        for t1, t2_counts in cooccurrence.items():
-            compatible_set = set()
-            for t2, count in t2_counts.items():
-                if count >= self.min_cooccurrence:
-                    compatible_set.add(t2)
-                    # Store score (normalized by max count)
-                    max_count = max(t2_counts.values())
-                    self.compatibility_scores[t1][t2] = count / max_count
+                for parent in parents:
+                    if parent not in visited:
+                        new_path = path + [parent]
+                        ancestor_info[parent] = (depth, new_path)
+                        next_level[parent] = (depth, new_path)
+                        visited.add(parent)
             
-            if compatible_set:
-                self.compatible_types[t1] = compatible_set
-        
-        print(f"  Learned compatibility for {len(self.compatible_types)} semantic types")
-        print(f"  Average compatible types per type: {np.mean([len(v) for v in self.compatible_types.values()]):.1f}")
-    
-    def learn_from_embedding_similarity(
-        self,
-        embeddings: Dict[str, np.ndarray]
-    ):
-        """
-        Learn compatibility from embedding similarity
-        Types whose CUIs have similar embeddings are compatible
-        """
-        print("Learning semantic type compatibility from embeddings...")
-        
-        # Group CUIs by semantic type
-        type_to_cuis = defaultdict(list)
-        for cui, types in self.cui_semantic_types.items():
-            if cui in embeddings:
-                for t in types:
-                    type_to_cuis[t].append(cui)
-        
-        # Compute average embedding per type
-        type_embeddings = {}
-        for sem_type, cuis in type_to_cuis.items():
-            if len(cuis) > 0:
-                type_embs = [embeddings[cui] for cui in cuis if cui in embeddings]
-                if type_embs:
-                    type_embeddings[sem_type] = np.mean(type_embs, axis=0)
-        
-        # Compute pairwise similarities
-        types_list = list(type_embeddings.keys())
-        if len(types_list) < 2:
-            print("  Not enough semantic types with embeddings")
-            return
-        
-        emb_matrix = np.array([type_embeddings[t] for t in types_list])
-        similarities = cosine_similarity(emb_matrix)
-        
-        # Build compatibility based on similarity
-        for i, t1 in enumerate(types_list):
-            compatible_set = self.compatible_types.get(t1, set())
-            
-            for j, t2 in enumerate(types_list):
-                if similarities[i, j] >= self.similarity_threshold:
-                    compatible_set.add(t2)
-                    # Update score (take max of graph and embedding)
-                    current_score = self.compatibility_scores[t1][t2]
-                    self.compatibility_scores[t1][t2] = max(current_score, similarities[i, j])
-            
-            self.compatible_types[t1] = compatible_set
-        
-        print(f"  Updated compatibility for {len(self.compatible_types)} semantic types")
-    
-    def apply_transitivity(self, max_iterations: int = 3):
-        """
-        Apply transitivity: if A->B and B->C compatible, then A->C compatible
-        """
-        print("Applying transitivity to expand compatibility...")
-        
-        for iteration in range(max_iterations):
-            added = 0
-            
-            for t1 in list(self.compatible_types.keys()):
-                compatible_t1 = set(self.compatible_types[t1])
-                
-                # For each compatible type
-                for t2 in list(compatible_t1):
-                    if t2 in self.compatible_types:
-                        # Add transitive compatibilities
-                        new_compatible = self.compatible_types[t2] - compatible_t1 - {t1}
-                        
-                        for t3 in new_compatible:
-                            # Compute transitive score (min of the two paths)
-                            score_t1_t2 = self.compatibility_scores[t1][t2]
-                            score_t2_t3 = self.compatibility_scores[t2][t3]
-                            transitive_score = min(score_t1_t2, score_t2_t3) * 0.8  # Decay
-                            
-                            # Only add if score is reasonable
-                            if transitive_score >= 0.3:
-                                compatible_t1.add(t3)
-                                # Update score if better
-                                if self.compatibility_scores[t1][t3] < transitive_score:
-                                    self.compatibility_scores[t1][t3] = transitive_score
-                                added += 1
-                
-                self.compatible_types[t1] = compatible_t1
-            
-            print(f"  Iteration {iteration + 1}: Added {added} transitive compatibilities")
-            
-            if added == 0:
+            if not next_level:
                 break
+            
+            current_level = next_level
+        
+        return ancestor_info
     
-    def learn_compatibility(
+    def _compute_hybrid_score(
         self,
-        graphs: List[nx.DiGraph] = None,
-        embeddings: Dict[str, np.ndarray] = None
-    ):
+        ancestor_depth: Optional[int] = None,
+        embedding_similarity: Optional[float] = None,
+        ancestor_weight: float = 0.4,
+        embedding_weight: float = 0.6
+    ) -> float:
         """
-        Main method to learn compatibility from data
-        
-        Args:
-            graphs: List of graphs to learn from (e.g., [reduced_graph, topic_graph])
-            embeddings: Combined embeddings dict
+        Compute hybrid score combining ancestor distance and embedding similarity
+        Closer ancestors = higher score, Higher similarity = higher score
         """
-        print("\n" + "="*70)
-        print("AUTOMATIC SEMANTIC TYPE COMPATIBILITY LEARNING")
-        print("="*70)
-        
-        if not self.cui_semantic_types:
-            print("No semantic types provided - skipping compatibility learning")
-            return
-        
-        # Learn from graph structure
-        if self.learn_from_graph and graphs:
-            for i, graph in enumerate(graphs):
-                print(f"\nGraph {i+1}/{len(graphs)}:")
-                self.learn_from_graph_structure(graph, max_depth=3)
-        
-        # Learn from embeddings
-        if self.learn_from_embeddings and embeddings:
-            self.learn_from_embedding_similarity(embeddings)
-        
-        # Apply transitivity
-        if self.compatible_types:
-            self.apply_transitivity(max_iterations=2)
-        
-        self.is_learned = True
-        
-        # Summary
-        print("\n" + "="*70)
-        print("LEARNING SUMMARY")
-        print("="*70)
-        print(f"Total semantic types: {len(self.compatible_types)}")
-        if self.compatible_types:
-            avg_compatible = np.mean([len(v) for v in self.compatible_types.values()])
-            print(f"Avg compatible types per type: {avg_compatible:.1f}")
-            
-            # Show examples
-            print("\nExample compatibilities:")
-            for sem_type in list(self.compatible_types.keys())[:5]:
-                compatible = self.compatible_types[sem_type]
-                scores = [self.compatibility_scores[sem_type][t] for t in compatible]
-                avg_score = np.mean(scores) if scores else 0
-                print(f"  {sem_type}: {len(compatible)} compatible types (avg score: {avg_score:.3f})")
-    
-    def are_compatible(self, cui1: str, cui2: str, strict: bool = False) -> Optional[bool]:
-        """
-        Check if two CUIs are semantically compatible
-        
-        Args:
-            cui1: First CUI
-            cui2: Second CUI
-            strict: If True, require compatibility score > 0.5
-        
-        Returns:
-            True if compatible, False if incompatible, None if no info
-        """
-        if cui1 not in self.cui_semantic_types or cui2 not in self.cui_semantic_types:
-            return None  # No semantic type info
-        
-        types1 = self.cui_semantic_types[cui1]
-        types2 = self.cui_semantic_types[cui2]
-        
-        # If no learned compatibility, assume compatible (permissive)
-        if not self.is_learned or not self.compatible_types:
-            # Fallback: at least one common type
-            return len(types1 & types2) > 0 if strict else None
-        
-        # Check learned compatibility
-        max_score = 0.0
-        for t1 in types1:
-            if t1 not in self.compatible_types:
-                continue
-            
-            compatible_t1 = self.compatible_types[t1]
-            for t2 in types2:
-                if t2 in compatible_t1:
-                    score = self.compatibility_scores[t1][t2]
-                    max_score = max(max_score, score)
-        
-        if strict:
-            return max_score > 0.5
-        else:
-            return max_score > 0.0
-    
-    def get_compatibility_score(self, cui1: str, cui2: str) -> float:
-        """Get compatibility score between two CUIs"""
-        if cui1 not in self.cui_semantic_types or cui2 not in self.cui_semantic_types:
+        if ancestor_depth is None and embedding_similarity is None:
             return 0.0
         
-        types1 = self.cui_semantic_types[cui1]
-        types2 = self.cui_semantic_types[cui2]
+        # Score ancestor by exponential decay with depth
+        ancestor_score = np.exp(-ancestor_depth / 3.0) if ancestor_depth is not None else 0.0
+        embedding_score = embedding_similarity if embedding_similarity is not None else 0.0
         
-        max_score = 0.0
-        for t1 in types1:
-            for t2 in types2:
-                score = self.compatibility_scores[t1].get(t2, 0.0)
-                max_score = max(max_score, score)
-        
-        return max_score
+        # Weighted combination
+        if ancestor_depth is not None and embedding_similarity is not None:
+            return ancestor_weight * ancestor_score + embedding_weight * embedding_score
+        elif ancestor_depth is not None:
+            return ancestor_score
+        else:
+            return embedding_score
     
-    def get_semantic_types(self, cui: str) -> Set[str]:
-        """Get semantic types for a CUI"""
-        return self.cui_semantic_types.get(cui, set())
-    
-    def export_compatibility_matrix(self, output_path: str):
-        """Export learned compatibility for inspection"""
-        rows = []
+    def direct_match(self, topic_cuis: Set[str]) -> pd.DataFrame:
+        """Step 1: Find direct CUI matches"""
+        print("="*70)
+        print("STEP 1: DIRECT MATCHING")
+        print("="*70)
         
-        for t1 in sorted(self.compatible_types.keys()):
-            for t2 in sorted(self.compatible_types[t1]):
-                score = self.compatibility_scores[t1][t2]
-                rows.append({
-                    'type1': t1,
-                    'type2': t2,
-                    'compatibility_score': score
+        matches = []
+        for topic_cui in topic_cuis:
+            if topic_cui in self.reduced_cuis:
+                matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': topic_cui,
+                    'method': 'direct',
+                    'confidence': 1.0,
+                    'similarity': 1.0,
+                    'hybrid_score': 1.0
                 })
         
-        df = pd.DataFrame(rows)
-        df.to_csv(output_path, index=False)
-        print(f"\nExported compatibility matrix to: {output_path}")
+        df = pd.DataFrame(matches)
+        
+        print(f"✓ Direct matches found: {len(df):,}")
+        print()
         
         return df
     
-    def save_learned_compatibility(self, output_path: str):
-        """Save learned compatibility for reuse"""
-        data = {
-            'compatible_types': {k: list(v) for k, v in self.compatible_types.items()},
-            'compatibility_scores': {
-                k: dict(v) for k, v in self.compatibility_scores.items()
+    def ancestor_match(
+        self,
+        unmatched_topic_cuis: Set[str],
+        max_depth: int = 5,
+        use_hybrid: bool = True
+    ) -> pd.DataFrame:
+        """Step 2: Find ancestor matches with hybrid scoring"""
+        print("="*70)
+        print("STEP 2: ANCESTOR MATCHING")
+        print("="*70)
+        print(f"Remaining CUIs: {len(unmatched_topic_cuis):,}")
+        
+        matches = []
+        
+        for topic_cui in unmatched_topic_cuis:
+            # Get ancestors with paths
+            ancestor_info = self._get_ancestors_with_paths(
+                self.topic_graph, topic_cui, max_depth
+            )
+            
+            # Find intersection with reduced CUIs
+            matching_ancestors = set(ancestor_info.keys()) & self.reduced_cuis
+            
+            if not matching_ancestors:
+                continue
+            
+            # Select best ancestor
+            if use_hybrid and topic_cui in self.topic_embeddings:
+                # Use hybrid scoring
+                topic_emb = self.topic_embeddings[topic_cui]
+                best_score = -1
+                best_ancestor = None
+                best_info = None
+                
+                for anc in matching_ancestors:
+                    depth, path = ancestor_info[anc]
+                    
+                    # Get embedding similarity if available
+                    emb_sim = None
+                    if anc in self.reduced_embeddings:
+                        anc_emb = self.reduced_embeddings[anc]
+                        emb_sim = float(cosine_similarity([topic_emb], [anc_emb])[0][0])
+                    
+                    # Compute hybrid score
+                    hybrid_score = self._compute_hybrid_score(depth, emb_sim)
+                    
+                    if hybrid_score > best_score:
+                        best_score = hybrid_score
+                        best_ancestor = anc
+                        best_info = (depth, path, emb_sim, hybrid_score)
+                
+                if best_ancestor:
+                    depth, path, emb_sim, hybrid_score = best_info
+                    confidence = max(0.5, 1.0 - (depth * 0.1))
+                    
+                    matches.append({
+                        'topic_cui': topic_cui,
+                        'reduced_cui': best_ancestor,
+                        'method': 'ancestor',
+                        'confidence': confidence,
+                        'similarity': emb_sim,
+                        'ancestor_depth': depth,
+                        'ancestor_path': str(path),
+                        'hybrid_score': hybrid_score,
+                        'num_candidates': len(matching_ancestors)
+                    })
+            else:
+                # Use simple closest ancestor
+                best_ancestor = min(matching_ancestors, 
+                                   key=lambda a: (ancestor_info[a][0], a))
+                depth, path = ancestor_info[best_ancestor]
+                confidence = max(0.5, 1.0 - (depth * 0.1))
+                
+                matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': best_ancestor,
+                    'method': 'ancestor',
+                    'confidence': confidence,
+                    'ancestor_depth': depth,
+                    'ancestor_path': str(path),
+                    'num_candidates': len(matching_ancestors)
+                })
+        
+        df = pd.DataFrame(matches)
+        
+        print(f"✓ Ancestor matches found: {len(df):,}")
+        print()
+        
+        return df
+    
+    def _embedding_match_batch(
+        self,
+        topic_cui_batch: List[str],
+        similarity_threshold: float,
+        top_k: int
+    ) -> List[Dict]:
+        """Process a batch of topic CUIs for embedding matching"""
+        matches = []
+        
+        # Prepare reduced embeddings
+        reduced_cuis_with_emb = [
+            cui for cui in self.reduced_cuis
+            if cui in self.reduced_embeddings
+        ]
+        
+        if not reduced_cuis_with_emb:
+            return matches
+        
+        reduced_emb_matrix = np.array([
+            self.reduced_embeddings[cui] for cui in reduced_cuis_with_emb
+        ])
+        
+        for topic_cui in topic_cui_batch:
+            if topic_cui not in self.topic_embeddings:
+                continue
+            
+            topic_emb = self.topic_embeddings[topic_cui]
+            
+            # Compute similarities
+            similarities = cosine_similarity([topic_emb], reduced_emb_matrix)[0]
+            
+            # Get top-k
+            top_indices = np.argsort(similarities)[-top_k:][::-1]
+            top_scores = similarities[top_indices]
+            
+            # Take best match above threshold
+            if top_scores[0] >= similarity_threshold:
+                best_reduced_cui = reduced_cuis_with_emb[top_indices[0]]
+                
+                matches.append({
+                    'topic_cui': topic_cui,
+                    'reduced_cui': best_reduced_cui,
+                    'method': 'embedding',
+                    'confidence': float(top_scores[0]),
+                    'similarity': float(top_scores[0]),
+                    'hybrid_score': float(top_scores[0])
+                })
+        
+        return matches
+    
+    def embedding_match(
+        self,
+        unmatched_topic_cuis: Set[str],
+        similarity_threshold: float = 0.7,
+        top_k: int = 3,
+        parallel: bool = True
+    ) -> pd.DataFrame:
+        """Step 3: Find embedding matches (only if needed)"""
+        print("="*70)
+        print("STEP 3: EMBEDDING MATCHING")
+        print("="*70)
+        print(f"Remaining CUIs: {len(unmatched_topic_cuis):,}")
+        
+        # Filter to CUIs with embeddings
+        topic_cuis_with_emb = [
+            cui for cui in unmatched_topic_cuis 
+            if cui in self.topic_embeddings
+        ]
+        
+        if not topic_cuis_with_emb:
+            print("✓ No CUIs with embeddings to match")
+            print()
+            return pd.DataFrame()
+        
+        # Parallel or sequential processing
+        if parallel and self.n_jobs > 1 and len(topic_cuis_with_emb) > 100:
+            # Split into batches
+            batch_size = max(10, len(topic_cuis_with_emb) // (self.n_jobs * 4))
+            batches = [topic_cuis_with_emb[i:i+batch_size] 
+                      for i in range(0, len(topic_cuis_with_emb), batch_size)]
+            
+            # Process in parallel
+            match_fn = partial(
+                self._embedding_match_batch,
+                similarity_threshold=similarity_threshold,
+                top_k=top_k
+            )
+            
+            with ThreadPoolExecutor(max_workers=self.n_jobs) as executor:
+                batch_results = list(executor.map(match_fn, batches))
+            
+            # Flatten results
+            matches = [match for batch in batch_results for match in batch]
+        else:
+            # Sequential processing
+            matches = self._embedding_match_batch(
+                topic_cuis_with_emb,
+                similarity_threshold,
+                top_k
+            )
+        
+        df = pd.DataFrame(matches)
+        
+        print(f"✓ Embedding matches found: {len(df):,}")
+        print()
+        
+        return df
+    
+    def evaluate(self, results_df: pd.DataFrame) -> Dict:
+        """Evaluate results against gold standard"""
+        if not self.gold_mappings:
+            return {}
+        
+        predicted = dict(zip(results_df['topic_cui'], results_df['reduced_cui']))
+        
+        gold_cuis = set(self.gold_mappings.keys())
+        pred_cuis = set(predicted.keys())
+        
+        tp = sum(1 for cui in (gold_cuis & pred_cuis) 
+                if predicted[cui] == self.gold_mappings[cui])
+        fp = sum(1 for cui in (gold_cuis & pred_cuis)
+                if predicted[cui] != self.gold_mappings[cui])
+        fn = len(gold_cuis - pred_cuis)
+        
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        accuracy = tp / len(gold_cuis & pred_cuis) if len(gold_cuis & pred_cuis) > 0 else 0.0
+        
+        return {
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'accuracy': accuracy,
+            'true_positives': tp,
+            'false_positives': fp,
+            'false_negatives': fn,
+            'coverage': len(pred_cuis) / len(gold_cuis) if len(gold_cuis) > 0 else 0.0
+        }
+    
+    def match_all(
+        self,
+        topic_cuis: Optional[Set[str]] = None,
+        ancestor_max_depth: int = 5,
+        use_hybrid_scoring: bool = True,
+        embedding_threshold: float = 0.7,
+        embedding_top_k: int = 3,
+        skip_embedding_if_ratio_high: float = 0.9,
+        parallel_embedding: bool = True
+    ) -> Tuple[pd.DataFrame, Set[str], Dict]:
+        """
+        Execute complete matching pipeline
+        
+        Args:
+            topic_cuis: CUIs to match (None = all)
+            ancestor_max_depth: Max depth for ancestor search
+            use_hybrid_scoring: Use hybrid scoring for ancestor selection
+            embedding_threshold: Min similarity for embedding matches
+            embedding_top_k: Top K candidates to evaluate
+            skip_embedding_if_ratio_high: Skip embedding step if match rate already high
+            parallel_embedding: Use parallel processing for embeddings
+        
+        Returns:
+            (results_df, unmatched_cuis, stats)
+        """
+        if topic_cuis is None:
+            topic_cuis = self.topic_cuis
+        else:
+            topic_cuis = set(topic_cuis)
+        
+        print("\n" + "="*70)
+        print("CUI MATCHING PIPELINE")
+        print("="*70)
+        print(f"Total topic CUIs to match: {len(topic_cuis):,}")
+        print("="*70)
+        print()
+        
+        all_results = []
+        
+        # Step 1: Direct matches
+        direct_results = self.direct_match(topic_cuis)
+        all_results.append(direct_results)
+        matched_cuis = set(direct_results['topic_cui']) if len(direct_results) > 0 else set()
+        
+        # Step 2: Ancestor matches
+        unmatched_after_direct = topic_cuis - matched_cuis
+        print(f"After direct matching: {len(unmatched_after_direct):,} CUIs remaining\n")
+        
+        ancestor_results = self.ancestor_match(
+            unmatched_after_direct,
+            max_depth=ancestor_max_depth,
+            use_hybrid=use_hybrid_scoring
+        )
+        all_results.append(ancestor_results)
+        matched_cuis.update(set(ancestor_results['topic_cui']) if len(ancestor_results) > 0 else set())
+        
+        # Check if we should skip embedding step
+        unmatched_after_ancestor = topic_cuis - matched_cuis
+        current_match_rate = len(matched_cuis) / len(topic_cuis) if len(topic_cuis) > 0 else 0
+        
+        print(f"After ancestor matching: {len(unmatched_after_ancestor):,} CUIs remaining")
+        print(f"Current match rate: {current_match_rate*100:.1f}%\n")
+        
+        # Step 3: Embedding matches (conditional)
+        if len(unmatched_after_ancestor) > 0:
+            if current_match_rate >= skip_embedding_if_ratio_high:
+                print(f"Skipping embedding step (match rate {current_match_rate*100:.1f}% >= {skip_embedding_if_ratio_high*100:.1f}%)")
+                print()
+                embedding_results = pd.DataFrame()
+            else:
+                embedding_results = self.embedding_match(
+                    unmatched_after_ancestor,
+                    similarity_threshold=embedding_threshold,
+                    top_k=embedding_top_k,
+                    parallel=parallel_embedding
+                )
+                all_results.append(embedding_results)
+                matched_cuis.update(set(embedding_results['topic_cui']) if len(embedding_results) > 0 else set())
+        else:
+            print("No unmatched CUIs - skipping embedding step\n")
+            embedding_results = pd.DataFrame()
+        
+        # Combine all results
+        results_df = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+        unmatched_cuis = topic_cuis - matched_cuis
+        
+        # Calculate statistics
+        stats = {
+            'total_topic_cuis': len(topic_cuis),
+            'total_matched': len(matched_cuis),
+            'total_unmatched': len(unmatched_cuis),
+            'match_rate': len(matched_cuis) / len(topic_cuis) if len(topic_cuis) > 0 else 0,
+            'by_method': {
+                'direct': len(direct_results),
+                'ancestor': len(ancestor_results),
+                'embedding': len(embedding_results)
             },
-            'is_learned': self.is_learned
+            'avg_confidence': results_df['confidence'].mean() if len(results_df) > 0 else 0,
+            'avg_hybrid_score': results_df['hybrid_score'].mean() if 'hybrid_score' in results_df.columns and len(results_df) > 0 else 0
         }
         
-        with open(output_path, 'wb') as f:
-            pickle.dump(data, f)
+        # Evaluation
+        if self.gold_mappings:
+            eval_metrics = self.evaluate(results_df)
+            stats['evaluation'] = eval_metrics
         
-        print(f"Saved learned compatibility to: {output_path}")
-    
-    def load_learned_compatibility(self, input_path: str):
-        """Load previously learned compatibility"""
-        with open(input_path, 'rb') as f:
-            data = pickle.load(f)
+        # Print final summary
+        self._print_summary(stats)
         
-        self.compatible_types = {k: set(v) for k, v in data['compatible_types'].items()}
-        self.compatibility_scores = defaultdict(
-            lambda: defaultdict(float),
-            {k: defaultdict(float, v) for k, v in data['compatibility_scores'].items()}
-        )
-        self.is_learned = data['is_learned']
+        return results_df, unmatched_cuis, stats
+    
+    def _print_summary(self, stats: Dict):
+        """Print final summary"""
+        print("="*70)
+        print("FINAL SUMMARY")
+        print("="*70)
+        print(f"Total matched:   {stats['total_matched']:,} / {stats['total_topic_cuis']:,} ({stats['match_rate']*100:.1f}%)")
+        print(f"Total unmatched: {stats['total_unmatched']:,}")
         
-        print(f"Loaded learned compatibility from: {input_path}")
-        print(f"  {len(self.compatible_types)} semantic types with compatibility rules")
+        print(f"\nBreakdown by method:")
+        for method, count in stats['by_method'].items():
+            pct = (count / stats['total_matched'] * 100) if stats['total_matched'] > 0 else 0
+            print(f"  {method:12s}: {count:,} ({pct:.1f}%)")
+        
+        print(f"\nQuality metrics:")
+        print(f"  Avg confidence:   {stats['avg_confidence']:.3f}")
+        print(f"  Avg hybrid score: {stats['avg_hybrid_score']:.3f}")
+        
+        if 'evaluation' in stats:
+            print(f"\nEvaluation (vs gold standard):")
+            eval_m = stats['evaluation']
+            print(f"  Precision: {eval_m['precision']:.3f}")
+            print(f"  Recall:    {eval_m['recall']:.3f}")
+            print(f"  F1 Score:  {eval_m['f1_score']:.3f}")
+            print(f"  Accuracy:  {eval_m['accuracy']:.3f}")
+        
+        print("="*70)
+        print()
+    
+    def save_results(
+        self,
+        results_df: pd.DataFrame,
+        output_csv: str = 'cui_matches.csv',
+        stats: Dict = None,
+        stats_json: str = 'cui_stats.json'
+    ):
+        """Save results to files"""
+        # Save main results
+        results_df.to_csv(output_csv, index=False)
+        print(f"✓ Results saved to: {output_csv}")
+        
+        # Save statistics
+        if stats:
+            with open(stats_json, 'w') as f:
+                json.dump(stats, f, indent=2)
+            print(f"✓ Statistics saved to: {stats_json}")
+        
+        print()
 
 
-def create_auto_validator_from_data(
-    cui_semantic_types: Dict[str, Set[str]],
-    reduced_graph: nx.DiGraph,
-    topic_graph: nx.DiGraph,
-    reduced_embeddings: Dict[str, np.ndarray],
-    topic_embeddings: Dict[str, np.ndarray],
-    similarity_threshold: float = 0.6,
-    min_cooccurrence: int = 5
-) -> AutoSemanticTypeValidator:
-    """
-    Convenience function to create and train validator from data
-    
-    Args:
-        cui_semantic_types: CUI to semantic types mapping
-        reduced_graph: Reduced CUI graph
-        topic_graph: Topic CUI graph
-        reduced_embeddings: Reduced embeddings
-        topic_embeddings: Topic embeddings
-        similarity_threshold: Min similarity for embedding-based compatibility
-        min_cooccurrence: Min co-occurrences for graph-based compatibility
-    
-    Returns:
-        Trained AutoSemanticTypeValidator
-    """
-    # Create validator
-    validator = AutoSemanticTypeValidator(
-        cui_semantic_types=cui_semantic_types,
-        learn_from_graph=True,
-        learn_from_embeddings=True,
-        similarity_threshold=similarity_threshold,
-        min_cooccurrence=min_cooccurrence
-    )
-    
-    # Combine embeddings
-    all_embeddings = {**reduced_embeddings, **topic_embeddings}
-    
-    # Learn compatibility
-    validator.learn_compatibility(
-        graphs=[reduced_graph, topic_graph],
-        embeddings=all_embeddings
-    )
-    
-    return validator
+# =============================================================================
+# USAGE EXAMPLE
+# =============================================================================
 
-
-# Example usage
 if __name__ == "__main__":
-    print("Automatic Semantic Type Compatibility Learning")
-    print("="*70)
-    print("\nThis module automatically discovers semantic type compatibility from:")
-    print("  1. Graph structure (co-occurrence in hierarchies)")
-    print("  2. Embedding similarity (semantic similarity)")
-    print("  3. Transitivity (if A→B and B→C, then A→C)")
-    print("\nNo manual rules needed!")
+    
+    # Initialize mapper
+    mapper = CUIMapper(
+        reduced_cui_graph_path='reduced_cui_graph.pkl',
+        reduced_embeddings=reduced_embeddings_dict,  # Your in-memory dict
+        topic_cui_graph_path='reduced_topic_cuis_graph.pkl',
+        topic_embeddings=topic_embeddings_dict,      # Your in-memory dict
+        gold_mappings=None,  # Optional: gold_standard_dict
+        n_jobs=-1
+    )
+    
+    # Run matching
+    results, unmatched, stats = mapper.match_all(
+        ancestor_max_depth=5,
+        use_hybrid_scoring=True,
+        embedding_threshold=0.7,
+        skip_embedding_if_ratio_high=0.9,  # Skip embeddings if 90%+ already matched
+        parallel_embedding=True
+    )
+    
+    # Save results
+    mapper.save_results(
+        results,
+        output_csv='cui_matches.csv',
+        stats=stats,
+        stats_json='cui_stats.json'
+    )
+    
+    # Create lookup dictionary
+    cui_map = dict(zip(results['topic_cui'], results['reduced_cui']))
+    print(f"Created mapping dictionary with {len(cui_map):,} entries")
