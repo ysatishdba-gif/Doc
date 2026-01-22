@@ -1,12 +1,10 @@
 """
-OFFICIAL GOOGLE IMPLEMENTATION
-Following: https://ai.google.dev/gemini-api/docs/structured-output
+FIXED: Removes $defs from JSON Schema for Vertex AI compatibility
 
-Key from official docs:
-config={
-    "response_mime_type": "application/json",
-    "response_json_schema": YourModel.model_json_schema(),
-}
+The issue: Pydantic generates schemas with "$defs" for nested models,
+but Vertex AI doesn't support this field.
+
+Solution: Inline the nested definitions or strip $defs.
 """
 
 import json
@@ -97,6 +95,45 @@ class QueriesOutput(BaseModel):
     total_queries: int
     intents: List[IntentQueries]
     all_queries: List[str]
+
+
+# ============================================================================
+# HELPER FUNCTION TO REMOVE $defs FROM SCHEMA
+# ============================================================================
+
+def clean_schema_for_vertex(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove $defs from Pydantic JSON Schema for Vertex AI compatibility.
+    Inlines the definitions into the properties that reference them.
+    """
+    # Make a copy to avoid modifying the original
+    schema = json.loads(json.dumps(schema))
+    
+    # Extract definitions if they exist
+    defs = schema.pop('$defs', {})
+    
+    def resolve_refs(obj):
+        """Recursively resolve $ref references by inlining definitions."""
+        if isinstance(obj, dict):
+            if '$ref' in obj:
+                # Extract the reference name
+                ref = obj['$ref']
+                if ref.startswith('#/$defs/'):
+                    def_name = ref.split('/')[-1]
+                    if def_name in defs:
+                        # Replace the $ref with the actual definition
+                        return resolve_refs(defs[def_name].copy())
+                return obj
+            else:
+                # Recursively process all values in the dict
+                return {k: resolve_refs(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [resolve_refs(item) for item in obj]
+        else:
+            return obj
+    
+    # Resolve all references in the schema
+    return resolve_refs(schema)
 
 
 # ============================================================================
@@ -350,14 +387,13 @@ class ContextualIntentPipeline:
                     response_schema=None) -> str:
         """
         Call model with optional schema enforcement.
-        OFFICIAL GOOGLE PATTERN from: https://ai.google.dev/gemini-api/docs/structured-output
+        FIXED: Removes $defs from schema for Vertex AI compatibility.
         """
         try:
             # Reset session to avoid context carryover
             if hasattr(self.model, "session") and self.model.session is not None:
                 self.model.session.reset()
             
-            # OFFICIAL GOOGLE PATTERN: Use config dict with response_mime_type and response_json_schema
             generation_config = {
                 "temperature": temperature,
                 "max_output_tokens": max_tokens,
@@ -366,10 +402,13 @@ class ContextualIntentPipeline:
                 "seed": 34
             }
             
-            # Add schema enforcement (Official Google pattern)
+            # Add schema enforcement with $defs removed
             if response_schema:
                 generation_config["response_mime_type"] = "application/json"
-                generation_config["response_json_schema"] = response_schema.model_json_schema()
+                # Get schema and remove $defs
+                raw_schema = response_schema.model_json_schema()
+                cleaned_schema = clean_schema_for_vertex(raw_schema)
+                generation_config["response_json_schema"] = cleaned_schema
             
             response = self.model.generate_content(
                 prompt,
