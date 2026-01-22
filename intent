@@ -1,86 +1,54 @@
 """
-Production-Ready Version - Following YOUR TEAM'S Pattern
+Production-Ready Clinical Intent Pipeline
+Following team's pattern from main.py
 
-Based on your team's main.py production code:
-1. Schema passed as separate parameter (not in config)
-2. Utility function handles schema conversion
-3. Clean separation of concerns
-
-Key from your team's code:
-config["response_mime_type"] = "application/json"
-config["response_schema"] = None  # Set separately via utility
-Then: run_genai(client, prompt, schema, model, config=config)
+Tested and error-checked version.
 """
 
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Type
 from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel
 from pydantic import BaseModel, Field
 
 
 # ============================================================================
-# UTILITY FUNCTION (Team's pattern from utils.py)
+# UTILITY FUNCTIONS
 # ============================================================================
 
 def clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Clean Pydantic schema for Gemini compatibility.
-    Removes $defs and inlines nested model references.
+    Remove $defs from Pydantic JSON Schema for Vertex AI compatibility.
+    Inlines nested model definitions.
     """
+    # Deep copy to avoid modifying original
     schema = json.loads(json.dumps(schema))
+    
+    # Extract and remove $defs
     defs = schema.pop('$defs', {})
     
-    def resolve_refs(obj):
+    def resolve_refs(obj: Any) -> Any:
+        """Recursively resolve $ref references."""
         if isinstance(obj, dict):
             if '$ref' in obj:
                 ref = obj['$ref']
                 if ref.startswith('#/$defs/'):
                     def_name = ref.split('/')[-1]
                     if def_name in defs:
+                        # Replace $ref with actual definition
                         return resolve_refs(defs[def_name].copy())
                 return obj
+            # Recursively process all dict values
             return {k: resolve_refs(v) for k, v in obj.items()}
         elif isinstance(obj, list):
+            # Recursively process all list items
             return [resolve_refs(item) for item in obj]
-        return obj
+        else:
+            return obj
     
     return resolve_refs(schema)
-
-
-def run_genai(
-    model: GenerativeModel,
-    prompt: str,
-    schema: Optional[BaseModel],
-    model_name: str,
-    config: Dict[str, Any]
-) -> Any:
-    """
-    Generate content with schema - following team's run_genai pattern.
-    
-    This matches the signature from your team's production code:
-    run_genai(client, prompt, schema, genai_model_name, config=config)
-    """
-    generation_config = config.copy()
-    
-    # Following team's pattern: set these in config
-    generation_config["response_mime_type"] = "application/json"
-    
-    if schema:
-        # Convert Pydantic schema and clean for Gemini
-        raw_schema = schema.model_json_schema()
-        cleaned_schema = clean_schema_for_gemini(raw_schema)
-        generation_config["response_schema"] = cleaned_schema
-    
-    # Generate content
-    response = model.generate_content(
-        prompt,
-        generation_config=generation_config
-    )
-    
-    return response
 
 
 # ============================================================================
@@ -114,7 +82,6 @@ class QueryExpansionOutput(BaseModel):
     abbreviations_expanded: List[str] = Field(default_factory=list)
 
 
-# Output 1: Intent Extractions
 class IntentBasic(BaseModel):
     intent_title: str
     description: str
@@ -127,7 +94,6 @@ class IntentExtractionsOutput(BaseModel):
     intents: List[IntentBasic]
 
 
-# Output 2: Nature Breakdown
 class IntentWithNature(BaseModel):
     intent_title: str
     description: str
@@ -142,7 +108,6 @@ class NatureBreakdownOutput(BaseModel):
     intents: List[IntentWithNature]
 
 
-# Output 3: Queries (for CUI extraction)
 class IntentQueries(BaseModel):
     intent_title: str
     final_queries: List[str]
@@ -158,7 +123,7 @@ class QueriesOutput(BaseModel):
 
 
 # ============================================================================
-# PROMPTS - UNCHANGED
+# PROMPTS
 # ============================================================================
 
 QUERY_EXPANSION_PROMPT = """
@@ -400,48 +365,41 @@ Timestamp: {timestamp}
 class ContextualIntentPipeline:    
     def __init__(self, project: str, location: str = "us-central1", 
                  model: str = "gemini-2.0-flash-exp"):
-
+        """Initialize pipeline with Vertex AI model."""
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
         self.model_name = model
         
-    def _call_model(self, prompt: str, schema: Optional[BaseModel] = None,
-                    config: Optional[Dict[str, Any]] = None) -> Any:
+    def _generate_with_schema(
+        self, 
+        prompt: str, 
+        schema: Optional[Type[BaseModel]], 
+        config: Dict[str, Any]
+    ) -> Any:
         """
-        Call model following team's pattern.
-        Schema passed as separate parameter.
+        Generate content with optional schema enforcement.
+        Follows team's pattern: schema passed separately from config.
         """
-        try:
-            # Reset session
-            if hasattr(self.model, "session") and self.model.session is not None:
-                self.model.session.reset()
-            
-            # Default config
-            if config is None:
-                config = {
-                    "temperature": 0.0,
-                    "max_output_tokens": 8096,
-                    "top_p": 1.0,
-                    "top_k": 1,
-                    "seed": 34
-                }
-            
-            # Use team's run_genai pattern
-            response = run_genai(
-                self.model,
-                prompt,
-                schema,
-                self.model_name,
-                config=config
-            )
-            
-            return response
-        except Exception as e:
-            print(f"Error calling model: {str(e)}")
-            raise
+        generation_config = config.copy()
+        generation_config["response_mime_type"] = "application/json"
+        
+        if schema is not None:
+            # Get Pydantic schema and clean for Vertex AI
+            raw_schema = schema.model_json_schema()
+            cleaned_schema = clean_schema_for_gemini(raw_schema)
+            generation_config["response_schema"] = cleaned_schema
+        
+        # Generate content
+        response = self.model.generate_content(
+            prompt,
+            generation_config=generation_config
+        )
+        
+        return response
     
     def _safe_json(self, text: str) -> Dict[str, Any]:
-        # Remove markdown
+        """Safely parse JSON from response text."""
+        # Remove markdown code blocks
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
         text = text.strip()
@@ -449,6 +407,7 @@ class ContextualIntentPipeline:
         try:
             return json.loads(text)
         except json.JSONDecodeError:
+            # Try to extract JSON object
             match = re.search(r'\{.*\}', text, re.DOTALL)
             if match:
                 try:
@@ -459,10 +418,13 @@ class ContextualIntentPipeline:
             return {}
     
     def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
+        """Validate that JSON has required keys."""
         return all(key in data for key in required_keys)
     
     def expand_query(self, query: str) -> Dict[str, Any]:
+        """Expand clinical query with abbreviations and context."""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
+        
         config = {
             "temperature": 0.0,
             "max_output_tokens": 2048,
@@ -471,21 +433,29 @@ class ContextualIntentPipeline:
             "seed": 34
         }
         
-        raw_response = self._call_model(prompt, schema=QueryExpansionOutput, config=config)
-        data = self._safe_json(raw_response.text)
-        
-        if not self._validate_json_structure(data, ["expanded_query"]):
+        try:
+            response = self._generate_with_schema(prompt, QueryExpansionOutput, config)
+            data = self._safe_json(response.text)
+            
+            if not self._validate_json_structure(data, ["expanded_query"]):
+                return {
+                    "expanded_query": query,
+                    "abbreviations_expanded": [],
+                }
+            
+            return {
+                "expanded_query": data.get("expanded_query", query),
+                "abbreviations_expanded": data.get("abbreviations_expanded", []),
+            }
+        except Exception as e:
+            print(f"Error in expand_query: {str(e)}")
             return {
                 "expanded_query": query,
                 "abbreviations_expanded": [],
             }
-        
-        return {
-            "expanded_query": data.get("expanded_query", query),
-            "abbreviations_expanded": data.get("abbreviations_expanded", []),
-        }
     
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
+        """Extract clinical intents from expanded query."""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
@@ -500,44 +470,55 @@ class ContextualIntentPipeline:
             "seed": 34
         }
         
-        raw_response = self._call_model(prompt, schema=FullIntentExtractionOutput, config=config)
-        data = self._safe_json(raw_response.text)
-        
-        if not data.get("is_clinical", True):
+        try:
+            response = self._generate_with_schema(prompt, FullIntentExtractionOutput, config)
+            data = self._safe_json(response.text)
+            
+            # Check if query was rejected as non-clinical
+            if not data.get("is_clinical", True):
+                return {
+                    "intents": [],
+                    "total_intents_detected": 0,
+                    "is_clinical": False,
+                    "rejected_reason": data.get("reason", "Query is not clinical"),
+                    "original_query": original_query,
+                    "expanded_query": expanded_query
+                }
+            
+            if not self._validate_json_structure(data, ["intents"]):
+                return {
+                    "intents": [],
+                    "total_intents_detected": 0,
+                    "error": "Failed to extract intents"
+                }
+            
+            # Validate intents have final_queries
+            intents = data.get("intents", [])
+            validated_intents = []
+            
+            for idx, intent in enumerate(intents):
+                if "final_queries" not in intent or not intent["final_queries"]:
+                    print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
+                    continue
+                validated_intents.append(intent)
+            
+            return {
+                "intents": validated_intents,
+                "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
+                "is_clinical": True,
+                "original_query": data.get("original_query", original_query),
+                "expanded_query": data.get("expanded_query", expanded_query)
+            }
+        except Exception as e:
+            print(f"Error in extract_intents: {str(e)}")
             return {
                 "intents": [],
                 "total_intents_detected": 0,
-                "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query is not clinical"),
-                "original_query": original_query,
-                "expanded_query": expanded_query
+                "error": f"Error extracting intents: {str(e)}"
             }
-        
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "error": "Failed to extract intents"
-            }
-        
-        intents = data.get("intents", [])
-        validated_intents = []
-        
-        for idx, intent in enumerate(intents):
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            validated_intents.append(intent)
-        
-        return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
-            "is_clinical": True,
-            "original_query": data.get("original_query", original_query),
-            "expanded_query": data.get("expanded_query", expanded_query)
-        }    
     
     def convert_to_intent_extractions(self, full_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert to Output 1: Intent Extractions."""
         return {
             "original_query": full_result["original_query"],
             "expanded_query": full_result["expanded_query"],
@@ -552,6 +533,7 @@ class ContextualIntentPipeline:
         }
     
     def convert_to_nature_breakdown(self, full_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert to Output 2: Nature Breakdown."""
         return {
             "original_query": full_result["original_query"],
             "expanded_query": full_result["expanded_query"],
@@ -568,6 +550,7 @@ class ContextualIntentPipeline:
         }
     
     def convert_to_queries(self, full_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert to Output 3: Queries for CUI extraction."""
         all_queries = []
         for intent in full_result["intents"]:
             all_queries.extend(intent["final_queries"])
@@ -588,19 +571,33 @@ class ContextualIntentPipeline:
         }
     
     def run(self, query: str, output_type: str = "full", verbose: bool = False) -> Dict[str, Any]:
+        """
+        Run complete pipeline.
+        
+        Args:
+            query: Clinical query to process
+            output_type: "full", "intent_extractions", "nature_breakdown", or "queries"
+            verbose: Print processing info
+            
+        Returns:
+            Dict with results in requested format
+        """
         start_time = datetime.utcnow()
         
         if verbose:
             print(f"Original Query: {query}")
         
+        # Step 1: Query Expansion
         expansion_result = self.expand_query(query)
         expanded_query = expansion_result["expanded_query"]
         
         if verbose:
             print(f"Expanded Query: {expanded_query}")
         
+        # Step 2: Intent Extraction
         intent_result = self.extract_intents(query, expanded_query)
         
+        # Check if non-clinical
         if not intent_result.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             if verbose:
@@ -617,6 +614,7 @@ class ContextualIntentPipeline:
                 "processing_time_seconds": processing_time
             }
         
+        # Build full result
         intents = intent_result.get("intents", [])        
         total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
         total_sub_natures = sum(len(intent.get('sub_natures', [])) for intent in intents)
@@ -637,6 +635,7 @@ class ContextualIntentPipeline:
             "processing_time_seconds": processing_time
         }
         
+        # Convert to requested format
         if output_type == "intent_extractions":
             return self.convert_to_intent_extractions(full_result)
         elif output_type == "nature_breakdown":
@@ -648,7 +647,8 @@ class ContextualIntentPipeline:
 
 
 if __name__ == "__main__":
-    PROJECT_ID = "your-project-id"  # CHANGE THIS
+    # CHANGE THIS to your GCP project ID
+    PROJECT_ID = "your-project-id"
     
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID,
@@ -669,4 +669,8 @@ if __name__ == "__main__":
         with open(output_filename, 'w') as f:
             json.dump(result, f, indent=2)
         
-        print(f"Saved to: {output_filename}")
+        print(f"\nSaved to: {output_filename}")
+        print(f"\nAll queries for CUI extraction:")
+        if result.get("all_queries"):
+            for q in result["all_queries"]:
+                print(f"  - {q}")
