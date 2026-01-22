@@ -1,14 +1,20 @@
+"""
+UPDATED: Fixed schema passing to work with Vertex AI SDK
+
+The key change: Convert Pydantic schemas to JSON Schema format using model_json_schema()
+"""
+
 import json
 import re
 from datetime import datetime
 from typing import Dict, Any, List
 from google.cloud import aiplatform
 from vertexai.generative_models import GenerativeModel
-from pydantic import BaseModel, Field  # NEW: Added for schema support
+from pydantic import BaseModel, Field
 
 
 # ============================================================================
-# SCHEMA DEFINITIONS - NEW: Added for structured outputs
+# SCHEMA DEFINITIONS
 # ============================================================================
 
 class SubNature(BaseModel):
@@ -89,7 +95,7 @@ class QueriesOutput(BaseModel):
 
 
 # ============================================================================
-# ORIGINAL PROMPTS - UNCHANGED
+# PROMPTS - UNCHANGED
 # ============================================================================
 
 QUERY_EXPANSION_PROMPT = """
@@ -330,14 +336,18 @@ Timestamp: {timestamp}
 
 class ContextualIntentPipeline:    
     def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = "gemini-2.0-flash-exp"):  # CHANGED: Added default model
+                 model: str = "gemini-2.0-flash-exp"):
 
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)        
         
     def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096,
-                    response_schema=None) -> str:  # MODIFIED: Added response_schema parameter
-
+                    response_schema=None) -> str:
+        """
+        Call model with optional schema enforcement.
+        
+        FIXED: Properly converts Pydantic schema to JSON Schema format for Vertex AI.
+        """
         try:
             # Reset session to avoid context carryover
             if hasattr(self.model, "session") and self.model.session is not None:
@@ -351,10 +361,14 @@ class ContextualIntentPipeline:
                 "seed": 34
             }
             
-            # NEW: Add schema if provided
+            # FIXED: Convert Pydantic model to JSON Schema format
             if response_schema:
                 generation_config["response_mime_type"] = "application/json"
-                generation_config["response_schema"] = response_schema
+                # Use model_json_schema() to get the proper JSON Schema format
+                if hasattr(response_schema, 'model_json_schema'):
+                    generation_config["response_schema"] = response_schema.model_json_schema()
+                else:
+                    generation_config["response_schema"] = response_schema
             
             response = self.model.generate_content(
                 prompt,
@@ -401,11 +415,10 @@ class ContextualIntentPipeline:
     def expand_query(self, query: str) -> Dict[str, Any]:
 
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        raw_response = self._call_model(prompt, response_schema=QueryExpansionOutput)  # MODIFIED: Added schema
+        raw_response = self._call_model(prompt, response_schema=QueryExpansionOutput)
         data = self._safe_json(raw_response)
         
         if not self._validate_json_structure(data, ["expanded_query"]):
-            # Fallback to original query if expansion fails
             return {
                 "expanded_query": query,
                 "abbreviations_expanded": [],
@@ -428,7 +441,7 @@ class ContextualIntentPipeline:
         
         # Use higher token limit for complex queries
         raw_response = self._call_model(prompt, max_tokens=8096, 
-                                       response_schema=FullIntentExtractionOutput)  # MODIFIED: Added schema
+                                       response_schema=FullIntentExtractionOutput)
         data = self._safe_json(raw_response)
         
         # Check if query was rejected as non-clinical
@@ -458,7 +471,6 @@ class ContextualIntentPipeline:
                 print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
                 continue
             
-            # No minimum requirement - let LLM decide based on complexity
             validated_intents.append(intent)
         
         return {
@@ -469,7 +481,7 @@ class ContextualIntentPipeline:
             "expanded_query": data.get("expanded_query", expanded_query)
         }    
     
-    # NEW: Conversion methods for three output formats
+    # Conversion methods for three output formats
     
     def convert_to_intent_extractions(self, full_result: Dict[str, Any]) -> Dict[str, Any]:
         """Convert full output to Output 1: Intent Extractions."""
@@ -526,7 +538,7 @@ class ContextualIntentPipeline:
     
     # Pipeline exec
     
-    def run(self, query: str, output_type: str = "full", verbose: bool = False) -> Dict[str, Any]:  # MODIFIED: Added output_type parameter
+    def run(self, query: str, output_type: str = "full", verbose: bool = False) -> Dict[str, Any]:
 
         start_time = datetime.utcnow()
         
@@ -584,7 +596,7 @@ class ContextualIntentPipeline:
             "processing_time_seconds": processing_time
         }
         
-        # NEW: Convert to requested output format
+        # Convert to requested output format
         if output_type == "intent_extractions":
             return self.convert_to_intent_extractions(full_result)
         elif output_type == "nature_breakdown":
@@ -622,8 +634,3 @@ if __name__ == "__main__":
             json.dump(result, f, indent=2)
         
         print(f"Saved to: {output_filename}")
-        
-        # You can also get other formats:
-        # result_intents = pipeline.run(query, output_type="intent_extractions")
-        # result_nature = pipeline.run(query, output_type="nature_breakdown")
-        # result_full = pipeline.run(query, output_type="full")  # or just pipeline.run(query)
