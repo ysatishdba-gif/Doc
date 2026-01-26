@@ -1,5 +1,634 @@
-Original Query: Patient with DM
-Expanded Query: Patient with Diabetes Mellitus
-Status: Clinical
-Intents: 1 | Sub-natures: 0 | Queries: 2
-Processing Time: 7.58s
+"""
+Clinical Intent Extraction Pipeline
+Author: Satish Kumar
+Last Updated: 2025-01-26
+
+Purpose: Extract clinical intents from medical queries for document retrieval
+Three output formats: intent_extraction, final_queries, nature_breakdown
+
+Uses Google Gen AI SDK (google-genai) with Vertex AI backend for production
+"""
+
+import json
+import re
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Literal, Tuple
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+MODEL_VERSION = "gemini-1.5-flash-002"
+PROJECT_ID = "your-project-id"  # Update this
+LOCATION = "us-central1"
+
+
+# =============================================================================
+# PROMPTS
+# =============================================================================
+
+QUERY_EXPANSION_PROMPT = """You are an expert medical AI assistant specializing in clinical query expansion.
+
+TASK: Expand the user's query into a comprehensive, detailed clinical description.
+
+INSTRUCTIONS:
+1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
+2. Clarify vague medical terms with specific clinical language
+3. Add relevant medical context based on standard clinical practice
+4. Identify implicit clinical concepts that should be explicit
+5. DO NOT add assumptions beyond reasonable clinical interpretation
+6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
+7. DO NOT hallucinate information not implied by the query
+8. Maintain the original query's intent and scope
+9. Make sure the temporal aspect is relevant to the query context
+
+EXAMPLES:
+- "Pt with DM" → "Patient with Diabetes Mellitus"
+- "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
+- "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
+- "SOB on exertion" → "Shortness of breath on exertion"
+
+User Input: {query}
+"""
+
+
+INTENT_EXTRACTION_PROMPT = """You are a clinical intent extraction engine for medical document retrieval.
+
+====================================================
+CLINICAL VALIDATION
+====================================================
+
+Return this ONLY if query is non-clinical:
+{{"is_clinical": false, "reason": "Query is not clinical in nature", "original_query": "{original_query}", "expanded_query": "{expanded_query}", "total_intents_detected": 0, "intents": []}}
+
+====================================================
+CORE PRINCIPLES
+====================================================
+
+**Extraction Philosophy:**
+When someone requests clinical information, extract everything needed to fully understand, act upon, or make decisions about that information safely and effectively.
+
+**Guiding Questions:**
+1. What is being requested?
+2. What contextual information is inseparable from this concept?
+3. What would be incomplete or unsafe without?
+4. How is this information naturally organized?
+
+====================================================
+INTENT GENERATION
+====================================================
+
+**Analyze the expanded query and identify distinct clinical intents.**
+
+Each intent represents a clinically independent concept that could be documented or understood separately.
+
+Generate as many intents as the expanded query contains. Let the content guide the count.
+
+====================================================
+INTENT STRUCTURE
+====================================================
+
+For each intent:
+
+1. **intent_title** - What is this about?
+2. **description** - What does this represent and why does it matter?
+3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
+4. **sub_natures[]** - What are the distinct dimensions of this information?
+5. **final_queries[]** - How would this appear in clinical documents?
+
+====================================================
+SUB_NATURE DECOMPOSITION
+====================================================
+
+**Core Question: "What are the meaningful aspects of this clinical concept?"**
+
+Structure:
+{{
+  "category_path": "Broad >> Specific >> Detail",
+  "atomic_concepts": ["terminal1", "terminal2"]
+}}
+
+**CATEGORY_PATH:**
+Think of this as organizing information from general to specific. Use " >> " as the separator.
+
+**ATOMIC_CONCEPTS:**
+These are the actual data points - the most specific, granular elements.
+
+Include all specific details mentioned: exact values, names, dates, measurements, descriptors.
+
+====================================================
+FINAL_QUERIES: ATOMIC SPECIFICITY
+====================================================
+
+**CRITICAL WORD COUNT RULE: 2-6 words per query (absolute maximum 8 words)**
+
+**Purpose:**
+Generate concise, atomic-level queries that map to precise clinical concepts without generating excessive CUIs.
+
+**Core Insight:**
+Long verbose queries generate too many CUIs. Short atomic queries target specific concepts.
+
+Consider the difference:
+- ❌ "metformin 500mg twice daily for diabetes management" (10 words → 15+ CUIs)
+- ✓ "metformin 500mg" (2 words → 2-3 CUIs)
+- ✓ "twice daily dosing" (3 words → 1-2 CUIs)
+
+**Query Characteristics:**
+- **TARGET: 2-4 words** (optimal for CUI mapping)
+- **ACCEPTABLE: 5-6 words** (if clinically necessary)
+- Each query → 1 atomic concept
+- Include only essential modifiers
+- Use standard medical terminology
+- Each query → 1-3 CUIs ideally
+
+**Coverage:**
+Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
+
+====================================================
+INPUT
+====================================================
+
+Original Query: {original_query}
+Expanded Query: {expanded_query}
+Timestamp: {timestamp}
+"""
+
+
+# =============================================================================
+# PYDANTIC SCHEMAS
+# =============================================================================
+
+class QueryExpansionOutput(BaseModel):
+    expanded_query: str
+    abbreviations_expanded: List[str] = Field(default_factory=list)
+
+
+class SubNature(BaseModel):
+    category_path: str
+    atomic_concepts: List[str]
+    
+    @field_validator('category_path')
+    @classmethod
+    def normalize_separator(cls, v: str) -> str:
+        normalized = re.sub(r'\s*(?:>>|>|->|→|/)\s*', ' >> ', v)
+        if '>>' not in normalized:
+            return v
+        return normalized.strip()
+
+
+class Intent(BaseModel):
+    intent_title: str
+    description: str
+    nature: str
+    sub_natures: List[SubNature]
+    final_queries: List[str]
+
+
+class IntentWithoutQueries(BaseModel):
+    """Intent schema WITHOUT final_queries field for Nature Breakdown output"""
+    intent_title: str
+    description: str
+    nature: str
+    sub_natures: List[SubNature]
+
+
+class IntentExtractionOutput(BaseModel):
+    is_clinical: bool
+    reason: Optional[str] = None
+    original_query: str
+    expanded_query: str
+    total_intents_detected: int
+    intents: List[Intent] = Field(default_factory=list)
+    
+    @model_validator(mode='after')
+    def fix_intent_count(self) -> 'IntentExtractionOutput':
+        actual = len(self.intents)
+        if self.total_intents_detected != actual:
+            self.total_intents_detected = actual
+        return self
+
+
+# Output schemas
+class IntentSummaryItem(BaseModel):
+    intent_title: str
+    description: str
+
+
+class Format1_IntentExtraction(BaseModel):
+    """Format 1: Intent Extraction - titles and descriptions only"""
+    user_query: str
+    intents: List[IntentSummaryItem]
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    timestamp: str
+
+
+class Format2_FinalQueries(BaseModel):
+    """Format 2: Final Queries - flat list for CUI mapping"""
+    user_query: str
+    final_queries: List[str]
+    total_queries: int
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    timestamp: str
+
+
+class Format3_NatureBreakdown(BaseModel):
+    """Format 3: Nature Breakdown - full structure with sub_natures"""
+    is_clinical: bool
+    reason: Optional[str] = None
+    original_query: str
+    expanded_query: str
+    total_intents_detected: int
+    intents: List[IntentWithoutQueries]
+    timestamp: str
+
+
+# =============================================================================
+# EXTRACTION RESULT CLASS
+# =============================================================================
+
+class ExtractionResult:
+    """
+    Container for extraction results that can be formatted in multiple ways.
+    
+    This ensures consistency across all output formats by extracting once
+    and formatting the same data multiple times.
+    """
+    def __init__(self, 
+                 original_query: str,
+                 expansion: QueryExpansionOutput,
+                 intents: IntentExtractionOutput,
+                 processing_time: float):
+        self.original_query = original_query
+        self.expansion = expansion
+        self.intents = intents
+        self.processing_time = processing_time
+        self.timestamp = datetime.utcnow().isoformat()
+    
+    def to_intent_extraction(self) -> Dict[str, Any]:
+        """Format 1: Intent Extraction - titles and descriptions"""
+        items = [
+            IntentSummaryItem(
+                intent_title=i.intent_title,
+                description=i.description
+            ) for i in self.intents.intents
+        ]
+        
+        result = Format1_IntentExtraction(
+            user_query=self.original_query,
+            intents=items,
+            is_clinical=self.intents.is_clinical,
+            rejected_reason=self.intents.reason,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_final_queries(self) -> Dict[str, Any]:
+        """Format 2: Final Queries - for CUI mapping"""
+        queries = [q for intent in self.intents.intents for q in intent.final_queries]
+        
+        result = Format2_FinalQueries(
+            user_query=self.original_query,
+            final_queries=queries,
+            total_queries=len(queries),
+            is_clinical=self.intents.is_clinical,
+            rejected_reason=self.intents.reason,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_nature_breakdown(self) -> Dict[str, Any]:
+        """Format 3: Nature Breakdown - full structure with sub_natures"""
+        intents_no_queries = [
+            IntentWithoutQueries(
+                intent_title=i.intent_title,
+                description=i.description,
+                nature=i.nature,
+                sub_natures=i.sub_natures
+            ) for i in self.intents.intents
+        ]
+        
+        result = Format3_NatureBreakdown(
+            is_clinical=self.intents.is_clinical,
+            reason=self.intents.reason,
+            original_query=self.intents.original_query,
+            expanded_query=self.intents.expanded_query,
+            total_intents_detected=self.intents.total_intents_detected,
+            intents=intents_no_queries,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_all_formats(self) -> Dict[str, Dict[str, Any]]:
+        """Get all three formats from single extraction"""
+        return {
+            "intent_extraction": self.to_intent_extraction(),
+            "final_queries": self.to_final_queries(),
+            "nature_breakdown": self.to_nature_breakdown()
+        }
+
+
+# =============================================================================
+# PIPELINE CLASS
+# =============================================================================
+
+class ContextualIntentPipeline:
+    
+    def __init__(self, project: str, location: str = LOCATION, model: str = MODEL_VERSION):
+        """
+        Initialize pipeline with Google Gen AI SDK using Vertex AI backend.
+        
+        This uses the production-ready Vertex AI infrastructure with project/location support.
+        Requires: gcloud auth application-default login
+        """
+        self.client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location
+        )
+        
+        self.project = project
+        self.location = location
+        self.model_name = model
+        
+        print(f"Initialized with Vertex AI")
+        print(f"  Project: {project}")
+        print(f"  Location: {location}")
+        print(f"  Model: {model}")
+        
+    def _extract_json(self, response) -> Dict[str, Any]:
+        """Extract JSON from response text"""
+        if hasattr(response, 'text'):
+            text = response.text
+        elif hasattr(response, 'candidates') and response.candidates:
+            text = response.candidates[0].content.parts[0].text
+        else:
+            text = str(response)
+        
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*', '', text)
+        text = text.strip()
+        
+        try:
+            return json.loads(text)
+        except:
+            pass
+        
+        json_patterns = [
+            (r'\{.*?\}', re.DOTALL),
+            (r'\[.*?\]', re.DOTALL),
+        ]
+        
+        for pattern, flags in json_patterns:
+            matches = list(re.finditer(pattern, text, flags))
+            matches.sort(key=lambda m: len(m.group(0)), reverse=True)
+            
+            for match in matches:
+                try:
+                    return json.loads(match.group(0))
+                except:
+                    continue
+        
+        raise ValueError(f"Could not parse JSON from response: {text[:500]}...")
+    
+    def _call_model(self, prompt: str, response_schema: type[BaseModel],
+                    context_query: str = "") -> BaseModel:
+        """Call model with JSON schema enforcement"""
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=8096,
+                response_mime_type="application/json",
+                response_schema=response_schema
+            )
+            
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=config
+            )
+            
+            data = self._extract_json(response)
+            return response_schema.model_validate(data)
+            
+        except Exception as e:
+            print(f"Model error: {e}")
+            
+            if response_schema == QueryExpansionOutput:
+                return QueryExpansionOutput(
+                    expanded_query=context_query if context_query else "",
+                    abbreviations_expanded=[]
+                )
+            else:
+                return IntentExtractionOutput(
+                    is_clinical=False,
+                    reason=f"Processing error: {str(e)}",
+                    original_query=context_query if context_query else "",
+                    expanded_query=context_query if context_query else "",
+                    total_intents_detected=0,
+                    intents=[]
+                )
+    
+    def expand_query(self, query: str) -> QueryExpansionOutput:
+        """Step 1: Expand abbreviations and add clinical context"""
+        prompt = QUERY_EXPANSION_PROMPT.format(query=query)
+        return self._call_model(prompt, QueryExpansionOutput, query)
+    
+    def extract_intents(self, original_query: str, expanded_query: str) -> IntentExtractionOutput:
+        """Step 2: Extract clinical intents with sub-natures"""
+        prompt = INTENT_EXTRACTION_PROMPT.format(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            timestamp=datetime.utcnow().isoformat()
+        )
+        return self._call_model(prompt, IntentExtractionOutput, original_query)
+    
+    def extract(self, query: str, verbose: bool = False) -> ExtractionResult:
+        """
+        Extract intents ONCE and return a result object that can be formatted multiple ways.
+        
+        This is the core method that should be used for production.
+        It ensures consistency across all output formats.
+        
+        Args:
+            query: User input
+            verbose: Print debug info
+            
+        Returns:
+            ExtractionResult object that can be formatted as intent_extraction/final_queries/nature_breakdown
+        """
+        if not query or not query.strip():
+            raise ValueError("Empty query provided")
+        
+        start_time = datetime.utcnow()
+        
+        # Step 1: Expand query
+        expansion = self.expand_query(query)
+        
+        # Step 2: Extract intents
+        intents = self.extract_intents(query, expansion.expanded_query)
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        if verbose:
+            print(f"Original Query: {query}")
+            print(f"Expanded Query: {expansion.expanded_query}")
+            
+            if intents.is_clinical:
+                total_queries = sum(len(i.final_queries) for i in intents.intents)
+                total_sub_natures = sum(len(i.sub_natures) for i in intents.intents)
+                print(f"Status: Clinical")
+                print(f"Intents: {intents.total_intents_detected} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
+            else:
+                print(f"Status: Non-clinical")
+                print(f"Reason: {intents.reason}")
+            
+            print(f"Processing Time: {processing_time:.2f}s")
+            print()
+        
+        return ExtractionResult(query, expansion, intents, processing_time)
+    
+    def run(self, query: str,
+            output_format: Literal["intent_extraction", "final_queries", "nature_breakdown"] = "nature_breakdown",
+            verbose: bool = False) -> Dict[str, Any]:
+        """
+        Execute pipeline and return single format.
+        
+        Note: For production, consider using extract() + to_*() methods instead
+        to avoid re-extraction when you need multiple formats.
+        
+        Args:
+            query: User input
+            output_format: "intent_extraction", "final_queries", or "nature_breakdown"
+            verbose: Print debug info
+            
+        Returns:
+            Dict with formatted output
+        """
+        try:
+            result = self.extract(query, verbose)
+            
+            if output_format == "intent_extraction":
+                return result.to_intent_extraction()
+            elif output_format == "final_queries":
+                return result.to_final_queries()
+            else:
+                return result.to_nature_breakdown()
+                
+        except ValueError as e:
+            return {
+                "error": str(e),
+                "query": query,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        except Exception as e:
+            if verbose:
+                print(f"Error: {e}\n")
+            return {
+                "error": str(e),
+                "query": query,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def save_json(data: Dict, filename: str):
+    """Save output to JSON file"""
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved: {filename}")
+
+
+def print_results(result: Dict):
+    """Pretty print results"""
+    print(json.dumps(result, indent=2))
+
+
+def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:
+    """Validate output matches schema"""
+    try:
+        if format_type == "intent_extraction":
+            Format1_IntentExtraction.model_validate(result)
+        elif format_type == "final_queries":
+            Format2_FinalQueries.model_validate(result)
+        elif format_type == "nature_breakdown":
+            Format3_NatureBreakdown.model_validate(result)
+        else:
+            return False, f"Unknown format type: {format_type}"
+        
+        return True, None
+        
+    except Exception as e:
+        return False, str(e)
+
+
+def test_pipeline_consistency(pipeline, query: str):
+    """
+    Test that all three formats are consistent (derived from same extraction).
+    This is the recommended way to generate multiple formats in production.
+    """
+    print(f"\n{'='*80}")
+    print(f"Testing: {query}")
+    print('='*80)
+    
+    # Extract ONCE
+    result = pipeline.extract(query, verbose=True)
+    
+    # Generate all three formats from the SAME extraction
+    all_formats = result.to_all_formats()
+    
+    # Save and validate each format
+    for fmt, data in all_formats.items():
+        filename = f"output_{fmt}.json"
+        save_json(data, filename)
+        
+        is_valid, error_msg = validate_schema(data, fmt)
+        if is_valid:
+            print(f"✓ {fmt} validated")
+        else:
+            print(f"✗ {fmt} validation failed: {error_msg}")
+    
+    print(f"\n{'='*80}")
+    print("✓ All formats generated from SINGLE extraction")
+    print(f"{'='*80}\n")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    pipeline = ContextualIntentPipeline(
+        project=PROJECT_ID,
+        location=LOCATION,
+        model=MODEL_VERSION
+    )
+    
+    test_queries = [
+        "Patient with DM and HTN",
+        "SOB on exertion",
+        "Metformin 500mg twice daily"
+    ]
+    
+    print(f"\nClinical Intent Extraction Pipeline")
+    print(f"Testing consistent outputs across formats\n")
+    
+    for idx, query in enumerate(test_queries, 1):
+        print(f"\n{'='*80}")
+        print(f"Query {idx}/{len(test_queries)}: {query}")
+        print('='*80)
+        
+        # Extract once, format multiple times
+        test_pipeline_consistency(pipeline, query)
+    
+    print(f"\n{'='*80}")
+    print("Testing complete")
+    print('='*80)
