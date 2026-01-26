@@ -1,13 +1,36 @@
+"""
+Clinical Intent Extraction Pipeline
+Author: Satish Kumar
+Last Updated: 2025-01-26
+
+Purpose: Extract clinical intents from medical queries for document retrieval
+Three output formats: summary, queries, breakdown
+"""
+
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Literal, Tuple
 from google.cloud import aiplatform
-from vertexai.generative_models import GenerativeModel
+from vertexai.generative_models import GenerativeModel, GenerationConfig
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-QUERY_EXPANSION_PROMPT = """
-You are an expert medical AI assistant specializing in clinical query expansion.
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+API_VERSION = "v1.2.0"
+MODEL_VERSION = "gemini-1.5-flash-002"
+PROJECT_ID = "your-project-id"  # Update this
+LOCATION = "us-central1"
+
+
+# =============================================================================
+# PROMPTS
+# =============================================================================
+
+QUERY_EXPANSION_PROMPT = """You are an expert medical AI assistant specializing in clinical query expansion.
 
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
 
@@ -20,7 +43,7 @@ INSTRUCTIONS:
 6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
 7. DO NOT hallucinate information not implied by the query
 8. Maintain the original query's intent and scope
-9.Make sure the Temporal accept is relevant to the Query context
+9. Make sure the temporal aspect is relevant to the query context
 
 EXAMPLES:
 - "Pt with DM" → "Patient with Diabetes Mellitus"
@@ -28,24 +51,18 @@ EXAMPLES:
 - "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
 - "SOB on exertion" → "Shortness of breath on exertion"
 
-Return ONLY valid JSON (no markdown, no explanation):
-{{
-  "expanded_query": "comprehensive expanded clinical description",
-  "abbreviations_expanded": ["list of abbreviations that were expanded"] 
-}}
-
 User Input: {query}
 """
 
-INTENT_EXTRACTION_PROMPT = """
-You are a clinical intent extraction engine for medical document retrieval.
+
+INTENT_EXTRACTION_PROMPT = """You are a clinical intent extraction engine for medical document retrieval.
 
 ====================================================
 CLINICAL VALIDATION
 ====================================================
 
 Return this ONLY if query is non-clinical:
-{{"is_clinical": false, "reason": "Query is not clinical in nature", "intents": []}}
+{{"is_clinical": false, "reason": "Query is not clinical in nature", "original_query": "{original_query}", "expanded_query": "{expanded_query}", "total_intents_detected": 0, "intents": []}}
 
 ====================================================
 CORE PRINCIPLES
@@ -135,6 +152,8 @@ If multiple pieces of information answer the same type of question, group them i
 FINAL_QUERIES: ATOMIC SPECIFICITY
 ====================================================
 
+**CRITICAL WORD COUNT RULE: 2-6 words per query (absolute maximum 8 words)**
+
 **Purpose:**
 Generate concise, atomic-level queries that map to precise clinical concepts without generating excessive CUIs.
 
@@ -142,9 +161,9 @@ Generate concise, atomic-level queries that map to precise clinical concepts wit
 Long verbose queries generate too many CUIs. Short atomic queries target specific concepts.
 
 Consider the difference:
--  "metformin 500mg twice daily for diabetes management" → generates 10+ CUIs, which is not required
-- ✓ "metformin 500mg" → generates 2-3 focused CUIs
-- ✓ "twice daily dosing" → generates 1-2 CUIs
+- ❌ "metformin 500mg twice daily for diabetes management" (10 words → 15+ CUIs)
+- ✓ "metformin 500mg" (2 words → 2-3 CUIs)
+- ✓ "twice daily dosing" (3 words → 1-2 CUIs)
 
 **Atomic Query Principle:**
 Each query should represent ONE atomic clinical concept or a tight pairing of inseparable concepts.
@@ -166,7 +185,9 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 - Will this generate a focused set of CUIs?
 
 **Query Characteristics:**
-- 2-4 words maximum
+- **TARGET: 2-4 words** (optimal for CUI mapping)
+- **ACCEPTABLE: 5-6 words** (if clinically necessary)
+- **HARD LIMIT: 8 words** (will fail validation)
 - One clinical concept per query
 - Include only essential modifiers
 - Use standard medical terminology
@@ -208,256 +229,515 @@ On Utility:
 - Do the queries cover all the important atomic_concepts?
 
 ====================================================
-OUTPUT FORMAT
+INPUT
 ====================================================
 
-{{
-  "is_clinical": true,
-  "reason": "",
-  "original_query": "{original_query}",
-  "expanded_query": "{expanded_query}",
-  "total_intents_detected": <number>,
-  "intents": [
-    {{
-      "intent_title": "<string>",
-      "description": "<string>",
-      "nature": "<string>",
-      "sub_natures": [
-        {{
-          "category_path": "<Broad >> Specific >> Detail>",
-          "atomic_concepts": ["<concept1>", "<concept2>"]
-        }}
-      ],
-      "final_queries": ["<query1>", "<query2>", "<query3>", "..."]
-    }}
-  ]
-}}
-
-User Input: {expanded_query}
+Original Query: {original_query}
+Expanded Query: {expanded_query}
 Timestamp: {timestamp}
 """
-# Pipeline
 
 
-class ContextualIntentPipeline:    
-    def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = MODEL_VERSION):
+# =============================================================================
+# PYDANTIC SCHEMAS
+# =============================================================================
 
-        aiplatform.init(project=project, location=location)
-        self.model = GenerativeModel(model)        
-        
-    def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096) -> str:
+class QueryExpansionOutput(BaseModel):
+    """
+    ✅ FIXED: Using default_factory to avoid mutable default
+    """
+    expanded_query: str
+    abbreviations_expanded: List[str] = Field(default_factory=list)
 
-        try:
-            # Reset session to avoid context carryover
-            if hasattr(self.model, "session") and self.model.session is not None:
-                self.model.session.reset()
-            
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.0,
-                    "max_output_tokens": max_tokens,
-                    "top_p": 1.0,
-                    "top_k": 1,
-                    "seed":34
-                }
-            )
-            return response.text.strip()
-        except Exception as e:
-            print(f"Error calling model: {str(e)}")
-            return "{}"
+
+class SubNature(BaseModel):
+    category_path: str
+    atomic_concepts: List[str]
     
-    def _safe_json(self, text: str) -> Dict[str, Any]:
+    @field_validator('category_path')
+    @classmethod
+    def normalize_separator(cls, v: str) -> str:
+        # Accept various separator styles and normalize to >>
+        normalized = re.sub(r'\s*(?:>>|>|->|→|/)\s*', ' >> ', v)
+        if '>>' not in normalized:
+            return v
+        return normalized.strip()
 
-        # Remove markdown code blocks if present
+
+class Intent(BaseModel):
+    intent_title: str
+    description: str
+    nature: str
+    sub_natures: List[SubNature]
+    final_queries: List[str]
+    
+    @field_validator('final_queries')
+    @classmethod
+    def check_query_length(cls, v: List[str]) -> List[str]:
+        """
+        ✅ FIXED: Now validates both optimal range and hard limit
+        - Optimal: 2-6 words (warning)
+        - Hard limit: 8 words (error)
+        """
+        for query in v:
+            words = query.split()
+            word_count = len(words)
+            
+            # Hard limit enforcement
+            if word_count > 8:
+                raise ValueError(
+                    f"Query exceeds 8-word limit: '{query}' ({word_count} words). "
+                    f"Must be 2-6 words for optimal CUI mapping."
+                )
+            
+            # Optimal range warning (1 word or 7-8 words)
+            if word_count < 2:
+                print(f"⚠️  Query too short: '{query}' ({word_count} word). Recommend 2-6 words.")
+            elif word_count > 6:
+                print(f"⚠️  Query longer than optimal: '{query}' ({word_count} words). Recommend 2-6 words.")
+        
+        return v
+
+
+class IntentWithoutQueries(BaseModel):
+    """
+    ✅ FIXED: Added comprehensive docstring
+    
+    Intent schema WITHOUT final_queries field.
+    
+    Used in Format 3 (breakdown) output to provide full intent analysis
+    with sub_natures while excluding the atomic queries. This separation
+    allows downstream consumers to:
+    1. Understand intent decomposition without query implementation details
+    2. Use Format 2 (queries) separately for CUI mapping
+    3. Avoid duplication when both breakdown and queries are needed
+    
+    The final_queries are intentionally excluded from this schema because:
+    - Format 2 provides them in a flat, ready-to-use structure
+    - Format 3 focuses on conceptual breakdown via sub_natures
+    - Prevents confusion about which format to use for CUI extraction
+    """
+    intent_title: str
+    description: str
+    nature: str
+    sub_natures: List[SubNature]
+
+
+class IntentExtractionOutput(BaseModel):
+    """
+    ✅ FIXED: Using default_factory for intents list
+    """
+    is_clinical: bool
+    reason: Optional[str] = None
+    original_query: str
+    expanded_query: str
+    total_intents_detected: int
+    intents: List[Intent] = Field(default_factory=list)
+    
+    @model_validator(mode='after')
+    def fix_intent_count(self) -> 'IntentExtractionOutput':
+        # LLM sometimes gives wrong count
+        actual = len(self.intents)
+        if self.total_intents_detected != actual:
+            self.total_intents_detected = actual
+        return self
+
+
+# Output schemas
+class IntentSummaryItem(BaseModel):
+    intent_title: str
+    description: str
+
+
+class Format1_IntentSummary(BaseModel):
+    api_version: str = API_VERSION
+    user_query: str
+    intents: List[IntentSummaryItem]
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    timestamp: str
+
+
+class Format2_FinalQueries(BaseModel):
+    api_version: str = API_VERSION
+    user_query: str
+    final_queries: List[str]
+    total_queries: int
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    timestamp: str
+
+
+class Format3_IntentBreakdown(BaseModel):
+    api_version: str = API_VERSION
+    is_clinical: bool
+    reason: Optional[str] = None
+    original_query: str
+    expanded_query: str
+    total_intents_detected: int
+    intents: List[IntentWithoutQueries]
+    timestamp: str
+
+
+# =============================================================================
+# PIPELINE CLASS
+# =============================================================================
+
+class ContextualIntentPipeline:
+    
+    def __init__(self, project: str, location: str = LOCATION, model: str = MODEL_VERSION):
+        aiplatform.init(project=project, location=location)
+        self.model = GenerativeModel(model)
+        self.api_version = API_VERSION
+        self.model_version = model
+        
+    def _extract_json(self, response) -> Dict[str, Any]:
+        """
+        ✅ FIXED: Using non-greedy regex to prevent over-matching
+        
+        Extract JSON from various response formats
+        """
+        # Try direct JSON method
+        if hasattr(response, 'json'):
+            try:
+                return response.json()
+            except:
+                pass
+        
+        # Get text and strip markdown
+        text = response.text if hasattr(response, 'text') else str(response)
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
         text = text.strip()
         
+        # Try direct parse
         try:
             return json.loads(text)
-        except json.JSONDecodeError:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
+        except:
+            pass
+        
+        # ✅ FIXED: Non-greedy regex (.*? instead of .*)
+        # Extract from surrounding text - try longest valid JSON first
+        json_patterns = [
+            (r'\{.*?\}', re.DOTALL),  # Non-greedy object match
+            (r'\[.*?\]', re.DOTALL),  # Non-greedy array match
+        ]
+        
+        for pattern, flags in json_patterns:
+            # Find all matches and try longest first
+            matches = list(re.finditer(pattern, text, flags))
+            matches.sort(key=lambda m: len(m.group(0)), reverse=True)
+            
+            for match in matches:
                 try:
                     return json.loads(match.group(0))
                 except:
-                    pass
+                    continue
+        
+        raise ValueError(f"Could not parse JSON from response: {text[:500]}...")
+    
+    def _call_model(self, prompt: str, response_schema: type[BaseModel],
+                    context_query: str = "") -> BaseModel:
+        """
+        ✅ FIXED: Fallback expanded_query now returns original query
+        
+        Call model with schema enforcement
+        """
+        try:
+            config = GenerationConfig(
+                temperature=0.0,
+                max_output_tokens=8096,
+                response_mime_type="application/json",
+                response_schema=response_schema.model_json_schema()
+            )
             
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    pass
+            response = self.model.generate_content(prompt, generation_config=config)
+            data = self._extract_json(response)
+            return response_schema.model_validate(data)
             
-            print(f"Failed to parse JSON from response: {text[:200]}")
-            return {}
+        except Exception as e:
+            print(f"Model error: {e}")
+            
+            # ✅ FIXED: Semantically correct fallbacks
+            if response_schema == QueryExpansionOutput:
+                # Return original query as expanded_query (no expansion possible)
+                return QueryExpansionOutput(
+                    expanded_query=context_query if context_query else "",
+                    abbreviations_expanded=[]
+                )
+            else:
+                # Return structured error for intent extraction
+                return IntentExtractionOutput(
+                    is_clinical=False,
+                    reason=f"Processing error: {str(e)}",
+                    original_query=context_query if context_query else "",
+                    expanded_query=context_query if context_query else "",
+                    total_intents_detected=0,
+                    intents=[]
+                )
     
-    def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
-
-        return all(key in data for key in required_keys)
-    
-    # STEP 1: Query Expansion
-    
-    def expand_query(self, query: str) -> Dict[str, Any]:
-
+    # Step 1: Query Expansion
+    def expand_query(self, query: str) -> QueryExpansionOutput:
+        """Expand abbreviations and add clinical context"""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        raw_response = self._call_model(prompt)
-        data = self._safe_json(raw_response)
-        
-        if not self._validate_json_structure(data, ["expanded_query"]):
-            # Fallback to original query if expansion fails
-            return {
-                "expanded_query": query,
-                "abbreviations_expanded": [],
-                # "concepts_added": []
-            }
-        
-        return {
-            "expanded_query": data.get("expanded_query", query),
-            "abbreviations_expanded": data.get("abbreviations_expanded", []),
-            # "concepts_added": data.get("concepts_added", [])
-        }
+        return self._call_model(prompt, QueryExpansionOutput, query)
     
-    # STEP 2: Intent Extraction
-    
-    def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-
+    # Step 2: Intent Extraction
+    def extract_intents(self, original_query: str, expanded_query: str) -> IntentExtractionOutput:
+        """Extract clinical intents with sub-natures"""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
             timestamp=datetime.utcnow().isoformat()
         )
+        return self._call_model(prompt, IntentExtractionOutput, original_query)
+    
+    # Output formatters
+    def _format_summary(self, query: str, result: IntentExtractionOutput) -> Format1_IntentSummary:
+        """Format 1: Simple summary"""
+        items = [
+            IntentSummaryItem(
+                intent_title=i.intent_title,
+                description=i.description
+            ) for i in result.intents
+        ]
+        return Format1_IntentSummary(
+            user_query=query,
+            intents=items,
+            is_clinical=result.is_clinical,
+            rejected_reason=result.reason,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    def _format_queries(self, query: str, result: IntentExtractionOutput) -> Format2_FinalQueries:
+        """Format 2: Queries for CUI mapping"""
+        queries = [q for intent in result.intents for q in intent.final_queries]
+        return Format2_FinalQueries(
+            user_query=query,
+            final_queries=queries,
+            total_queries=len(queries),
+            is_clinical=result.is_clinical,
+            rejected_reason=result.reason,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    def _format_breakdown(self, query: str, expansion: QueryExpansionOutput,
+                         result: IntentExtractionOutput) -> Format3_IntentBreakdown:
+        """Format 3: Full breakdown with sub-natures"""
+        intents_no_queries = [
+            IntentWithoutQueries(
+                intent_title=i.intent_title,
+                description=i.description,
+                nature=i.nature,
+                sub_natures=i.sub_natures
+            ) for i in result.intents
+        ]
+        return Format3_IntentBreakdown(
+            is_clinical=result.is_clinical,
+            reason=result.reason,
+            original_query=result.original_query,
+            expanded_query=result.expanded_query,
+            total_intents_detected=result.total_intents_detected,
+            intents=intents_no_queries,
+            timestamp=datetime.utcnow().isoformat()
+        )
+    
+    # Main pipeline
+    def run(self, query: str,
+            output_format: Literal["summary", "queries", "breakdown"] = "breakdown",
+            verbose: bool = False) -> Dict[str, Any]:
+        """
+        Execute the complete pipeline
         
-        # Use higher token limit for complex queries
-        raw_response = self._call_model(prompt, max_tokens=8096)
-        data = self._safe_json(raw_response)
+        Args:
+            query: User input
+            output_format: "summary", "queries", or "breakdown"
+            verbose: Print debug info
         
-        # Check if query was rejected as non-clinical
-        if not data.get("is_clinical", True):
+        Returns:
+            Dict with formatted output
+        """
+        # Input validation
+        if not query or not query.strip():
             return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "is_clinical": False,
-                "rejected_reason": data.get("reason", "Query is not clinical"),
-                "original_query": original_query,
-                "expanded_query": expanded_query
+                "api_version": self.api_version,
+                "error": "Empty query",
+                "timestamp": datetime.utcnow().isoformat()
             }
         
-        if not self._validate_json_structure(data, ["intents"]):
-            return {
-                "intents": [],
-                "total_intents_detected": 0,
-                "error": "Failed to extract intents"
-            }
-        
-        # Validate that all intents have final_queries
-        intents = data.get("intents", [])
-        validated_intents = []
-        
-        for idx, intent in enumerate(intents):
-            if "final_queries" not in intent or not intent["final_queries"]:
-                print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
-                continue
-            
-            # No minimum requirement - let LLM decide based on complexity
-            validated_intents.append(intent)
-        
-        return {
-            "intents": validated_intents,
-            "total_intents_detected": data.get("total_intents_detected", len(validated_intents)),
-            "is_clinical": True,
-            "original_query": data.get("original_query", original_query),
-            "expanded_query": data.get("expanded_query", expanded_query)
-        }    
-          
-    
-    # Pipeline exec
-    
-    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
-
         start_time = datetime.utcnow()
         
         if verbose:
-            print(f"Original Query: {query}")
+            print(f"\n{'='*80}")
+            print(f"Query: {query}")
+            print(f"Format: {output_format}")
+            print(f"{'='*80}\n")
         
-        # Step 1: Query Expansion
-        expansion_result = self.expand_query(query)
-        expanded_query = expansion_result["expanded_query"]
-        
-        if verbose:
-            print(f"Expanded Query: {expanded_query}")
-        
-        # Step 2: Intent Extraction
-        intent_result = self.extract_intents(query, expanded_query)
-        
-       
-        if not intent_result.get("is_clinical", True):
+        try:
+            # Step 1: Expand query
+            expansion = self.expand_query(query)
+            
+            if verbose:
+                print(f"Expanded: {expansion.expanded_query}")
+                if expansion.abbreviations_expanded:
+                    print(f"Abbreviations: {', '.join(expansion.abbreviations_expanded)}")
+                print()
+            
+            # Step 2: Extract intents
+            intents = self.extract_intents(query, expansion.expanded_query)
+            
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             
             if verbose:
-                print(f"Status: NON-CLINICAL (rejected)")
-                print(f"Processing Time: {processing_time:.2f}s\n")
+                print(f"Intents detected: {intents.total_intents_detected}")
+                print(f"Is clinical: {intents.is_clinical}")
+                if not intents.is_clinical:
+                    print(f"Reason: {intents.reason}")
+                else:
+                    total_queries = sum(len(i.final_queries) for i in intents.intents)
+                    total_sub_natures = sum(len(i.sub_natures) for i in intents.intents)
+                    print(f"Sub-natures: {total_sub_natures}")
+                    print(f"Final queries: {total_queries}")
+                print(f"Processing time: {processing_time:.2f}s\n")
             
+            # Step 3: Format output
+            if output_format == "summary":
+                output = self._format_summary(query, intents)
+            elif output_format == "queries":
+                output = self._format_queries(query, intents)
+            else:
+                output = self._format_breakdown(query, expansion, intents)
+            
+            return output.model_dump()
+            
+        except Exception as e:
+            if verbose:
+                print(f"Error: {e}\n")
             return {
-                "original_query": query,
-                "expanded_query": expanded_query,
-                "intents": [],
-                "is_clinical": False,
-                "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
-                "timestamp": datetime.utcnow().isoformat(),
-                "processing_time_seconds": processing_time
+                "api_version": self.api_version,
+                "error": str(e),
+                "query": query,
+                "timestamp": datetime.utcnow().isoformat()
             }
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
+
+def save_json(data: Dict, filename: str):
+    """Save output to JSON file"""
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"Saved: {filename}")
+
+
+def print_results(result: Dict):
+    """Pretty print results"""
+    print(json.dumps(result, indent=2))
+
+
+def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:
+    """
+    ✅ FIXED: Returns tuple instead of printing
+    
+    Validate output matches schema
+    
+    Args:
+        result: Output dictionary to validate
+        format_type: One of "summary", "queries", "breakdown"
+    
+    Returns:
+        Tuple of (is_valid, error_message)
+        - (True, None) if valid
+        - (False, error_message) if invalid
+    """
+    try:
+        if format_type == "summary":
+            Format1_IntentSummary.model_validate(result)
+        elif format_type == "queries":
+            Format2_FinalQueries.model_validate(result)
+        elif format_type == "breakdown":
+            Format3_IntentBreakdown.model_validate(result)
+        else:
+            return False, f"Unknown format type: {format_type}"
         
-        intents = intent_result.get("intents", [])        
+        return True, None
         
-        # Calculate statistics
-        total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
-        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
+    except Exception as e:
+        return False, str(e)
+
+
+def test_pipeline(pipeline, query: str):
+    """Test all three formats"""
+    print(f"\n{'='*80}")
+    print(f"Testing: {query}")
+    print('='*80)
+    
+    for fmt in ["summary", "queries", "breakdown"]:
+        print(f"\n{fmt.upper()}:")
+        result = pipeline.run(query, output_format=fmt)
         
-        if verbose:
-            print(f"Status: Clinical")
-            print(f"Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
-            print(f"Processing Time: {processing_time:.2f}s\n")
+        # Show snippet
+        if fmt == "summary":
+            print(f"  Intents: {len(result.get('intents', []))}")
+        elif fmt == "queries":
+            print(f"  Total queries: {result.get('total_queries', 0)}")
+        else:
+            print(f"  Intents detected: {result.get('total_intents_detected', 0)}")
         
-        return {
-            "original_query": query,
-            # "expanded_query": expanded_query,
-            # "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            # "concepts_added": expansion_result.get("concepts_added", []),
-            "is_clinical": True,
-            "intents": intents,            
-            # "timestamp": datetime.utcnow().isoformat(),
-            "processing_time_seconds": processing_time
-            }
+        # Validate (now returns tuple)
+        is_valid, error_msg = validate_schema(result, fmt)
+        if is_valid:
+            print(f"  ✓ Schema valid")
+        else:
+            print(f"  ✗ Schema invalid: {error_msg}")
         
+        # Save
+        save_json(result, f"output_{fmt}.json")
+    
+    print(f"\n{'='*80}\n")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
 
 if __name__ == "__main__":
-    PROJECT_ID = PROJECT_ID    
+    # Initialize
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID,
-        location="us-central1",
+        location=LOCATION,
         model=MODEL_VERSION
-
     )
     
-# Test queries
+    # Test queries
     test_queries = [
-       "Patient with DM", "SOB on exertion"
+        "Patient with DM and HTN",
+        "SOB on exertion",
+        "Metformin 500mg twice daily"
     ]
+    
+    print(f"\nClinical Intent Extraction Pipeline - API {API_VERSION}")
+    print(f"Model: {MODEL_VERSION}\n")
     
     for idx, query in enumerate(test_queries, 1):
         print(f"\n{'='*80}")
-        print(f"Query {idx}/{len(test_queries)}")
-        print(f"{'='*80}")
+        print(f"Query {idx}/{len(test_queries)}: {query}")
+        print('='*80)
         
-        result = pipeline.run(query, verbose=True)
-        
-        output_filename = f"query_result_{idx}.json"
-        with open(output_filename, 'w') as f:
-            json.dump(result, f, indent=2)
-        
-        print(f"Saved to: {output_filename}")
+        # Test all formats
+        for fmt in ["summary", "queries", "breakdown"]:
+            result = pipeline.run(query, output_format=fmt, verbose=(fmt == "breakdown"))
+            filename = f"query_{idx}_{fmt}.json"
+            save_json(result, filename)
+            
+            is_valid, error_msg = validate_schema(result, fmt)
+            if is_valid:
+                print(f"✓ {fmt} format validated")
+            else:
+                print(f"✗ {fmt} format validation failed: {error_msg}")
+    
+    print(f"\n{'='*80}")
+    print("Testing complete")
+    print('='*80)
