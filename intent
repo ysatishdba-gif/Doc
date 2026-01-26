@@ -6,7 +6,7 @@ Last Updated: 2025-01-26
 Purpose: Extract clinical intents from medical queries for document retrieval
 Three output formats: summary, queries, breakdown
 
-Uses Google Gen AI SDK (google-genai) with Vertex AI backend for production
+FIXED: Now extracts intents ONCE and formats them consistently across all outputs
 """
 
 import json
@@ -267,6 +267,91 @@ class Format3_IntentBreakdown(BaseModel):
 
 
 # =============================================================================
+# EXTRACTION RESULT CLASS
+# =============================================================================
+
+class ExtractionResult:
+    """
+    Container for extraction results that can be formatted in multiple ways.
+    
+    This ensures consistency across all output formats by extracting once
+    and formatting the same data multiple times.
+    """
+    def __init__(self, 
+                 original_query: str,
+                 expansion: QueryExpansionOutput,
+                 intents: IntentExtractionOutput,
+                 processing_time: float):
+        self.original_query = original_query
+        self.expansion = expansion
+        self.intents = intents
+        self.processing_time = processing_time
+        self.timestamp = datetime.utcnow().isoformat()
+    
+    def to_summary(self) -> Dict[str, Any]:
+        """Format 1: Simple summary"""
+        items = [
+            IntentSummaryItem(
+                intent_title=i.intent_title,
+                description=i.description
+            ) for i in self.intents.intents
+        ]
+        
+        result = Format1_IntentSummary(
+            user_query=self.original_query,
+            intents=items,
+            is_clinical=self.intents.is_clinical,
+            rejected_reason=self.intents.reason,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_queries(self) -> Dict[str, Any]:
+        """Format 2: Queries for CUI mapping"""
+        queries = [q for intent in self.intents.intents for q in intent.final_queries]
+        
+        result = Format2_FinalQueries(
+            user_query=self.original_query,
+            final_queries=queries,
+            total_queries=len(queries),
+            is_clinical=self.intents.is_clinical,
+            rejected_reason=self.intents.reason,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_breakdown(self) -> Dict[str, Any]:
+        """Format 3: Full breakdown with sub-natures"""
+        intents_no_queries = [
+            IntentWithoutQueries(
+                intent_title=i.intent_title,
+                description=i.description,
+                nature=i.nature,
+                sub_natures=i.sub_natures
+            ) for i in self.intents.intents
+        ]
+        
+        result = Format3_IntentBreakdown(
+            is_clinical=self.intents.is_clinical,
+            reason=self.intents.reason,
+            original_query=self.intents.original_query,
+            expanded_query=self.intents.expanded_query,
+            total_intents_detected=self.intents.total_intents_detected,
+            intents=intents_no_queries,
+            timestamp=self.timestamp
+        )
+        return result.model_dump()
+    
+    def to_all_formats(self) -> Dict[str, Dict[str, Any]]:
+        """Get all three formats from single extraction"""
+        return {
+            "summary": self.to_summary(),
+            "queries": self.to_queries(),
+            "breakdown": self.to_breakdown()
+        }
+
+
+# =============================================================================
 # PIPELINE CLASS
 # =============================================================================
 
@@ -279,7 +364,6 @@ class ContextualIntentPipeline:
         This uses the production-ready Vertex AI infrastructure with project/location support.
         Requires: gcloud auth application-default login
         """
-        # Initialize Gen AI client with Vertex AI backend
         self.client = genai.Client(
             vertexai=True,
             project=project,
@@ -297,7 +381,6 @@ class ContextualIntentPipeline:
         
     def _extract_json(self, response) -> Dict[str, Any]:
         """Extract JSON from response text"""
-        # Get text from response
         if hasattr(response, 'text'):
             text = response.text
         elif hasattr(response, 'candidates') and response.candidates:
@@ -305,18 +388,15 @@ class ContextualIntentPipeline:
         else:
             text = str(response)
         
-        # Strip markdown code blocks
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
         text = text.strip()
         
-        # Try direct parse
         try:
             return json.loads(text)
         except:
             pass
         
-        # Non-greedy regex extraction
         json_patterns = [
             (r'\{.*?\}', re.DOTALL),
             (r'\[.*?\]', re.DOTALL),
@@ -338,7 +418,6 @@ class ContextualIntentPipeline:
                     context_query: str = "") -> BaseModel:
         """Call model with JSON schema enforcement"""
         try:
-            # Configure generation
             config = types.GenerateContentConfig(
                 temperature=0.0,
                 max_output_tokens=8096,
@@ -346,7 +425,6 @@ class ContextualIntentPipeline:
                 response_schema=response_schema
             )
             
-            # Generate content
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
@@ -388,120 +466,91 @@ class ContextualIntentPipeline:
         )
         return self._call_model(prompt, IntentExtractionOutput, original_query)
     
-    def _format_summary(self, query: str, result: IntentExtractionOutput) -> Format1_IntentSummary:
-        """Format 1: Simple summary"""
-        items = [
-            IntentSummaryItem(
-                intent_title=i.intent_title,
-                description=i.description
-            ) for i in result.intents
-        ]
-        return Format1_IntentSummary(
-            user_query=query,
-            intents=items,
-            is_clinical=result.is_clinical,
-            rejected_reason=result.reason,
-            timestamp=datetime.utcnow().isoformat()
-        )
-    
-    def _format_queries(self, query: str, result: IntentExtractionOutput) -> Format2_FinalQueries:
-        """Format 2: Queries for CUI mapping"""
-        queries = [q for intent in result.intents for q in intent.final_queries]
-        return Format2_FinalQueries(
-            user_query=query,
-            final_queries=queries,
-            total_queries=len(queries),
-            is_clinical=result.is_clinical,
-            rejected_reason=result.reason,
-            timestamp=datetime.utcnow().isoformat()
-        )
-    
-    def _format_breakdown(self, query: str, expansion: QueryExpansionOutput,
-                         result: IntentExtractionOutput) -> Format3_IntentBreakdown:
-        """Format 3: Full breakdown with sub-natures"""
-        intents_no_queries = [
-            IntentWithoutQueries(
-                intent_title=i.intent_title,
-                description=i.description,
-                nature=i.nature,
-                sub_natures=i.sub_natures
-            ) for i in result.intents
-        ]
-        return Format3_IntentBreakdown(
-            is_clinical=result.is_clinical,
-            reason=result.reason,
-            original_query=result.original_query,
-            expanded_query=result.expanded_query,
-            total_intents_detected=result.total_intents_detected,
-            intents=intents_no_queries,
-            timestamp=datetime.utcnow().isoformat()
-        )
-    
-    def run(self, query: str,
-            output_format: Literal["summary", "queries", "breakdown"] = "breakdown",
-            verbose: bool = False) -> Dict[str, Any]:
+    def extract(self, query: str, verbose: bool = False) -> ExtractionResult:
         """
-        Execute the complete pipeline
+        Extract intents ONCE and return a result object that can be formatted multiple ways.
+        
+        This is the core method that should be used for production.
+        It ensures consistency across all output formats.
         
         Args:
             query: User input
-            output_format: "summary", "queries", or "breakdown"
             verbose: Print debug info
-        
+            
         Returns:
-            Dict with formatted output
+            ExtractionResult object that can be formatted as summary/queries/breakdown
         """
         if not query or not query.strip():
-            return {
-                "error": "Empty query",
-                "timestamp": datetime.utcnow().isoformat()
-            }
+            raise ValueError("Empty query provided")
         
         start_time = datetime.utcnow()
         
         if verbose:
             print(f"\n{'='*80}")
-            print(f"Query: {query}")
-            print(f"Format: {output_format}")
+            print(f"Extracting intents for: {query}")
             print(f"{'='*80}\n")
         
-        try:
-            # Step 1: Expand query
-            expansion = self.expand_query(query)
-            
-            if verbose:
-                print(f"Expanded: {expansion.expanded_query}")
-                if expansion.abbreviations_expanded:
-                    print(f"Abbreviations: {', '.join(expansion.abbreviations_expanded)}")
-                print()
-            
-            # Step 2: Extract intents
-            intents = self.extract_intents(query, expansion.expanded_query)
-            
-            processing_time = (datetime.utcnow() - start_time).total_seconds()
-            
-            if verbose:
-                print(f"Intents detected: {intents.total_intents_detected}")
-                print(f"Is clinical: {intents.is_clinical}")
-                if not intents.is_clinical:
-                    print(f"Reason: {intents.reason}")
-                else:
-                    total_queries = sum(len(i.final_queries) for i in intents.intents)
-                    total_sub_natures = sum(len(i.sub_natures) for i in intents.intents)
-                    print(f"Sub-natures: {total_sub_natures}")
-                    print(f"Final queries: {total_queries}")
-                print(f"Processing time: {processing_time:.2f}s\n")
-            
-            # Step 3: Format output
-            if output_format == "summary":
-                output = self._format_summary(query, intents)
-            elif output_format == "queries":
-                output = self._format_queries(query, intents)
+        # Step 1: Expand query
+        expansion = self.expand_query(query)
+        
+        if verbose:
+            print(f"Expanded: {expansion.expanded_query}")
+            if expansion.abbreviations_expanded:
+                print(f"Abbreviations: {', '.join(expansion.abbreviations_expanded)}")
+            print()
+        
+        # Step 2: Extract intents
+        intents = self.extract_intents(query, expansion.expanded_query)
+        
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        if verbose:
+            print(f"Intents detected: {intents.total_intents_detected}")
+            print(f"Is clinical: {intents.is_clinical}")
+            if not intents.is_clinical:
+                print(f"Reason: {intents.reason}")
             else:
-                output = self._format_breakdown(query, expansion, intents)
+                total_queries = sum(len(i.final_queries) for i in intents.intents)
+                total_sub_natures = sum(len(i.sub_natures) for i in intents.intents)
+                print(f"Sub-natures: {total_sub_natures}")
+                print(f"Final queries: {total_queries}")
+            print(f"Processing time: {processing_time:.2f}s\n")
+        
+        return ExtractionResult(query, expansion, intents, processing_time)
+    
+    def run(self, query: str,
+            output_format: Literal["summary", "queries", "breakdown"] = "breakdown",
+            verbose: bool = False) -> Dict[str, Any]:
+        """
+        Execute pipeline and return single format.
+        
+        Note: For production, consider using extract() + to_*() methods instead
+        to avoid re-extraction when you need multiple formats.
+        
+        Args:
+            query: User input
+            output_format: "summary", "queries", or "breakdown"
+            verbose: Print debug info
             
-            return output.model_dump()
+        Returns:
+            Dict with formatted output
+        """
+        try:
+            result = self.extract(query, verbose)
             
+            if output_format == "summary":
+                return result.to_summary()
+            elif output_format == "queries":
+                return result.to_queries()
+            else:
+                return result.to_breakdown()
+                
+        except ValueError as e:
+            return {
+                "error": str(e),
+                "query": query,
+                "timestamp": datetime.utcnow().isoformat()
+            }
         except Exception as e:
             if verbose:
                 print(f"Error: {e}\n")
@@ -546,32 +595,49 @@ def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]
         return False, str(e)
 
 
-def test_pipeline(pipeline, query: str):
-    """Test all three formats"""
+def test_pipeline_consistency(pipeline, query: str):
+    """
+    Test that all three formats are consistent (derived from same extraction).
+    This is the recommended way to generate multiple formats in production.
+    """
     print(f"\n{'='*80}")
-    print(f"Testing: {query}")
+    print(f"Testing consistency for: {query}")
     print('='*80)
     
-    for fmt in ["summary", "queries", "breakdown"]:
-        print(f"\n{fmt.upper()}:")
-        result = pipeline.run(query, output_format=fmt)
-        
-        if fmt == "summary":
-            print(f"  Intents: {len(result.get('intents', []))}")
-        elif fmt == "queries":
-            print(f"  Total queries: {result.get('total_queries', 0)}")
-        else:
-            print(f"  Intents detected: {result.get('total_intents_detected', 0)}")
-        
-        is_valid, error_msg = validate_schema(result, fmt)
-        if is_valid:
-            print(f"  ✓ Schema valid")
-        else:
-            print(f"  ✗ Schema invalid: {error_msg}")
-        
-        save_json(result, f"output_{fmt}.json")
+    # Extract ONCE
+    result = pipeline.extract(query, verbose=True)
     
-    print(f"\n{'='*80}\n")
+    # Generate all three formats from the SAME extraction
+    all_formats = result.to_all_formats()
+    
+    # Save and validate each format
+    for fmt, data in all_formats.items():
+        filename = f"output_{fmt}.json"
+        save_json(data, filename)
+        
+        is_valid, error_msg = validate_schema(data, fmt)
+        if is_valid:
+            print(f"✓ {fmt} format validated")
+        else:
+            print(f"✗ {fmt} format validation failed: {error_msg}")
+        
+        # Show snippet
+        if fmt == "summary":
+            print(f"  Intents: {len(data.get('intents', []))}")
+            if data.get('intents'):
+                print(f"  First intent: {data['intents'][0]['intent_title']}")
+        elif fmt == "queries":
+            print(f"  Total queries: {data.get('total_queries', 0)}")
+            if data.get('final_queries'):
+                print(f"  First query: {data['final_queries'][0]}")
+        else:
+            print(f"  Intents detected: {data.get('total_intents_detected', 0)}")
+            if data.get('intents'):
+                print(f"  First intent: {data['intents'][0]['intent_title']}")
+    
+    print(f"\n{'='*80}")
+    print("✓ All formats generated from SINGLE extraction - guaranteed consistency")
+    print(f"{'='*80}\n")
 
 
 # =============================================================================
@@ -579,7 +645,6 @@ def test_pipeline(pipeline, query: str):
 # =============================================================================
 
 if __name__ == "__main__":
-    # Initialize pipeline with project and location
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID,
         location=LOCATION,
@@ -592,24 +657,17 @@ if __name__ == "__main__":
         "Metformin 500mg twice daily"
     ]
     
-    print(f"\nClinical Intent Extraction Pipeline\n")
+    print(f"\nClinical Intent Extraction Pipeline")
+    print(f"Testing CONSISTENT output across formats\n")
     
     for idx, query in enumerate(test_queries, 1):
         print(f"\n{'='*80}")
         print(f"Query {idx}/{len(test_queries)}: {query}")
         print('='*80)
         
-        for fmt in ["summary", "queries", "breakdown"]:
-            result = pipeline.run(query, output_format=fmt, verbose=(fmt == "breakdown"))
-            filename = f"query_{idx}_{fmt}.json"
-            save_json(result, filename)
-            
-            is_valid, error_msg = validate_schema(result, fmt)
-            if is_valid:
-                print(f"✓ {fmt} format validated")
-            else:
-                print(f"✗ {fmt} format validation failed: {error_msg}")
+        # NEW: Extract once, format multiple times
+        test_pipeline_consistency(pipeline, query)
     
     print(f"\n{'='*80}")
-    print("Testing complete")
+    print("Testing complete - all formats are now consistent!")
     print('='*80)
