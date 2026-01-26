@@ -20,7 +20,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # CONFIGURATION
 # =============================================================================
 
-API_VERSION = "v1.2.0"
 MODEL_VERSION = "gemini-1.5-flash-002"
 PROJECT_ID = "your-project-id"  # Update this
 LOCATION = "us-central1"
@@ -243,9 +242,6 @@ Timestamp: {timestamp}
 # =============================================================================
 
 class QueryExpansionOutput(BaseModel):
-    """
-    ✅ FIXED: Using default_factory to avoid mutable default
-    """
     expanded_query: str
     abbreviations_expanded: List[str] = Field(default_factory=list)
 
@@ -275,7 +271,7 @@ class Intent(BaseModel):
     @classmethod
     def check_query_length(cls, v: List[str]) -> List[str]:
         """
-        ✅ FIXED: Now validates both optimal range and hard limit
+        Validate query word count
         - Optimal: 2-6 words (warning)
         - Hard limit: 8 words (error)
         """
@@ -283,14 +279,12 @@ class Intent(BaseModel):
             words = query.split()
             word_count = len(words)
             
-            # Hard limit enforcement
             if word_count > 8:
                 raise ValueError(
                     f"Query exceeds 8-word limit: '{query}' ({word_count} words). "
                     f"Must be 2-6 words for optimal CUI mapping."
                 )
             
-            # Optimal range warning (1 word or 7-8 words)
             if word_count < 2:
                 print(f"⚠️  Query too short: '{query}' ({word_count} word). Recommend 2-6 words.")
             elif word_count > 6:
@@ -301,8 +295,6 @@ class Intent(BaseModel):
 
 class IntentWithoutQueries(BaseModel):
     """
-    ✅ FIXED: Added comprehensive docstring
-    
     Intent schema WITHOUT final_queries field.
     
     Used in Format 3 (breakdown) output to provide full intent analysis
@@ -324,9 +316,6 @@ class IntentWithoutQueries(BaseModel):
 
 
 class IntentExtractionOutput(BaseModel):
-    """
-    ✅ FIXED: Using default_factory for intents list
-    """
     is_clinical: bool
     reason: Optional[str] = None
     original_query: str
@@ -336,21 +325,20 @@ class IntentExtractionOutput(BaseModel):
     
     @model_validator(mode='after')
     def fix_intent_count(self) -> 'IntentExtractionOutput':
-        # LLM sometimes gives wrong count
         actual = len(self.intents)
         if self.total_intents_detected != actual:
             self.total_intents_detected = actual
         return self
 
 
-# Output schemas
+# Output schemas (no api_version)
 class IntentSummaryItem(BaseModel):
     intent_title: str
     description: str
 
 
 class Format1_IntentSummary(BaseModel):
-    api_version: str = API_VERSION
+    """Format 1: Simple intent summary"""
     user_query: str
     intents: List[IntentSummaryItem]
     is_clinical: bool
@@ -359,7 +347,7 @@ class Format1_IntentSummary(BaseModel):
 
 
 class Format2_FinalQueries(BaseModel):
-    api_version: str = API_VERSION
+    """Format 2: Queries for CUI mapping"""
     user_query: str
     final_queries: List[str]
     total_queries: int
@@ -369,7 +357,7 @@ class Format2_FinalQueries(BaseModel):
 
 
 class Format3_IntentBreakdown(BaseModel):
-    api_version: str = API_VERSION
+    """Format 3: Full breakdown with sub-natures"""
     is_clinical: bool
     reason: Optional[str] = None
     original_query: str
@@ -388,15 +376,10 @@ class ContextualIntentPipeline:
     def __init__(self, project: str, location: str = LOCATION, model: str = MODEL_VERSION):
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)
-        self.api_version = API_VERSION
         self.model_version = model
         
     def _extract_json(self, response) -> Dict[str, Any]:
-        """
-        ✅ FIXED: Using non-greedy regex to prevent over-matching
-        
-        Extract JSON from various response formats
-        """
+        """Extract JSON from various response formats"""
         # Try direct JSON method
         if hasattr(response, 'json'):
             try:
@@ -416,15 +399,13 @@ class ContextualIntentPipeline:
         except:
             pass
         
-        # ✅ FIXED: Non-greedy regex (.*? instead of .*)
-        # Extract from surrounding text - try longest valid JSON first
+        # Non-greedy regex - extract from surrounding text
         json_patterns = [
-            (r'\{.*?\}', re.DOTALL),  # Non-greedy object match
-            (r'\[.*?\]', re.DOTALL),  # Non-greedy array match
+            (r'\{.*?\}', re.DOTALL),
+            (r'\[.*?\]', re.DOTALL),
         ]
         
         for pattern, flags in json_patterns:
-            # Find all matches and try longest first
             matches = list(re.finditer(pattern, text, flags))
             matches.sort(key=lambda m: len(m.group(0)), reverse=True)
             
@@ -438,11 +419,7 @@ class ContextualIntentPipeline:
     
     def _call_model(self, prompt: str, response_schema: type[BaseModel],
                     context_query: str = "") -> BaseModel:
-        """
-        ✅ FIXED: Fallback expanded_query now returns original query
-        
-        Call model with schema enforcement
-        """
+        """Call model with schema enforcement"""
         try:
             config = GenerationConfig(
                 temperature=0.0,
@@ -458,15 +435,12 @@ class ContextualIntentPipeline:
         except Exception as e:
             print(f"Model error: {e}")
             
-            # ✅ FIXED: Semantically correct fallbacks
             if response_schema == QueryExpansionOutput:
-                # Return original query as expanded_query (no expansion possible)
                 return QueryExpansionOutput(
                     expanded_query=context_query if context_query else "",
                     abbreviations_expanded=[]
                 )
             else:
-                # Return structured error for intent extraction
                 return IntentExtractionOutput(
                     is_clinical=False,
                     reason=f"Processing error: {str(e)}",
@@ -476,15 +450,13 @@ class ContextualIntentPipeline:
                     intents=[]
                 )
     
-    # Step 1: Query Expansion
     def expand_query(self, query: str) -> QueryExpansionOutput:
-        """Expand abbreviations and add clinical context"""
+        """Step 1: Expand abbreviations and add clinical context"""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
         return self._call_model(prompt, QueryExpansionOutput, query)
     
-    # Step 2: Intent Extraction
     def extract_intents(self, original_query: str, expanded_query: str) -> IntentExtractionOutput:
-        """Extract clinical intents with sub-natures"""
+        """Step 2: Extract clinical intents with sub-natures"""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
@@ -492,7 +464,6 @@ class ContextualIntentPipeline:
         )
         return self._call_model(prompt, IntentExtractionOutput, original_query)
     
-    # Output formatters
     def _format_summary(self, query: str, result: IntentExtractionOutput) -> Format1_IntentSummary:
         """Format 1: Simple summary"""
         items = [
@@ -542,7 +513,6 @@ class ContextualIntentPipeline:
             timestamp=datetime.utcnow().isoformat()
         )
     
-    # Main pipeline
     def run(self, query: str,
             output_format: Literal["summary", "queries", "breakdown"] = "breakdown",
             verbose: bool = False) -> Dict[str, Any]:
@@ -557,10 +527,8 @@ class ContextualIntentPipeline:
         Returns:
             Dict with formatted output
         """
-        # Input validation
         if not query or not query.strip():
             return {
-                "api_version": self.api_version,
                 "error": "Empty query",
                 "timestamp": datetime.utcnow().isoformat()
             }
@@ -614,7 +582,6 @@ class ContextualIntentPipeline:
             if verbose:
                 print(f"Error: {e}\n")
             return {
-                "api_version": self.api_version,
                 "error": str(e),
                 "query": query,
                 "timestamp": datetime.utcnow().isoformat()
@@ -639,8 +606,6 @@ def print_results(result: Dict):
 
 def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:
     """
-    ✅ FIXED: Returns tuple instead of printing
-    
     Validate output matches schema
     
     Args:
@@ -649,8 +614,6 @@ def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]
     
     Returns:
         Tuple of (is_valid, error_message)
-        - (True, None) if valid
-        - (False, error_message) if invalid
     """
     try:
         if format_type == "summary":
@@ -678,7 +641,6 @@ def test_pipeline(pipeline, query: str):
         print(f"\n{fmt.upper()}:")
         result = pipeline.run(query, output_format=fmt)
         
-        # Show snippet
         if fmt == "summary":
             print(f"  Intents: {len(result.get('intents', []))}")
         elif fmt == "queries":
@@ -686,14 +648,12 @@ def test_pipeline(pipeline, query: str):
         else:
             print(f"  Intents detected: {result.get('total_intents_detected', 0)}")
         
-        # Validate (now returns tuple)
         is_valid, error_msg = validate_schema(result, fmt)
         if is_valid:
             print(f"  ✓ Schema valid")
         else:
             print(f"  ✗ Schema invalid: {error_msg}")
         
-        # Save
         save_json(result, f"output_{fmt}.json")
     
     print(f"\n{'='*80}\n")
@@ -704,21 +664,19 @@ def test_pipeline(pipeline, query: str):
 # =============================================================================
 
 if __name__ == "__main__":
-    # Initialize
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID,
         location=LOCATION,
         model=MODEL_VERSION
     )
     
-    # Test queries
     test_queries = [
         "Patient with DM and HTN",
         "SOB on exertion",
         "Metformin 500mg twice daily"
     ]
     
-    print(f"\nClinical Intent Extraction Pipeline - API {API_VERSION}")
+    print(f"\nClinical Intent Extraction Pipeline")
     print(f"Model: {MODEL_VERSION}\n")
     
     for idx, query in enumerate(test_queries, 1):
@@ -726,7 +684,6 @@ if __name__ == "__main__":
         print(f"Query {idx}/{len(test_queries)}: {query}")
         print('='*80)
         
-        # Test all formats
         for fmt in ["summary", "queries", "breakdown"]:
             result = pipeline.run(query, output_format=fmt, verbose=(fmt == "breakdown"))
             filename = f"query_{idx}_{fmt}.json"
