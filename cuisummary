@@ -1,41 +1,96 @@
-import asyncio
-import aiohttp
+"""
+MODULE 1: CUI REDUCTION ENGINE - GCP PRODUCTION VERSION
+Complete pipeline: Text → CUI Extraction API → Edge-Based Reduction
+
+Flow:
+1. Text input → CUI extraction API (GCP authenticated)
+2. Filter CUIs by SAB (ICD, SNOMED, LOINC)
+3. Edge-based reduction using NetworkX pickle + BigQuery
+4. Return reduced CUIs with comprehensive stats
+
+Zero API keys needed (GCP native authentication)
+Production-ready for clinical NLP pipelines
+"""
+
 import subprocess
-import re
 import logging
-from pathlib import Path
-import json
-from typing import List, Dict, Set, Optional, Tuple
-from collections import defaultdict
 import time
-from dataclasses import dataclass, asdict
-import threading
 import pickle
 import numpy as np
+from typing import List, Dict, Set, Tuple, Optional
+from collections import defaultdict
+from dataclasses import dataclass, asdict
+import threading
+import requests
+from requests.adapters import HTTPAdapter, Retry
 from google.cloud import bigquery
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics.pairwise import cosine_distances
-import nest_asyncio
-import requests
-from requests.adapters import HTTPAdapter, Retry
+from sklearn.metrics import silhouette_score
+import networkx as nx
 
-nest_asyncio.apply()
-
-# --------------------- Logging ---------------------
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --------------------- GCP Token ---------------------
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+# IC Score Configuration
+OPTIMAL_IC_MIN = 4.0
+OPTIMAL_IC_MAX = 7.0
+OPTIMAL_IC_TARGET = 5.5
+
+# Edge-Based Reduction Configuration
+ENABLE_EDGE_BASED_REDUCTION = True
+ENABLE_FALLBACK_PARENTS = True
+MAX_HIERARCHY_DEPTH = 10
+
+# Clustering Configuration
+MIN_INTRA_CLUSTER_COHERENCE = 0.7
+MIN_INTER_CLUSTER_SEPARATION = 0.3
+HIERARCHY_EDGE_THRESHOLD = 3
+
+# Validation
+MAX_INPUT_CUIS = 1000
+MIN_INPUT_CUIS = 1
+
+# SAB Filtering (ICD, SNOMED, LOINC only)
+ALLOWED_SABS = [
+    'CCSR_ICD10CM', 'CCSR_ICD10PCS', 'DMDICD10', 'ICD10', 'ICD10AE', 
+    'ICD10AM', 'ICD10AMAE', 'ICD10CM', 'ICD10DUT', 'ICD10PCS', 
+    'ICD9CM', 'ICPC2ICD10DUT', 'ICPC2ICD10ENG', 'SNOMEDCT_US', 'LOINC'
+]
+
+
+# ============================================================================
+# GCP TOKEN PROVIDER
+# ============================================================================
+
 class GCPTokenProvider:
+    """
+    Provides GCP authentication tokens using gcloud CLI
+    Thread-safe with automatic refresh
+    """
     _lock = threading.Lock()
     _token = None
     _expiry = 0
 
     @classmethod
     def get_headers(cls, force: bool = False) -> Dict[str, str]:
+        """
+        Get authentication headers for GCP APIs
+        
+        Args:
+            force: Force token refresh even if not expired
+            
+        Returns:
+            Dictionary with Authorization and Content-Type headers
+        """
         with cls._lock:
             now = time.time()
             if not force and cls._token and now < cls._expiry:
@@ -49,7 +104,7 @@ class GCPTokenProvider:
                 timeout=10
             )
             if proc.returncode != 0:
-                raise RuntimeError(proc.stderr)
+                raise RuntimeError(f"Failed to get GCP token: {proc.stderr}")
 
             token = proc.stdout.strip()
             if not token:
@@ -60,11 +115,17 @@ class GCPTokenProvider:
                 "Content-Type": "application/json"
             }
             cls._expiry = now + 3300  # ~55 minutes
+            logger.info("GCP authentication token refreshed")
             return cls._token
 
-# --------------------- Data Classes ---------------------
+
+# ============================================================================
+# DATA CLASSES
+# ============================================================================
+
 @dataclass
 class ReductionStats:
+    """Statistics for CUI reduction"""
     initial_count: int
     after_ic_rollup: int
     final_count: int
@@ -74,42 +135,40 @@ class ReductionStats:
     processing_time: float
     ic_threshold_used: float
     hierarchy_size: int = 0
-    api_call_time: float = 0.0
     group_stats: Dict = None
     missing_embeddings_count: int = 0
+    edge_based_stats: Dict = None
 
     def to_dict(self):
         return asdict(self)
 
-# --------------------- Filter CUIs ---------------------
-def filter_allowed_cuis(cuis: Set[str], project_id: str, dataset_id: str) -> List[str]:
-    if not cuis:
-        return []
-    try:
-        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
-        client = bigquery.Client(project=project_id)
-        query = f"""
-        SELECT DISTINCT CUI
-        FROM `{project_id}.{dataset_id}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis)
-          AND SAB IN ('CCSR_ICD10CM','CCSR_ICD10PCS','DMDICD10','ICD10','ICD10AE','ICD10AM','ICD10AMAE',
-                      'ICD10CM','ICD10DUT','ICD10PCS','ICD9CM','ICPC2ICD10DUT','ICPC2ICD10ENG',
-                      'SNOMEDCT_US', 'LOINC')
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis))]
-        )
-        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        allowed_cuis = df['CUI'].tolist()
-        logger.info(f"{len(allowed_cuis)} CUIs after filter")
-        return allowed_cuis
-    except Exception as e:
-        logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
-        return []
 
-# --------------------- CUI API Client ---------------------
+# ============================================================================
+# CUI EXTRACTION API CLIENT
+# ============================================================================
+
 class CUIAPIClient:
-    def __init__(self, api_base_url: str, timeout: int = 60, top_k: int = 3, max_retries: int = 3):
+    """
+    Client for CUI extraction API
+    Uses GCP authentication and automatic retries
+    """
+    
+    def __init__(
+        self, 
+        api_base_url: str, 
+        timeout: int = 60, 
+        top_k: int = 3, 
+        max_retries: int = 3
+    ):
+        """
+        Initialize CUI API client
+        
+        Args:
+            api_base_url: Base URL for CUI extraction API
+            timeout: Request timeout in seconds
+            top_k: Number of top CUI matches to return
+            max_retries: Maximum retry attempts
+        """
         self.api_base_url = api_base_url.rstrip('/')
         self.timeout = timeout
         self.top_k = top_k
@@ -130,12 +189,29 @@ class CUIAPIClient:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
-    def extract_cuis_batch(self, texts: List[str], retry_auth: bool = True) -> Set[str]:
+    def extract_cuis_batch(
+        self, 
+        texts: List[str], 
+        retry_auth: bool = True
+    ) -> Set[str]:
+        """
+        Extract CUIs from text using API
+        
+        Args:
+            texts: List of text strings to process
+            retry_auth: Whether to retry with fresh token on 401
+            
+        Returns:
+            Set of extracted CUI strings
+        """
         if not texts:
             return set()
+        
         payload = {"query_texts": texts, "top_k": self.top_k}
         headers = GCPTokenProvider.get_headers()
+        
         logger.info(f"Extracting CUIs from {len(texts)} text(s)...")
+        
         try:
             response = self.session.post(
                 self.api_base_url,
@@ -143,306 +219,1470 @@ class CUIAPIClient:
                 headers=headers,
                 timeout=self.timeout
             )
+            
             if response.status_code == 401 and retry_auth:
                 logger.warning("Token expired, refreshing...")
                 GCPTokenProvider.get_headers(force=True)
                 return self.extract_cuis_batch(texts, retry_auth=False)
+            
             response.raise_for_status()
             data = response.json()
+            
             all_cuis = set()
             for text in texts:
                 cuis = data.get(text, [])
                 if isinstance(cuis, list):
                     all_cuis.update(str(c) for c in cuis if c)
+            
             logger.info(f"Extracted {len(all_cuis)} unique CUIs from {len(texts)} texts")
             return all_cuis
+        
         except Exception as e:
             logger.error(f"API call failed: {str(e)}")
             return set()
 
-# --------------------- Enhanced Reducer ---------------------
-class EnhancedCUIReducer:
+
+# ============================================================================
+# CUI FILTER (SAB-BASED)
+# ============================================================================
+
+def filter_allowed_cuis(
+    cuis: Set[str], 
+    project_id: str, 
+    dataset_id: str
+) -> List[str]:
+    """
+    Filter CUIs to retain only ICD, SNOMED, and LOINC
+    
+    Args:
+        cuis: Set of CUIs to filter
+        project_id: GCP project ID
+        dataset_id: BigQuery dataset ID
+        
+    Returns:
+        List of filtered CUI strings
+    """
+    if not cuis:
+        return []
+    
+    try:
+        logger.info(f"Filtering {len(cuis)} CUIs to retain only ICD, SNOMED, and LOINC...")
+        client = bigquery.Client(project=project_id)
+        
+        query = f"""
+        SELECT DISTINCT CUI
+        FROM `{project_id}.{dataset_id}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis)
+          AND SAB IN UNNEST(@sabs)
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", list(cuis)),
+                bigquery.ArrayQueryParameter("sabs", "STRING", ALLOWED_SABS)
+            ]
+        )
+        
+        df = client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+        allowed_cuis = df['CUI'].tolist()
+        
+        logger.info(f"{len(allowed_cuis)} CUIs after SAB filter ({len(cuis) - len(allowed_cuis)} removed)")
+        return allowed_cuis
+    
+    except Exception as e:
+        logger.error(f"Failed to filter CUIs by SAB: {str(e)}")
+        return []
+
+
+# ============================================================================
+# BIGQUERY EMBEDDINGS CLIENT
+# ============================================================================
+
+class BigQueryEmbeddingsClient:
+    """
+    Client for fetching CUI embeddings from BigQuery
+    Includes caching and batch operations
+    """
+    
     def __init__(
-        self,
-        project_id: str,
-        dataset_id: str,
-        cui_embeddings_table: str,
-        mrsty_table: str,
-        umls_network_obj: dict
+        self, 
+        project_id: str, 
+        dataset_id: str, 
+        cui_embeddings_table: str
     ):
-        self.client = bigquery.Client(project=project_id)
+        """
+        Initialize BigQuery embeddings client
+        
+        Args:
+            project_id: GCP project ID
+            dataset_id: BigQuery dataset ID
+            cui_embeddings_table: Table name containing CUI embeddings
+        """
         self.project_id = project_id
         self.dataset_id = dataset_id
         self.cui_embeddings_table = cui_embeddings_table
-        self.mrsty_table = mrsty_table
-        self._preloaded_network = umls_network_obj
+        self.client = bigquery.Client(project=project_id)
+        self._embedding_cache = {}
+    
+    def get_embeddings_batch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        """
+        Fetch embeddings for multiple CUIs
+        
+        Args:
+            cuis: List of CUI strings
+            
+        Returns:
+            Dictionary mapping CUI to embedding vector
+        """
+        # Check cache first
+        uncached = [c for c in cuis if c not in self._embedding_cache]
+        
+        if uncached:
+            query = f"""
+            SELECT CUI AS cui, embedding AS embedding
+            FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
+            WHERE CUI IN UNNEST(@cuis)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
+                ]
+            )
+            
+            try:
+                df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
+                
+                for _, row in df.iterrows():
+                    if row["embedding"] is not None:
+                        self._embedding_cache[row["cui"]] = np.asarray(row["embedding"], dtype=np.float32)
+                
+                logger.info(f"Fetched {len(df)} embeddings from BigQuery")
+            
+            except Exception as e:
+                logger.error(f"Error fetching embeddings: {e}")
+        
+        # Return all requested embeddings from cache
+        results = {}
+        for cui in cuis:
+            if cui in self._embedding_cache:
+                results[cui] = self._embedding_cache[cui]
+        
+        return results
+    
+    def compute_coherence(self, cui_list: List[str]) -> Optional[float]:
+        """
+        Compute average pairwise cosine similarity for a list of CUIs
+        
+        Args:
+            cui_list: List of CUIs
+            
+        Returns:
+            Average coherence score (0-1) or None if insufficient embeddings
+        """
+        if len(cui_list) < 2:
+            return 1.0
+        
+        embeddings_dict = self.get_embeddings_batch(cui_list)
+        
+        if len(embeddings_dict) < 2:
+            return None
+        
+        embeddings = np.array([embeddings_dict[cui] for cui in cui_list if cui in embeddings_dict])
+        
+        # Compute pairwise cosine similarity
+        similarities = []
+        for i in range(len(embeddings)):
+            for j in range(i + 1, len(embeddings)):
+                sim = np.dot(embeddings[i], embeddings[j]) / (
+                    np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j])
+                )
+                similarities.append(sim)
+        
+        return float(np.mean(similarities)) if similarities else None
+    
+    def get_centroid(self, cui_list: List[str]) -> Optional[np.ndarray]:
+        """
+        Compute centroid of CUI embeddings
+        
+        Args:
+            cui_list: List of CUIs
+            
+        Returns:
+            Centroid vector or None
+        """
+        embeddings_dict = self.get_embeddings_batch(cui_list)
+        
+        if not embeddings_dict:
+            return None
+        
+        embeddings = np.array([embeddings_dict[cui] for cui in cui_list if cui in embeddings_dict])
+        
+        if len(embeddings) == 0:
+            return None
+        
+        return np.mean(embeddings, axis=0)
+    
+    def get_cache_size(self) -> int:
+        """Get number of cached embeddings"""
+        return len(self._embedding_cache)
+    
+    def clear_cache(self):
+        """Clear embedding cache"""
+        self._embedding_cache.clear()
 
-        self._hierarchy_cache = {}
-        self._ic_scores_cache = {}
-        self._description_cache = {}
-        self._missing_embeddings_total = 0
 
-    # --------------------- Main Reduction Function ---------------------
+# ============================================================================
+# NETWORKX CLIENT
+# ============================================================================
+
+class UMLSNetworkClient:
+    """
+    Client for accessing UMLS hierarchy from NetworkX pickle
+    Wraps NetworkX graph operations with caching
+    """
+    
+    def __init__(
+        self, 
+        network_obj: nx.DiGraph,
+        bigquery_client: bigquery.Client,
+        project_id: str,
+        dataset_id: str
+    ):
+        """
+        Initialize UMLS network client
+        
+        Args:
+            network_obj: NetworkX DiGraph with parent→child edges
+            bigquery_client: BigQuery client for metadata
+            project_id: GCP project ID
+            dataset_id: BigQuery dataset ID
+        """
+        self.network = network_obj
+        self.bq_client = bigquery_client
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        
+        # Caches
+        self._cui_info_cache = {}
+        self._parents_cache = {}
+        self._children_cache = {}
+        self._ancestors_cache = {}
+        self._lca_cache = {}
+        
+        logger.info(f"UMLS Network Client initialized with {self.network.number_of_nodes()} nodes")
+    
+    def has_node(self, cui: str) -> bool:
+        """Check if CUI exists in network"""
+        return self.network.has_node(cui)
+    
+    def get_parents(self, cui: str) -> List[str]:
+        """Get immediate parent CUIs (predecessors in parent→child graph)"""
+        if cui in self._parents_cache:
+            return self._parents_cache[cui]
+        
+        if not self.has_node(cui):
+            return []
+        
+        parents = list(self.network.predecessors(cui))
+        self._parents_cache[cui] = parents
+        return parents
+    
+    def get_children(self, cui: str) -> List[str]:
+        """Get immediate child CUIs (successors in parent→child graph)"""
+        if cui in self._children_cache:
+            return self._children_cache[cui]
+        
+        if not self.has_node(cui):
+            return []
+        
+        children = list(self.network.successors(cui))
+        self._children_cache[cui] = children
+        return children
+    
+    def get_cui_info(self, cui: str) -> Dict:
+        """
+        Get CUI metadata from BigQuery
+        
+        Args:
+            cui: Concept Unique Identifier
+            
+        Returns:
+            Dictionary with name and semantic types
+        """
+        if cui in self._cui_info_cache:
+            return self._cui_info_cache[cui]
+        
+        # Get preferred name from MRCONSO
+        query = f"""
+        SELECT STR AS name
+        FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
+        WHERE CUI = @cui AND LAT = 'ENG' AND ISPREF = 'Y'
+        LIMIT 1
+        """
+        
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ScalarQueryParameter("cui", "STRING", cui)
+            ]
+        )
+        
+        try:
+            df = self.bq_client.query(query, job_config=job_config).result().to_dataframe()
+            name = df['name'].iloc[0] if not df.empty else ''
+        except Exception as e:
+            logger.warning(f"Error fetching name for {cui}: {e}")
+            name = ''
+        
+        # Get semantic types from MRSTY
+        query_sty = f"""
+        SELECT STY
+        FROM `{self.project_id}.{self.dataset_id}.MRSTY`
+        WHERE CUI = @cui
+        """
+        
+        try:
+            df_sty = self.bq_client.query(query_sty, job_config=job_config).result().to_dataframe()
+            semantic_types = df_sty['STY'].tolist() if not df_sty.empty else []
+        except Exception as e:
+            logger.warning(f"Error fetching semantic types for {cui}: {e}")
+            semantic_types = []
+        
+        info = {
+            'cui': cui,
+            'name': name,
+            'semantic_types': semantic_types
+        }
+        
+        self._cui_info_cache[cui] = info
+        return info
+    
+    def get_multiple_cui_info(self, cuis: List[str]) -> Dict[str, Dict]:
+        """
+        Batch fetch CUI information
+        
+        Args:
+            cuis: List of CUIs
+            
+        Returns:
+            Dictionary mapping CUI to info dict
+        """
+        results = {}
+        uncached = [c for c in cuis if c not in self._cui_info_cache]
+        
+        if uncached:
+            # Batch fetch names
+            query = f"""
+            SELECT CUI, STR AS name
+            FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y'
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", uncached)
+                ]
+            )
+            
+            try:
+                df = self.bq_client.query(query, job_config=job_config).result().to_dataframe()
+                cui_to_name = dict(zip(df['CUI'], df['name']))
+            except Exception as e:
+                logger.error(f"Error batch fetching names: {e}")
+                cui_to_name = {}
+            
+            # Batch fetch semantic types
+            query_sty = f"""
+            SELECT CUI, STY
+            FROM `{self.project_id}.{self.dataset_id}.MRSTY`
+            WHERE CUI IN UNNEST(@cuis)
+            """
+            
+            try:
+                df_sty = self.bq_client.query(query_sty, job_config=job_config).result().to_dataframe()
+                cui_to_stys = defaultdict(list)
+                for _, row in df_sty.iterrows():
+                    cui_to_stys[row['CUI']].append(row['STY'])
+            except Exception as e:
+                logger.error(f"Error batch fetching semantic types: {e}")
+                cui_to_stys = {}
+            
+            # Cache results
+            for cui in uncached:
+                info = {
+                    'cui': cui,
+                    'name': cui_to_name.get(cui, ''),
+                    'semantic_types': cui_to_stys.get(cui, [])
+                }
+                self._cui_info_cache[cui] = info
+        
+        # Return all requested
+        for cui in cuis:
+            if cui in self._cui_info_cache:
+                results[cui] = self._cui_info_cache[cui]
+        
+        return results
+    
+    def get_ancestors(self, cui: str, max_depth: int = 10) -> List[List[str]]:
+        """
+        Get all ancestor paths from CUI to roots
+        
+        Args:
+            cui: Concept Unique Identifier
+            max_depth: Maximum traversal depth
+            
+        Returns:
+            List of paths (each path is list of CUIs from child to root)
+        """
+        cache_key = (cui, max_depth)
+        if cache_key in self._ancestors_cache:
+            return self._ancestors_cache[cache_key]
+        
+        if not self.has_node(cui):
+            return [[cui]]
+        
+        def traverse_up(current: str, path: List[str], depth: int) -> List[List[str]]:
+            if depth >= max_depth:
+                return [path]
+            
+            parents = self.get_parents(current)
+            
+            if not parents:
+                return [path]
+            
+            all_paths = []
+            for parent in parents:
+                if parent not in path:  # Avoid cycles
+                    new_path = path + [parent]
+                    all_paths.extend(traverse_up(parent, new_path, depth + 1))
+            
+            return all_paths if all_paths else [path]
+        
+        try:
+            paths = traverse_up(cui, [cui], 0)
+            self._ancestors_cache[cache_key] = paths
+            return paths
+        except Exception as e:
+            logger.error(f"Error getting ancestors for {cui}: {e}")
+            return [[cui]]
+    
+    def get_lowest_common_ancestor(self, cui1: str, cui2: str) -> Optional[str]:
+        """Find lowest common ancestor of two CUIs"""
+        cache_key = tuple(sorted([cui1, cui2]))
+        if cache_key in self._lca_cache:
+            return self._lca_cache[cache_key]
+        
+        try:
+            paths1 = self.get_ancestors(cui1)
+            paths2 = self.get_ancestors(cui2)
+            
+            common_ancestors = []
+            for path1 in paths1:
+                for path2 in paths2:
+                    common = set(path1) & set(path2)
+                    if common:
+                        for cui in path1:
+                            if cui in common:
+                                common_ancestors.append((cui, path1.index(cui)))
+                                break
+            
+            if not common_ancestors:
+                self._lca_cache[cache_key] = None
+                return None
+            
+            lca = min(common_ancestors, key=lambda x: x[1])
+            self._lca_cache[cache_key] = lca[0]
+            return lca[0]
+        
+        except Exception as e:
+            logger.error(f"Error finding LCA for {cui1} and {cui2}: {e}")
+            return None
+    
+    def find_common_ancestor_for_group(self, cuis: List[str]) -> Optional[str]:
+        """Find lowest common ancestor for a group of CUIs"""
+        if not cuis:
+            return None
+        
+        if len(cuis) == 1:
+            parents = self.get_parents(cuis[0])
+            return parents[0] if parents else cuis[0]
+        
+        try:
+            lca = self.get_lowest_common_ancestor(cuis[0], cuis[1])
+            
+            for cui in cuis[2:]:
+                if lca:
+                    lca = self.get_lowest_common_ancestor(lca, cui)
+                else:
+                    break
+            
+            return lca
+        except Exception as e:
+            logger.error(f"Error finding common ancestor for group: {e}")
+            return None
+    
+    def get_semantic_types(self, cui: str) -> List[str]:
+        """Get semantic type names for a CUI"""
+        info = self.get_cui_info(cui)
+        return info.get('semantic_types', [])
+    
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics"""
+        return {
+            'cui_info_cache': len(self._cui_info_cache),
+            'parents_cache': len(self._parents_cache),
+            'children_cache': len(self._children_cache),
+            'ancestors_cache': len(self._ancestors_cache),
+            'lca_cache': len(self._lca_cache),
+            'network_nodes': self.network.number_of_nodes(),
+            'network_edges': self.network.number_of_edges()
+        }
+    
+    def clear_cache(self):
+        """Clear all caches"""
+        self._cui_info_cache.clear()
+        self._parents_cache.clear()
+        self._children_cache.clear()
+        self._ancestors_cache.clear()
+        self._lca_cache.clear()
+
+
+# ============================================================================
+# EDGE DETECTOR
+# ============================================================================
+
+class EdgeDetector:
+    """
+    Detects edge nodes (leaves) in CUI hierarchies
+    Implements edge-based reduction strategy
+    """
+    
+    def __init__(self, network_client, ic_optimizer):
+        self.network_client = network_client
+        self.ic_optimizer = ic_optimizer
+    
+    def is_leaf_node(self, cui: str) -> bool:
+        """Check if CUI is a leaf node (has no children)"""
+        children = self.network_client.get_children(cui)
+        return len(children) == 0
+    
+    def is_effective_edge(self, cui: str, input_cuis: Set[str]) -> Tuple[bool, str]:
+        """
+        Check if CUI is an effective edge
+        
+        Returns:
+            (is_edge, reason)
+        """
+        if self.is_leaf_node(cui):
+            return True, "true_leaf"
+        
+        children = self.network_client.get_children(cui)
+        children_in_input = [c for c in children if c in input_cuis]
+        
+        if not children_in_input:
+            return True, "no_children_in_input"
+        
+        return False, "has_children_in_input"
+    
+    def detect_edges_in_cluster(self, cluster: Dict, input_cuis: Set[str]) -> Dict:
+        """Detect all edges in a cluster"""
+        member_cuis = cluster['member_cuis']
+        lca_cui = cluster.get('lca_cui')
+        
+        edges = []
+        edge_metadata = {}
+        
+        for cui in member_cuis:
+            is_edge, reason = self.is_effective_edge(cui, input_cuis)
+            
+            if is_edge:
+                ic_score = self.ic_optimizer.get_ic_score(cui)
+                
+                edge_metadata[cui] = {
+                    'cui': cui,
+                    'reason': reason,
+                    'ic_score': ic_score,
+                    'is_optimal_ic': OPTIMAL_IC_MIN <= ic_score <= OPTIMAL_IC_MAX
+                }
+                
+                edges.append(cui)
+        
+        parent_needed = self._should_keep_parent_fallback(lca_cui, edges, input_cuis)
+        
+        return {
+            'edges': edges,
+            'edge_metadata': edge_metadata,
+            'parent_needed': parent_needed,
+            'parent_cui': lca_cui,
+            'total_members': len(member_cuis),
+            'edge_count': len(edges)
+        }
+    
+    def _should_keep_parent_fallback(
+        self,
+        parent_cui: str,
+        detected_edges: List[str],
+        input_cuis: Set[str]
+    ) -> bool:
+        """Determine if parent should be kept as fallback"""
+        if not parent_cui:
+            return False
+        
+        all_children = self.network_client.get_children(parent_cui)
+        
+        if not all_children:
+            return False
+        
+        edges_set = set(detected_edges)
+        all_children_set = set(all_children)
+        
+        # If edges cover all children, parent is redundant
+        if edges_set >= all_children_set:
+            return False
+        
+        return True
+    
+    def adjust_edge_for_ic_level(self, edge_cui: str, max_traversal: int = MAX_HIERARCHY_DEPTH) -> Dict:
+        """Adjust edge CUI to optimal IC level if needed"""
+        current_cui = edge_cui
+        current_ic = self.ic_optimizer.get_ic_score(current_cui)
+        
+        if OPTIMAL_IC_MIN <= current_ic <= OPTIMAL_IC_MAX:
+            return {
+                'optimal_cui': edge_cui,
+                'adjustment_made': False,
+                'traversal_count': 0,
+                'reason': 'already_optimal'
+            }
+        
+        if current_ic < OPTIMAL_IC_MIN:
+            return {
+                'optimal_cui': edge_cui,
+                'adjustment_made': False,
+                'traversal_count': 0,
+                'reason': 'too_general_keep_anyway'
+            }
+        
+        # Too specific - traverse up
+        traversal_count = 0
+        best_cui = edge_cui
+        best_ic = current_ic
+        
+        while current_ic > OPTIMAL_IC_MAX and traversal_count < max_traversal:
+            parents = self.network_client.get_parents(current_cui)
+            
+            if not parents:
+                break
+            
+            parent = parents[0]
+            parent_ic = self.ic_optimizer.get_ic_score(parent)
+            
+            current_cui = parent
+            current_ic = parent_ic
+            traversal_count += 1
+            
+            if OPTIMAL_IC_MIN <= current_ic <= OPTIMAL_IC_MAX:
+                best_cui = current_cui
+                best_ic = current_ic
+                break
+            
+            if abs(current_ic - OPTIMAL_IC_TARGET) < abs(best_ic - OPTIMAL_IC_TARGET):
+                best_cui = current_cui
+                best_ic = current_ic
+        
+        return {
+            'optimal_cui': best_cui,
+            'optimal_ic': best_ic,
+            'original_cui': edge_cui,
+            'original_ic': self.ic_optimizer.get_ic_score(edge_cui),
+            'adjustment_made': best_cui != edge_cui,
+            'traversal_count': traversal_count,
+            'reason': 'adjusted_to_optimal_ic'
+        }
+    
+    def select_representatives_edge_based(self, cluster: Dict, input_cuis: Set[str]) -> Dict:
+        """Select representatives using edge-based strategy"""
+        edge_analysis = self.detect_edges_in_cluster(cluster, input_cuis)
+        
+        representatives = []
+        representative_metadata = []
+        
+        for edge_cui in edge_analysis['edges']:
+            adjustment = self.adjust_edge_for_ic_level(edge_cui)
+            
+            optimal_cui = adjustment['optimal_cui']
+            representatives.append(optimal_cui)
+            
+            edge_meta = edge_analysis['edge_metadata'][edge_cui]
+            representative_metadata.append({
+                'cui': optimal_cui,
+                'original_cui': edge_cui if adjustment['adjustment_made'] else None,
+                'ic_score': adjustment.get('optimal_ic', edge_meta['ic_score']),
+                'selection_reason': 'edge_based',
+                'edge_reason': edge_meta['reason'],
+                'ic_adjusted': adjustment['adjustment_made'],
+                'traversal_count': adjustment['traversal_count']
+            })
+        
+        # Add parent as fallback if needed
+        if edge_analysis['parent_needed'] and edge_analysis['parent_cui']:
+            parent_cui = edge_analysis['parent_cui']
+            representatives.append(parent_cui)
+            
+            representative_metadata.append({
+                'cui': parent_cui,
+                'ic_score': self.ic_optimizer.get_ic_score(parent_cui),
+                'selection_reason': 'fallback_parent',
+                'edge_reason': 'incomplete_coverage',
+                'ic_adjusted': False,
+                'traversal_count': 0
+            })
+        
+        representatives = list(set(representatives))
+        
+        return {
+            'representatives': representatives,
+            'representative_metadata': representative_metadata,
+            'edge_analysis': edge_analysis,
+            'strategy': 'edge_based_with_fallback',
+            'reduction_achieved': len(representatives) < cluster['size']
+        }
+    
+    def compute_coverage_statistics(self, parent_cui: str, edges_in_input: List[str]) -> Dict:
+        """Compute coverage statistics for edges"""
+        all_children = self.network_client.get_children(parent_cui)
+        
+        if not all_children:
+            return {
+                'has_children': False,
+                'coverage_complete': True,
+                'coverage_ratio': 1.0
+            }
+        
+        edges_set = set(edges_in_input)
+        all_children_set = set(all_children)
+        
+        coverage = len(edges_set & all_children_set) / len(all_children_set)
+        
+        return {
+            'has_children': True,
+            'total_children': len(all_children),
+            'edges_present': len(edges_set & all_children_set),
+            'edges_missing': len(all_children_set - edges_set),
+            'coverage_ratio': coverage,
+            'coverage_complete': coverage == 1.0,
+            'missing_children': list(all_children_set - edges_set)
+        }
+
+
+# ============================================================================
+# HIERARCHICAL CLUSTERER
+# ============================================================================
+
+class HierarchicalClusterer:
+    """Groups CUIs into clusters based on hierarchical relationships"""
+    
+    def __init__(self, network_client):
+        self.network_client = network_client
+    
+    def build_hierarchy_graph(self, cuis: List[str], max_levels: int = 3) -> nx.Graph:
+        """Build graph connecting CUIs through hierarchical relationships"""
+        G = nx.Graph()
+        
+        for cui in cuis:
+            G.add_node(cui)
+        
+        logger.info(f"Building hierarchy graph for {len(cuis)} CUIs...")
+        
+        for i, cui1 in enumerate(cuis):
+            for cui2 in cuis[i+1:]:
+                lca = self.network_client.get_lowest_common_ancestor(cui1, cui2)
+                
+                if lca:
+                    paths1 = self.network_client.get_ancestors(cui1)
+                    paths2 = self.network_client.get_ancestors(cui2)
+                    
+                    min_distance = float('inf')
+                    for path1 in paths1:
+                        for path2 in paths2:
+                            if lca in path1 and lca in path2:
+                                dist = path1.index(lca) + path2.index(lca)
+                                min_distance = min(min_distance, dist)
+                    
+                    if min_distance <= max_levels:
+                        G.add_edge(cui1, cui2, weight=min_distance, lca=lca)
+        
+        logger.info(f"Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges")
+        return G
+    
+    def find_clusters(self, graph: nx.Graph) -> List[Set[str]]:
+        """Find connected components (clusters) in the graph"""
+        clusters = list(nx.connected_components(graph))
+        logger.info(f"Found {len(clusters)} clusters")
+        return clusters
+    
+    def get_cluster_lca(self, cluster: Set[str]) -> Dict:
+        """Find lowest common ancestor for all CUIs in a cluster"""
+        cluster_list = list(cluster)
+        
+        if len(cluster_list) == 1:
+            cui = cluster_list[0]
+            parents = self.network_client.get_parents(cui)
+            lca_cui = parents[0] if parents else cui
+            lca_info = self.network_client.get_cui_info(lca_cui)
+            
+            return {
+                'lca_cui': lca_cui,
+                'lca_name': lca_info.get('name', ''),
+                'level': 1,
+                'paths': {cui: [cui, lca_cui]}
+            }
+        
+        lca_cui = self.network_client.find_common_ancestor_for_group(cluster_list)
+        
+        if not lca_cui:
+            logger.warning(f"No common ancestor found for cluster: {cluster_list}")
+            lca_cui = cluster_list[0]
+        
+        lca_info = self.network_client.get_cui_info(lca_cui)
+        
+        paths = {}
+        for cui in cluster_list:
+            cui_paths = self.network_client.get_ancestors(cui)
+            for path in cui_paths:
+                if lca_cui in path:
+                    paths[cui] = path[:path.index(lca_cui) + 1]
+                    break
+            
+            if cui not in paths:
+                paths[cui] = [cui, lca_cui]
+        
+        avg_level = sum(len(path) - 1 for path in paths.values()) / len(paths)
+        
+        return {
+            'lca_cui': lca_cui,
+            'lca_name': lca_info.get('name', ''),
+            'lca_semantic_types': lca_info.get('semantic_types', []),
+            'level': int(avg_level),
+            'paths': paths
+        }
+    
+    def cluster_cuis(self, cuis: List[str], max_levels: int = 3) -> List[Dict]:
+        """Main clustering method"""
+        if not cuis:
+            return []
+        
+        graph = self.build_hierarchy_graph(cuis, max_levels)
+        raw_clusters = self.find_clusters(graph)
+        
+        clusters_with_metadata = []
+        for idx, cluster in enumerate(raw_clusters):
+            lca_info = self.get_cluster_lca(cluster)
+            
+            cluster_data = {
+                'cluster_id': idx,
+                'member_cuis': list(cluster),
+                'size': len(cluster),
+                **lca_info
+            }
+            
+            clusters_with_metadata.append(cluster_data)
+        
+        clusters_with_metadata.sort(key=lambda x: x['size'], reverse=True)
+        
+        logger.info(f"Clustered {len(cuis)} CUIs into {len(clusters_with_metadata)} groups")
+        return clusters_with_metadata
+
+
+# ============================================================================
+# IC OPTIMIZER
+# ============================================================================
+
+class ICOptimizer:
+    """Optimizes CUI selection based on Information Content scores"""
+    
+    def __init__(self, network_client, ic_scores: Optional[Dict[str, float]] = None):
+        self.network_client = network_client
+        self.ic_scores = ic_scores or {}
+    
+    def estimate_ic_from_hierarchy(self, cui: str) -> float:
+        """Estimate IC score based on position in hierarchy"""
+        paths = self.network_client.get_ancestors(cui)
+        
+        if not paths:
+            return 5.0
+        
+        min_depth = min(len(path) for path in paths)
+        estimated_ic = min(10.0, 1.0 + min_depth * 0.9)
+        
+        return estimated_ic
+    
+    def get_ic_score(self, cui: str) -> float:
+        """Get IC score for a CUI"""
+        if cui in self.ic_scores:
+            return self.ic_scores[cui]
+        
+        ic = self.estimate_ic_from_hierarchy(cui)
+        self.ic_scores[cui] = ic
+        return ic
+    
+    def compute_cluster_ic_stats(self, clusters: List[Dict]) -> Dict:
+        """Compute IC statistics across all clusters"""
+        if not clusters:
+            return {}
+        
+        ic_values = []
+        for cluster in clusters:
+            representatives = cluster.get('representatives', [])
+            for cui in representatives:
+                ic = self.get_ic_score(cui)
+                ic_values.append(ic)
+        
+        if not ic_values:
+            return {}
+        
+        return {
+            'mean': float(np.mean(ic_values)),
+            'median': float(np.median(ic_values)),
+            'std': float(np.std(ic_values)),
+            'min': float(np.min(ic_values)),
+            'max': float(np.max(ic_values)),
+            'optimal_range': [OPTIMAL_IC_MIN, OPTIMAL_IC_MAX],
+            'in_range_count': sum(1 for ic in ic_values 
+                                  if OPTIMAL_IC_MIN <= ic <= OPTIMAL_IC_MAX),
+            'in_range_percent': 100 * sum(1 for ic in ic_values 
+                                          if OPTIMAL_IC_MIN <= ic <= OPTIMAL_IC_MAX) / len(ic_values)
+        }
+
+
+# ============================================================================
+# EMBEDDING REFINEMENT
+# ============================================================================
+
+class EmbeddingRefinement:
+    """Refines clusters using embedding-based semantic similarity"""
+    
+    def __init__(self, embeddings_client):
+        self.embeddings_client = embeddings_client
+    
+    def compute_intra_cluster_coherence(self, cui_list: List[str]) -> float:
+        """Compute average pairwise similarity within a cluster"""
+        coherence = self.embeddings_client.compute_coherence(cui_list)
+        return coherence if coherence is not None else 0.0
+    
+    def should_split_cluster(self, cluster: Dict) -> bool:
+        """Determine if a cluster should be split based on coherence"""
+        member_cuis = cluster['member_cuis']
+        
+        if len(member_cuis) <= 2:
+            return False
+        
+        coherence = cluster.get('coherence')
+        if coherence is None:
+            coherence = self.compute_intra_cluster_coherence(member_cuis)
+            cluster['coherence'] = coherence
+        
+        return coherence < MIN_INTRA_CLUSTER_COHERENCE
+    
+    def split_cluster(self, cluster: Dict) -> List[Dict]:
+        """Split a low-coherence cluster into singleton clusters"""
+        new_clusters = []
+        
+        for cui in cluster['member_cuis']:
+            new_cluster = {
+                'member_cuis': [cui],
+                'size': 1,
+                'coherence': 1.0,
+                'split_from': cluster['cluster_id']
+            }
+            new_clusters.append(new_cluster)
+        
+        logger.info(f"Split cluster {cluster['cluster_id']} into {len(new_clusters)} singletons")
+        return new_clusters
+    
+    def refine_clusters_iteratively(
+        self,
+        clusters: List[Dict],
+        max_iterations: int = 3
+    ) -> List[Dict]:
+        """Iteratively refine clusters by splitting low-coherence ones"""
+        refined = clusters.copy()
+        
+        for iteration in range(max_iterations):
+            logger.info(f"Refinement iteration {iteration + 1}/{max_iterations}")
+            
+            to_split = []
+            keep = []
+            
+            for cluster in refined:
+                if self.should_split_cluster(cluster):
+                    to_split.append(cluster)
+                else:
+                    keep.append(cluster)
+            
+            if to_split:
+                for cluster in to_split:
+                    keep.extend(self.split_cluster(cluster))
+                logger.info(f"Split {len(to_split)} clusters")
+            else:
+                logger.info(f"Converged after {iteration + 1} iterations")
+                break
+            
+            refined = keep
+        
+        # Re-number cluster IDs
+        for idx, cluster in enumerate(refined):
+            cluster['cluster_id'] = idx
+        
+        logger.info(f"Refinement complete: {len(refined)} final clusters")
+        return refined
+
+
+# ============================================================================
+# MAIN CUI REDUCTION ENGINE
+# ============================================================================
+
+class CUIReductionEngine:
+    """
+    Main engine for CUI reduction using edge-based strategy
+    Complete pipeline: Text → CUIs → Edge-based reduction
+    """
+    
+    def __init__(
+        self,
+        umls_network_obj: nx.DiGraph,
+        project_id: str,
+        dataset_id: str,
+        cui_embeddings_table: str,
+        cui_extraction_api_url: str,
+        ic_scores: Optional[Dict[str, float]] = None
+    ):
+        """
+        Initialize CUI reduction engine
+        
+        Args:
+            umls_network_obj: NetworkX DiGraph with parent→child edges
+            project_id: GCP project ID
+            dataset_id: BigQuery dataset ID
+            cui_embeddings_table: Table name for CUI embeddings
+            cui_extraction_api_url: URL for CUI extraction API
+            ic_scores: Optional pre-computed IC scores
+        """
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        
+        # Initialize BigQuery client
+        bq_client = bigquery.Client(project=project_id)
+        
+        # Initialize clients
+        self.api_client = CUIAPIClient(cui_extraction_api_url)
+        self.embeddings_client = BigQueryEmbeddingsClient(
+            project_id, dataset_id, cui_embeddings_table
+        )
+        self.network_client = UMLSNetworkClient(
+            umls_network_obj, bq_client, project_id, dataset_id
+        )
+        
+        # Initialize components
+        self.hierarchical_clusterer = HierarchicalClusterer(self.network_client)
+        self.ic_optimizer = ICOptimizer(self.network_client, ic_scores)
+        self.embedding_refiner = EmbeddingRefinement(self.embeddings_client)
+        self.edge_detector = EdgeDetector(self.network_client, self.ic_optimizer)
+        
+        logger.info("CUI Reduction Engine initialized (GCP native, edge-based strategy)")
+    
+    def reduce_from_text(
+        self,
+        texts: List[str],
+        filter_by_sab: bool = True,
+        max_hierarchy_levels: int = HIERARCHY_EDGE_THRESHOLD,
+        refine_with_embeddings: bool = True,
+        compute_metrics: bool = True
+    ) -> Dict:
+        """
+        Complete pipeline: Text → CUIs → Reduction
+        
+        Args:
+            texts: List of text strings to process
+            filter_by_sab: Whether to filter by SAB (ICD, SNOMED, LOINC)
+            max_hierarchy_levels: Max levels for clustering
+            refine_with_embeddings: Whether to refine with embeddings
+            compute_metrics: Whether to compute quality metrics
+            
+        Returns:
+            Dictionary with reduced CUIs and comprehensive stats
+        """
+        start_time = time.time()
+        
+        logger.info(f"Starting reduction pipeline for {len(texts)} text(s)")
+        
+        # Step 1: Extract CUIs from text
+        logger.info("Step 1: Extracting CUIs from text...")
+        extracted_cuis = self.api_client.extract_cuis_batch(texts)
+        
+        if not extracted_cuis:
+            logger.warning("No CUIs extracted from text")
+            return {
+                'texts': texts,
+                'extracted_cuis': [],
+                'filtered_cuis': [],
+                'reduced_cuis': [],
+                'stats': ReductionStats(
+                    initial_count=0,
+                    after_ic_rollup=0,
+                    final_count=0,
+                    ic_rollup_reduction_pct=0,
+                    semantic_clustering_reduction_pct=0,
+                    total_reduction_pct=0,
+                    processing_time=time.time() - start_time,
+                    ic_threshold_used=0
+                ).to_dict()
+            }
+        
+        # Step 2: Filter CUIs by SAB
+        if filter_by_sab:
+            logger.info("Step 2: Filtering CUIs by SAB...")
+            filtered_cuis = filter_allowed_cuis(extracted_cuis, self.project_id, self.dataset_id)
+        else:
+            filtered_cuis = list(extracted_cuis)
+        
+        if not filtered_cuis:
+            logger.warning("No CUIs after SAB filter")
+            return {
+                'texts': texts,
+                'extracted_cuis': list(extracted_cuis),
+                'filtered_cuis': [],
+                'reduced_cuis': [],
+                'stats': ReductionStats(
+                    initial_count=len(extracted_cuis),
+                    after_ic_rollup=0,
+                    final_count=0,
+                    ic_rollup_reduction_pct=100.0,
+                    semantic_clustering_reduction_pct=0,
+                    total_reduction_pct=100.0,
+                    processing_time=time.time() - start_time,
+                    ic_threshold_used=0
+                ).to_dict()
+            }
+        
+        # Step 3: Edge-based reduction
+        logger.info("Step 3: Edge-based reduction...")
+        result = self.reduce(
+            cuis=filtered_cuis,
+            source_type="query",
+            max_hierarchy_levels=max_hierarchy_levels,
+            refine_with_embeddings=refine_with_embeddings,
+            compute_metrics=compute_metrics
+        )
+        
+        # Add extraction context
+        result['texts'] = texts
+        result['extracted_cuis'] = list(extracted_cuis)
+        result['filtered_cuis'] = filtered_cuis
+        result['pipeline_processing_time'] = time.time() - start_time
+        
+        return result
+    
     def reduce(
         self,
-        input_cuis: List[str],
-        ic_percentile: int = 75,
-        similarity_threshold: float = 0.75,
-        distance_from_centroid_threshold: float = 0.15
-    ) -> Tuple[List[str], ReductionStats]:
-
+        cuis: List[str],
+        source_type: str = "query",
+        max_hierarchy_levels: int = HIERARCHY_EDGE_THRESHOLD,
+        refine_with_embeddings: bool = True,
+        compute_metrics: bool = True
+    ) -> Dict:
+        """
+        Reduce CUI list using edge-based strategy
+        
+        Args:
+            cuis: List of CUIs to reduce
+            source_type: "query" or "document"
+            max_hierarchy_levels: Max levels for clustering
+            refine_with_embeddings: Whether to refine with embeddings
+            compute_metrics: Whether to compute quality metrics
+            
+        Returns:
+            Dictionary with reduction results
+        """
         start_time = time.time()
-        input_cuis = list(set(input_cuis))
-        initial_count = len(input_cuis)
-        logger.info(f"Starting semantic-group based reduction for {initial_count} CUIs")
-
-        # --------------------- Semantic type grouping ---------------------
-        semantic_groups = self._group_by_semantic_type_dynamic(input_cuis)
-        logger.info(f"Created {len(semantic_groups)} semantic groups")
-
-        all_reduced_cuis = []
-        group_stats = {}
-        total_after_ic = 0
-
-        for group_name, group_cuis in semantic_groups.items():
-            if not group_cuis:
-                continue
-
-            # --------------------- Build hierarchy from pickle ---------------------
-            hierarchy = self._build_hierarchy_depthwise(group_cuis)
-
-            # --------------------- IC scores ---------------------
-            ic_scores = self._compute_ic_scores_within_group(hierarchy, group_cuis, group_name)
-            ic_threshold = np.percentile(list(ic_scores.values()), ic_percentile) if ic_scores else 0.0
-            high_ic_cuis = [cui for cui in group_cuis if ic_scores.get(cui, 0) >= ic_threshold]
-            total_after_ic += len(high_ic_cuis)
-
-            # --------------------- Embedding-based clustering ---------------------
-            if len(high_ic_cuis) > 1:
-                group_reduced = self._cluster_and_select_diverse(high_ic_cuis, similarity_threshold, distance_from_centroid_threshold)
-            else:
-                group_reduced = high_ic_cuis
-
-            all_reduced_cuis.extend(group_reduced)
-            group_stats[group_name] = {
-                'original': len(group_cuis),
-                'after_ic_filter': len(high_ic_cuis),
-                'final': len(group_reduced),
-                'reduction_pct': (1 - len(group_reduced)/len(group_cuis)) * 100 if group_cuis else 0
+        
+        # Validate input
+        if not cuis:
+            raise ValueError("CUI list cannot be empty")
+        
+        if len(cuis) > MAX_INPUT_CUIS:
+            raise ValueError(f"Maximum {MAX_INPUT_CUIS} CUIs allowed, got {len(cuis)}")
+        
+        logger.info(f"Starting edge-based reduction for {len(cuis)} CUIs (source: {source_type})")
+        
+        input_cuis_set = set(cuis)
+        initial_count = len(cuis)
+        
+        # Step 1: Hierarchical Clustering
+        logger.info("Step 1: Hierarchical clustering...")
+        clusters = self.hierarchical_clusterer.cluster_cuis(cuis, max_hierarchy_levels)
+        
+        if not clusters:
+            logger.warning("No clusters formed, returning original CUIs")
+            return {
+                'original_cuis': cuis,
+                'reduced_cuis': cuis,
+                'reduction_metadata': {
+                    'clusters': [],
+                    'method': 'no_reduction',
+                    'reason': 'no_clusters_formed'
+                },
+                'processing_time': time.time() - start_time
             }
-
-        # --------------------- Final deduplication ---------------------
-        final_cuis = list(set(all_reduced_cuis))
-        # self._fetch_descriptions(final_cuis)
-
+        
+        logger.info(f"Formed {len(clusters)} initial clusters")
+        
+        # Step 2: Embedding-based Refinement (optional)
+        if refine_with_embeddings:
+            logger.info("Step 2: Embedding-based refinement...")
+            clusters = self.embedding_refiner.refine_clusters_iteratively(clusters)
+            logger.info(f"Refined to {len(clusters)} clusters")
+        
+        # Step 3: Edge-Based Representative Selection
+        logger.info("Step 3: Edge-based representative selection...")
+        reduced_cuis = []
+        edge_stats = {
+            'total_edges': 0,
+            'fallback_parents': 0,
+            'ic_adjusted': 0
+        }
+        
+        for cluster in clusters:
+            selection_result = self.edge_detector.select_representatives_edge_based(
+                cluster,
+                input_cuis_set
+            )
+            
+            cluster['representatives'] = selection_result['representatives']
+            cluster['representative_metadata'] = selection_result['representative_metadata']
+            cluster['edge_analysis'] = selection_result['edge_analysis']
+            cluster['selection_strategy'] = selection_result['strategy']
+            
+            reduced_cuis.extend(selection_result['representatives'])
+            
+            # Track stats
+            edge_stats['total_edges'] += selection_result['edge_analysis']['edge_count']
+            if selection_result['edge_analysis']['parent_needed']:
+                edge_stats['fallback_parents'] += 1
+            edge_stats['ic_adjusted'] += sum(1 for m in selection_result['representative_metadata'] 
+                                             if m.get('ic_adjusted', False))
+        
+        reduced_cuis = list(set(reduced_cuis))
+        
+        logger.info(f"Reduced {len(cuis)} CUIs to {len(reduced_cuis)} ({len(reduced_cuis)/len(cuis)*100:.1f}%)")
+        
+        # Step 4: Compute Quality Metrics
+        quality_metrics = {}
+        if compute_metrics:
+            logger.info("Step 4: Computing quality metrics...")
+            quality_metrics = self._compute_quality_metrics(cuis, clusters)
+        
+        # Build comprehensive stats
         stats = ReductionStats(
             initial_count=initial_count,
-            after_ic_rollup=total_after_ic,
-            final_count=len(final_cuis),
-            ic_rollup_reduction_pct=self._safe_percentage(initial_count - total_after_ic, initial_count),
-            semantic_clustering_reduction_pct=self._safe_percentage(total_after_ic - len(final_cuis), initial_count),
-            total_reduction_pct=self._safe_percentage(initial_count - len(final_cuis), initial_count),
+            after_ic_rollup=len(reduced_cuis),  # After edge detection
+            final_count=len(reduced_cuis),
+            ic_rollup_reduction_pct=0,  # Not using IC percentile
+            semantic_clustering_reduction_pct=(1 - len(reduced_cuis)/initial_count) * 100,
+            total_reduction_pct=(1 - len(reduced_cuis)/initial_count) * 100,
             processing_time=time.time() - start_time,
-            ic_threshold_used=ic_percentile,
-            hierarchy_size=sum(len(h.get("all_cuis", [])) for h in self._hierarchy_cache.values()),
-            api_call_time=0.0,
-            group_stats=group_stats,
-            missing_embeddings_count=self._missing_embeddings_total
+            ic_threshold_used=0,  # Not using percentile threshold
+            hierarchy_size=self.network_client.network.number_of_nodes(),
+            group_stats={f"cluster_{i}": {
+                'size': c['size'],
+                'representatives': len(c.get('representatives', [])),
+                'edges': c.get('edge_analysis', {}).get('edge_count', 0)
+            } for i, c in enumerate(clusters)},
+            edge_based_stats=edge_stats
         )
-
-        return final_cuis, stats
-
-    # --------------------- Semantic type grouping ---------------------
-    def _group_by_semantic_type_dynamic(self, cuis: List[str]) -> Dict[str, List[str]]:
-        query = f"""
-        SELECT DISTINCT CUI, STY
-        FROM `{self.project_id}.{self.dataset_id}.{self.mrsty_table}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cuis)]
-        )
-        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        if df.empty:
-            return {'UNKNOWN': cuis}
-
-        semantic_groups = defaultdict(set)
-        cui_to_types = defaultdict(set)
-        for _, row in df.iterrows():
-            semantic_groups[row['STY']].add(row['CUI'])
-            cui_to_types[row['CUI']].add(row['STY'])
-
-        final_groups = defaultdict(list)
-        for cui in cuis:
-            types = cui_to_types.get(cui, {'UNKNOWN'})
-            sorted_types = sorted(types, key=lambda x: (-len(x), x))
-            for t in sorted_types:
-                final_groups[t].append(cui)
-        return dict(final_groups)
-
-    # --------------------- Hierarchy from pickle ---------------------
-    def _build_hierarchy_depthwise(self, cuis: List[str]) -> Dict:
-        key = tuple(sorted(cuis))
-        if key in self._hierarchy_cache:
-            return self._hierarchy_cache[key]
-
-        all_cuis = set()
-        parent_to_children = defaultdict(list)
-        child_to_parents = defaultdict(list)
-
-        for cui in cuis:
-            if not UMLS_NETWORK_OBJ.has_node(cui):
-                continue
-            # Children
-            for child in UMLS_NETWORK_OBJ.successors(cui):
-                parent_to_children[cui].append(child)
-                child_to_parents[child].append(cui)
-                all_cuis.update([cui, child])
-            # Parents
-            for parent in UMLS_NETWORK_OBJ.predecessors(cui):
-                child_to_parents[cui].append(parent)
-                parent_to_children[parent].append(cui)
-                all_cuis.update([cui, parent])
-
-        hierarchy = {
-            "parent_to_children": dict(parent_to_children),
-            "child_to_parents": dict(child_to_parents),
-            "all_cuis": all_cuis
+        
+        # Build output
+        result = {
+            'original_cuis': cuis,
+            'reduced_cuis': reduced_cuis,
+            
+            'reduction_metadata': {
+                'source_type': source_type,
+                'method': 'edge_based_hierarchical_networkx',
+                'clusters': self._format_clusters_for_output(clusters),
+                'reduction_ratio': len(reduced_cuis) / len(cuis),
+                'num_clusters': len(clusters),
+                'processing_time': time.time() - start_time,
+                'strategy_details': {
+                    'edge_based': ENABLE_EDGE_BASED_REDUCTION,
+                    'fallback_parents': ENABLE_FALLBACK_PARENTS,
+                    'embedding_refinement': refine_with_embeddings,
+                    'uses_networkx_pickle': True,
+                    'uses_gcp_native_auth': True
+                }
+            },
+            
+            'quality_metrics': quality_metrics,
+            'stats': stats.to_dict(),
+            'processing_time': time.time() - start_time
         }
-        self._hierarchy_cache[key] = hierarchy
-        return hierarchy
+        
+        logger.info(f"Edge-based reduction complete in {result['processing_time']:.2f}s")
+        return result
+    
+    def _format_clusters_for_output(self, clusters: List[Dict]) -> List[Dict]:
+        """Format cluster information for output"""
+        formatted = []
+        
+        for cluster in clusters:
+            member_info = self.network_client.get_multiple_cui_info(cluster['member_cuis'])
+            member_names = [
+                member_info.get(cui, {}).get('name', 'Unknown')
+                for cui in cluster['member_cuis']
+            ]
+            
+            representatives = cluster.get('representatives', [])
+            rep_metadata = cluster.get('representative_metadata', [])
+            
+            formatted_representatives = []
+            for rep_meta in rep_metadata:
+                cui = rep_meta['cui']
+                cui_info = self.network_client.get_cui_info(cui)
+                
+                formatted_representatives.append({
+                    'cui': cui,
+                    'name': cui_info.get('name', 'Unknown'),
+                    'ic_score': rep_meta.get('ic_score'),
+                    'selection_reason': rep_meta.get('selection_reason'),
+                    'edge_reason': rep_meta.get('edge_reason'),
+                    'ic_adjusted': rep_meta.get('ic_adjusted', False),
+                    'original_cui': rep_meta.get('original_cui')
+                })
+            
+            edge_analysis = cluster.get('edge_analysis', {})
+            
+            formatted_cluster = {
+                'cluster_id': cluster['cluster_id'],
+                'size': cluster['size'],
+                
+                'representatives': formatted_representatives,
+                'representative_count': len(representatives),
+                
+                'member_cuis': cluster['member_cuis'],
+                'member_names': member_names,
+                
+                'lca_cui': cluster.get('lca_cui'),
+                'lca_name': cluster.get('lca_name'),
+                'lca_semantic_types': cluster.get('lca_semantic_types', []),
+                'hierarchy_level': cluster.get('level', 0),
+                
+                'edge_count': edge_analysis.get('edge_count', 0),
+                'parent_as_fallback': edge_analysis.get('parent_needed', False),
+                'selection_strategy': cluster.get('selection_strategy', 'edge_based'),
+                
+                'coherence': cluster.get('coherence'),
+                'paths': cluster.get('paths', {})
+            }
+            
+            if edge_analysis.get('parent_cui'):
+                coverage_stats = self.edge_detector.compute_coverage_statistics(
+                    edge_analysis['parent_cui'],
+                    edge_analysis.get('edges', [])
+                )
+                formatted_cluster['coverage_statistics'] = coverage_stats
+            
+            formatted.append(formatted_cluster)
+        
+        return formatted
+    
+    def _compute_quality_metrics(self, original_cuis: List[str], clusters: List[Dict]) -> Dict:
+        """Compute comprehensive quality metrics"""
+        metrics = {}
+        
+        # IC-based metrics
+        ic_stats = self.ic_optimizer.compute_cluster_ic_stats(clusters)
+        metrics['ic_statistics'] = ic_stats
+        
+        # Reduction statistics
+        reduced_count = sum(len(c.get('representatives', [])) for c in clusters)
+        metrics['reduction_statistics'] = {
+            'original_count': len(original_cuis),
+            'reduced_count': reduced_count,
+            'reduction_ratio': reduced_count / len(original_cuis),
+            'reduction_percent': (1 - reduced_count / len(original_cuis)) * 100,
+            'avg_cluster_size': sum(c['size'] for c in clusters) / len(clusters)
+        }
+        
+        # Cluster size distribution
+        sizes = [c['size'] for c in clusters]
+        metrics['cluster_size_distribution'] = {
+            'min': min(sizes),
+            'max': max(sizes),
+            'mean': sum(sizes) / len(sizes),
+            'singletons': sum(1 for s in sizes if s == 1),
+            'singleton_percent': sum(1 for s in sizes if s == 1) / len(sizes) * 100
+        }
+        
+        return metrics
+    
+    def get_reduction_stats(self) -> Dict:
+        """Get statistics about the reduction engine"""
+        return {
+            'network_cache_stats': self.network_client.get_cache_stats(),
+            'embeddings_cache_size': self.embeddings_client.get_cache_size(),
+            'configuration': {
+                'max_input_cuis': MAX_INPUT_CUIS,
+                'min_input_cuis': MIN_INPUT_CUIS,
+                'hierarchy_edge_threshold': HIERARCHY_EDGE_THRESHOLD,
+                'optimal_ic_range': [OPTIMAL_IC_MIN, OPTIMAL_IC_MAX],
+                'uses_networkx_pickle': True,
+                'uses_gcp_native_auth': True,
+                'sab_filter': ALLOWED_SABS
+            }
+        }
 
-    # --------------------- IC Scores ---------------------
-    def _compute_ic_scores_within_group(
-        self,
-        hierarchy: Dict,
-        group_cuis: List[str],
-        group_name: str
-    ) -> Dict[str, float]:
-        cache_key = f"{group_name}_{tuple(sorted(group_cuis))}"
-        if cache_key in self._ic_scores_cache:
-            return self._ic_scores_cache[cache_key]
 
-        parent_to_children = hierarchy.get("parent_to_children", {})
-        group_set = set(group_cuis)
-        descendant_counts = {}
+# ============================================================================
+# END OF MODULE 1 - GCP PRODUCTION VERSION
+# ============================================================================
 
-        def count_descendants(cui: str, visited: Set[str] = None) -> int:
-            if visited is None:
-                visited = set()
-            if cui in visited or cui not in group_set:
-                return 0
-            visited.add(cui)
-            children = [c for c in parent_to_children.get(cui, []) if c in group_set]
-            count = len(children)
-            for child in children:
-                count += count_descendants(child, visited)
-            descendant_counts[cui] = count
-            return count
+"""
+USAGE EXAMPLE:
 
-        for cui in group_cuis:
-            if cui not in descendant_counts:
-                try:
-                    count_descendants(cui)
-                except RecursionError:
-                    descendant_counts[cui] = 0
+import pickle
+from google.cloud import bigquery
 
-        group_size = len(group_cuis)
-        ic_scores = {cui: max(0.0, -np.log((descendant_counts.get(cui,0)+1)/group_size)) for cui in group_cuis}
-        self._ic_scores_cache[cache_key] = ic_scores
-        return ic_scores
+# Load NetworkX pickle
+with open("umls_network.pkl", "rb") as f:
+    UMLS_NETWORK_OBJ = pickle.load(f)
 
-    # --------------------- Embedding Clustering ---------------------
-    def _cluster_and_select_diverse(self, cui_list, similarity_threshold, distance_threshold):
-        if len(cui_list) <= 1:
-            return cui_list
-        query = f"""
-        SELECT CUI AS cui, embedding AS embedding
-        FROM `{self.project_id}.{self.dataset_id}.{self.cui_embeddings_table}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", cui_list)]
-        )
-        df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-        if df.empty:
-            return cui_list
-        valid = [(row["cui"], np.asarray(row["embedding"], dtype=np.float32)) for _, row in df.iterrows() if row["embedding"] is not None]
-        if len(valid) < 2:
-            return cui_list
-        cuis, embeddings = zip(*valid)
-        embeddings = np.vstack(embeddings)
-        clustering = AgglomerativeClustering(n_clusters=None, distance_threshold=1-similarity_threshold, metric="cosine", linkage="average")
-        labels = clustering.fit_predict(embeddings)
-        selected = set()
-        for label in np.unique(labels):
-            idx = np.where(labels == label)[0]
-            cluster_emb = embeddings[idx]
-            centroid = np.mean(cluster_emb, axis=0)
-            distances = cosine_distances([centroid], cluster_emb)[0]
-            far = idx[distances > distance_threshold]
-            if len(far):
-                selected.update([cuis[i] for i in far])
-            else:
-                selected.add(cuis[idx[np.argmax(distances)]])
-        return list(selected)
+# Initialize reduction engine
+reduction_engine = CUIReductionEngine(
+    umls_network_obj=UMLS_NETWORK_OBJ,
+    project_id="your-project-id",
+    dataset_id="your-umls-dataset",
+    cui_embeddings_table="cui_embeddings",
+    cui_extraction_api_url="https://your-cui-api.com"
+)
 
-    # --------------------- Fetch descriptions ---------------------
-    # def _fetch_descriptions(self, cuis: List[str]):
-    # to_fetch = [c for c in cuis if c not in self._description_cache]
-    # if not to_fetch:
-    #     return
-    # query = f"""
-    # SELECT CUI AS cui, DEF AS description
-    # FROM `{self.project_id}.{self.dataset_id}.MRDEF`
-    # WHERE CUI IN UNNEST(@cuis)
-    # """
-    # job_config = bigquery.QueryJobConfig(
-    #     query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", to_fetch)]
-    # )
-    # df = self.client.query(query, job_config=job_config).result(timeout=60).to_dataframe()
-    # for _, row in df.iterrows():
-    #     self._description_cache[row['cui']] = row['description']
-    # logger.info(f"Fetched {len(df)} definitions")
+# Option 1: Reduce from text (complete pipeline)
+texts = ["ankle pain", "patient has difficulty walking"]
+result = reduction_engine.reduce_from_text(
+    texts=texts,
+    filter_by_sab=True,
+    compute_metrics=True
+)
 
-    # --------------------- Utility ---------------------
-    @staticmethod
-    def _safe_percentage(numerator: float, denominator: float) -> float:
-        return (numerator / denominator * 100) if denominator else 0.0
+print(f"Texts: {result['texts']}")
+print(f"Extracted CUIs: {len(result['extracted_cuis'])}")
+print(f"Filtered CUIs: {len(result['filtered_cuis'])}")
+print(f"Reduced CUIs: {len(result['reduced_cuis'])}")
+print(f"Total reduction: {result['stats']['total_reduction_pct']:.1f}%")
 
-# --------------------- Main Pipeline ---------------------
-if __name__ == "__main__":
+# Option 2: Reduce from CUI list (if you already have CUIs)
+cuis = ["C0002838", "C0239377", "C0239378"]
+result = reduction_engine.reduce(cuis=cuis, compute_metrics=True)
 
-    # # --------------------- Load Pickle ---------------------
-    # NETWORK_PKL = "/home/jupyter/NER/networkx_cui_context_v1_1_0.pkl"
-    # with open(NETWORK_PKL, "rb") as f:
-    #     UMLS_NETWORK_OBJ = pickle.load(f)
-    # logger.info(f"Pickle loaded. Type: {type(UMLS_NETWORK_OBJ)}")
-
-    # --------------------- Inputs ---------------------
-    project_id = project_id
-    dataset_id = dataset
-    cui_embeddings_table = embedding_table
-    mrsty_table = "MRSTY"
-    texts = ["ankle pain"]
-
-    # --------------------- Extract CUIs ---------------------
-    api_url = url
-    api_client = CUIAPIClient(api_url)
-    extracted_cuis = api_client.extract_cuis_batch(texts)
-
-    # --------------------- Filter CUIs ---------------------
-    filtered_cuis = filter_allowed_cuis(extracted_cuis, project_id, dataset_id)
-
-    # --------------------- Reduce CUIs ---------------------
-    reducer = EnhancedCUIReducer(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        cui_embeddings_table=cui_embeddings_table,
-        mrsty_table=mrsty_table,
-        umls_network_obj=UMLS_NETWORK_OBJ
-    )
-    final_cuis, stats = reducer.reduce(filtered_cuis)
-
-    logger.info(f"Final CUIs ({len(final_cuis)}): {len(final_cuis)}")
-    # logger.info(f"Reduction Stats: {stats.to_dict()}")
+print(f"Reduced {len(result['original_cuis'])} to {len(result['reduced_cuis'])} CUIs")
+print(f"Method: {result['reduction_metadata']['method']}")
+"""
