@@ -1,16 +1,914 @@
-2026-01-29 19:12:08,289 - __main__ - INFO - UMLS Network Client initialized with 25445111 nodes
-2026-01-29 19:12:08,290 - __main__ - INFO - CUI Reduction Engine initialized (GCP native, edge-based strategy)
-2026-01-29 19:12:08,291 - __main__ - INFO - Starting reduction pipeline for 2 text(s)
-2026-01-29 19:12:08,292 - __main__ - INFO - Step 1: Extracting CUIs from text...
-2026-01-29 19:12:09,182 - __main__ - INFO - GCP authentication token refreshed
-2026-01-29 19:12:09,183 - __main__ - INFO - Extracting CUIs from 2 text(s)...
-2026-01-29 19:12:09,235 - urllib3.connectionpool - WARNING - Retrying (Retry(total=2, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7fd5a72413f0>: Failed to establish a new connection: [Errno -2] Name or service not known')': /
-2026-01-29 19:12:11,249 - urllib3.connectionpool - WARNING - Retrying (Retry(total=1, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7fd41b954850>: Failed to establish a new connection: [Errno -2] Name or service not known')': /
-2026-01-29 19:12:15,265 - urllib3.connectionpool - WARNING - Retrying (Retry(total=0, connect=None, read=None, redirect=None, status=None)) after connection broken by 'NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7fd5a7241120>: Failed to establish a new connection: [Errno -2] Name or service not known')': /
-2026-01-29 19:12:15,279 - __main__ - ERROR - API call failed: HTTPSConnectionPool(host='your-cui-api.com', port=443): Max retries exceeded with url: / (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7fd5a7241780>: Failed to establish a new connection: [Errno -2] Name or service not known'))
-2026-01-29 19:12:15,280 - __main__ - WARNING - No CUIs extracted from text
-Texts: ['ankle pain', 'patient has difficulty walking']
-Extracted CUIs: 0
-Filtered CUIs: 0
-Reduced CUIs: 0
-Total reduction: 0.0%
+"""
+CUI REDUCTION ENGINE – STREAMING + EDGE-BASED
+
+Design Goals
+------------
+- No hard CUI limits (streaming)
+- Bounded memory usage (LRU cache)
+- Batch BigQuery operations
+- Edge-based reduction with fallback parents
+- Coverage-aware selection
+- Production-ready for GCP
+
+Combines:
+- Streaming architecture (this version)
+- Edge-based strategy (previous version)
+"""
+
+import time
+import logging
+import threading
+import subprocess
+import requests
+import numpy as np
+import pickle
+
+from typing import Iterable, Dict, List, Set, Generator, Optional, Tuple
+from collections import defaultdict, OrderedDict
+from dataclasses import dataclass, asdict, field
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from google.cloud import bigquery
+
+# ------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------
+
+BQ_BATCH_SIZE = 5000
+API_BATCH_SIZE = 100
+ANCESTOR_DEPTH = 3
+EMBED_CACHE_SIZE = 50000
+
+# Edge-based configuration
+OPTIMAL_IC_MIN = 4.0
+OPTIMAL_IC_MAX = 7.0
+MAX_HIERARCHY_DEPTH = 10
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Suppress urllib3 warnings
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+
+# ------------------------------------------------------------------
+# HELPERS
+# ------------------------------------------------------------------
+
+def chunked(iterable, size):
+    """Yield successive chunks from iterable"""
+    batch = []
+    for item in iterable:
+        batch.append(item)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+# ------------------------------------------------------------------
+# DATA CLASS
+# ------------------------------------------------------------------
+
+@dataclass
+class ReductionStats:
+    initial_count: int = 0
+    final_count: int = 0
+    processing_time: float = 0.0
+    reduction_pct: float = 0.0
+    group_stats: Dict = field(default_factory=dict)
+    edge_stats: Dict = field(default_factory=dict)
+    
+    def to_dict(self):
+        return asdict(self)
+
+# ------------------------------------------------------------------
+# LRU CACHE
+# ------------------------------------------------------------------
+
+class LRUCache:
+    """Least Recently Used cache with fixed size"""
+    
+    def __init__(self, maxsize=EMBED_CACHE_SIZE):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, k):
+        if k in self.cache:
+            self.cache.move_to_end(k)
+            self.hits += 1
+            return self.cache[k]
+        self.misses += 1
+        return None
+
+    def put(self, k, v):
+        self.cache[k] = v
+        self.cache.move_to_end(k)
+        if len(self.cache) > self.maxsize:
+            self.cache.popitem(last=False)
+    
+    def stats(self):
+        total = self.hits + self.misses
+        hit_rate = self.hits / total if total > 0 else 0
+        return {
+            'size': len(self.cache),
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': hit_rate
+        }
+
+# ------------------------------------------------------------------
+# TOKEN PROVIDER
+# ------------------------------------------------------------------
+
+class GCPTokenProvider:
+    """GCP authentication token provider with caching"""
+    
+    _lock = threading.Lock()
+    _token = None
+    _expiry = 0
+
+    @classmethod
+    def headers(cls, force: bool = False):
+        """Get authentication headers"""
+        with cls._lock:
+            now = time.time()
+            if not force and cls._token and now < cls._expiry:
+                return cls._token
+
+            proc = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10
+            )
+            
+            if proc.returncode != 0:
+                raise RuntimeError(f"gcloud auth failed: {proc.stderr}")
+            
+            token = proc.stdout.strip()
+            if not token:
+                raise RuntimeError("Empty token from gcloud")
+
+            cls._token = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+            cls._expiry = now + 3300
+            logger.debug("GCP token refreshed")
+            return cls._token
+
+# ------------------------------------------------------------------
+# API CLIENT
+# ------------------------------------------------------------------
+
+class CUIAPIClient:
+    """Streaming CUI extraction API client"""
+    
+    def __init__(self, url: str, timeout: int = 60):
+        self.url = url
+        self.timeout = timeout
+        self.session = requests.Session()
+        
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_stream(
+        self, 
+        texts: Iterable[str]
+    ) -> Generator[str, None, None]:
+        """
+        Stream CUIs from texts in batches
+        
+        Args:
+            texts: Iterable of text strings
+            
+        Yields:
+            CUI strings
+        """
+        for batch in chunked(texts, API_BATCH_SIZE):
+            try:
+                r = self.session.post(
+                    self.url,
+                    json={"query_texts": batch, "top_k": 3},
+                    headers=GCPTokenProvider.headers(),
+                    timeout=self.timeout
+                )
+                
+                if r.status_code == 401:
+                    # Retry with fresh token
+                    r = self.session.post(
+                        self.url,
+                        json={"query_texts": batch, "top_k": 3},
+                        headers=GCPTokenProvider.headers(force=True),
+                        timeout=self.timeout
+                    )
+                
+                r.raise_for_status()
+                data = r.json()
+
+                # Handle different response formats
+                if isinstance(data, dict):
+                    for v in data.values():
+                        if isinstance(v, list):
+                            for c in v:
+                                if c:
+                                    yield str(c)
+                elif isinstance(data, list):
+                    for item in data:
+                        for c in item.get("cuis", []):
+                            if c:
+                                yield str(c)
+            
+            except Exception as e:
+                logger.error(f"API batch failed: {e}")
+                continue
+
+# ------------------------------------------------------------------
+# BIGQUERY EMBEDDINGS
+# ------------------------------------------------------------------
+
+class EmbeddingClient:
+    """Streaming BigQuery embeddings client with LRU cache"""
+    
+    def __init__(self, project: str, dataset: str, table: str):
+        self.client = bigquery.Client(project=project)
+        self.table = f"{project}.{dataset}.{table}"
+        self.cache = LRUCache(EMBED_CACHE_SIZE)
+
+    def get_embeddings(
+        self, 
+        cuis: Iterable[str]
+    ) -> Dict[str, np.ndarray]:
+        """
+        Get embeddings for CUIs (cached)
+        
+        Args:
+            cuis: Iterable of CUI strings
+            
+        Returns:
+            Dictionary mapping CUI to embedding vector
+        """
+        result = {}
+        uncached = []
+
+        # Check cache first
+        for c in cuis:
+            emb = self.cache.get(c)
+            if emb is not None:
+                result[c] = emb
+            else:
+                uncached.append(c)
+
+        if not uncached:
+            return result
+
+        # Batch fetch from BigQuery
+        for batch in chunked(uncached, BQ_BATCH_SIZE):
+            q = f"""
+                SELECT CUI, embedding
+                FROM `{self.table}`
+                WHERE CUI IN UNNEST(@cuis)
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+                ]
+            )
+
+            try:
+                rows = list(self.client.query(q, job_config=job_config).result())
+                for r in rows:
+                    vec = np.array(r.embedding, dtype=np.float32)
+                    self.cache.put(r.CUI, vec)
+                    result[r.CUI] = vec
+            
+            except Exception as e:
+                logger.error(f"BigQuery embedding fetch failed: {e}")
+                continue
+
+        return result
+    
+    def cache_stats(self):
+        """Get cache statistics"""
+        return self.cache.stats()
+
+# ------------------------------------------------------------------
+# HIERARCHY CLIENT
+# ------------------------------------------------------------------
+
+class NetworkXHierarchyClient:
+    """
+    Hierarchy client using NetworkX pickle
+    Lightweight with LRU caching
+    """
+    
+    def __init__(self, network_obj):
+        """
+        Initialize with NetworkX graph
+        
+        Args:
+            network_obj: NetworkX DiGraph (parent→child)
+        """
+        self.network = network_obj
+        self._ancestors_cache = LRUCache(10000)
+        self._children_cache = {}
+        self._ic_cache = {}
+        
+        logger.info(f"Hierarchy client initialized: {self.network.number_of_nodes()} nodes")
+    
+    def get_parents(self, cui: str) -> List[str]:
+        """Get immediate parents"""
+        if not self.network.has_node(cui):
+            return []
+        return list(self.network.predecessors(cui))
+    
+    def get_children(self, cui: str) -> List[str]:
+        """Get immediate children (cached)"""
+        if cui in self._children_cache:
+            return self._children_cache[cui]
+        
+        if not self.network.has_node(cui):
+            children = []
+        else:
+            children = list(self.network.successors(cui))
+        
+        self._children_cache[cui] = children
+        return children
+    
+    def get_ancestors(
+        self, 
+        cui: str, 
+        max_depth: int = ANCESTOR_DEPTH
+    ) -> List[str]:
+        """
+        Get ancestor path up to max_depth
+        
+        Args:
+            cui: Concept Unique Identifier
+            max_depth: Maximum levels to traverse
+            
+        Returns:
+            List of ancestor CUIs (closest to farthest)
+        """
+        cache_key = (cui, max_depth)
+        cached = self._ancestors_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        if not self.network.has_node(cui):
+            return []
+        
+        ancestors = []
+        current = cui
+        
+        for _ in range(max_depth):
+            parents = self.get_parents(current)
+            if not parents:
+                break
+            
+            parent = parents[0]  # Take first parent
+            if parent in ancestors:
+                break  # Avoid cycles
+            
+            ancestors.append(parent)
+            current = parent
+        
+        self._ancestors_cache.put(cache_key, ancestors)
+        return ancestors
+    
+    def estimate_ic(self, cui: str) -> float:
+        """
+        Estimate IC from hierarchy depth
+        
+        Args:
+            cui: Concept Unique Identifier
+            
+        Returns:
+            Estimated IC score
+        """
+        if cui in self._ic_cache:
+            return self._ic_cache[cui]
+        
+        ancestors = self.get_ancestors(cui, max_depth=MAX_HIERARCHY_DEPTH)
+        depth = len(ancestors)
+        
+        # Estimate IC from depth
+        ic = min(10.0, 1.0 + depth * 0.9)
+        
+        self._ic_cache[cui] = ic
+        return ic
+
+# ------------------------------------------------------------------
+# EDGE DETECTOR (STREAMING VERSION)
+# ------------------------------------------------------------------
+
+class StreamingEdgeDetector:
+    """
+    Edge-based reduction for streaming CUIs
+    Lightweight version with core logic
+    """
+    
+    def __init__(self, hierarchy: NetworkXHierarchyClient):
+        self.h = hierarchy
+    
+    def is_effective_edge(
+        self, 
+        cui: str, 
+        group_members: Set[str]
+    ) -> Tuple[bool, str]:
+        """
+        Check if CUI is an effective edge
+        
+        Args:
+            cui: Concept Unique Identifier
+            group_members: All CUIs in the group
+            
+        Returns:
+            (is_edge, reason)
+        """
+        children = self.h.get_children(cui)
+        
+        # True leaf node
+        if not children:
+            return True, "true_leaf"
+        
+        # Check if children are in group
+        children_in_group = [c for c in children if c in group_members]
+        
+        if not children_in_group:
+            return True, "no_children_in_group"
+        
+        return False, "has_children_in_group"
+    
+    def should_keep_parent_fallback(
+        self,
+        parent_cui: str,
+        edges: List[str]
+    ) -> bool:
+        """
+        Check if parent needed as fallback
+        
+        Args:
+            parent_cui: Parent CUI
+            edges: Detected edge CUIs
+            
+        Returns:
+            True if parent should be kept
+        """
+        all_children = self.h.get_children(parent_cui)
+        
+        if not all_children:
+            return False
+        
+        edges_set = set(edges)
+        all_children_set = set(all_children)
+        
+        # If edges cover all children, parent redundant
+        if edges_set >= all_children_set:
+            return False
+        
+        # Incomplete coverage, need parent
+        return True
+    
+    def adjust_for_ic(self, cui: str) -> str:
+        """
+        Adjust CUI to optimal IC level
+        
+        Args:
+            cui: Concept Unique Identifier
+            
+        Returns:
+            CUI at optimal IC level (or original if already optimal)
+        """
+        ic = self.h.estimate_ic(cui)
+        
+        # Already optimal or too general
+        if ic <= OPTIMAL_IC_MAX:
+            return cui
+        
+        # Too specific - traverse up
+        current = cui
+        for _ in range(5):  # Max 5 levels up
+            parents = self.h.get_parents(current)
+            if not parents:
+                break
+            
+            parent = parents[0]
+            parent_ic = self.h.estimate_ic(parent)
+            
+            if OPTIMAL_IC_MIN <= parent_ic <= OPTIMAL_IC_MAX:
+                return parent
+            
+            if parent_ic < ic:
+                current = parent
+                ic = parent_ic
+            else:
+                break
+        
+        return current
+    
+    def select_representatives(
+        self,
+        group: Set[str],
+        ancestor_cui: Optional[str] = None
+    ) -> Dict:
+        """
+        Select representatives for a group using edge-based strategy
+        
+        Args:
+            group: Set of CUIs in the group
+            ancestor_cui: Common ancestor (if known)
+            
+        Returns:
+            Dictionary with representatives and metadata
+        """
+        if not group:
+            return {'representatives': [], 'metadata': {}}
+        
+        # Single CUI - just return it
+        if len(group) == 1:
+            cui = next(iter(group))
+            return {
+                'representatives': [cui],
+                'metadata': {
+                    'strategy': 'singleton',
+                    'edge_count': 1,
+                    'parent_as_fallback': False
+                }
+            }
+        
+        # Detect edges
+        edges = []
+        for cui in group:
+            is_edge, reason = self.is_effective_edge(cui, group)
+            if is_edge:
+                # Adjust for optimal IC
+                adjusted = self.adjust_for_ic(cui)
+                edges.append(adjusted)
+        
+        edges = list(set(edges))  # Deduplicate
+        
+        # Determine if parent needed
+        parent_needed = False
+        if ancestor_cui and edges:
+            parent_needed = self.should_keep_parent_fallback(ancestor_cui, edges)
+        
+        representatives = edges.copy()
+        
+        # Add parent if needed
+        if parent_needed and ancestor_cui:
+            representatives.append(ancestor_cui)
+        
+        # If no edges found, pick best by IC
+        if not representatives:
+            best_cui = min(group, key=lambda c: abs(self.h.estimate_ic(c) - 5.5))
+            representatives = [best_cui]
+        
+        return {
+            'representatives': list(set(representatives)),
+            'metadata': {
+                'strategy': 'edge_based',
+                'edge_count': len(edges),
+                'parent_as_fallback': parent_needed,
+                'group_size': len(group)
+            }
+        }
+
+# ------------------------------------------------------------------
+# STREAM CLUSTERER
+# ------------------------------------------------------------------
+
+class StreamClusterer:
+    """Clusters CUIs by common ancestors"""
+    
+    def __init__(self, hierarchy: NetworkXHierarchyClient):
+        self.h = hierarchy
+
+    def bucket_by_ancestor(
+        self, 
+        cuis: Iterable[str]
+    ) -> Dict[str, Set[str]]:
+        """
+        Group CUIs by common ancestors
+        
+        Args:
+            cuis: Iterable of CUI strings
+            
+        Returns:
+            Dictionary mapping ancestor CUI to set of descendant CUIs
+        """
+        buckets = defaultdict(set)
+
+        for cui in cuis:
+            ancestors = self.h.get_ancestors(cui, max_depth=ANCESTOR_DEPTH)
+            
+            if not ancestors:
+                # No ancestors - group by itself
+                buckets[cui].add(cui)
+            else:
+                # Group by first (closest) ancestor
+                buckets[ancestors[0]].add(cui)
+
+        return dict(buckets)
+
+# ------------------------------------------------------------------
+# STREAMING REDUCTION ENGINE
+# ------------------------------------------------------------------
+
+class CUIReductionEngine:
+    """
+    Main streaming reduction engine with edge-based strategy
+    """
+    
+    def __init__(
+        self, 
+        hierarchy: NetworkXHierarchyClient,
+        embedding_client: Optional[EmbeddingClient] = None
+    ):
+        """
+        Initialize reduction engine
+        
+        Args:
+            hierarchy: NetworkXHierarchyClient instance
+            embedding_client: Optional EmbeddingClient for semantic validation
+        """
+        self.h = hierarchy
+        self.embedding_client = embedding_client
+        self.clusterer = StreamClusterer(hierarchy)
+        self.edge_detector = StreamingEdgeDetector(hierarchy)
+
+    def reduce_stream(
+        self, 
+        cuis: Iterable[str],
+        use_edge_based: bool = True
+    ) -> Dict:
+        """
+        Reduce streaming CUIs using edge-based strategy
+        
+        Args:
+            cuis: Iterable of CUI strings (can be generator)
+            use_edge_based: Whether to use edge-based selection
+            
+        Returns:
+            Dictionary with reduced CUIs and statistics
+        """
+        start = time.time()
+        stats = ReductionStats()
+
+        # Stream dedupe
+        seen = set()
+        for c in cuis:
+            seen.add(c)
+
+        stats.initial_count = len(seen)
+        logger.info(f"Processing {stats.initial_count} unique CUIs...")
+
+        # Group by ancestors
+        buckets = self.clusterer.bucket_by_ancestor(seen)
+        logger.info(f"Formed {len(buckets)} ancestor-based groups")
+
+        reduced = set()
+        edge_stats = {
+            'total_edges': 0,
+            'fallback_parents': 0,
+            'ic_adjusted': 0
+        }
+
+        # Process each group
+        for ancestor_cui, group in buckets.items():
+            if use_edge_based:
+                # Use edge-based selection
+                result = self.edge_detector.select_representatives(
+                    group,
+                    ancestor_cui
+                )
+                
+                representatives = result['representatives']
+                metadata = result['metadata']
+                
+                # Track stats
+                edge_stats['total_edges'] += metadata.get('edge_count', 0)
+                if metadata.get('parent_as_fallback'):
+                    edge_stats['fallback_parents'] += 1
+            
+            else:
+                # Simple edge detection (original version)
+                edges = [
+                    c for c in group
+                    if not self.h.get_children(c)
+                ]
+                
+                if edges:
+                    representatives = edges
+                else:
+                    representatives = [next(iter(group))]
+            
+            reduced.update(representatives)
+
+        stats.final_count = len(reduced)
+        stats.processing_time = time.time() - start
+        stats.reduction_pct = (
+            1 - stats.final_count / max(stats.initial_count, 1)
+        ) * 100
+        stats.edge_stats = edge_stats
+        stats.group_stats = {
+            'num_groups': len(buckets),
+            'avg_group_size': sum(len(g) for g in buckets.values()) / len(buckets) if buckets else 0
+        }
+
+        logger.info(
+            f"Reduced {stats.initial_count} → {stats.final_count} CUIs "
+            f"({stats.reduction_pct:.1f}% reduction) in {stats.processing_time:.2f}s"
+        )
+
+        return {
+            "reduced_cuis": list(reduced),
+            "stats": stats.to_dict(),
+            "cache_stats": {
+                'hierarchy': {
+                    'ancestors_cache': self.h._ancestors_cache.stats(),
+                    'children_cache_size': len(self.h._children_cache),
+                    'ic_cache_size': len(self.h._ic_cache)
+                }
+            }
+        }
+    
+    def reduce_from_texts(
+        self,
+        texts: Iterable[str],
+        api_client: CUIAPIClient,
+        filter_sab: bool = True,
+        project_id: Optional[str] = None,
+        dataset_id: Optional[str] = None
+    ) -> Dict:
+        """
+        Complete pipeline: texts → CUIs → reduction
+        
+        Args:
+            texts: Iterable of text strings
+            api_client: CUIAPIClient instance
+            filter_sab: Whether to filter by SAB
+            project_id: GCP project (for SAB filtering)
+            dataset_id: BigQuery dataset (for SAB filtering)
+            
+        Returns:
+            Dictionary with reduced CUIs and stats
+        """
+        start = time.time()
+        
+        # Step 1: Extract CUIs
+        logger.info("Step 1: Extracting CUIs from texts...")
+        extracted_cuis = set(api_client.extract_stream(texts))
+        logger.info(f"Extracted {len(extracted_cuis)} unique CUIs")
+        
+        if not extracted_cuis:
+            return {
+                'extracted_cuis': [],
+                'filtered_cuis': [],
+                'reduced_cuis': [],
+                'stats': ReductionStats(
+                    initial_count=0,
+                    final_count=0,
+                    processing_time=time.time() - start
+                ).to_dict()
+            }
+        
+        # Step 2: Filter by SAB (optional)
+        if filter_sab and project_id and dataset_id:
+            logger.info("Step 2: Filtering by SAB...")
+            filtered_cuis = self._filter_by_sab(
+                extracted_cuis,
+                project_id,
+                dataset_id
+            )
+            logger.info(f"Filtered to {len(filtered_cuis)} CUIs")
+        else:
+            filtered_cuis = list(extracted_cuis)
+        
+        if not filtered_cuis:
+            return {
+                'extracted_cuis': list(extracted_cuis),
+                'filtered_cuis': [],
+                'reduced_cuis': [],
+                'stats': ReductionStats(
+                    initial_count=len(extracted_cuis),
+                    final_count=0,
+                    processing_time=time.time() - start
+                ).to_dict()
+            }
+        
+        # Step 3: Reduce
+        logger.info("Step 3: Edge-based reduction...")
+        result = self.reduce_stream(filtered_cuis, use_edge_based=True)
+        
+        result['extracted_cuis'] = list(extracted_cuis)
+        result['filtered_cuis'] = filtered_cuis
+        result['pipeline_time'] = time.time() - start
+        
+        return result
+    
+    def _filter_by_sab(
+        self,
+        cuis: Set[str],
+        project_id: str,
+        dataset_id: str
+    ) -> List[str]:
+        """Filter CUIs by SAB (ICD, SNOMED, LOINC)"""
+        if not cuis:
+            return []
+        
+        sabs = [
+            'CCSR_ICD10CM', 'CCSR_ICD10PCS', 'ICD10', 'ICD10CM',
+            'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC'
+        ]
+        
+        client = bigquery.Client(project=project_id)
+        
+        filtered = []
+        for batch in chunked(list(cuis), BQ_BATCH_SIZE):
+            query = f"""
+            SELECT DISTINCT CUI
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis) AND SAB IN UNNEST(@sabs)
+            """
+            
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", batch),
+                    bigquery.ArrayQueryParameter("sabs", "STRING", sabs)
+                ]
+            )
+            
+            try:
+                df = client.query(query, job_config=job_config).result().to_dataframe()
+                filtered.extend(df['CUI'].tolist())
+            except Exception as e:
+                logger.error(f"SAB filter batch failed: {e}")
+                continue
+        
+        return filtered
+
+
+# ------------------------------------------------------------------
+# USAGE EXAMPLE
+# ------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import pickle
+    
+    # Load NetworkX pickle
+    with open("umls_network.pkl", "rb") as f:
+        network = pickle.load(f)
+    
+    # Initialize clients
+    hierarchy = NetworkXHierarchyClient(network)
+    
+    embedding_client = EmbeddingClient(
+        project="your-project",
+        dataset="your-dataset",
+        table="cui_embeddings"
+    )
+    
+    # Initialize engine
+    engine = CUIReductionEngine(
+        hierarchy=hierarchy,
+        embedding_client=embedding_client
+    )
+    
+    # Option 1: Reduce from CUI list
+    cuis = ["C0002838", "C0239377", "C0239378", "C0458119"]
+    result = engine.reduce_stream(cuis, use_edge_based=True)
+    
+    print(f"Reduced: {len(result['reduced_cuis'])} CUIs")
+    print(f"Reduction: {result['stats']['reduction_pct']:.1f}%")
+    print(f"Edge stats: {result['stats']['edge_stats']}")
+    
+    # Option 2: Complete pipeline from texts
+    api_client = CUIAPIClient("https://your-api.com/extract")
+    
+    texts = ["ankle pain", "difficulty walking"]
+    result = engine.reduce_from_texts(
+        texts=texts,
+        api_client=api_client,
+        filter_sab=True,
+        project_id="your-project",
+        dataset_id="your-dataset"
+    )
+    
+    print(f"\nPipeline results:")
+    print(f"Extracted: {len(result['extracted_cuis'])} CUIs")
+    print(f"Filtered: {len(result['filtered_cuis'])} CUIs")
+    print(f"Reduced: {len(result['reduced_cuis'])} CUIs")
+    print(f"Total time: {result['pipeline_time']:.2f}s")
