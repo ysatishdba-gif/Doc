@@ -1,0 +1,303 @@
+import pickle as pk
+import numpy as np
+from collections import defaultdict, deque
+import pandas as pd
+import time
+from google.cloud import bigquery
+import networkx as nx
+
+def load_embedding_store(memmap_file=MEMMAP_FILE, dict_file=DICT_FILE, dim=D, total_rows=N):
+    with open(dict_file, "rb") as f:
+        cui_to_idx = pk.load(f)
+    embeddings = np.memmap(memmap_file, dtype="float32", mode="r", shape=(total_rows, dim))
+    return embeddings, cui_to_idx
+
+def get_embedding(cui, embeddings, cui_to_idx):
+    return embeddings[cui_to_idx[cui]]
+
+def get_embeddings_batch(cui_list, embeddings, cui_to_idx):
+    idx_list = [cui_to_idx[cui] for cui in cui_list]
+    return embeddings[idx_list]
+
+start = time.time()
+cnet = pk.load(open(NORM_NET, 'rb'))
+embeddings, cui_to_idx = load_embedding_store()
+end = time.time()
+print(f"Whenever machine restarts Preload dictionary will be executed in: {end - start:.2f} seconds")
+
+def load_CUI_DETAILS():
+    """
+    Loads the BigQuery table 'UMLS_CLUSTER_RAW_DATA' into a pandas DataFrame.
+    
+    Returns:
+        pd.DataFrame: DataFrame containing the table data.
+    """
+    # Initialize BigQuery client
+    client = bigquery.Client()
+
+    # Define the full table ID
+    table_id = "aif-usr-p-ep-cg-wcdm-0767.aif_wcdm_osm_pipeline.CUI_DETAILS"
+
+    # Run the query or use client to download the table
+    query = f"SELECT CUI,CUIName,SemanticTypes,Definition FROM `{table_id}`"
+    df = client.query(query).to_dataframe()
+
+    return df
+
+start = time.time()
+cui_details = load_CUI_DETAILS()
+cui_details.sort_values(by='CUI', ascending=True,inplace=True)
+cui_details.set_index('CUI', inplace=True)
+end = time.time()
+print(f"Whenever machine restarts Preload will be executed in: {end - start:.2f} seconds")
+def get_node_name(node):
+    """
+    Return name of the node with suffix
+    Note all nodes are considered the same but might be used multiple times for different purposes.
+    In such circumstance, a node's name will have a suffix to differentiate their uses
+    This function basically remove that suffix and return rest of the string
+    :param node: name of the node without suffix
+    :return:
+    """
+    x = node.split('-')
+    return '-'.join(x[0:-1]) if len(x) > 1 else node
+def fetch_child_cui(pcui):
+    """
+    Fetch all children CUIs of a given parent CUI.
+    Handles missing nodes gracefully.
+
+    Args:
+        pcui (str): Parent CUI
+
+    Returns:
+        set: Set of child CUIs (possibly empty)
+    """
+    tmp = set()
+
+    # Check if parent node exists
+    if pcui not in cnet:
+        # Optional: log or silently skip
+        # print(f"⚠️ Warning: {pcui} not found in graph.")
+        return tmp
+
+    try:
+        # Iterate over direct successors
+        for ele in cnet.successors(pcui):
+            try:
+                #cui = get_node_name(ele)
+                cui = ele
+                tmp.add(cui)
+            except Exception:
+                # If intermediate node missing or invalid, skip
+                continue
+
+    except Exception:
+        # If parent lookup fails, return empty
+        pass
+
+    return tmp
+def fetch_nodes_of_cluster(ref_cui):
+    client = bigquery.Client()
+    query = f"""
+        SELECT node_cui
+        FROM `{PROJECT_ID}.{DATASET_NAME}.{NODE_CLUSTER_TABLE}`,
+        UNNEST(NODE_CUI_LIST) AS node_cui
+        WHERE REF_CUI = '{ref_cui}';
+    """
+
+    job = client.query(query)
+    result = job.result()
+
+    # Collect all node CUIs
+    nodes = [row.node_cui for row in result if row.node_cui is not None]
+
+    return nodes
+def cosine_similarity_with_parent_vec(parent_vec, child_cui, embeddings, cui_to_idx,debug_flag = False):
+    """
+    Compute cosine similarity between a pre-fetched parent vector and a child CUI.
+
+    Args:
+        parent_vec (np.ndarray): Embedding vector for the parent CUI
+        child_cui (str): Child CUI
+        embeddings (np.ndarray): 2D array of all embeddings
+        cui_to_idx (dict): Maps CUI -> index in embeddings
+
+    Returns:
+        float: Cosine similarity (0–1)
+    """
+    try:
+        child_cui_normalized = child_cui.split('-')[0]
+        child_vec = get_embedding(child_cui_normalized, embeddings, cui_to_idx)
+
+        denom = np.linalg.norm(parent_vec) * np.linalg.norm(child_vec)
+        if denom == 0:
+            return 0.0
+
+        sim = np.dot(parent_vec, child_vec) / denom
+        return sim
+
+    except KeyError:
+        if debug_flag == True:
+            print("Child CUI not found in embedding index: marking similarity as 0",child_cui_normalized)
+        # Child CUI not found in embedding index
+        return 0.0
+def has_descendant_in_cluster(node, cluster_nodes, visited=None):
+    """
+    Recursively check if any descendant of a node is in the cluster.
+    Returns:
+        (found, chain)
+        - found: bool -> True if a descendant is in the cluster
+        - chain: list -> the chain from node to that descendant
+    """
+    if visited is None:
+        visited = set()
+
+    if node in visited:
+        return False, []  # avoid infinite loops
+    visited.add(node)
+    children = fetch_child_cui(node)
+
+    for child in children:
+        # Direct child in cluster → return immediately
+        if child.split('-')[0] in cluster_nodes:
+            return True, [node, child]
+
+        # Recursively search deeper
+        found, chain = has_descendant_in_cluster(child, cluster_nodes, visited)
+        if found:
+            return True, [node] + chain
+
+    return False, []
+from collections import defaultdict
+
+def fetch_child_map(remaining, cluster_nodes):
+    """
+    Build a dictionary mapping each node to its valid children within the cluster.
+    Recursively expands to include descendants that connect to cluster nodes.
+    """
+
+    children_map = {}
+    pending_nodes = set()
+
+    for n in remaining:
+        all_children = fetch_child_cui(n)
+        all_children.discard(n)  # remove parent if self-linked
+        valid_children = []
+
+        # Keep if the child is in the cluster, or has a descendant in the cluster
+        for c in all_children:
+            c_normalized = c.split('-')[0]
+
+            if c_normalized in cluster_nodes:
+                valid_children.append(c)
+                if c not in remaining:
+                    pending_nodes.add(c)
+
+            else:
+                descendant_flag, child_chain = has_descendant_in_cluster(c, cluster_nodes)
+                if descendant_flag:
+                    valid_children.append(c)
+                    pending_nodes.update(child_chain)
+
+        children_map[n] = valid_children
+
+    # --- Recursive expansion if pending nodes found ---
+    if pending_nodes:
+        pending_child_map = fetch_child_map(pending_nodes, cluster_nodes)
+        
+        # Merge children_map + pending_child_map
+        merged = defaultdict(list)
+        for k, v in children_map.items():
+            merged[k].extend(v)
+        for k, v in pending_child_map.items():
+            merged[k].extend(v)
+        children_map = dict(merged)
+
+    return children_map
+def compute_cluster_scores(ref_cui, embeddings, cui_to_idx,debug_flag=False):
+    cluster_scores = {}
+    cluster_nodes = set(fetch_nodes_of_cluster(ref_cui))
+    children_map = fetch_child_map(cluster_nodes, cluster_nodes)
+    remaining = set(children_map.keys())
+
+    # print(children_map)
+    # print("Value of children of children_map['C0202679'] ", children_map['C0202679'])
+    known_scores = {n: 1.0 for n, ch in children_map.items() if not ch}
+    # print("Intial known_scores (No children as 1",known_scores)
+    remaining = remaining - set(known_scores.keys())
+    
+
+    iteration = 0
+    while remaining:
+        progress = False
+        iteration += 1
+
+        for node in list(remaining):
+            children = children_map.get(node, [])
+                
+                
+            if all(c in known_scores or c not in remaining for c in children):
+                node_normalized = node.split('-')[0]
+                # ✅ Pre-fetch parent vector once
+                # if iteration ==  7: 
+                #     print("inside for node ",node)
+                try:
+                    parent_vec = get_embedding(node_normalized, embeddings, cui_to_idx)
+                except KeyError:
+                    if debug_flag == True:
+                        print("Parent CUI not found in embedding index:marking it as 0",node_normalized)
+                    known_scores[node] = 0
+                    remaining.remove(node)
+                    progress = True
+                    
+                    # Child CUI not found in embedding index
+                    continue;
+
+                if node_normalized in cluster_nodes:
+                    base_score = 1.0
+                else:
+                    base_score = 0.0
+
+                child_contrib = 0.0
+
+                for child in children:
+                    #if child not in cluster_nodes it is part of remaining hence child contrib for that child is zero:
+                    if child in known_scores:   
+                        sim = cosine_similarity_with_parent_vec(parent_vec, child, embeddings, cui_to_idx)
+                        child_contrib += sim * known_scores[child]
+                
+                known_scores[node] = base_score + child_contrib
+                remaining.remove(node)
+                progress = True
+
+        if not progress:
+            print(f"⚠️ Warning: No progress in iteration {iteration}. Remaining: {remaining}")
+            break
+
+    for c in cluster_nodes:
+        cluster_scores[c] = known_scores[c]
+    sorted_cluster_scores= sorted(cluster_scores.items(), key=lambda item: item[1], reverse=True)
+    return sorted_cluster_scores
+    
+def process(cui, display_row_count = 20):
+    start_time = time.time()
+    cluster_scores = compute_cluster_scores(cui,embeddings, cui_to_idx )
+    end_time = time.time()
+    print("Cluster Scoring time--- %s seconds ---" % (end_time - start_time))
+
+    # for node, score in cluster_scores:
+    #     print(f"{node}: {score:.3f}")
+    # Filter for values greater than 1
+    cui_with_score_greater_than_one = {key: value for key, value in cluster_scores if value > 1}
+    cui_with_score_one_and_lower = {key: value for key, value in cluster_scores if value <= 1}
+    df = pd.DataFrame(list(cui_with_score_greater_than_one.items()), columns=['CUI', 'Score'])
+    df_details = pd.merge(df,cui_details, on='CUI', how='inner',sort=False)
+    pd.set_option('display.max_colwidth', None)
+    display(df_details.head(display_row_count))
+    return df_details
+if __name__ == "__main__":
+    display_row_count = 10
+    cui = input("Enter the Ref CUI for which you want topic weights:")
+    
+    df = process(cui, display_row_count)
+    df.to_csv(input("Enter name of csv you want to save for this cluster"),index = False)    
