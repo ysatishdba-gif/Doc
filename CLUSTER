@@ -1,296 +1,439 @@
-"""
-MODULE 2: CUI CLUSTERING, TOPIC DISCOVERY & STANDARD TOPIC CLASSIFICATION
-USING BIGQUERY EMBEDDINGS
-"""
-
 import time
-import numpy as np
-import pandas as pd
-from typing import List, Dict, Tuple, Optional
+import threading
+from typing import List, Dict, Optional
 from dataclasses import dataclass
-from collections import Counter
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
+import numpy as np
+import networkx as nx
+import pickle
+import psutil
+import requests
 from google.cloud import bigquery
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.cluster import AgglomerativeClustering
+import subprocess
+import pandas as pd
 
-# ══════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
 
-DEFAULT_N_TOPICS = 10
-MIN_CUIS_PER_TOPIC = 2
-MIN_PRIMARY_TOPIC_CONF = 0.70
-MIN_SECONDARY_TOPIC_CONF = 0.55
+# ------------------------- THREAD-SAFE PRINT -------------------------
+print_lock = threading.Lock()
+def thread_safe_print(msg: str):
+    with print_lock:
+        print(msg, flush=True)
 
-# ══════════════════════════════════════════════════════════════════
-# DATA STRUCTURES
-# ══════════════════════════════════════════════════════════════════
+# ------------------------- FULLY ADAPTIVE LRU CACHE -------------------------
+class FullyAdaptiveLRUCache:
+    """LRU cache that grows dynamically and evicts only on memory pressure"""
+    def __init__(self):
+        self.cache = {}
+        self.order = []
+        self.lock = threading.RLock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+                self.order.append(key)
+                return self.cache[key]
+            return None
+    
+    def put(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+            self.cache[key] = value
+            self.order.append(key)
+            self._evict_if_needed()
+    
+    def _evict_if_needed(self):
+        mem = psutil.virtual_memory()
+        while mem.available < 0.2 * mem.total and self.order:
+            oldest = self.order.pop(0)
+            del self.cache[oldest]
+            mem = psutil.virtual_memory()
 
-@dataclass
-class CUISet:
-    set_id: Optional[str]
-    cuis: List[str]
+# ------------------------- HIERARCHY CLIENT -------------------------
+class HierarchyClient:
+    def __init__(self, network_obj, ic_scores: Optional[Dict[str, float]] = None):
+        self.network = network_obj
+        self.ic_scores = ic_scores or {}
+        self.ancestors_cache = FullyAdaptiveLRUCache()
+        self.children_cache = FullyAdaptiveLRUCache()
+        self.ic_cache = FullyAdaptiveLRUCache()
+        self.lock = threading.RLock()
+    
+    def get_children(self, cui: str) -> List[str]:
+        cached = self.children_cache.get(cui)
+        if cached is not None:
+            return cached
+        children = list(self.network.successors(cui)) if self.network.has_node(cui) else []
+        self.children_cache.put(cui, children)
+        return children
+    
+    def get_parents(self, cui: str) -> List[str]:
+        return list(self.network.predecessors(cui)) if self.network.has_node(cui) else []
+    
+    def get_ancestors(self, cui: str, max_depth: int = 10) -> List[List[str]]:
+        key = (cui, max_depth)
+        cached = self.ancestors_cache.get(key)
+        if cached is not None:
+            return cached
+        queue = [(0, [cui])]
+        visited = set()
+        paths = []
+        while queue:
+            depth, path = queue.pop(0)
+            node = path[-1]
+            if node in visited:
+                continue
+            visited.add(node)
+            if depth >= max_depth or not self.network.has_node(node):
+                paths.append(path)
+                continue
+            for parent in self.get_parents(node):
+                queue.append((depth + 1, path + [parent]))
+        self.ancestors_cache.put(key, paths)
+        return paths
+    
+    def get_ic_score(self, cui: str) -> float:
+        cached = self.ic_cache.get(cui)
+        if cached is not None:
+            return cached
+        if cui in self.ic_scores:
+            ic = self.ic_scores[cui]
+        else:
+            paths = self.get_ancestors(cui)
+            if paths:
+                avg_depth = sum(len(p) for p in paths) / len(paths)
+                ic = min(10.0, 2.0 + np.log1p(avg_depth) * 2.0)
+            else:
+                ic = 3.0
+        self.ic_cache.put(cui, ic)
+        return ic
 
-@dataclass
-class Topic:
-    topic_id: int
-    primary_label: str
-    representative_cuis: List[str]
-    cui_set_ids: List[str]
-    set_count: int
-    all_cuis: List[str]
+# ------------------------- EDGE DETECTOR -------------------------
+class EdgeDetectorAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
 
-@dataclass
-class StandardTopic:
-    topic_id: str
-    name: str
-    description: str
-    anchor_cuis: List[str]
+    def adjust_ic(self, cui: str) -> str:
+        ic = self.h.get_ic_score(cui)
+        target_min, target_max, target_opt = 4.0, 7.0, 5.5
+        if target_min <= ic <= target_max:
+            return cui
+        paths = self.h.get_ancestors(cui, max_depth=20)
+        best, best_dist = cui, abs(ic - target_opt)
+        for path in paths:
+            for ancestor in path:
+                a_ic = self.h.get_ic_score(ancestor)
+                dist = abs(a_ic - target_opt)
+                if target_min <= a_ic <= target_max and dist < best_dist:
+                    best, best_dist = ancestor, dist
+        return best
 
-@dataclass
-class CUITopicAssignment:
-    cui: str
-    primary_topic: Optional[str]
-    primary_confidence: float
-    secondary_topics: List[Tuple[str, float]]
+    def select_representatives(self, group: set) -> List[str]:
+        if not group:
+            return []
+        max_reps = max(1, int(len(group) ** 0.5))
+        scored = [(c, abs(self.h.get_ic_score(c) - 5.5)) for c in group]
+        scored.sort(key=lambda x: x[1])
+        reps = [self.adjust_ic(c[0]) for c in scored[:max_reps]]
+        return list(set(reps))
 
-@dataclass
-class TopicResult:
-    topics: List[Topic]
-    set_to_topic: Dict[str, int]
-    n_topics: int
-    silhouette_score: Optional[float]
-    processing_time: float
-    cui_topic_assignments: Dict[str, CUITopicAssignment]
+# ------------------------- CLUSTERER -------------------------
+class ClustererAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
 
-# ══════════════════════════════════════════════════════════════════
-# BIGQUERY EMBEDDING STORE
-# ══════════════════════════════════════════════════════════════════
+    def cluster(self, cuis: List[str]) -> Dict[str, set]:
+        buckets = {}
+        for cui in cuis:
+            paths = self.h.get_ancestors(cui, max_depth=5)
+            ancestor = paths[0][0] if paths and paths[0] else cui
+            buckets.setdefault(ancestor, set()).add(cui)
+        return buckets
 
-class BigQueryEmbeddingStore:
-    """Fetch CUI embeddings directly from BigQuery"""
-    def __init__(self, project_id: str, dataset_id: str, table_name: str):
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.table_name = table_name
-        self.client = bigquery.Client(project=project_id)
+# ------------------------- REDUCTION ENGINE -------------------------
+class ReductionEngineAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+        self.clusterer = ClustererAdaptive(hierarchy)
+        self.edge_detector = EdgeDetectorAdaptive(hierarchy)
 
-    def get_batch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
-        if not cuis:
-            return {}
+    def reduce_cuis(self, cuis: List[str]):
+        cuis = list(set(cuis))
+        buckets = self.clusterer.cluster(cuis)
+        reduced = []
+        for ancestor, group in buckets.items():
+            reps = self.edge_detector.select_representatives(group)
+            reduced.extend(reps)
+        return list(set(reduced)), len(buckets)
+
+# ------------------------- CUI EXTRACTOR -------------------------
+class CUIExtractor:
+    def __init__(self, api_url: str):
+        self.api_url = api_url
+        self.session = requests.Session()
+
+        # 🔐 Get identity token ONCE
+        tmp = subprocess.run(
+            ['gcloud', 'auth', 'print-identity-token'],
+            stdout=subprocess.PIPE,
+            universal_newlines=True
+        )
+        token = tmp.stdout.strip()
+
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_for_text(self, text: str) -> List[str]:
+        try:
+            payload = {
+                "query_texts": [text],
+                "top_k": 3
+            }
+
+            resp = self.session.post(
+                self.api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=30
+            )
+
+            thread_safe_print(f"[Extractor] Status: {resp.status_code}")
+            thread_safe_print(f"[Extractor] Body: {len(resp.text)}")
+
+            resp.raise_for_status()
+
+            data = resp.json()
+            cuis = []
+
+            for v in data.values():
+                if isinstance(v, list):
+                    cuis.extend(v)
+
+            return list(set(map(str, cuis)))
+
+        except Exception as e:
+            thread_safe_print("CUI extraction failed")
+            thread_safe_print(str(e))
+            return []
+
+
+# ------------------------- SAB FILTER -------------------------
+ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
+def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str]:
+    if not cuis:
+        return []
+    try:
+        client = bigquery.Client(project=project_id)
+        filtered = []
+        for i in range(0, len(cuis), 2000):
+            batch = cuis[i:i+2000]
+            query = f"""
+            SELECT DISTINCT CUI
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis)
+              AND SAB IN UNNEST(@sabs)
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis","STRING",batch),
+                    bigquery.ArrayQueryParameter("sabs","STRING",ALLOWED_SABS)
+                ]
+            )
+            results = client.query(query, job_config=job_config).result(timeout=60)
+            filtered.extend([row.CUI for row in results])
+        return filtered
+    except Exception as e:
+        thread_safe_print(f"SAB filter failed: {e}")
+        return []
+
+# ------------------------- EMBEDDING-BASED SECOND-LEVEL REDUCTION -------------------------
+def fetch_cui_embeddings(cuis: List[str], project_id: str, dataset_id: str, table_name=embedding_table) -> Dict[str, np.ndarray]:
+    client = bigquery.Client(project=project_id)
+    embeddings = {}
+    for i in range(0, len(cuis), 2000):
+        batch = cuis[i:i+2000]
         query = f"""
-        SELECT CUI, Embedding
-        FROM `{self.project_id}.{self.dataset_id}.{self.table_name}`
+        SELECT CUI, embedding
+        FROM `{project_id}.{dataset_id}.{table_name}`
         WHERE CUI IN UNNEST(@cuis)
         """
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
-            ]
+            query_parameters=[bigquery.ArrayQueryParameter("cuis","STRING",batch)]
         )
-        df = self.client.query(query, job_config=job_config).to_dataframe()
-        return {row["CUI"]: np.array(row["Embedding"], dtype=np.float32) for _, row in df.iterrows()}
+        results = client.query(query, job_config=job_config).result(timeout=60)
+        for row in results:
+            embeddings[row.CUI] = np.array(row.embedding)
+    return embeddings
 
-    def get(self, cui: str) -> Optional[np.ndarray]:
-        return self.get_batch([cui]).get(cui, None)
+def cluster_cuis_by_embedding(cuis: List[str], embeddings: Dict[str, np.ndarray], n_clusters=None) -> Dict[int, List[str]]:
+    valid_cuis = [c for c in cuis if c in embeddings]
+    if not valid_cuis:
+        return {}
+    X = np.stack([embeddings[c] for c in valid_cuis])
+    n_clusters = n_clusters or max(1, int(len(valid_cuis)**0.5))
+    clustering = AgglomerativeClustering(n_clusters=n_clusters,metric='cosine',linkage='average')
+    labels = clustering.fit_predict(X)
+    clusters = {}
+    for cui, label in zip(valid_cuis, labels):
+        clusters.setdefault(label, []).append(cui)
+    return clusters
 
-# ══════════════════════════════════════════════════════════════════
-# CUI DETAILS STORE
-# ══════════════════════════════════════════════════════════════════
+def pick_representative_per_embedding_cluster(clusters: Dict[int, List[str]], embeddings: Dict[str, np.ndarray]) -> List[str]:
+    reduced = []
+    for cluster_cuis in clusters.values():
+        if len(cluster_cuis) == 1:
+            reduced.append(cluster_cuis[0])
+            continue
+        X = np.stack([embeddings[c] for c in cluster_cuis])
+        centroid = np.mean(X, axis=0)
+        distances = np.linalg.norm(X - centroid, axis=1)
+        idx = np.argmin(distances)
+        reduced.append(cluster_cuis[idx])
+    return reduced
 
-class CUIDetailsStore:
-    def __init__(self, project_id: str, dataset_id: str):
-        client = bigquery.Client(project=project_id)
-        query = f"""
-        SELECT CUI, CUIName
-        FROM `{project_id}.{dataset_id}.CUI_DETAILS`
-        """
-        self.df = client.query(query).to_dataframe().set_index("CUI")
+# ------------------------- TEXT REDUCTION RESULT -------------------------
+@dataclass
+class TextReductionResult:
+    text: str
+    extracted_cuis: List[str]
+    filtered_cuis: List[str]
+    reduced_cuis: List[str]
+    num_clusters: int
 
-    def get_name(self, cui: str) -> str:
-        return self.df.loc[cui, "CUIName"] if cui in self.df.index else cui
+# ------------------------- FULL PIPELINE -------------------------
+def process_single_text_full(text: str, extractor: CUIExtractor, hierarchy: HierarchyClient,
+                             engine: ReductionEngineAdaptive, project_id: str, dataset_id: str) -> TextReductionResult:
+    # Step 1: Extract
+    extracted = extractor.extract_for_text(text)
+    # Step 2: SAB Filter
+    filtered = filter_by_sab(extracted, project_id, dataset_id)
+    # Step 3: Hierarchy reduction
+    reduced, num_clusters = engine.reduce_cuis(filtered)
+    # Step 4: Embedding-based second-level reduction
+    if reduced:
+        embeddings = fetch_cui_embeddings(reduced, project_id, dataset_id)
+        clusters = cluster_cuis_by_embedding(reduced, embeddings)
+        reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+    return TextReductionResult(text, extracted, filtered, reduced, num_clusters)
 
-# ══════════════════════════════════════════════════════════════════
-# TOPIC REFERENCE (CONFIG-DRIVEN)
-# ══════════════════════════════════════════════════════════════════
+def run_pipeline_parallel_full(texts, UMLS_NETWORK_OBJ, api_url, project_id, dataset_id, max_workers=5):
+    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+    engine = ReductionEngineAdaptive(hierarchy)
+    extractor = CUIExtractor(api_url)
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_single_text_full, t, extractor, hierarchy, engine, project_id, dataset_id)
+                   for t in texts]
+        for f in as_completed(futures):
+            results.append(f.result())
+    return results
 
-class TopicReferenceStore:
-    def __init__(self, topics: List[StandardTopic]):
-        self.topics = topics
-
-    def get_topics(self) -> List[StandardTopic]:
-        return self.topics
-
-# ══════════════════════════════════════════════════════════════════
-# CUI SET EMBEDDER
-# ══════════════════════════════════════════════════════════════════
-
-class CUISetEmbedder:
-    def __init__(self, store: BigQueryEmbeddingStore):
-        self.store = store
-
-    def embed(self, cui_sets: List[CUISet]) -> Dict[str, np.ndarray]:
-        out = {}
-        for s in cui_sets:
-            vecs = self.store.get_batch(s.cuis)
-            if vecs:
-                out[s.set_id or "0"] = np.mean(list(vecs.values()), axis=0)
-            else:
-                out[s.set_id or "0"] = np.zeros(768, dtype=np.float32)
-        return out
-
-# ══════════════════════════════════════════════════════════════════
-# STANDARD TOPIC CLASSIFIER
-# ══════════════════════════════════════════════════════════════════
-
-class CUITopicClassifier:
-    def __init__(self, store: BigQueryEmbeddingStore, topic_store: TopicReferenceStore):
-        self.store = store
-        self.topic_store = topic_store
-        self.centroids = self._build_centroids()
-
-    def _build_centroids(self):
-        centroids = {}
-        for t in self.topic_store.get_topics():
-            vecs = self.store.get_batch(t.anchor_cuis)
-            if vecs:
-                centroids[t.topic_id] = np.mean(list(vecs.values()), axis=0)
-        return centroids
-
-    def classify(self, cui: str) -> CUITopicAssignment:
-        v = self.store.get(cui)
-        if v is None:
-            return CUITopicAssignment(cui, None, 0.0, [])
-
-        v = v / (np.linalg.norm(v) + 1e-10)
-        scores = {}
-        for tid, c in self.centroids.items():
-            c = c / (np.linalg.norm(c) + 1e-10)
-            scores[tid] = float(np.dot(v, c))
-
-        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        primary, conf = ranked[0]
-
-        if conf < MIN_PRIMARY_TOPIC_CONF:
-            return CUITopicAssignment(cui, None, conf, [])
-
-        secondary = [(t, s) for t, s in ranked[1:] if s >= MIN_SECONDARY_TOPIC_CONF]
-        return CUITopicAssignment(cui, primary, conf, secondary)
-
-# ══════════════════════════════════════════════════════════════════
-# MAIN MODELER
-# ══════════════════════════════════════════════════════════════════
-
-class CUITopicModeler:
-    def __init__(self, embedding_store: BigQueryEmbeddingStore, topic_store: TopicReferenceStore):
-        self.embedder = CUISetEmbedder(embedding_store)
-        self.classifier = CUITopicClassifier(embedding_store, topic_store)
-
-    def discover_topics(self, cui_sets: List[CUISet], n_topics: int) -> TopicResult:
-        start = time.time()
-
-        embeds = self.embedder.embed(cui_sets)
-        X = np.stack(list(embeds.values()))
-        ids = list(embeds.keys())
-
-        kmeans = KMeans(
-            n_clusters=min(n_topics, len(X)),
-            random_state=42,
-            n_init=10
-        )
-        labels = kmeans.fit_predict(X)
-
-        topics = []
-        for tid in set(labels):
-            idxs = [i for i, l in enumerate(labels) if l == tid]
-            cluster_sets = [cui_sets[i] for i in idxs]
-            if len(cluster_sets) < MIN_CUIS_PER_TOPIC:
-                continue
-
-            cuis = [c for s in cluster_sets for c in s.cuis]
-            top_cuis = [c for c, _ in Counter(cuis).most_common(5)]
-
-            topics.append(Topic(
-                topic_id=tid,
-                primary_label=" + ".join(top_cuis[:3]),
-                representative_cuis=top_cuis,
-                cui_set_ids=[ids[i] for i in idxs],
-                set_count=len(cluster_sets),
-                all_cuis=list(set(cuis))
-            ))
-
-        all_cuis = {c for s in cui_sets for c in s.cuis}
-        cui_assignments = {c: self.classifier.classify(c) for c in all_cuis}
-
-        return TopicResult(
-            topics=topics,
-            set_to_topic=dict(zip(ids, labels)),
-            n_topics=len(topics),
-            silhouette_score=float(
-                silhouette_score(X, labels, metric="cosine")
-            ) if len(set(labels)) > 1 else None,
-            processing_time=time.time() - start,
-            cui_topic_assignments=cui_assignments
-        )
-
-# ══════════════════════════════════════════════════════════════════
-# MAIN FUNCTION (ENTRY POINT)
-# ══════════════════════════════════════════════════════════════════
-
-def run_module_2_from_df(
-    df: pd.DataFrame,
-    project_id: str,
-    dataset_id: str,
-    embedding_table: str,
-    standard_topics: List[StandardTopic],
-    n_topics: int = DEFAULT_N_TOPICS
-) -> TopicResult:
-    if "cui" not in df.columns:
-        raise ValueError("Input DF must contain column: 'cui'")
-
-    if len(df) != 1:
-        raise ValueError("Expected a single-row DataFrame with reduced CUI list")
-
-    cuis = df.iloc[0]["cui"]
-    if not isinstance(cuis, list) or not cuis:
-        raise ValueError("Column 'cui' must be a non-empty list")
-
-    cui_set = CUISet(set_id=None, cuis=list(dict.fromkeys(cuis)))
-
-    embedding_store = BigQueryEmbeddingStore(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        table_name=embedding_table
-    )
-    topic_store = TopicReferenceStore(standard_topics)
-
-    modeler = CUITopicModeler(
-        embedding_store=embedding_store,
-        topic_store=topic_store
-    )
-
-    return modeler.discover_topics([cui_set], n_topics=n_topics)
-
-# ══════════════════════════════════════════════════════════════════
-# SAMPLE USAGE
-# ══════════════════════════════════════════════════════════════════
-
+# ------------------------- RUN EXAMPLE -------------------------
 if __name__ == "__main__":
-    # df from Module 1 CUI reduction
-    df = previous_cui_reduction_output_df  # <-- real pipeline output
+    import pickle
+    import networkx as nx
 
-    # Load standard topics from config / DB
-    standard_topics = standard_topics_config
+    # ------------------------- CONFIG -------------------------
+    NETWORK_PKL_PATH = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
 
-    result = run_module_2_from_df(
-        df=df,
-        project_id="my-gcp-project",
-        dataset_id="cui_embeddings",
-        embedding_table="cui_vectors",
-        standard_topics=standard_topics,
-        n_topics=1
-    )
+    API_URL = url
+    PROJECT_ID = project_id
+    DATASET_ID = dataset
 
-    print("\nPer-CUI classification:")
-    for cui, assignment in result.cui_topic_assignments.items():
-        print(f"{cui} → {assignment.primary_topic} (conf={assignment.primary_confidence:.2f})")
+    texts = [
+        "ankle pain","high blood pressure","grams"
+    ]
+
+    # ------------------------- LOAD NETWORK -------------------------
+    # with open(NETWORK_PKL_PATH, "rb") as f:
+    #     UMLS_NETWORK_OBJ = pickle.load(f)
+
+    # ------------------------- SANITY CHECKS -------------------------
+#     print("Network type:", type(UMLS_NETWORK_OBJ))
+#     if not isinstance(UMLS_NETWORK_OBJ, nx.DiGraph):
+#         raise TypeError(
+#             f"Expected networkx.DiGraph, got {type(UMLS_NETWORK_OBJ)}"
+#         )
+
+#     print(f"Network nodes: {UMLS_NETWORK_OBJ.number_of_nodes()}")
+#     print(f"Network edges: {UMLS_NETWORK_OBJ.number_of_edges()}")
+
+    # ------------------------- INIT PIPELINE -------------------------
+    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+    engine = ReductionEngineAdaptive(hierarchy)
+    extractor = CUIExtractor(API_URL)
+
+    all_rows = []
+
+    for text in texts:
+        print(f"\n===== Processing: {text} =====")
+
+        # Step 1: Extract
+        extracted = extractor.extract_for_text(text)
+        n_extracted = len(extracted)
+
+        # Step 2: Filter by SAB
+        filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID)
+        n_filtered = len(filtered)
+
+        # Step 3: IC stats
+        ic_scores = [hierarchy.get_ic_score(c) for c in filtered]
+        ic_min = min(ic_scores) if ic_scores else 0
+        ic_max = max(ic_scores) if ic_scores else 0
+        ic_mean = sum(ic_scores)/len(ic_scores) if ic_scores else 0
+
+        # Step 4: Hierarchy reduction
+        reduced, num_clusters = engine.reduce_cuis(filtered)
+        n_reduced = len(reduced)
+
+        # Step 5: Embedding-based clustering
+        if reduced:
+            embeddings = fetch_cui_embeddings(reduced, PROJECT_ID, DATASET_ID)
+            clusters = cluster_cuis_by_embedding(reduced, embeddings)
+            n_embedding_clusters = len(clusters)
+            final_reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+        else:
+            n_embedding_clusters = 0
+            final_reduced = []
+
+        n_final = len(final_reduced)
+
+        # ------------------------- PRINT SUMMARY -------------------------
+        print(f"Extracted CUIs: {n_extracted}")
+        print(f"Filtered CUIs:  {n_filtered}")
+        print(f"IC scores: min={ic_min:.2f}, max={ic_max:.2f}, mean={ic_mean:.2f}")
+        print(f"Reduced CUIs:   {n_reduced} across {num_clusters} hierarchy clusters")
+        print(f"Embedding clusters: {n_embedding_clusters}")
+        print(f"Final CUIs: {n_final}")
+
+        # ------------------------- COLLECT FOR TABLE -------------------------
+        all_rows.append({
+            "Text": text,
+            "Extracted CUIs": n_extracted,
+            "Filtered CUIs": n_filtered,
+            "IC min": ic_min,
+            "IC max": ic_max,
+            "IC mean": ic_mean,
+            "Reduced CUIs": n_reduced,
+            "Hierarchy Clusters": num_clusters,
+            "Embedding Clusters": n_embedding_clusters,
+            "Final CUIs": n_final
+        })
+
+    # ------------------------- TABLE -------------------------
+    df = pd.DataFrame(all_rows)
+    print("\n===== PIPELINE SUMMARY =====")
+    print(df)
