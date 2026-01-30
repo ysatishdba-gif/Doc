@@ -1,501 +1,441 @@
-"""
-MODULE 1: Two-Level CUI Reduction - SIMPLE & ACCURATE
-
-Pipeline:
-  Text → Extract → SAB Filter → Level 1 (Extremes) → Level 2 (Diversity) → Done
-
-Strategy:
-- Level 1: Pick EXTREMES (broad + specific) for coverage
-- Level 2: Pick DIVERSE (furthest apart) for search matching
-- Simple, clean, effective for query-document matching
-
-~300 lines
-"""
-
 import time
-import subprocess
 import threading
-from typing import List, Dict, Optional, Tuple, Set
+from typing import List, Dict, Optional
 from dataclasses import dataclass
-from collections import OrderedDict
 import numpy as np
 import networkx as nx
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from sklearn.cluster import AgglomerativeClustering
+import pickle
+import psutil
 import requests
+from google.cloud import bigquery
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from google.cloud import bigquery
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.cluster import AgglomerativeClustering
+import subprocess
+import pandas as pd
 
-# Configuration
-BQ_BATCH_SIZE = 2000
-ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
 
+# ------------------------- THREAD-SAFE PRINT -------------------------
 print_lock = threading.Lock()
-
-def print_safe(msg: str):
+def thread_safe_print(msg: str):
     with print_lock:
         print(msg, flush=True)
 
-# ══════════════════════════════════════════════════════════════════
-# SIMPLE CACHE
-# ══════════════════════════════════════════════════════════════════
-
-class SimpleCache:
-    """Simple LRU cache - good enough"""
-    def __init__(self, maxsize: int = 10000):
-        self.cache = OrderedDict()
-        self.maxsize = maxsize
+# ------------------------- FULLY ADAPTIVE LRU CACHE -------------------------
+class FullyAdaptiveLRUCache:
+    """LRU cache that grows dynamically and evicts only on memory pressure"""
+    def __init__(self):
+        self.cache = {}
+        self.order = []
+        self.lock = threading.RLock()
     
     def get(self, key):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return None
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+                self.order.append(key)
+                return self.cache[key]
+            return None
     
     def put(self, key, value):
-        if key in self.cache:
-            self.cache.move_to_end(key)
-        else:
-            if len(self.cache) >= self.maxsize:
-                self.cache.popitem(last=False)
-        self.cache[key] = value
-
-# ══════════════════════════════════════════════════════════════════
-# HIERARCHY CLIENT
-# ══════════════════════════════════════════════════════════════════
-
-class HierarchyClient:
-    """Simple hierarchy client with caching"""
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+            self.cache[key] = value
+            self.order.append(key)
+            self._evict_if_needed()
     
-    def __init__(self, network_obj):
+    def _evict_if_needed(self):
+        mem = psutil.virtual_memory()
+        while mem.available < 0.2 * mem.total and self.order:
+            oldest = self.order.pop(0)
+            del self.cache[oldest]
+            mem = psutil.virtual_memory()
+
+# ------------------------- HIERARCHY CLIENT -------------------------
+class HierarchyClient:
+    def __init__(self, network_obj, ic_scores: Optional[Dict[str, float]] = None):
         self.network = network_obj
-        self.cache = SimpleCache()
+        self.ic_scores = ic_scores or {}
+        self.ancestors_cache = FullyAdaptiveLRUCache()
+        self.children_cache = FullyAdaptiveLRUCache()
+        self.ic_cache = FullyAdaptiveLRUCache()
+        self.lock = threading.RLock()
     
     def get_children(self, cui: str) -> List[str]:
-        if not self.network.has_node(cui):
-            return []
-        return list(self.network.successors(cui))
+        cached = self.children_cache.get(cui)
+        if cached is not None:
+            return cached
+        children = list(self.network.successors(cui)) if self.network.has_node(cui) else []
+        self.children_cache.put(cui, children)
+        return children
+    
+    def get_parents(self, cui: str) -> List[str]:
+        return list(self.network.predecessors(cui)) if self.network.has_node(cui) else []
     
     def get_ancestors(self, cui: str, max_depth: int = 10) -> List[List[str]]:
-        """Get ancestor paths (cached)"""
         key = (cui, max_depth)
-        cached = self.cache.get(key)
-        if cached:
+        cached = self.ancestors_cache.get(key)
+        if cached is not None:
             return cached
-        
-        if not self.network.has_node(cui):
-            return []
-        
-        # Simple BFS
         queue = [(0, [cui])]
         visited = set()
         paths = []
-        
         while queue:
             depth, path = queue.pop(0)
             node = path[-1]
-            
-            if node in visited or depth >= max_depth:
+            if node in visited:
+                continue
+            visited.add(node)
+            if depth >= max_depth or not self.network.has_node(node):
                 paths.append(path)
                 continue
-            
-            visited.add(node)
-            parents = list(self.network.predecessors(node)) if self.network.has_node(node) else []
-            
-            if not parents:
-                paths.append(path)
-            else:
-                for parent in parents:
-                    if parent not in path:
-                        queue.append((depth + 1, path + [parent]))
-        
-        self.cache.put(key, paths)
+            for parent in self.get_parents(node):
+                queue.append((depth + 1, path + [parent]))
+        self.ancestors_cache.put(key, paths)
         return paths
     
     def get_ic_score(self, cui: str) -> float:
-        """Estimate IC from depth"""
-        paths = self.get_ancestors(cui)
-        if not paths:
-            return 3.0
-        
-        avg_depth = sum(len(p) for p in paths) / len(paths)
-        return min(10.0, 2.0 + np.log1p(avg_depth) * 2.0)
+        cached = self.ic_cache.get(cui)
+        if cached is not None:
+            return cached
+        if cui in self.ic_scores:
+            ic = self.ic_scores[cui]
+        else:
+            paths = self.get_ancestors(cui)
+            if paths:
+                avg_depth = sum(len(p) for p in paths) / len(paths)
+                ic = min(10.0, 2.0 + np.log1p(avg_depth) * 2.0)
+            else:
+                ic = 3.0
+        self.ic_cache.put(cui, ic)
+        return ic
 
-# ══════════════════════════════════════════════════════════════════
-# LEVEL 1: HIERARCHY REDUCTION
-# ══════════════════════════════════════════════════════════════════
-
-class HierarchyReducer:
-    """Simple hierarchy-based reduction"""
-    
+# ------------------------- EDGE DETECTOR -------------------------
+class EdgeDetectorAdaptive:
     def __init__(self, hierarchy: HierarchyClient):
         self.h = hierarchy
-    
-    def reduce(self, cuis: List[str]) -> List[str]:
-        """Reduce CUIs using hierarchy"""
-        if not cuis:
+
+    def adjust_ic(self, cui: str) -> str:
+        ic = self.h.get_ic_score(cui)
+        target_min, target_max, target_opt = 4.0, 7.0, 5.5
+        if target_min <= ic <= target_max:
+            return cui
+        paths = self.h.get_ancestors(cui, max_depth=20)
+        best, best_dist = cui, abs(ic - target_opt)
+        for path in paths:
+            for ancestor in path:
+                a_ic = self.h.get_ic_score(ancestor)
+                dist = abs(a_ic - target_opt)
+                if target_min <= a_ic <= target_max and dist < best_dist:
+                    best, best_dist = ancestor, dist
+        return best
+
+    def select_representatives(self, group: set) -> List[str]:
+        if not group:
             return []
-        
-        # Cluster by first ancestor
-        clusters = {}
-        for cui in set(cuis):
+        max_reps = max(1, int(len(group) ** 0.5))
+        scored = [(c, abs(self.h.get_ic_score(c) - 5.5)) for c in group]
+        scored.sort(key=lambda x: x[1])
+        reps = [self.adjust_ic(c[0]) for c in scored[:max_reps]]
+        return list(set(reps))
+
+# ------------------------- CLUSTERER -------------------------
+class ClustererAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+
+    def cluster(self, cuis: List[str]) -> Dict[str, set]:
+        buckets = {}
+        for cui in cuis:
             paths = self.h.get_ancestors(cui, max_depth=5)
-            ancestor = paths[0][0] if paths else cui
-            
-            if ancestor not in clusters:
-                clusters[ancestor] = set()
-            clusters[ancestor].add(cui)
-        
-        # Pick EXTREMES per cluster (broad + specific for search coverage)
+            ancestor = paths[0][0] if paths and paths[0] else cui
+            buckets.setdefault(ancestor, set()).add(cui)
+        return buckets
+
+# ------------------------- REDUCTION ENGINE -------------------------
+class ReductionEngineAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+        self.clusterer = ClustererAdaptive(hierarchy)
+        self.edge_detector = EdgeDetectorAdaptive(hierarchy)
+
+    def reduce_cuis(self, cuis: List[str]):
+        cuis = list(set(cuis))
+        buckets = self.clusterer.cluster(cuis)
         reduced = []
-        for group in clusters.values():
-            if len(group) <= 2:
-                reduced.extend(group)
-            else:
-                # Score by IC
-                scored = [(cui, self.h.get_ic_score(cui)) for cui in group]
-                scored.sort(key=lambda x: x[1])
-                
-                # Pick min (broad) and max (specific)
-                reduced.append(scored[0][0])   # Most broad
-                reduced.append(scored[-1][0])  # Most specific
-        
-        return list(set(reduced))
+        for ancestor, group in buckets.items():
+            reps = self.edge_detector.select_representatives(group)
+            reduced.extend(reps)
+        return list(set(reduced)), len(buckets)
 
-# ══════════════════════════════════════════════════════════════════
-# LEVEL 2: EMBEDDING REDUCTION
-# ══════════════════════════════════════════════════════════════════
-
-class EmbeddingReducer:
-    """Simple embedding-based clustering"""
-    
-    def __init__(self, project_id: str, dataset_id: str, table: str):
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.table = table
-        self.client = bigquery.Client(project=project_id)
-    
-    def fetch_embeddings(self, cuis: List[str]) -> Dict[str, np.ndarray]:
-        """Fetch embeddings from BigQuery"""
-        embeddings = {}
-        
-        for i in range(0, len(cuis), BQ_BATCH_SIZE):
-            batch = cuis[i:i + BQ_BATCH_SIZE]
-            
-            query = f"""
-            SELECT CUI, embedding
-            FROM `{self.project_id}.{self.dataset_id}.{self.table}`
-            WHERE CUI IN UNNEST(@cuis)
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)]
-            )
-            
-            try:
-                results = self.client.query(query, job_config=job_config).result(timeout=60)
-                for row in results:
-                    embeddings[row.CUI] = np.array(row.embedding, dtype=np.float32)
-            except Exception as e:
-                print_safe(f"Embedding fetch failed: {e}")
-        
-        return embeddings
-    
-    def reduce(self, cuis: List[str]) -> List[str]:
-        """Cluster by embeddings, pick DIVERSE representatives for search coverage"""
-        if not cuis or len(cuis) == 1:
-            return cuis
-        
-        # Get embeddings
-        embeddings = self.fetch_embeddings(cuis)
-        valid_cuis = [c for c in cuis if c in embeddings]
-        
-        if len(valid_cuis) <= 1:
-            return cuis
-        
-        # Stack embeddings
-        X = np.stack([embeddings[c] for c in valid_cuis])
-        
-        # Cluster (adaptive √n)
-        n_clusters = max(1, int(len(valid_cuis) ** 0.5))
-        clustering = AgglomerativeClustering(n_clusters=n_clusters, metric='cosine', linkage='average')
-        labels = clustering.fit_predict(X)
-        
-        # Pick DIVERSE per cluster (iterative furthest point)
-        reduced = []
-        for label in set(labels):
-            mask = labels == label
-            cluster_cuis = [valid_cuis[i] for i in range(len(valid_cuis)) if mask[i]]
-            cluster_vecs = X[mask]
-            
-            if len(cluster_cuis) == 1:
-                reduced.append(cluster_cuis[0])
-            else:
-                # Pick diverse using iterative furthest point
-                n_select = max(1, int(len(cluster_cuis) ** 0.5))
-                selected_indices = [0]  # Start with first
-                
-                for _ in range(min(n_select - 1, len(cluster_cuis) - 1)):
-                    max_min_dist = -1
-                    best_idx = -1
-                    
-                    for i in range(len(cluster_cuis)):
-                        if i in selected_indices:
-                            continue
-                        
-                        # Min distance to any selected
-                        min_dist = min(np.linalg.norm(cluster_vecs[i] - cluster_vecs[j]) 
-                                     for j in selected_indices)
-                        
-                        if min_dist > max_min_dist:
-                            max_min_dist = min_dist
-                            best_idx = i
-                    
-                    if best_idx != -1:
-                        selected_indices.append(best_idx)
-                
-                reduced.extend([cluster_cuis[i] for i in selected_indices])
-        
-        return reduced
-
-# ══════════════════════════════════════════════════════════════════
-# CUI EXTRACTOR
-# ══════════════════════════════════════════════════════════════════
-
+# ------------------------- CUI EXTRACTOR -------------------------
 class CUIExtractor:
-    """Simple CUI extraction with token refresh"""
-    
     def __init__(self, api_url: str):
         self.api_url = api_url
         self.session = requests.Session()
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-        self.session.mount("https://", HTTPAdapter(max_retries=retry))
-        
-        self.token_expiry = 0
-        self._refresh_token()
-    
-    def _refresh_token(self):
-        proc = subprocess.run(["gcloud", "auth", "print-identity-token"], 
-                            stdout=subprocess.PIPE, text=True, timeout=10)
+
+        #  Get identity token ONCE
+        tmp = subprocess.run(
+            ['gcloud', 'auth', 'print-identity-token'],
+            stdout=subprocess.PIPE,
+            universal_newlines=True
+        )
+        token = tmp.stdout.strip()
+
         self.headers = {
-            "Authorization": f"Bearer {proc.stdout.strip()}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
-        self.token_expiry = time.time() + 3300  # 55 minutes
-    
-    def extract(self, text: str) -> List[str]:
-        """Extract CUIs for text"""
-        # Refresh token if expired
-        if time.time() >= self.token_expiry:
-            self._refresh_token()
-        
+
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_for_text(self, text: str) -> List[str]:
         try:
+            payload = {
+                "query_texts": [text],
+                "top_k": 3
+            }
+
             resp = self.session.post(
                 self.api_url,
-                json={"query_texts": [text], "top_k": 3},
                 headers=self.headers,
-                timeout=30
+                json=payload,
+                timeout=200
             )
+
+            thread_safe_print(f"[Extractor] Status: {resp.status_code}")
+            thread_safe_print(f"[Extractor] Cui Count: {len(resp.text)}")
+
             resp.raise_for_status()
-            
+
+            data = resp.json()
             cuis = []
-            for v in resp.json().values():
+
+            for v in data.values():
                 if isinstance(v, list):
                     cuis.extend(v)
-            
-            return list(set(str(c) for c in cuis))
+
+            return list(set(map(str, cuis)))
+
         except Exception as e:
-            print_safe(f"Extraction failed: {e}")
+            thread_safe_print("CUI extraction failed")
+            thread_safe_print(str(e))
             return []
 
-# ══════════════════════════════════════════════════════════════════
-# SAB FILTER
-# ══════════════════════════════════════════════════════════════════
 
-def filter_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str]:
-    """Filter by SAB"""
+# ------------------------- SAB FILTER -------------------------
+ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
+def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str]:
     if not cuis:
         return []
-    
+    try:
+        client = bigquery.Client(project=project_id)
+        filtered = []
+        for i in range(0, len(cuis), 2000):
+            batch = cuis[i:i+2000]
+            query = f"""
+            SELECT DISTINCT CUI
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis)
+              AND SAB IN UNNEST(@sabs)
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis","STRING",batch),
+                    bigquery.ArrayQueryParameter("sabs","STRING",ALLOWED_SABS)
+                ]
+            )
+            results = client.query(query, job_config=job_config).result(timeout=200)
+            filtered.extend([row.CUI for row in results])
+        return filtered
+    except Exception as e:
+        thread_safe_print(f"SAB filter failed: {e}")
+        return []
+
+# ------------------------- EMBEDDING-BASED SECOND-LEVEL REDUCTION -------------------------
+def fetch_cui_embeddings(cuis: List[str], project_id: str, dataset_id: str, table_name=embedding_table) -> Dict[str, np.ndarray]:
     client = bigquery.Client(project=project_id)
-    filtered = []
-    
-    for i in range(0, len(cuis), BQ_BATCH_SIZE):
-        batch = cuis[i:i + BQ_BATCH_SIZE]
-        
+    embeddings = {}
+    for i in range(0, len(cuis), 2000):
+        batch = cuis[i:i+2000]
         query = f"""
-        SELECT DISTINCT CUI
-        FROM `{project_id}.{dataset_id}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis) AND SAB IN UNNEST(@sabs)
+        SELECT CUI, embedding
+        FROM `{project_id}.{dataset_id}.{table_name}`
+        WHERE CUI IN UNNEST(@cuis)
         """
-        
         job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", batch),
-                bigquery.ArrayQueryParameter("sabs", "STRING", ALLOWED_SABS)
-            ]
+            query_parameters=[bigquery.ArrayQueryParameter("cuis","STRING",batch)]
         )
-        
-        results = client.query(query, job_config=job_config).result(timeout=60)
-        filtered.extend([row.CUI for row in results])
-    
-    return filtered
+        results = client.query(query, job_config=job_config).result(timeout=200)
+        for row in results:
+            embeddings[row.CUI] = np.array(row.embedding)
+    return embeddings
 
-# ══════════════════════════════════════════════════════════════════
-# RESULT STRUCTURE
-# ══════════════════════════════════════════════════════════════════
+def cluster_cuis_by_embedding(cuis: List[str], embeddings: Dict[str, np.ndarray], n_clusters=None) -> Dict[int, List[str]]:
+    valid_cuis = [c for c in cuis if c in embeddings]
+    if not valid_cuis:
+        return {}
+    X = np.stack([embeddings[c] for c in valid_cuis])
+    n_clusters = n_clusters or max(1, int(len(valid_cuis)**0.5))
+    clustering = AgglomerativeClustering(n_clusters=n_clusters,metric='cosine',linkage='average')
+    labels = clustering.fit_predict(X)
+    clusters = {}
+    for cui, label in zip(valid_cuis, labels):
+        clusters.setdefault(label, []).append(cui)
+    return clusters
 
+def pick_representative_per_embedding_cluster(clusters: Dict[int, List[str]], embeddings: Dict[str, np.ndarray]) -> List[str]:
+    reduced = []
+    for cluster_cuis in clusters.values():
+        if len(cluster_cuis) == 1:
+            reduced.append(cluster_cuis[0])
+            continue
+        X = np.stack([embeddings[c] for c in cluster_cuis])
+        centroid = np.mean(X, axis=0)
+        distances = np.linalg.norm(X - centroid, axis=1)
+        idx = np.argmin(distances)
+        reduced.append(cluster_cuis[idx])
+    return reduced
+
+# ------------------------- TEXT REDUCTION RESULT -------------------------
 @dataclass
-class Result:
-    text_id: int
+class TextReductionResult:
     text: str
-    extracted: List[str]
-    filtered: List[str]
-    level1: List[str]
-    level2: List[str]
-    reduction_pct: float
-    time: float
+    extracted_cuis: List[str]
+    filtered_cuis: List[str]
+    reduced_cuis: List[str]
+    num_clusters: int
 
-# ══════════════════════════════════════════════════════════════════
-# PIPELINE
-# ══════════════════════════════════════════════════════════════════
+# ------------------------- FULL PIPELINE -------------------------
+def process_single_text_full(text: str, extractor: CUIExtractor, hierarchy: HierarchyClient,
+                             engine: ReductionEngineAdaptive, project_id: str, dataset_id: str) -> TextReductionResult:
+    # Step 1: Extract
+    extracted = extractor.extract_for_text(text)
+    # Step 2: SAB Filter
+    filtered = filter_by_sab(extracted, project_id, dataset_id)
+    # Step 3: Hierarchy reduction
+    reduced, num_clusters = engine.reduce_cuis(filtered)
+    # Step 4: Embedding-based second-level reduction
+    if reduced:
+        embeddings = fetch_cui_embeddings(reduced, project_id, dataset_id)
+        clusters = cluster_cuis_by_embedding(reduced, embeddings)
+        reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+    return TextReductionResult(text, extracted, filtered, reduced, num_clusters)
 
-def process_text(
-    text_id: int,
-    text: str,
-    extractor: CUIExtractor,
-    hierarchy_reducer: HierarchyReducer,
-    embedding_reducer: EmbeddingReducer,
-    project_id: str,
-    dataset_id: str
-) -> Result:
-    """Process single text"""
-    start = time.time()
-    
-    print_safe(f"[{text_id}] Processing: {text[:50]}...")
-    
-    # Extract
-    extracted = extractor.extract(text)
-    print_safe(f"[{text_id}] Extracted: {len(extracted)}")
-    
-    # SAB filter
-    filtered = filter_sab(extracted, project_id, dataset_id)
-    print_safe(f"[{text_id}] Filtered: {len(filtered)}")
-    
-    # Level 1: Hierarchy
-    level1 = hierarchy_reducer.reduce(filtered)
-    print_safe(f"[{text_id}] Level 1: {len(filtered)} → {len(level1)}")
-    
-    # Level 2: Embeddings
-    level2 = embedding_reducer.reduce(level1)
-    print_safe(f"[{text_id}] Level 2: {len(level1)} → {len(level2)}")
-    
-    reduction = (1 - len(level2) / len(filtered)) * 100 if filtered else 0
-    elapsed = time.time() - start
-    
-    print_safe(f"[{text_id}] ✓ Done: {reduction:.1f}% reduction in {elapsed:.1f}s")
-    
-    return Result(text_id, text, extracted, filtered, level1, level2, reduction, elapsed)
-
-
-def run_pipeline(
-    texts: List[str],
-    network_path: str,
-    api_url: str,
-    project_id: str,
-    dataset_id: str,
-    embedding_table: str,
-    workers: int = 5
-) -> List[Result]:
-    """
-    Simple two-level reduction pipeline
-    
-    Args:
-        texts: Clinical texts
-        network_path: Path to UMLS NetworkX pickle
-        api_url: CUI extraction API
-        project_id: GCP project
-        dataset_id: BigQuery dataset
-        embedding_table: Embeddings table
-        workers: Parallel workers
-    
-    Returns:
-        List of Results
-    """
-    print_safe("="*60)
-    print_safe(f"MODULE 1: {len(texts)} texts, {workers} workers")
-    print_safe("="*60)
-    
-    # Load network
-    import pickle
-    with open(network_path, "rb") as f:
-        network = pickle.load(f)
-    print_safe(f"Loaded: {network.number_of_nodes()} nodes\n")
-    
-    # Initialize
-    hierarchy = HierarchyClient(network)
-    hierarchy_reducer = HierarchyReducer(hierarchy)
-    embedding_reducer = EmbeddingReducer(project_id, dataset_id, embedding_table)
+def run_pipeline_parallel_full(texts, UMLS_NETWORK_OBJ, api_url, project_id, dataset_id, max_workers=5):
+    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+    engine = ReductionEngineAdaptive(hierarchy)
     extractor = CUIExtractor(api_url)
-    
-    # Process in parallel
     results = []
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [
-            executor.submit(process_text, i+1, text, extractor, 
-                          hierarchy_reducer, embedding_reducer, project_id, dataset_id)
-            for i, text in enumerate(texts)
-        ]
-        
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception as e:
-                print_safe(f"Failed: {e}")
-    
-    # Sort and summarize
-    results.sort(key=lambda r: r.text_id)
-    
-    total_filtered = sum(len(r.filtered) for r in results)
-    total_final = sum(len(r.level2) for r in results)
-    overall = (1 - total_final / total_filtered) * 100 if total_filtered else 0
-    
-    print_safe("\n" + "="*60)
-    print_safe("SUMMARY")
-    print_safe("="*60)
-    print_safe(f"Texts: {len(results)}")
-    print_safe(f"Total CUIs: {total_filtered} → {total_final}")
-    print_safe(f"Reduction: {overall:.1f}%")
-    print_safe("="*60)
-    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(process_single_text_full, t, extractor, hierarchy, engine, project_id, dataset_id)
+                   for t in texts]
+        for f in as_completed(futures):
+            results.append(f.result())
     return results
 
-
-# ══════════════════════════════════════════════════════════════════
-# USAGE
-# ══════════════════════════════════════════════════════════════════
-
+# ------------------------- RUN EXAMPLE -------------------------
 if __name__ == "__main__":
-    
+    import pickle
+    import networkx as nx
+
+    # ------------------------- CONFIG -------------------------
+    NETWORK_PKL_PATH = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
+
+    API_URL = url
+    PROJECT_ID = project_id
+    DATASET_ID = dataset
+
     texts = [
-        "patient has ankle pain",
-        "difficulty walking",
-        "chronic headache"
+        "ankle pain"
     ]
-    
-    results = run_pipeline(
-        texts=texts,
-        network_path="/path/to/umls_network.pkl",
-        api_url="https://your-api.com/extract",
-        project_id="your-project",
-        dataset_id="your-dataset",
-        embedding_table="cui_embeddings",
-        workers=3
-    )
-    
-    # Use results
-    for r in results:
-        print(f"\n{r.text}")
-        print(f"  Final: {r.level2[:5]}")
-        print(f"  Reduction: {r.reduction_pct:.1f}%")
+
+    # ------------------------- LOAD NETWORK -------------------------
+    # with open(NETWORK_PKL_PATH, "rb") as f:
+    #     UMLS_NETWORK_OBJ = pickle.load(f)
+
+    # ------------------------- SANITY CHECKS -------------------------
+#     print("Network type:", type(UMLS_NETWORK_OBJ))
+#     if not isinstance(UMLS_NETWORK_OBJ, nx.DiGraph):
+#         raise TypeError(
+#             f"Expected networkx.DiGraph, got {type(UMLS_NETWORK_OBJ)}"
+#         )
+
+#     print(f"Network nodes: {UMLS_NETWORK_OBJ.number_of_nodes()}")
+#     print(f"Network edges: {UMLS_NETWORK_OBJ.number_of_edges()}")
+
+    # ------------------------- INIT PIPELINE -------------------------
+    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+    engine = ReductionEngineAdaptive(hierarchy)
+    extractor = CUIExtractor(API_URL)
+
+    all_rows = []
+
+    for text in texts:
+        print(f"\n===== Processing: {text} =====")
+
+        # Step 1: Extract
+        extracted = extractor.extract_for_text(text)
+        n_extracted = len(extracted)
+
+        # Step 2: Filter by SAB
+        filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID)
+        n_filtered = len(filtered)
+
+        # Step 3: IC stats
+        ic_scores = [hierarchy.get_ic_score(c) for c in filtered]
+        ic_min = min(ic_scores) if ic_scores else 0
+        ic_max = max(ic_scores) if ic_scores else 0
+        ic_mean = sum(ic_scores)/len(ic_scores) if ic_scores else 0
+
+        # Step 4: Hierarchy reduction
+        reduced, num_clusters = engine.reduce_cuis(filtered)
+        n_reduced = len(reduced)
+
+        # Step 5: Embedding-based clustering
+        if reduced:
+            embeddings = fetch_cui_embeddings(reduced, PROJECT_ID, DATASET_ID)
+            clusters = cluster_cuis_by_embedding(reduced, embeddings)
+            n_embedding_clusters = len(clusters)
+            final_reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+        else:
+            n_embedding_clusters = 0
+            final_reduced = []
+
+        n_final = len(final_reduced)
+
+        # ------------------------- PRINT SUMMARY -------------------------
+        print(f"Extracted CUIs: {n_extracted}")
+        print(f"Filtered CUIs:  {n_filtered}")
+        print(f"IC scores: min={ic_min:.2f}, max={ic_max:.2f}, mean={ic_mean:.2f}")
+        print(f"Reduced CUIs:   {n_reduced} across {num_clusters} hierarchy clusters")
+        print(f"Embedding clusters: {n_embedding_clusters}")
+        print(f"Final CUIs: {n_final}")
+
+        # ------------------------- COLLECT FOR TABLE -------------------------
+        all_rows.append({
+        "Text": text,
+
+        # CUI lists
+        "Extracted CUIs": extracted,
+        "Filtered CUIs": filtered,
+        "Hierarchy Reduced CUIs": reduced,
+        "Final CUIs": final_reduced,        
+        "IC min": ic_min,
+        "IC max": ic_max,
+        "IC mean": ic_mean,
+        "Hierarchy Clusters": num_clusters,
+        "Embedding Clusters": n_embedding_clusters
+    })
+
+   
+    df = pd.DataFrame(all_rows)
+    print("\n===== PIPELINE SUMMARY =====")
+    print(df)
