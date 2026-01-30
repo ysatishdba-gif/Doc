@@ -1,15 +1,14 @@
 """
 MODULE 2: CUI CLUSTERING, TOPIC DISCOVERY & STANDARD TOPIC CLASSIFICATION
-
+USING BIGQUERY EMBEDDINGS
 """
 
-import pickle
 import time
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
-from collections import Counter, defaultdict
+from collections import Counter
 from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from google.cloud import bigquery
@@ -29,7 +28,7 @@ MIN_SECONDARY_TOPIC_CONF = 0.55
 
 @dataclass
 class CUISet:
-    set_id: str
+    set_id: Optional[str]
     cuis: List[str]
 
 @dataclass
@@ -65,29 +64,38 @@ class TopicResult:
     cui_topic_assignments: Dict[str, CUITopicAssignment]
 
 # ══════════════════════════════════════════════════════════════════
-# EMBEDDING STORE
+# BIGQUERY EMBEDDING STORE
 # ══════════════════════════════════════════════════════════════════
 
-class MemMapEmbeddingStore:
-    def __init__(self, memmap_file: str, dict_file: str, dim: int = 768):
-        with open(dict_file, "rb") as f:
-            self.cui_to_idx = pickle.load(f)
-        self.embeddings = np.memmap(
-            memmap_file,
-            dtype="float32",
-            mode="r",
-            shape=(len(self.cui_to_idx), dim)
-        )
-
-    def get(self, cui: str) -> Optional[np.ndarray]:
-        idx = self.cui_to_idx.get(cui)
-        return self.embeddings[idx].copy() if idx is not None else None
+class BigQueryEmbeddingStore:
+    """Fetch CUI embeddings directly from BigQuery"""
+    def __init__(self, project_id: str, dataset_id: str, table_name: str):
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        self.table_name = table_name
+        self.client = bigquery.Client(project=project_id)
 
     def get_batch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
-        return {c: self.get(c) for c in cuis if self.get(c) is not None}
+        if not cuis:
+            return {}
+        query = f"""
+        SELECT CUI, Embedding
+        FROM `{self.project_id}.{self.dataset_id}.{self.table_name}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
+            ]
+        )
+        df = self.client.query(query, job_config=job_config).to_dataframe()
+        return {row["CUI"]: np.array(row["Embedding"], dtype=np.float32) for _, row in df.iterrows()}
+
+    def get(self, cui: str) -> Optional[np.ndarray]:
+        return self.get_batch([cui]).get(cui, None)
 
 # ══════════════════════════════════════════════════════════════════
-# CUI DETAILS
+# CUI DETAILS STORE
 # ══════════════════════════════════════════════════════════════════
 
 class CUIDetailsStore:
@@ -114,21 +122,21 @@ class TopicReferenceStore:
         return self.topics
 
 # ══════════════════════════════════════════════════════════════════
-# EMBEDDING HELPERS
+# CUI SET EMBEDDER
 # ══════════════════════════════════════════════════════════════════
 
 class CUISetEmbedder:
-    def __init__(self, store: MemMapEmbeddingStore):
+    def __init__(self, store: BigQueryEmbeddingStore):
         self.store = store
 
     def embed(self, cui_sets: List[CUISet]) -> Dict[str, np.ndarray]:
         out = {}
         for s in cui_sets:
             vecs = self.store.get_batch(s.cuis)
-            out[s.set_id] = (
-                np.mean(list(vecs.values()), axis=0)
-                if vecs else np.zeros(768, dtype=np.float32)
-            )
+            if vecs:
+                out[s.set_id or "0"] = np.mean(list(vecs.values()), axis=0)
+            else:
+                out[s.set_id or "0"] = np.zeros(768, dtype=np.float32)
         return out
 
 # ══════════════════════════════════════════════════════════════════
@@ -136,7 +144,7 @@ class CUISetEmbedder:
 # ══════════════════════════════════════════════════════════════════
 
 class CUITopicClassifier:
-    def __init__(self, store: MemMapEmbeddingStore, topic_store: TopicReferenceStore):
+    def __init__(self, store: BigQueryEmbeddingStore, topic_store: TopicReferenceStore):
         self.store = store
         self.topic_store = topic_store
         self.centroids = self._build_centroids()
@@ -174,11 +182,7 @@ class CUITopicClassifier:
 # ══════════════════════════════════════════════════════════════════
 
 class CUITopicModeler:
-    def __init__(
-        self,
-        embedding_store: MemMapEmbeddingStore,
-        topic_store: TopicReferenceStore
-    ):
+    def __init__(self, embedding_store: BigQueryEmbeddingStore, topic_store: TopicReferenceStore):
         self.embedder = CUISetEmbedder(embedding_store)
         self.classifier = CUITopicClassifier(embedding_store, topic_store)
 
@@ -230,94 +234,63 @@ class CUITopicModeler:
         )
 
 # ══════════════════════════════════════════════════════════════════
-# MAIN FUNCTION (EXPECTED ENTRY POINT)
+# MAIN FUNCTION (ENTRY POINT)
 # ══════════════════════════════════════════════════════════════════
 
 def run_module_2_from_df(
     df: pd.DataFrame,
-    memmap_file: str,
-    dict_file: str,
+    project_id: str,
+    dataset_id: str,
+    embedding_table: str,
     standard_topics: List[StandardTopic],
     n_topics: int = DEFAULT_N_TOPICS
 ) -> TopicResult:
-    """
-    Adapter for Module 2.
-    
-    Input DF schema (from Module 1):
-      - cui: List[str]
-    """
-
-    # ---------- Validate input ----------
     if "cui" not in df.columns:
-        raise ValueError("Input DataFrame must contain column: 'cui'")
+        raise ValueError("Input DF must contain column: 'cui'")
 
     if len(df) != 1:
-        raise ValueError(
-            "Expected a single-row DataFrame with reduced CUI list"
-        )
+        raise ValueError("Expected a single-row DataFrame with reduced CUI list")
 
     cuis = df.iloc[0]["cui"]
+    if not isinstance(cuis, list) or not cuis:
+        raise ValueError("Column 'cui' must be a non-empty list")
 
-    if not isinstance(cuis, list):
-        raise ValueError("Column 'cui' must be a list of CUIs")
+    cui_set = CUISet(set_id=None, cuis=list(dict.fromkeys(cuis)))
 
-    if not cuis:
-        raise ValueError("CUI list is empty")
-
-    # ---------- Build CUISet (internal only) ----------
-    cui_set = CUISet(
-        set_id=None,                 # internal, ignored externally
-        cuis=list(dict.fromkeys(cuis))  # stable dedupe, preserves order
+    embedding_store = BigQueryEmbeddingStore(
+        project_id=project_id,
+        dataset_id=dataset_id,
+        table_name=embedding_table
     )
-
-    # ---------- Load stores ----------
-    embedding_store = MemMapEmbeddingStore(
-        memmap_file=memmap_file,
-        dict_file=dict_file
-    )
-
     topic_store = TopicReferenceStore(standard_topics)
 
-    # ---------- Run model ----------
     modeler = CUITopicModeler(
         embedding_store=embedding_store,
         topic_store=topic_store
     )
 
-    return modeler.discover_topics(
-        cui_sets=[cui_set],
-        n_topics=1
-    )
-
-
+    return modeler.discover_topics([cui_set], n_topics=n_topics)
 
 # ══════════════════════════════════════════════════════════════════
 # SAMPLE USAGE
 # ══════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    # df from Module 1 CUI reduction
+    df = previous_cui_reduction_output_df  # <-- real pipeline output
 
-    # df is produced by CUI reduction
-    df = df  
+    # Load standard topics from config / DB
+    standard_topics = standard_topics_config
 
     result = run_module_2_from_df(
         df=df,
-        memmap_file="embeddings.memmap",
-        dict_file=cui_to_idx,
-        standard_topics=standard_topics_config,  # loaded from config / DB
+        project_id="my-gcp-project",
+        dataset_id="cui_embeddings",
+        embedding_table="cui_vectors",
+        standard_topics=standard_topics,
         n_topics=1
     )
 
-    # Downstream consumption
-    topic_summary = result.topics[0]
-
-    print("Primary topic:", topic_summary.primary_label)
-    print("Confidence:", topic_summary.primary_confidence)
-
     print("\nPer-CUI classification:")
     for cui, assignment in result.cui_topic_assignments.items():
-        print(
-            cui,
-            assignment.primary_topic,
-            assignment.primary_confidence
-        )
+        print(f"{cui} → {assignment.primary_topic} (conf={assignment.primary_confidence:.2f})")
