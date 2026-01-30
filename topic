@@ -1,718 +1,631 @@
-# === IMPORTS & SETUP ===
-import os
-import random
+"""
+COMPLETE PIPELINE: MODULE 1 (CUI REDUCTION) + MODULE 2 (TOPIC DISCOVERY)
+Single cell execution
+"""
+
+import time
+import threading
+from typing import List, Dict, Optional
+from dataclasses import dataclass
 import numpy as np
-import torch
-import nltk
-import logging
-import re
+import networkx as nx
+import pickle
+import psutil
+import requests
+from google.cloud import bigquery
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.metrics import silhouette_score
+import subprocess
+import pandas as pd
 
-from collections import defaultdict, Counter
-from nltk.tokenize import sent_tokenize
-from sentence_transformers import SentenceTransformer
-from bertopic import BERTopic
-from bertopic.representation import KeyBERTInspired
-from hdbscan import HDBSCAN
-from umap import UMAP
-import scann
+# ═══════════════════════════════════════════════════════════════════
+# MODULE 1: CUI EXTRACTION & REDUCTION
+# ═══════════════════════════════════════════════════════════════════
 
-from gensim.models.coherencemodel import CoherenceModel
-from gensim.corpora import Dictionary
-from sklearn.metrics import silhouette_score, precision_recall_fscore_support
-from sklearn.metrics.pairwise import cosine_similarity
+# ------------------------- THREAD-SAFE PRINT -------------------------
+print_lock = threading.Lock()
+def thread_safe_print(msg: str):
+    with print_lock:
+        print(msg, flush=True)
 
-# === SEED FIXING ===
-SEED = 42
-np.random.seed(SEED)
-random.seed(SEED)
-os.environ["PYTHONHASHSEED"] = str(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.manual_seed_all(SEED)
-torch.use_deterministic_algorithms(True)
-nltk.download("punkt")
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ------------------------- FULLY ADAPTIVE LRU CACHE -------------------------
+class FullyAdaptiveLRUCache:
+    """LRU cache that grows dynamically and evicts only on memory pressure"""
+    def __init__(self):
+        self.cache = {}
+        self.order = []
+        self.lock = threading.RLock()
+    
+    def get(self, key):
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+                self.order.append(key)
+                return self.cache[key]
+            return None
+    
+    def put(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                self.order.remove(key)
+            self.cache[key] = value
+            self.order.append(key)
+            self._evict_if_needed()
+    
+    def _evict_if_needed(self):
+        mem = psutil.virtual_memory()
+        while mem.available < 0.2 * mem.total and self.order:
+            oldest = self.order.pop(0)
+            del self.cache[oldest]
+            mem = psutil.virtual_memory()
 
-# === GLOBAL WARNING & LOG SUPPRESSION ===
-import warnings
-warnings.filterwarnings('ignore')
- 
-import os
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
- 
-import logging
-logging.basicConfig(level=logging.ERROR)  # Only show errors and above
-
-
-# === CLEANING & CONTEXT EXTRACTION (IMPROVED) ===
-def clean_text(text):
-    text = text.lower()
-    text = re.sub(r"[^\w\s]", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def extract_entity_contexts(chunks, entities_per_chunk, use_multi_sentence=True):
-    entity_context_pairs = []
-    for idx, ents in enumerate(entities_per_chunk):
-        chunk = clean_text(chunks[idx])
-        sentences = sent_tokenize(chunk)
-        for ent in ents:
-            ent_lower = ent.lower()
-            matched = False
-            for i, sent in enumerate(sentences):
-                if ent_lower in sent:
-                    context = " ".join(sentences[max(0, i - 1): i + 2]) if use_multi_sentence else sent.strip()
-                    enriched = f"The concept '{ent_lower}' appears in the following context: {context}"
-                    entity_context_pairs.append((ent_lower, enriched.strip()))
-                    matched = True
-                    break
-            if not matched:
-                fallback = f"The concept '{ent_lower}' appears in the following context: {chunk}"
-                entity_context_pairs.append((ent_lower, fallback.strip()))
-    return entity_context_pairs
-
-
-# === TOPIC SEARCHER CLASS (WITH DEDUPLICATION, NOISE FILTERING) ===
-class AllergyTopicSearcher:
-    def __init__(self, chunks, entities_per_chunk, umap_params, hdbscan_params,
-                 model_name="pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb"):
-        self.chunks = chunks
-        self.entities_per_chunk = entities_per_chunk
-        self.embedding_model = SentenceTransformer(model_name)
-
-        self.umap_params = umap_params
-        self.hdbscan_params = hdbscan_params
-
-        self.topic_model = None
-        self.topic_metadata = []
-        self.topic_embeddings = None
-        self.searcher = None
-
-        self._prepare()
-
-    def _prepare(self):
-        entity_context_pairs = extract_entity_contexts(self.chunks, self.entities_per_chunk)
-        contextual_texts = [ctx for _, ctx in entity_context_pairs]
-        contextual_embeddings = self.embedding_model.encode(contextual_texts, normalize_embeddings=False)
-
-        umap_model = UMAP(**self.umap_params, random_state=SEED)
-        hdbscan_model = HDBSCAN(**self.hdbscan_params, prediction_data=True)
-
-        self.topic_model = BERTopic(
-            embedding_model=self.embedding_model,
-            umap_model=umap_model,
-            hdbscan_model=hdbscan_model,
-            representation_model=KeyBERTInspired(),
-            calculate_probabilities=True,
-            verbose=False,
-        )
-
-        topics, _ = self.topic_model.fit_transform(contextual_texts, embeddings=contextual_embeddings)
-
-        topic_to_contexts = defaultdict(list)
-        topic_to_entities = defaultdict(set)
-        topic_to_embeddings = defaultdict(list)
-
-        for i, topic in enumerate(topics):
-            if topic == -1:
-                continue  # Skip noisy topics
-            ent, ctx = entity_context_pairs[i]
-            topic_to_contexts[topic].append(ctx)
-            topic_to_entities[topic].add(ent)
-            topic_to_embeddings[topic].append(contextual_embeddings[i])
-
-        topic_embeddings = []
-        topic_metadata = []
-
-        for topic_id in topic_to_contexts:
-            emb = topic_to_embeddings[topic_id]
-            centroid = np.mean(emb, axis=0)
-            centroid /= np.linalg.norm(centroid) + 1e-10
-            topic_embeddings.append(centroid)
-            topic_metadata.append({
-                "topic_id": topic_id,
-                "entities": list(topic_to_entities[topic_id]),
-                "sentences": topic_to_contexts[topic_id],
-                "sentence_embeddings": np.array(emb)
-            })
-
-        # === OPTIONAL: Merge semantically similar topics (cosine sim > 0.95)
-        deduped_metadata = []
-        used = set()
-
-        for i, emb_i in enumerate(topic_embeddings):
-            if i in used:
+# ------------------------- HIERARCHY CLIENT -------------------------
+class HierarchyClient:
+    def __init__(self, network_obj, ic_scores: Optional[Dict[str, float]] = None):
+        self.network = network_obj
+        self.ic_scores = ic_scores or {}
+        self.ancestors_cache = FullyAdaptiveLRUCache()
+        self.children_cache = FullyAdaptiveLRUCache()
+        self.ic_cache = FullyAdaptiveLRUCache()
+        self.lock = threading.RLock()
+    
+    def get_children(self, cui: str) -> List[str]:
+        cached = self.children_cache.get(cui)
+        if cached is not None:
+            return cached
+        children = list(self.network.successors(cui)) if self.network.has_node(cui) else []
+        self.children_cache.put(cui, children)
+        return children
+    
+    def get_parents(self, cui: str) -> List[str]:
+        return list(self.network.predecessors(cui)) if self.network.has_node(cui) else []
+    
+    def get_ancestors(self, cui: str, max_depth: int = 10) -> List[List[str]]:
+        key = (cui, max_depth)
+        cached = self.ancestors_cache.get(key)
+        if cached is not None:
+            return cached
+        queue = [(0, [cui])]
+        visited = set()
+        paths = []
+        while queue:
+            depth, path = queue.pop(0)
+            node = path[-1]
+            if node in visited:
                 continue
-            group = [i]
-            sim_scores = cosine_similarity([emb_i], topic_embeddings)[0]
-            for j in range(i + 1, len(sim_scores)):
-                if sim_scores[j] > 0.95:
-                    group.append(j)
-                    used.add(j)
+            visited.add(node)
+            if depth >= max_depth or not self.network.has_node(node):
+                paths.append(path)
+                continue
+            for parent in self.get_parents(node):
+                queue.append((depth + 1, path + [parent]))
+        self.ancestors_cache.put(key, paths)
+        return paths
+    
+    def get_ic_score(self, cui: str) -> float:
+        cached = self.ic_cache.get(cui)
+        if cached is not None:
+            return cached
+        if cui in self.ic_scores:
+            ic = self.ic_scores[cui]
+        else:
+            paths = self.get_ancestors(cui)
+            if paths:
+                avg_depth = sum(len(p) for p in paths) / len(paths)
+                ic = min(10.0, 2.0 + np.log1p(avg_depth) * 2.0)
+            else:
+                ic = 3.0
+        self.ic_cache.put(cui, ic)
+        return ic
 
-            merged = {
-                "topic_id": i,
-                "sentences": [],
-                "entities": [],
-                "sentence_embeddings": []
+# ------------------------- EDGE DETECTOR -------------------------
+class EdgeDetectorAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+
+    def adjust_ic(self, cui: str) -> str:
+        ic = self.h.get_ic_score(cui)
+        target_min, target_max, target_opt = 4.0, 7.0, 5.5
+        if target_min <= ic <= target_max:
+            return cui
+        paths = self.h.get_ancestors(cui, max_depth=20)
+        best, best_dist = cui, abs(ic - target_opt)
+        for path in paths:
+            for ancestor in path:
+                a_ic = self.h.get_ic_score(ancestor)
+                dist = abs(a_ic - target_opt)
+                if target_min <= a_ic <= target_max and dist < best_dist:
+                    best, best_dist = ancestor, dist
+        return best
+
+    def select_representatives(self, group: set) -> List[str]:
+        if not group:
+            return []
+        max_reps = max(1, int(len(group) ** 0.5))
+        scored = [(c, abs(self.h.get_ic_score(c) - 5.5)) for c in group]
+        scored.sort(key=lambda x: x[1])
+        reps = [self.adjust_ic(c[0]) for c in scored[:max_reps]]
+        return list(set(reps))
+
+# ------------------------- CLUSTERER -------------------------
+class ClustererAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+
+    def cluster(self, cuis: List[str]) -> Dict[str, set]:
+        buckets = {}
+        for cui in cuis:
+            paths = self.h.get_ancestors(cui, max_depth=5)
+            ancestor = paths[0][0] if paths and paths[0] else cui
+            buckets.setdefault(ancestor, set()).add(cui)
+        return buckets
+
+# ------------------------- REDUCTION ENGINE -------------------------
+class ReductionEngineAdaptive:
+    def __init__(self, hierarchy: HierarchyClient):
+        self.h = hierarchy
+        self.clusterer = ClustererAdaptive(hierarchy)
+        self.edge_detector = EdgeDetectorAdaptive(hierarchy)
+
+    def reduce_cuis(self, cuis: List[str]):
+        cuis = list(set(cuis))
+        buckets = self.clusterer.cluster(cuis)
+        reduced = []
+        for ancestor, group in buckets.items():
+            reps = self.edge_detector.select_representatives(group)
+            reduced.extend(reps)
+        return list(set(reduced)), len(buckets)
+
+# ------------------------- CUI EXTRACTOR -------------------------
+class CUIExtractor:
+    def __init__(self, api_url: str):
+        self.api_url = api_url
+        self.session = requests.Session()
+
+        tmp = subprocess.run(
+            ['gcloud', 'auth', 'print-identity-token'],
+            stdout=subprocess.PIPE,
+            universal_newlines=True
+        )
+        token = tmp.stdout.strip()
+
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504]
+        )
+        self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def extract_for_text(self, text: str) -> List[str]:
+        try:
+            payload = {
+                "query_texts": [text],
+                "top_k": 3
             }
-            for g in group:
-                merged["sentences"] += topic_metadata[g]["sentences"]
-                merged["entities"] += topic_metadata[g]["entities"]
-                merged["sentence_embeddings"] += list(topic_metadata[g]["sentence_embeddings"])
 
-            merged["sentence_embeddings"] = np.array(merged["sentence_embeddings"])
-            merged["entities"] = list(set(merged["entities"]))
-            deduped_metadata.append(merged)
+            resp = self.session.post(
+                self.api_url,
+                headers=self.headers,
+                json=payload,
+                timeout=200
+            )
 
-        self.topic_metadata = deduped_metadata
-        self.topic_embeddings = np.array([
-            np.mean(m["sentence_embeddings"], axis=0) /
-            (np.linalg.norm(np.mean(m["sentence_embeddings"], axis=0)) + 1e-10)
-            for m in deduped_metadata
-        ])
+            thread_safe_print(f"[Extractor] Status: {resp.status_code}")
 
-        self.searcher = (
-            scann.scann_ops_pybind.builder(self.topic_embeddings, 3, "dot_product")
-            .tree(num_leaves=10, num_leaves_to_search=5, training_sample_size=len(self.topic_embeddings))
-            .score_brute_force()
-            .reorder(5)
-            .build()
+            resp.raise_for_status()
+
+            data = resp.json()
+            cuis = []
+
+            for v in data.values():
+                if isinstance(v, list):
+                    cuis.extend(v)
+
+            return list(set(map(str, cuis)))
+
+        except Exception as e:
+            thread_safe_print(f"CUI extraction failed: {str(e)}")
+            return []
+
+# ------------------------- SAB FILTER -------------------------
+ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
+
+def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str]:
+    if not cuis:
+        return []
+    try:
+        client = bigquery.Client(project=project_id)
+        filtered = []
+        for i in range(0, len(cuis), 2000):
+            batch = cuis[i:i+2000]
+            query = f"""
+            SELECT DISTINCT CUI
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis)
+              AND SAB IN UNNEST(@sabs)
+            """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis","STRING",batch),
+                    bigquery.ArrayQueryParameter("sabs","STRING",ALLOWED_SABS)
+                ]
+            )
+            results = client.query(query, job_config=job_config).result(timeout=200)
+            filtered.extend([row.CUI for row in results])
+        return filtered
+    except Exception as e:
+        thread_safe_print(f"SAB filter failed: {e}")
+        return []
+
+# ------------------------- EMBEDDING-BASED REDUCTION -------------------------
+def fetch_cui_embeddings(cuis: List[str], project_id: str, dataset_id: str, table_name: str) -> Dict[str, np.ndarray]:
+    client = bigquery.Client(project=project_id)
+    embeddings = {}
+    for i in range(0, len(cuis), 2000):
+        batch = cuis[i:i+2000]
+        query = f"""
+        SELECT CUI, embedding
+        FROM `{project_id}.{dataset_id}.{table_name}`
+        WHERE CUI IN UNNEST(@cuis)
+        """
+        job_config = bigquery.QueryJobConfig(
+            query_parameters=[bigquery.ArrayQueryParameter("cuis","STRING",batch)]
         )
+        results = client.query(query, job_config=job_config).result(timeout=200)
+        for row in results:
+            embeddings[row.CUI] = np.array(row.embedding)
+    return embeddings
 
-    import re
+def cluster_cuis_by_embedding(cuis: List[str], embeddings: Dict[str, np.ndarray], n_clusters=None) -> Dict[int, List[str]]:
+    valid_cuis = [c for c in cuis if c in embeddings]
+    if not valid_cuis:
+        return {}
+    X = np.stack([embeddings[c] for c in valid_cuis])
+    n_clusters = n_clusters or max(1, int(len(valid_cuis)**0.5))
+    clustering = AgglomerativeClustering(n_clusters=n_clusters,metric='cosine',linkage='average')
+    labels = clustering.fit_predict(X)
+    clusters = {}
+    for cui, label in zip(valid_cuis, labels):
+        clusters.setdefault(label, []).append(cui)
+    return clusters
 
-    def search(self, query, top_k_topics=3, top_k_sents=3):
-        query_emb = self.embedding_model.encode([query], normalize_embeddings=True)[0]
-        neighbors, scores = self.searcher.search(query_emb, final_num_neighbors=top_k_topics)
-
-        results = []
-        prefix_pattern = r"^the concept '.*?' appears in (the following )?context:\s*"
-
-        for i, idx in enumerate(neighbors):
-            meta = self.topic_metadata[idx]
-            topic_score = float(scores[i])
-
-            # Deduplicate sentences
-            seen = set()
-            cleaned_sentences = []
-            cleaned_embeddings = []
-
-            for sent, emb in zip(meta["sentences"], meta["sentence_embeddings"]):
-            # Apply regex to remove beginning prefix
-                cleaned = re.sub(prefix_pattern, "", sent, flags=re.IGNORECASE).strip()
-
-        # No duplicates
-                if cleaned not in seen:
-                    seen.add(cleaned)
-                    cleaned_sentences.append(cleaned)
-                    cleaned_embeddings.append(emb)
-
-            if not cleaned_sentences:
-                continue
-
-            emb_array = np.array(cleaned_embeddings)
-            sims = np.dot(emb_array / np.linalg.norm(emb_array, axis=1, keepdims=True), query_emb)
-            top_ids = sims.argsort()[::-1][:top_k_sents]
-
-            top_sents = [(cleaned_sentences[j], float(sims[j])) for j in top_ids]
-            results.append({
-            "topic_id": meta["topic_id"],
-            "topic_score": topic_score,
-            "entities": meta["entities"],
-            "sentences": top_sents,
-            })
-
-        return results
-
-
-
-
-# === METRICS ===
-def compute_bertopic_coherence(topic_model, topic_metadata, topk=15):
-    topics = [topic_model.get_topic(meta["topic_id"])[:topk] for meta in topic_metadata]
-    word_lists = [[word for word, _ in topic] for topic in topics]
-
-    texts = []
-    for meta in topic_metadata:
-        for s in meta["sentences"]:
-            tokens = clean_text(s).split()
-            texts.append(tokens)
-
-    dictionary = Dictionary(texts)
-    corpus = [dictionary.doc2bow(t) for t in texts]
-
-    cm = CoherenceModel(
-        topics=word_lists,
-        texts=texts,
-        dictionary=dictionary,
-        coherence="c_v"
-    )
-    return cm.get_coherence()
-
-
-def compute_topic_diversity(topic_model, topic_metadata, topk=10):
-    topic_words = [topic_model.get_topic(meta["topic_id"])[:topk] for meta in topic_metadata]
-    unique_words = set(word for topic in topic_words for word, _ in topic)
-    return len(unique_words) / (len(topic_words) * topk)
-
-
-def compute_silhouette_score_custom(topic_metadata):
-    all_embeddings = []
-    all_labels = []
-
-    for meta in topic_metadata:
-        emb = meta["sentence_embeddings"]
-        if len(emb) < 2:  # skip small clusters
+def pick_representative_per_embedding_cluster(clusters: Dict[int, List[str]], embeddings: Dict[str, np.ndarray]) -> List[str]:
+    reduced = []
+    for cluster_cuis in clusters.values():
+        if len(cluster_cuis) == 1:
+            reduced.append(cluster_cuis[0])
             continue
-        all_embeddings.extend(emb)
-        all_labels.extend([meta["topic_id"]] * len(emb))
+        X = np.stack([embeddings[c] for c in cluster_cuis])
+        centroid = np.mean(X, axis=0)
+        distances = np.linalg.norm(X - centroid, axis=1)
+        idx = np.argmin(distances)
+        reduced.append(cluster_cuis[idx])
+    return reduced
 
-    if len(all_embeddings) < 3:
-        return None
+# ═══════════════════════════════════════════════════════════════════
+# MODULE 2: ADAPTIVE TOPIC DISCOVERY
+# ═══════════════════════════════════════════════════════════════════
 
-    all_embeddings = np.vstack(all_embeddings)
-    return silhouette_score(all_embeddings, all_labels, metric="cosine")
+@dataclass
+class Topic:
+    """Discovered topic"""
+    topic_id: int
+    topic_name: str
+    representative_cuis: List[str]
+    cui_definitions: Dict[str, str]
+    cui_count: int
+    source_texts: List[str]
 
+@dataclass
+class TopicResult:
+    """Complete result"""
+    topics: List[Topic]
+    cui_to_topic: Dict[str, int]
+    n_topics: int
+    silhouette_score: float
+    processing_time: float
 
-# === DATASET & INITIALIZATION ===
-allergy_dataset = {
-  "chunks": [
-    "Mrs. M is a 68-year-old female with a complex medical history including hypertension, type 2 diabetes mellitus, and stage 3 chronic kidney disease.",
-    "She presents to the internal medicine clinic with ongoing complaints of dull, persistent occipital headaches for the past six weeks.",
-    "The headaches are associated with episodes of dizziness and intermittent blurred vision, particularly in the morning hours.",
-    "She reports that these symptoms have gradually increased in frequency and intensity.",
-    "At-home blood pressure monitoring consistently shows elevated readings above 160/95 mmHg.",
-    "These elevated blood pressure values are most pronounced during early mornings.",
-    "Her current antihypertensive regimen includes amlodipine 10 mg daily and hydrochlorothiazide 25 mg daily.",
-    "Despite adherence, her blood pressure remains poorly controlled.",
-    "She also has a history of hyperlipidemia managed with atorvastatin.",
-    "Her most recent HbA1c is 7.8%, indicating suboptimal glycemic control.",
-    "She suffers from osteoarthritis, predominantly affecting her knees and hips.",
-    "Osteoarthritis significantly limits her mobility and daily activity.",
-    "She averages fewer than 1,000 steps per day, as recorded by her wearable tracker.",
-    "She has recently developed bilateral ankle edema, particularly in the evenings.",
-    "Mild shortness of breath is present with moderate physical exertion.",
-    "These symptoms raise concerns for evolving heart failure.",
-    "Her clinic vitals reveal a blood pressure of 168/98 mmHg while seated.",
-    "Heart rate is 88 bpm, respiratory rate 18, and oxygen saturation is 96% on room air.",
-    "Temperature is within normal limits.",
-    "Cardiovascular exam reveals a displaced apical impulse at the 6th intercostal space.",
-    "A soft systolic murmur (grade 2/6) is heard over the cardiac apex.",
-    "No jugular venous distension is appreciated.",
-    "Pulmonary examination shows clear lung fields bilaterally.",
-    "Mild 1+ pitting edema is noted at both ankles.",
-    "Fundoscopic exam shows arteriolar narrowing and scattered cotton wool spots.",
-    "There is no evidence of papilledema.",
-    "Recent labs show stable serum creatinine at 1.4 mg/dL.",
-    "Her eGFR is estimated at 48 mL/min/1.73 m².",
-    "Electrolyte levels remain within normal limits.",
-    "Her lipid panel reveals LDL cholesterol at 130 mg/dL.",
-    "HDL is 38 mg/dL and triglycerides are measured at 160 mg/dL.",
-    "A 12-lead ECG reveals left ventricular hypertrophy with strain pattern.",
-    "There are no arrhythmias or conduction defects observed on ECG.",
-    "Echocardiography demonstrates concentric LV hypertrophy with LVEF of 60%.",
-    "Mild left atrial enlargement is present on echocardiogram.",
-    "Trace mitral regurgitation is also identified.",
-    "She expresses challenges adhering to a low-sodium diet.",
-    "Meal preparation is difficult due to joint pain and fatigue.",
-    "She frequently consumes processed or ready-made meals.",
-    "Her husband assists with shopping but she manages meal planning.",
-    "Despite previous dietary counseling, her weight has remained stable.",
-    "She reports feeling frustrated with her lack of progress.",
-    "Her hydrochlorothiazide dose was reduced due to borderline hypokalemia.",
-    "Lisinopril 10 mg daily was added to improve BP control and renal protection.",
-    "She was instructed to record BP twice daily and maintain a log.",
-    "Additional labs were ordered to reassess renal function and electrolytes.",
-    "A follow-up lipid panel was also requested.",
-    "She was counseled on symptoms of hypertensive urgency.",
-    "Educational materials were provided about recognizing chest pain, confusion, or sudden weakness.",
-    "She was encouraged to gradually increase activity within tolerance.",
-    "Physical therapy referral was made to support her with joint-friendly exercises.",
-    "Dietitian consultation was arranged to address nutritional gaps.",
-    "The diet plan focuses on kidney-friendly and low-sodium strategies.",
-    "Home health services were initiated to aid with BP monitoring.",
-    "Medication adherence support and lifestyle reinforcement are included in home visits.",
-    "Cardiology follow-up is scheduled within 4 weeks.",
-    "Nephrology will reassess renal function and medication tolerance.",
-    "She lives with her husband in a single-story home.",
-    "Her husband offers daily assistance and emotional support.",
-    "She is the primary caregiver for her elderly mother-in-law with dementia.",
-    "Caregiver duties contribute to emotional stress and fatigue.",
-    "She reports occasional insomnia and feelings of anxiety.",
-    "There is no history of tobacco or alcohol use.",
-    "She denies symptoms of depression.",
-    "Social work referral was made to explore caregiver resources.",
-    "Multidisciplinary care was emphasized to support long-term BP management.",
-    "She was advised to follow up within 6 weeks or sooner if symptoms worsen.",
-    "She agreed to maintain a BP log and bring it to her next visit.",
-    "Nutritional handouts and physical therapy instructions were given in print.",
-    "She was educated on avoiding NSAIDs due to kidney function.",
-    "She occasionally used over-the-counter pain relievers for joint discomfort.",
-    "Acetaminophen was recommended instead of ibuprofen.",
-    "Fluid status will be monitored to avoid volume overload.",
-    "She was advised to elevate legs periodically throughout the day.",
-    "Compression stockings were discussed for managing ankle edema.",
-    "Psychosocial support and stress management were reviewed during the visit.",
-    "Behavioral therapy referral was considered if insomnia persists.",
-    "Cognitive function was grossly intact during the visit.",
-    "There was no evidence of delirium or memory impairment.",
-    "Speech, gait, and motor function appeared normal during physical exam.",
-    "Her last eye exam was over a year ago; ophthalmology referral was placed.",
-    "Diabetic foot screening was normal, with intact sensation and no ulceration.",
-    "She is due for her pneumococcal and influenza vaccinations.",
-    "Vaccination updates were administered during this visit.",
-    "Her BMI is 31, placing her in the obese category.",
-    "Weight reduction strategies were discussed, including dietary adjustments.",
-    "She agreed to log meals and reduce sugary beverages.",
-    "She was encouraged to attend group diabetes education sessions.",
-    "A glucose meter was prescribed for home use.",
-    "Target fasting blood glucose levels were reviewed with her.",
-    "She demonstrated appropriate technique for fingerstick glucose testing.",
-    "Pharmacist consultation was arranged to review medication regimen.",
-    "Her medication list was reconciled and updated in the EHR.",
-    "There are no current drug allergies reported.",
-    "Her creatinine will be monitored every 3 months going forward.",
-    "UACR (urine albumin-to-creatinine ratio) was ordered to assess proteinuria.",
-    "Recent lab results were reviewed and explained in detail.",
-    "Patient verbalized understanding of the treatment plan.",
-    "Emergency contact information was verified and updated.",
-    "Instructions were provided on when to seek urgent care.",
-    "She was advised to avoid high-potassium foods temporarily.",
-    "A potassium supplement was not needed at this time.",
-    "She requested information on local support groups for caregivers.",
-    "Social worker will follow up within 2 weeks.",
-    "Progress notes and care plan summary were printed for her records.",
-    "Next appointment was scheduled before she left the clinic.",
-    "Clinic staff reviewed transportation resources if needed.",
-    "She prefers morning appointments due to caregiver duties in the afternoon.",
-    "Her husband accompanied her to the visit and asked questions about medications.",
-    "Together, they expressed appreciation for coordinated care.",
-    "She was reminded of the importance of medication timing consistency.",
-    "BP monitor calibration was reviewed and verified as accurate.",
-    "Telehealth follow-up was discussed as an option for future visits.",
-    "Patient was comfortable with the use of video visits.",
-    "Portal access instructions were provided to view lab results online.",
-    "Patient's adherence barriers were reviewed in depth.",
-    "She reported no issues obtaining her prescriptions.",
-    "Medication copays are affordable with current insurance.",
-    "She uses a pill organizer to stay consistent with medications.",
-    "No adverse effects were noted with lisinopril initiation.",
-    "She will follow up earlier if she experiences cough or dizziness.",
-    "Lab orders were sent electronically to her preferred lab facility.",
-    "Her primary care physician was updated with a detailed note.",
-    "All referrals were placed and communicated via the EHR.",
-    "She verbalized a commitment to improve her dietary habits.",
-    "Caregiver support remains a critical concern in her daily life.",
-    "A family meeting was suggested to discuss shared caregiving responsibilities.",
-    "Advance directives were briefly discussed and documented in the chart.",
-    "She has not completed a living will but expressed interest in doing so.",
-    "Goals of care conversation was scheduled for her next visit.",
-    "The care team concluded the visit with a review of next steps.",
-    "Mrs. M was thanked for her active participation and engagement in her care.",
-    "Patient has peanut allergy causing hives and swelling. Anaphylaxis noted once during a reaction.",
-    "Allergic rhinitis, or hay fever, results from exposure to pollen, dust, or pet dander.",
-    "Severe anaphylaxis symptoms require immediate treatment with epinephrine.",
-    "Food allergies to milk and eggs can cause skin reactions like urticaria and eczema.",
-    "Cold weather does not cause allergy symptoms in this patient."
-  ]
+def normalize(v: np.ndarray) -> np.ndarray:
+    """Normalize vector"""
+    return v / (np.linalg.norm(v) + 1e-10)
 
-,
-"entities":[
-    [ "Mrs. M", "68-year-old female", "hypertension", "type 2 diabetes mellitus", "stage 3 chronic kidney disease" ],
-  [ "internal medicine clinic", "dull, persistent occipital headaches", "past six weeks" ],
-  [ "headaches", "dizziness", "intermittent blurred vision", "morning hours" ],
-  [ "symptoms" ],
-  [ "At-home blood pressure monitoring", "elevated readings", "160/95 mmHg" ],
-  [ "elevated blood pressure values", "early mornings" ],
-  [ "antihypertensive regimen", "amlodipine", "10 mg daily", "hydrochlorothiazide", "25 mg daily" ],
-  [ "blood pressure" ],
-  [ "hyperlipidemia", "atorvastatin" ],
-  [ "HbA1c", "7.8%", "suboptimal glycemic control" ],
-  [ "osteoarthritis", "knees", "hips" ],
-  [ "Osteoarthritis", "mobility", "daily activity" ],
-  [ "1,000 steps per day", "wearable tracker" ],
-  [ "bilateral ankle edema", "evenings" ],
-  [ "Mild shortness of breath", "moderate physical exertion" ],
-  [ "symptoms", "heart failure" ],
-  [ "clinic vitals", "blood pressure", "168/98 mmHg" ],
-  [ "Heart rate", "88 bpm", "respiratory rate", "18", "oxygen saturation", "96%", "room air" ],
-  [ "Temperature" ],
-  [ "Cardiovascular exam", "displaced apical impulse", "6th intercostal space" ],
-  [ "soft systolic murmur (grade 2/6)", "cardiac apex" ],
-  [ "jugular venous distension" ],
-  [ "Pulmonary examination", "clear lung fields" ],
-  [ "Mild 1+ pitting edema", "ankles" ],
-  [ "Fundoscopic exam", "arteriolar narrowing", "scattered cotton wool spots" ],
-  [ "papilledema" ],
-  [ "labs", "serum creatinine", "1.4 mg/dL" ],
-  [ "eGFR", "48 mL/min/1.73 m²" ],
-  [ "Electrolyte levels" ],
-  [ "lipid panel", "LDL cholesterol", "130 mg/dL" ],
-  [ "HDL", "38 mg/dL", "triglycerides", "160 mg/dL" ],
-  [ "12-lead ECG", "left ventricular hypertrophy with strain pattern" ],
-  [ "arrhythmias", "conduction defects", "ECG" ],
-  [ "Echocardiography", "concentric LV hypertrophy", "LVEF", "60%" ],
-  [ "Mild left atrial enlargement", "echocardiogram" ],
-  [ "Trace mitral regurgitation" ],
-  [ "low-sodium diet" ],
-  [ "Meal preparation", "joint pain", "fatigue" ],
-  [ "processed or ready-made meals" ],
-  [ "husband", "shopping", "meal planning" ],
-  [ "dietary counseling", "weight" ],
-  [ "frustrated" ],
-  [ "hydrochlorothiazide", "borderline hypokalemia" ],
-  [ "Lisinopril", "10 mg daily", "BP control", "renal protection" ],
-  [ "BP", "twice daily", "log" ],
-  [ "labs", "renal function", "electrolytes" ],
-  [ "lipid panel" ],
-  [ "symptoms", "hypertensive urgency" ],
-  [ "chest pain", "confusion", "sudden weakness" ],
-  [ "activity" ],
-  [ "Physical therapy", "joint-friendly exercises" ],
-  [ "Dietitian", "consultation", "nutritional gaps" ],
-  [ "diet plan", "kidney-friendly", "low-sodium" ],
-  [ "Home health services", "BP monitoring" ],
-  [ "Medication adherence support", "lifestyle reinforcement", "home visits" ],
-  [ "Cardiology", "follow-up", "4 weeks" ],
-  [ "Nephrology", "renal function", "medication tolerance" ],
-  [ "husband", "single-story home" ],
-  [ "husband", "daily assistance", "emotional support" ],
-  [ "primary caregiver", "elderly mother-in-law", "dementia" ],
-  [ "Caregiver duties", "emotional stress", "fatigue" ],
-  [ "insomnia", "anxiety" ],
-  [ "tobacco", "alcohol" ],
-  [ "symptoms of depression" ],
-  [ "Social work", "caregiver resources" ],
-  [ "Multidisciplinary care", "long-term BP management" ],
-  [ "follow up", "6 weeks", "symptoms" ],
-  [ "BP log", "next visit" ],
-  [ "Nutritional handouts", "physical therapy instructions" ],
-  [ "NSAIDs", "kidney function" ],
-  [ "over-the-counter pain relievers", "joint discomfort" ],
-  [ "Acetaminophen", "ibuprofen" ],
-  [ "Fluid status", "volume overload" ],
-  [ "legs" ],
-  [ "Compression stockings", "ankle edema" ],
-  [ "Psychosocial support", "stress management", "visit" ],
-  [ "Behavioral therapy", "insomnia" ],
-  [ "Cognitive function", "visit" ],
-  [ "delirium", "memory impairment" ],
-  [ "Speech", "gait", "motor function", "physical exam" ],
-  [ "eye exam", "over a year ago", "ophthalmology" ],
-  [ "Diabetic foot screening", "intact sensation", "ulceration" ],
-  [ "pneumococcal", "influenza vaccinations" ],
-  [ "Vaccination", "visit" ],
-  [ "BMI", "31", "obese category" ],
-  [ "Weight reduction strategies", "dietary adjustments" ],
-  [ "log meals", "sugary beverages" ],
-  [ "group diabetes education sessions" ],
-  [ "glucose meter" ],
-  [ "Target fasting blood glucose levels" ],
-  [ "fingerstick glucose testing" ],
-  [ "Pharmacist", "consultation", "medication regimen" ],
-  [ "medication list", "EHR" ],
-  [ "drug allergies" ],
-  [ "creatinine", "every 3 months" ],
-  [ "UACR (urine albumin-to-creatinine ratio)", "proteinuria" ],
-  [ "lab results" ],
-  [ "Patient", "treatment plan" ],
-  [ "Emergency contact information" ],
-  [ "urgent care" ],
-  [ "high-potassium foods", "temporarily" ],
-  [ "potassium supplement" ],
-  [ "local support groups for caregivers" ],
-  [ "Social worker", "2 weeks" ],
-  [ "Progress notes", "care plan summary" ],
-  [ "Next appointment", "clinic" ],
-  [ "Clinic staff", "transportation resources" ],
-  [ "morning appointments", "caregiver duties", "afternoon" ],
-  [ "husband", "visit", "medications" ],
-  [ "coordinated care" ],
-  [ "medication timing consistency" ],
-  [ "BP monitor", "calibration" ],
-  [ "Telehealth follow-up", "future visits" ],
-  [ "Patient", "video visits" ],
-  [ "Portal", "lab results" ],
-  [ "Patient's adherence barriers" ],
-  [ "prescriptions" ],
-  [ "Medication copays", "current insurance" ],
-  [ "pill organizer", "medications" ],
-  [ "adverse effects", "lisinopril" ],
-  [ "cough", "dizziness" ],
-  [ "Lab orders", "lab facility" ],
-  [ "primary care physician", "note" ],
-  [ "referrals", "EHR" ],
-  [ "dietary habits" ],
-  [ "Caregiver support" ],
-  [ "family meeting", "shared caregiving responsibilities" ],
-  [ "Advance directives", "chart" ],
-  [ "living will" ],
-  [ "Goals of care conversation", "next visit" ],
-  [ "care team", "visit", "next steps" ],
-  [ "Mrs. M", "care" ],
-  ["peanut allergy", "hives", "swelling", "anaphylaxis"],
-  ["allergic rhinitis", "hay fever", "pollen", "dust", "pet dander"],
-  ["anaphylaxis", "epinephrine", "treatment"],
-  ["food allergies", "milk", "eggs", "urticaria", "eczema"],
-  ["cold weather", "allergy symptoms"]
-]
-
-}
-
-best_umap = {"n_neighbors": 10, "n_components": 3, "min_dist":0.1,  "metric": "cosine"}
-best_hdbscan = {"min_cluster_size": 2, "min_samples": 1, "metric": "euclidean"}
-
-searcher = AllergyTopicSearcher(
-    chunks=allergy_dataset["chunks"],
-    entities_per_chunk=allergy_dataset["entities"],
-    umap_params=best_umap,
-    hdbscan_params=best_hdbscan,
-    model_name="pritamdeka/BioBERT-mnli-snli-scinli-scitail-mednli-stsb"
-)
-print(" Model ready for querying.")
-print("\n===  Generated Topics and Entities ===")
-for meta in searcher.topic_metadata:
-    topic_id = meta["topic_id"]
-    entities = ", ".join(meta["entities"])
-    print(f" Topic ID: {topic_id} — Entities: {entities}")
-
-# === METRICS ===
-coherence = compute_bertopic_coherence(searcher.topic_model, searcher.topic_metadata, topk=15)
-diversity = compute_topic_diversity(searcher.topic_model, searcher.topic_metadata, topk=10)
-sil_score = compute_silhouette_score_custom(searcher.topic_metadata)
-
-print("\n=== Topic Quality Metrics ===")
-print(f" Coherence Score (c_v): {coherence:.4f}")
-print(f" Topic Diversity: {diversity:.4f}")
-if sil_score is not None:
-    print(f" Silhouette Score: {sil_score:.4f}")
-else:
-    print(" Silhouette Score: Not applicable.")
-import numpy as np
-import plotly.graph_objects as go
-import umap
-
-# Assuming you have these from your previous steps
-topics = searcher.topic_metadata[:3]
-
-all_entities = []
-all_assigned_labels = []
-all_topic_ids = []
-all_embeddings = []
-
-cui_to_label = {cui: label for cui, label in cui_term_list}
-
-for topic in topics:
-    topic_id = topic["topic_id"]
-    entities = topic["entities"]
-    row = df2[df2["topic_id"] == topic_id].iloc[0]
-    entity_assignments = row["entity_level_assignments"]
-    embeddings = topic["sentence_embeddings"]
-
-    all_entities.extend([ea["entity"] for ea in entity_assignments])
-    all_assigned_labels.extend([ea["assigned__cui"] for ea in entity_assignments])
-    all_topic_ids.extend([topic_id] * len(entity_assignments))
-    all_embeddings.extend(embeddings[:len(entity_assignments)])
-
-all_embeddings = np.array(all_embeddings)
-
-reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric="cosine", random_state=42)
-embedding_2d = reducer.fit_transform(all_embeddings)
-
-def get_short_label(full_label):
-    return full_label.split(':')[0] if ':' in full_label else full_label
-
-topic_ids_unique = list(set(all_topic_ids))
-colors = ["red", "blue", "green", "orange"]
-topic_color_map = {tid: colors[i % len(colors)] for i, tid in enumerate(topic_ids_unique)}
-
-fig = go.Figure()
-
-topic_centers = {}
-
-for topic_id in topic_ids_unique:
-    idxs = [i for i, t in enumerate(all_topic_ids) if t == topic_id]
-    x = embedding_2d[idxs, 0]
-    y = embedding_2d[idxs, 1]
-    color = topic_color_map[topic_id]
-
-    text_labels = [all_entities[i] for i in idxs]
-
-    # Scatter plot for entities with names displayed
-    fig.add_trace(go.Scatter(
-        x=x, y=y,
-        mode='markers+text',
-        marker=dict(color=color, size=10, opacity=0.8),
-        name=f"Topic {topic_id}",
-        text=text_labels,
-        textposition="top center",
-        textfont=dict(size=10, color=color),
-        hoverinfo='skip'
-    ))
-
-    # Circle cluster around entities
-    center = np.mean(np.column_stack((x, y)), axis=0)
-    topic_centers[topic_id] = center
-    radius = np.max(np.linalg.norm(np.column_stack((x, y)) - center, axis=1)) + 0.3
-
-    theta = np.linspace(0, 2 * np.pi, 100)
-    circle_x = center[0] + radius * np.cos(theta)
-    circle_y = center[1] + radius * np.sin(theta)
-
-    fig.add_trace(go.Scatter(
-        x=circle_x, y=circle_y,
-        mode='lines',
-        line=dict(color=color, width=2, dash='dash'),
-        showlegend=False,
-        hoverinfo='skip'
-    ))
-
-# Now add the label legends next to each topic cluster
-label_x_offset = 0.7  # horizontal distance right from circle center
-
-for topic_id in topic_ids_unique:
-    center = topic_centers[topic_id]
-    row = df2[df2["topic_id"] == topic_id].iloc[0]
-    topic_labels = row["topic_level_labels"]  # list of (CUI, score)
-    color = topic_color_map[topic_id]
-
-    # Title label for this topic's labels
-    fig.add_annotation(
-        x=center[0] + label_x_offset,
-        y=center[1] + 0.2,
-        text=f"<b>Topic {topic_id} Labels:</b>",
-        showarrow=False,
-        font=dict(color=color, size=12),
-        xanchor='left',
-        yanchor='bottom'
+def fetch_cui_data(cuis: List[str], project_id: str, dataset_id: str, embedding_table: str) -> Dict[str, Dict]:
+    """Fetch CUI embeddings and definitions"""
+    client = bigquery.Client(project=project_id)
+    
+    query = f"""
+    SELECT CUI, Embedding, Definition
+    FROM `{project_id}.{dataset_id}.{embedding_table}`
+    WHERE CUI IN UNNEST(@cuis)
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", list(set(cuis)))
+        ]
     )
+    
+    results = client.query(query, job_config=job_config).result(timeout=200)
+    
+    cui_data = {}
+    for row in results:
+        cui_data[row.CUI] = {
+            'embedding': np.array(row.Embedding, dtype=np.float32),
+            'definition': row.Definition
+        }
+    
+    return cui_data
 
-    # Individual labels listed vertically below the title
-    for i, (cui, _) in enumerate(topic_labels):
-        short_label = get_short_label(cui_to_label.get(cui, cui))
-        fig.add_annotation(
-            x=center[0] + label_x_offset,
-            y=center[1] + 0.2 - (i + 1) * 0.06,
-            text=f"{short_label} ({cui})",
-            showarrow=False,
-            font=dict(color=color, size=10),
-            xanchor='left',
-            yanchor='top'
+def find_optimal_clusters(X: np.ndarray, max_clusters: int = None) -> int:
+    """Automatically find optimal number of clusters"""
+    n_samples = len(X)
+    
+    if max_clusters is None:
+        max_clusters = min(n_samples - 1, max(2, int(np.sqrt(n_samples))))
+    
+    if n_samples < 2:
+        return 1
+    
+    if n_samples == 2:
+        return 2
+    
+    best_k = 2
+    best_score = -1
+    
+    print(f"Finding optimal number of topics (testing 2 to {max_clusters})...")
+    
+    for k in range(2, max_clusters + 1):
+        clustering = AgglomerativeClustering(
+            n_clusters=k,
+            metric='cosine',
+            linkage='average'
         )
+        labels = clustering.fit_predict(X)
+        
+        score = silhouette_score(X, labels, metric='cosine')
+        
+        print(f"  k={k}: silhouette={score:.3f}")
+        
+        if score > best_score:
+            best_score = score
+            best_k = k
+    
+    print(f"Optimal number of topics: {best_k} (silhouette={best_score:.3f})")
+    return best_k
 
-fig.update_layout(
-    title="UMAP Visualization of Topics with Entities and Assigned Labels",
-    xaxis_title="UMAP Dimension 1",
-    yaxis_title="UMAP Dimension 2",
-    legend_title="Topics",
-    width=1000,
-    height=700,
-    template='plotly_white',
-    margin=dict(r=150)
-)
+def discover_topics_adaptive(df_module1: pd.DataFrame, project_id: str, dataset_id: str, 
+                            embedding_table: str, max_topics: int = None) -> TopicResult:
+    """Adaptively discover topics from Module 1 output"""
+    
+    start_time = time.time()
+    
+    print(f"\n{'='*70}")
+    print("MODULE 2: ADAPTIVE TOPIC DISCOVERY")
+    print(f"{'='*70}\n")
+    
+    # Collect all CUIs
+    print(f"Processing {len(df_module1)} texts from Module 1...")
+    
+    all_cuis = []
+    text_to_cuis = {}
+    
+    for idx, row in df_module1.iterrows():
+        text = row["Text"]
+        final_cuis = row["Final CUIs"]
+        
+        if final_cuis and isinstance(final_cuis, list):
+            all_cuis.extend(final_cuis)
+            text_to_cuis[text] = final_cuis
+    
+    unique_cuis = list(set(all_cuis))
+    print(f"Found {len(unique_cuis)} unique CUIs across all texts")
+    
+    if len(unique_cuis) == 0:
+        print("No CUIs found")
+        return TopicResult([], {}, 0, 0.0, time.time() - start_time)
+    
+    if len(unique_cuis) == 1:
+        print("Only 1 unique CUI - creating single topic")
+        cui_data = fetch_cui_data(unique_cuis, project_id, dataset_id, embedding_table)
+        cui = unique_cuis[0]
+        source_texts = [text for text, text_cuis in text_to_cuis.items() if cui in text_cuis]
+        
+        topic = Topic(
+            topic_id=0,
+            topic_name=cui_data.get(cui, {}).get('definition', cui)[:60],
+            representative_cuis=[cui],
+            cui_definitions={cui: cui_data.get(cui, {}).get('definition', '')},
+            cui_count=1,
+            source_texts=source_texts
+        )
+        
+        return TopicResult([topic], {cui: 0}, 1, 0.0, time.time() - start_time)
+    
+    # Fetch embeddings
+    print("Fetching CUI embeddings and definitions from BigQuery...")
+    cui_data = fetch_cui_data(unique_cuis, project_id, dataset_id, embedding_table)
+    
+    valid_cuis = [cui for cui in unique_cuis if cui in cui_data]
+    print(f"Got embeddings for {len(valid_cuis)} CUIs")
+    
+    if len(valid_cuis) < 2:
+        print("Not enough CUIs with embeddings")
+        return TopicResult([], {}, 0, 0.0, time.time() - start_time)
+    
+    # Prepare embeddings
+    X = np.vstack([normalize(cui_data[cui]['embedding']) for cui in valid_cuis])
+    
+    # Find optimal number of topics
+    n_topics = find_optimal_clusters(X, max_clusters=max_topics)
+    
+    # Cluster
+    print(f"\nClustering {len(valid_cuis)} CUIs into {n_topics} topics...")
+    
+    clustering = AgglomerativeClustering(n_clusters=n_topics, metric='cosine', linkage='average')
+    labels = clustering.fit_predict(X)
+    
+    final_silhouette = float(silhouette_score(X, labels, metric='cosine')) if n_topics > 1 else 0.0
+    
+    # Build topics
+    print("Building topics...")
+    
+    topics = []
+    cui_to_topic = {}
+    
+    for topic_id in range(n_topics):
+        cluster_mask = labels == topic_id
+        topic_cuis = [valid_cuis[i] for i in range(len(valid_cuis)) if cluster_mask[i]]
+        
+        if not topic_cuis:
+            continue
+        
+        source_texts = []
+        for text, text_cuis in text_to_cuis.items():
+            if any(cui in topic_cuis for cui in text_cuis):
+                source_texts.append(text)
+        
+        cui_definitions = {cui: cui_data[cui]['definition'] for cui in topic_cuis}
+        
+        topic_name = cui_data[topic_cuis[0]]['definition'][:60]
+        if len(cui_data[topic_cuis[0]]['definition']) > 60:
+            topic_name += "..."
+        
+        for cui in topic_cuis:
+            cui_to_topic[cui] = topic_id
+        
+        topic = Topic(
+            topic_id=topic_id,
+            topic_name=topic_name,
+            representative_cuis=topic_cuis,
+            cui_definitions=cui_definitions,
+            cui_count=len(topic_cuis),
+            source_texts=source_texts
+        )
+        
+        topics.append(topic)
+    
+    elapsed = time.time() - start_time
+    
+    result = TopicResult(topics, cui_to_topic, len(topics), final_silhouette, elapsed)
+    
+    # Print summary
+    print(f"\n{'='*70}")
+    print("DISCOVERED TOPICS")
+    print(f"{'='*70}")
+    print(f"Topics discovered: {result.n_topics}")
+    print(f"Silhouette score: {result.silhouette_score:.3f}")
+    print(f"Processing time: {result.processing_time:.2f}s")
+    print(f"{'='*70}\n")
+    
+    for topic in result.topics:
+        print(f"Topic {topic.topic_id}: {topic.topic_name}")
+        print(f"  CUIs: {topic.cui_count}")
+        print(f"  Representative CUIs: {', '.join(topic.representative_cuis)}")
+        print(f"  Source texts: {', '.join(topic.source_texts)}")
+        print()
+    
+    return result
 
-fig.show()
+# ═══════════════════════════════════════════════════════════════════
+# MAIN EXECUTION
+# ═══════════════════════════════════════════════════════════════════
 
+if __name__ == "__main__":
+    
+    # ------------------------- CONFIGURATION -------------------------
+    PROJECT_ID = project_id
+    DATASET_ID = dataset
+    API_URL = url
+    EMBEDDING_TABLE = embedding_table
+    NETWORK_PKL_PATH = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
+    
+    # Your texts to process
+    texts = [
+        "ankle pain",
+        "bp 120/90"
+    ]
+    
+    # ------------------------- LOAD NETWORK -------------------------
+    print("Loading UMLS network...")
+    with open(NETWORK_PKL_PATH, "rb") as f:
+        UMLS_NETWORK_OBJ = pickle.load(f)
+    print(f"Network loaded: {UMLS_NETWORK_OBJ.number_of_nodes()} nodes")
+    
+    # ------------------------- MODULE 1: CUI REDUCTION -------------------------
+    print(f"\n{'='*70}")
+    print("MODULE 1: CUI EXTRACTION & REDUCTION")
+    print(f"{'='*70}\n")
+    
+    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+    engine = ReductionEngineAdaptive(hierarchy)
+    extractor = CUIExtractor(API_URL)
+    
+    all_rows = []
+    
+    for text in texts:
+        print(f"Processing: {text}")
+        
+        # Extract
+        extracted = extractor.extract_for_text(text)
+        
+        # Filter by SAB
+        filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID)
+        
+        # Hierarchy reduction
+        reduced, num_clusters = engine.reduce_cuis(filtered)
+        
+        # Embedding-based reduction
+        if reduced:
+            embeddings = fetch_cui_embeddings(reduced, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
+            clusters = cluster_cuis_by_embedding(reduced, embeddings)
+            final_reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+        else:
+            final_reduced = []
+        
+        all_rows.append({
+            "Text": text,
+            "Extracted CUIs": extracted,
+            "Filtered CUIs": filtered,
+            "Hierarchy Reduced CUIs": reduced,
+            "Final CUIs": final_reduced,
+            "Hierarchy Clusters": num_clusters,
+            "Embedding Clusters": len(clusters) if reduced else 0
+        })
+    
+    df_module1 = pd.DataFrame(all_rows)
+    
+    print(f"\n{'='*70}")
+    print("MODULE 1 SUMMARY")
+    print(f"{'='*70}")
+    print(df_module1[["Text", "Final CUIs"]])
+    
+    # ------------------------- MODULE 2: TOPIC DISCOVERY -------------------------
+    
+    topic_result = discover_topics_adaptive(
+        df_module1=df_module1,
+        project_id=PROJECT_ID,
+        dataset_id=DATASET_ID,
+        embedding_table=EMBEDDING_TABLE,
+        max_topics=None  # Auto-detect
+    )
+    
+    # ------------------------- FINAL OUTPUT -------------------------
+    print(f"\n{'='*70}")
+    print("COMPLETE PIPELINE RESULTS")
+    print(f"{'='*70}\n")
+    
+    print(f"Processed {len(texts)} texts")
+    print(f"Discovered {topic_result.n_topics} topics automatically\n")
+    
+    for topic in topic_result.topics:
+        print(f"Topic {topic.topic_id}: {topic.topic_name}")
+        print(f"  CUIs: {topic.representative_cuis}")
+        print(f"  Source texts: {topic.source_texts}\n")
