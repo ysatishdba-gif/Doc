@@ -1,257 +1,309 @@
 """
-MODULE 2: CUI CLUSTERING & SEMANTIC TOPIC DISCOVERY
-USING BIGQUERY EMBEDDINGS (NO FREQUENCY)
+MODULE 2: ADAPTIVE TOPIC DISCOVERY
+Takes df from Module 1 and discovers topics
 """
 
 import time
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict
 from dataclasses import dataclass
-from sklearn.cluster import KMeans
+from sklearn.cluster import AgglomerativeClustering
 from sklearn.metrics import silhouette_score
 from google.cloud import bigquery
 
-# ══════════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════════
-
-DEFAULT_N_TOPICS = 10
-MIN_CUIS_PER_TOPIC = 1
-TOP_K_LABELS = 5
-
-# ══════════════════════════════════════════════════════════════════
-# UTILS
-# ══════════════════════════════════════════════════════════════════
-
-def normalize(v: np.ndarray) -> np.ndarray:
-    return v / (np.linalg.norm(v) + 1e-10)
-
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
 # DATA STRUCTURES
-# ══════════════════════════════════════════════════════════════════
-
-@dataclass
-class CUISet:
-    set_id: Optional[str]
-    cuis: List[str]
+# ═══════════════════════════════════════════════════════════════════
 
 @dataclass
 class Topic:
+    """Discovered topic"""
     topic_id: int
-    primary_label: str
+    topic_name: str
     representative_cuis: List[str]
-    representative_definitions: List[str]
-    cui_set_ids: List[str]
-    set_count: int
-    all_cuis: List[str]
+    cui_definitions: Dict[str, str]
+    cui_count: int
+    source_texts: List[str]
 
 @dataclass
 class TopicResult:
+    """Complete result"""
     topics: List[Topic]
-    set_to_topic: Dict[str, int]
+    cui_to_topic: Dict[str, int]
     n_topics: int
-    silhouette_score: Optional[float]
+    silhouette_score: float
     processing_time: float
 
-# ══════════════════════════════════════════════════════════════════
-# BIGQUERY EMBEDDING + DEFINITION STORE
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════
 
-class BigQueryEmbeddingStore:
+def normalize(v: np.ndarray) -> np.ndarray:
+    """Normalize vector"""
+    return v / (np.linalg.norm(v) + 1e-10)
+
+def fetch_cui_data(cuis: List[str], project_id: str, dataset_id: str, embedding_table: str) -> Dict[str, Dict]:
     """Fetch CUI embeddings and definitions from BigQuery"""
-
-    def __init__(self, project_id: str, dataset_id: str, table_name: str):
-        self.client = bigquery.Client(project=project_id)
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-        self.table_name = table_name
-
-    def get_batch(self, cuis: List[str]) -> Dict[str, Dict]:
-        if not cuis:
-            return {}
-
-        query = f"""
-        SELECT CUI, Embedding, Definition
-        FROM `{self.project_id}.{self.dataset_id}.{self.table_name}`
-        WHERE CUI IN UNNEST(@cuis)
-        """
-
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", cuis)
-            ]
-        )
-
-        df = self.client.query(query, job_config=job_config).to_dataframe()
-
-        return {
-            row["CUI"]: {
-                "embedding": np.array(row["Embedding"], dtype=np.float32),
-                "definition": row["Definition"]
-            }
-            for _, row in df.iterrows()
+    client = bigquery.Client(project=project_id)
+    
+    query = f"""
+    SELECT CUI, Embedding, Definition
+    FROM `{project_id}.{dataset_id}.{embedding_table}`
+    WHERE CUI IN UNNEST(@cuis)
+    """
+    
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", list(set(cuis)))
+        ]
+    )
+    
+    results = client.query(query, job_config=job_config).result(timeout=200)
+    
+    cui_data = {}
+    for row in results:
+        cui_data[row.CUI] = {
+            'embedding': np.array(row.Embedding, dtype=np.float32),
+            'definition': row.Definition
         }
+    
+    return cui_data
 
-# ══════════════════════════════════════════════════════════════════
-# CUI SET EMBEDDER
-# ══════════════════════════════════════════════════════════════════
-
-class CUISetEmbedder:
-    def __init__(self, store: BigQueryEmbeddingStore):
-        self.store = store
-
-    def embed(self, cui_sets: List[CUISet]) -> Dict[str, np.ndarray]:
-        embeddings = {}
-
-        for s in cui_sets:
-            cui_data = self.store.get_batch(s.cuis)
-            vecs = [v["embedding"] for v in cui_data.values()]
-
-            embeddings[s.set_id or "set0"] = (
-                normalize(np.mean(vecs, axis=0))
-                if vecs else np.zeros(768, dtype=np.float32)
-            )
-
-        return embeddings
-
-# ══════════════════════════════════════════════════════════════════
-# MAIN TOPIC MODELER
-# ══════════════════════════════════════════════════════════════════
-
-class CUITopicModeler:
-    def __init__(self, embedding_store: BigQueryEmbeddingStore):
-        self.embedding_store = embedding_store
-        self.embedder = CUISetEmbedder(embedding_store)
-
-    def discover_topics(self, cui_sets: List[CUISet], n_topics: int) -> TopicResult:
-        start_time = time.time()
-
-        # === 1. Embed CUI sets (BigQuery) ===
-        set_embeddings = self.embedder.embed(cui_sets)
-        X = np.stack(list(set_embeddings.values()))
-        set_ids = list(set_embeddings.keys())
-
-        # === 2. Cluster ===
-        kmeans = KMeans(
-            n_clusters=min(n_topics, len(X)),
-            random_state=42,
-            n_init=10
+def find_optimal_clusters(X: np.ndarray, max_clusters: int = None) -> int:
+    """Automatically find optimal number of clusters using silhouette analysis"""
+    n_samples = len(X)
+    
+    if max_clusters is None:
+        max_clusters = min(n_samples - 1, max(2, int(np.sqrt(n_samples))))
+    
+    if n_samples < 2:
+        return 1
+    
+    if n_samples == 2:
+        return 2
+    
+    best_k = 2
+    best_score = -1
+    
+    print(f"Finding optimal number of topics (testing 2 to {max_clusters})...")
+    
+    for k in range(2, max_clusters + 1):
+        clustering = AgglomerativeClustering(
+            n_clusters=k,
+            metric='cosine',
+            linkage='average'
         )
-        labels = kmeans.fit_predict(X)
+        labels = clustering.fit_predict(X)
+        
+        score = silhouette_score(X, labels, metric='cosine')
+        
+        print(f"  k={k}: silhouette={score:.3f}")
+        
+        if score > best_score:
+            best_score = score
+            best_k = k
+    
+    print(f"Optimal number of topics: {best_k} (silhouette={best_score:.3f})")
+    return best_k
 
-        # === 3. Fetch ALL CUI embeddings + definitions from BigQuery ===
-        all_cuis = list({c for s in cui_sets for c in s.cuis})
-        cui_data = self.embedding_store.get_batch(all_cuis)
+# ═══════════════════════════════════════════════════════════════════
+# MAIN: ADAPTIVE TOPIC DISCOVERY
+# ═══════════════════════════════════════════════════════════════════
 
-        cui_ids = list(cui_data.keys())
-        cui_embeddings = np.stack([normalize(v["embedding"]) for v in cui_data.values()])
-        cui_definitions = {k: v["definition"] for k, v in cui_data.items()}
-
-        topics = []
-
-        for tid in sorted(set(labels)):
-            idxs = [i for i, l in enumerate(labels) if l == tid]
-            cluster_sets = [cui_sets[i] for i in idxs]
-
-            if len(cluster_sets) < MIN_CUIS_PER_TOPIC:
-                continue
-
-            # === 4. Topic centroid ===
-            centroid = normalize(np.mean(X[idxs], axis=0))
-
-            # === 5. Semantic topic labeling (NO FREQUENCY) ===
-            sims = np.dot(cui_embeddings, centroid)
-            top_idx = sims.argsort()[::-1][:TOP_K_LABELS]
-
-            rep_cuis = [cui_ids[i] for i in top_idx]
-            rep_defs = [cui_definitions[c] for c in rep_cuis]
-            primary_label = " + ".join(rep_cuis[:3])
-
-            topics.append(
-                Topic(
-                    topic_id=tid,
-                    primary_label=primary_label,
-                    representative_cuis=rep_cuis,
-                    representative_definitions=rep_defs,
-                    cui_set_ids=[set_ids[i] for i in idxs],
-                    set_count=len(cluster_sets),
-                    all_cuis=list({c for s in cluster_sets for c in s.cuis})
-                )
-            )
-
-        sil = (
-            float(silhouette_score(X, labels, metric="cosine"))
-            if len(set(labels)) > 1
-            else None
-        )
-
-        return TopicResult(
-            topics=topics,
-            set_to_topic=dict(zip(set_ids, labels)),
-            n_topics=len(topics),
-            silhouette_score=sil,
-            processing_time=time.time() - start_time
-        )
-
-# ══════════════════════════════════════════════════════════════════
-# ENTRY FUNCTION
-# ══════════════════════════════════════════════════════════════════
-
-def run_module2(
-    df_reduction: pd.DataFrame,
+def discover_topics_adaptive(
+    df_module1: pd.DataFrame,
     project_id: str,
     dataset_id: str,
     embedding_table: str,
-    n_topics: int = DEFAULT_N_TOPICS
+    max_topics: int = None
 ) -> TopicResult:
     """
-    Run Module 2: CUI clustering & semantic topic discovery
+    Adaptively discover topics from Module 1 output
+    
+    Args:
+        df_module1: DataFrame from Module 1 with "Final CUIs" column
+        project_id: GCP project
+        dataset_id: BigQuery dataset
+        embedding_table: Embeddings table name
+        max_topics: Optional maximum topics (None = auto-detect)
+    
+    Returns:
+        TopicResult with discovered topics
     """
-
-    if "cui" not in df_reduction.columns:
-        raise ValueError("DataFrame must have a 'cui' column")
-
-    if len(df_reduction) != 1:
-        raise ValueError("Expected single-row DataFrame")
-
-    cuis = df_reduction.iloc[0]["cui"]
-
-    if not isinstance(cuis, list) or not cuis:
-        raise ValueError("'cui' must be a non-empty list")
-
-    cui_sets = [CUISet(set_id=c, cuis=[c]) for c in cuis]
-
-    store = BigQueryEmbeddingStore(
-        project_id=project_id,
-        dataset_id=dataset_id,
-        table_name=embedding_table
+    
+    start_time = time.time()
+    
+    print(f"\n{'='*70}")
+    print("MODULE 2: ADAPTIVE TOPIC DISCOVERY")
+    print(f"{'='*70}\n")
+    
+    # Step 1: Collect all CUIs
+    print(f"Processing {len(df_module1)} texts from Module 1...")
+    
+    all_cuis = []
+    text_to_cuis = {}
+    
+    for idx, row in df_module1.iterrows():
+        text = row["Text"]
+        final_cuis = row["Final CUIs"]
+        
+        if final_cuis and isinstance(final_cuis, list):
+            all_cuis.extend(final_cuis)
+            text_to_cuis[text] = final_cuis
+    
+    unique_cuis = list(set(all_cuis))
+    print(f"Found {len(unique_cuis)} unique CUIs across all texts")
+    
+    if len(unique_cuis) == 0:
+        print("No CUIs found")
+        return TopicResult([], {}, 0, 0.0, time.time() - start_time)
+    
+    # Handle single CUI case
+    if len(unique_cuis) == 1:
+        print("Only 1 unique CUI - creating single topic")
+        cui_data = fetch_cui_data(unique_cuis, project_id, dataset_id, embedding_table)
+        cui = unique_cuis[0]
+        source_texts = [text for text, text_cuis in text_to_cuis.items() if cui in text_cuis]
+        
+        topic = Topic(
+            topic_id=0,
+            topic_name=cui_data.get(cui, {}).get('definition', cui)[:60],
+            representative_cuis=[cui],
+            cui_definitions={cui: cui_data.get(cui, {}).get('definition', '')},
+            cui_count=1,
+            source_texts=source_texts
+        )
+        
+        result = TopicResult([topic], {cui: 0}, 1, 0.0, time.time() - start_time)
+        _print_summary(result)
+        return result
+    
+    # Step 2: Fetch embeddings
+    print("Fetching CUI embeddings and definitions from BigQuery...")
+    cui_data = fetch_cui_data(unique_cuis, project_id, dataset_id, embedding_table)
+    
+    valid_cuis = [cui for cui in unique_cuis if cui in cui_data]
+    print(f"Got embeddings for {len(valid_cuis)} CUIs")
+    
+    if len(valid_cuis) < 2:
+        print("Not enough CUIs with embeddings")
+        return TopicResult([], {}, 0, 0.0, time.time() - start_time)
+    
+    # Step 3: Prepare embeddings
+    X = np.vstack([normalize(cui_data[cui]['embedding']) for cui in valid_cuis])
+    
+    # Step 4: Find optimal number of topics
+    n_topics = find_optimal_clusters(X, max_clusters=max_topics)
+    
+    # Step 5: Cluster with optimal K
+    print(f"\nClustering {len(valid_cuis)} CUIs into {n_topics} topics...")
+    
+    clustering = AgglomerativeClustering(
+        n_clusters=n_topics,
+        metric='cosine',
+        linkage='average'
     )
-
-    modeler = CUITopicModeler(store)
-
-    return modeler.discover_topics(cui_sets, n_topics=n_topics)
-
-# ══════════════════════════════════════════════════════════════════
-# EXAMPLE EXECUTION
-# ══════════════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    result = run_module2(
-        df_reduction=df_module2,
-        project_id=project_id,
-        dataset_id=dataset,
-        embedding_table=embedding_table,
-        n_topics=DEFAULT_N_TOPICS
+    labels = clustering.fit_predict(X)
+    
+    # Calculate silhouette score
+    final_silhouette = float(silhouette_score(X, labels, metric='cosine')) if n_topics > 1 else 0.0
+    
+    # Step 6: Build topics
+    print("Building topics...")
+    
+    topics = []
+    cui_to_topic = {}
+    
+    for topic_id in range(n_topics):
+        cluster_mask = labels == topic_id
+        topic_cuis = [valid_cuis[i] for i in range(len(valid_cuis)) if cluster_mask[i]]
+        
+        if not topic_cuis:
+            continue
+        
+        # Find source texts
+        source_texts = []
+        for text, text_cuis in text_to_cuis.items():
+            if any(cui in topic_cuis for cui in text_cuis):
+                source_texts.append(text)
+        
+        # Get definitions
+        cui_definitions = {cui: cui_data[cui]['definition'] for cui in topic_cuis}
+        
+        # Generate topic name
+        topic_name = cui_data[topic_cuis[0]]['definition'][:60]
+        if len(cui_data[topic_cuis[0]]['definition']) > 60:
+            topic_name += "..."
+        
+        # Map CUIs to topic
+        for cui in topic_cuis:
+            cui_to_topic[cui] = topic_id
+        
+        topic = Topic(
+            topic_id=topic_id,
+            topic_name=topic_name,
+            representative_cuis=topic_cuis,
+            cui_definitions=cui_definitions,
+            cui_count=len(topic_cuis),
+            source_texts=source_texts
+        )
+        
+        topics.append(topic)
+    
+    elapsed = time.time() - start_time
+    
+    result = TopicResult(
+        topics=topics,
+        cui_to_topic=cui_to_topic,
+        n_topics=len(topics),
+        silhouette_score=final_silhouette,
+        processing_time=elapsed
     )
+    
+    _print_summary(result)
+    
+    return result
 
-    print(f"\nDiscovered {len(result.topics)} topics")
-    print(f"Silhouette score: {result.silhouette_score}\n")
+def _print_summary(result: TopicResult):
+    """Print summary of discovered topics"""
+    print(f"\n{'='*70}")
+    print("DISCOVERED TOPICS")
+    print(f"{'='*70}")
+    print(f"Topics discovered: {result.n_topics}")
+    print(f"Silhouette score: {result.silhouette_score:.3f}")
+    print(f"Processing time: {result.processing_time:.2f}s")
+    print(f"{'='*70}\n")
+    
+    for topic in result.topics:
+        print(f"Topic {topic.topic_id}: {topic.topic_name}")
+        print(f"  CUIs: {topic.cui_count}")
+        print(f"  Representative CUIs: {', '.join(topic.representative_cuis)}")
+        print(f"  Source texts: {', '.join(topic.source_texts)}")
+        print()
 
-    for t in result.topics:
-        print(f"Topic {t.topic_id}")
-        print(f" Label CUIs: {t.primary_label}")
-        print(" Definitions:")
-        for d in t.representative_definitions:
-            print(f"  - {d}")
-        print("-" * 60)
+# ═══════════════════════════════════════════════════════════════════
+# RUN MODULE 2
+# ═══════════════════════════════════════════════════════════════════
+
+# Run topic discovery on Module 1 output (df from previous cell)
+topic_result = discover_topics_adaptive(
+    df_module1=df,  # This is the DataFrame from Module 1
+    project_id=PROJECT_ID,
+    dataset_id=DATASET_ID,
+    embedding_table=EMBEDDING_TABLE,
+    max_topics=None  # Auto-detect optimal number
+)
+
+# Access results
+print(f"\n{'='*70}")
+print("FINAL RESULTS")
+print(f"{'='*70}\n")
+
+print(f"Processed {len(df)} texts")
+print(f"Discovered {topic_result.n_topics} topics automatically\n")
+
+for topic in topic_result.topics:
+    print(f"Topic {topic.topic_id}: {topic.topic_name}")
+    print(f"  CUIs ({topic.cui_count}): {topic.representative_cuis}")
+    print(f"  Texts: {topic.source_texts}\n")
