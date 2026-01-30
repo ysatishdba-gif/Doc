@@ -1,3 +1,8 @@
+"""
+MODULE 1: CUI EXTRACTION & REDUCTION
+Your existing pipeline
+"""
+
 import time
 import threading
 from typing import List, Dict, Optional
@@ -14,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from sklearn.cluster import AgglomerativeClustering
 import subprocess
 import pandas as pd
-
 
 # ------------------------- THREAD-SAFE PRINT -------------------------
 print_lock = threading.Lock()
@@ -176,7 +180,6 @@ class CUIExtractor:
         self.api_url = api_url
         self.session = requests.Session()
 
-        #  Get identity token ONCE
         tmp = subprocess.run(
             ['gcloud', 'auth', 'print-identity-token'],
             stdout=subprocess.PIPE,
@@ -211,7 +214,6 @@ class CUIExtractor:
             )
 
             thread_safe_print(f"[Extractor] Status: {resp.status_code}")
-            thread_safe_print(f"[Extractor] Cui Count: {len(resp.text)}")
 
             resp.raise_for_status()
 
@@ -225,13 +227,12 @@ class CUIExtractor:
             return list(set(map(str, cuis)))
 
         except Exception as e:
-            thread_safe_print("CUI extraction failed")
-            thread_safe_print(str(e))
+            thread_safe_print(f"CUI extraction failed: {str(e)}")
             return []
-
 
 # ------------------------- SAB FILTER -------------------------
 ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
+
 def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str]:
     if not cuis:
         return []
@@ -259,8 +260,8 @@ def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str) -> List[str
         thread_safe_print(f"SAB filter failed: {e}")
         return []
 
-# ------------------------- EMBEDDING-BASED SECOND-LEVEL REDUCTION -------------------------
-def fetch_cui_embeddings(cuis: List[str], project_id: str, dataset_id: str, table_name=embedding_table) -> Dict[str, np.ndarray]:
+# ------------------------- EMBEDDING-BASED REDUCTION -------------------------
+def fetch_cui_embeddings(cuis: List[str], project_id: str, dataset_id: str, table_name: str) -> Dict[str, np.ndarray]:
     client = bigquery.Client(project=project_id)
     embeddings = {}
     for i in range(0, len(cuis), 2000):
@@ -304,138 +305,72 @@ def pick_representative_per_embedding_cluster(clusters: Dict[int, List[str]], em
         reduced.append(cluster_cuis[idx])
     return reduced
 
-# ------------------------- TEXT REDUCTION RESULT -------------------------
-@dataclass
-class TextReductionResult:
-    text: str
-    extracted_cuis: List[str]
-    filtered_cuis: List[str]
-    reduced_cuis: List[str]
-    num_clusters: int
+# ═══════════════════════════════════════════════════════════════════
+# RUN MODULE 1
+# ═══════════════════════════════════════════════════════════════════
 
-# ------------------------- FULL PIPELINE -------------------------
-def process_single_text_full(text: str, extractor: CUIExtractor, hierarchy: HierarchyClient,
-                             engine: ReductionEngineAdaptive, project_id: str, dataset_id: str) -> TextReductionResult:
-    # Step 1: Extract
+# Configuration
+PROJECT_ID = project_id
+DATASET_ID = dataset
+API_URL = url
+EMBEDDING_TABLE = embedding_table
+NETWORK_PKL_PATH = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
+
+texts = [
+    "ankle pain",
+    "bp 120/90"
+]
+
+# Load UMLS network
+print("Loading UMLS network...")
+with open(NETWORK_PKL_PATH, "rb") as f:
+    UMLS_NETWORK_OBJ = pickle.load(f)
+print(f"Network loaded: {UMLS_NETWORK_OBJ.number_of_nodes()} nodes\n")
+
+# Initialize
+print(f"{'='*70}")
+print("MODULE 1: CUI EXTRACTION & REDUCTION")
+print(f"{'='*70}\n")
+
+hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
+engine = ReductionEngineAdaptive(hierarchy)
+extractor = CUIExtractor(API_URL)
+
+all_rows = []
+
+for text in texts:
+    print(f"Processing: {text}")
+    
+    # Extract
     extracted = extractor.extract_for_text(text)
-    # Step 2: SAB Filter
-    filtered = filter_by_sab(extracted, project_id, dataset_id)
-    # Step 3: Hierarchy reduction
+    
+    # Filter by SAB
+    filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID)
+    
+    # Hierarchy reduction
     reduced, num_clusters = engine.reduce_cuis(filtered)
-    # Step 4: Embedding-based second-level reduction
+    
+    # Embedding-based reduction
     if reduced:
-        embeddings = fetch_cui_embeddings(reduced, project_id, dataset_id)
+        embeddings = fetch_cui_embeddings(reduced, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
         clusters = cluster_cuis_by_embedding(reduced, embeddings)
-        reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
-    return TextReductionResult(text, extracted, filtered, reduced, num_clusters)
-
-def run_pipeline_parallel_full(texts, UMLS_NETWORK_OBJ, api_url, project_id, dataset_id, max_workers=5):
-    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
-    engine = ReductionEngineAdaptive(hierarchy)
-    extractor = CUIExtractor(api_url)
-    results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_single_text_full, t, extractor, hierarchy, engine, project_id, dataset_id)
-                   for t in texts]
-        for f in as_completed(futures):
-            results.append(f.result())
-    return results
-
-# ------------------------- RUN EXAMPLE -------------------------
-if __name__ == "__main__":
-    import pickle
-    import networkx as nx
-
-    # ------------------------- CONFIG -------------------------
-    NETWORK_PKL_PATH = "/home/jupyter/CUIreduction/networkx_cui_context_v1_1_0.pkl"
-
-    API_URL = url
-    PROJECT_ID = project_id
-    DATASET_ID = dataset
-
-    texts = [
-        "ankle pain","bp 120/90"
-    ]
-
-    # ------------------------- LOAD NETWORK -------------------------
-    # with open(NETWORK_PKL_PATH, "rb") as f:
-    #     UMLS_NETWORK_OBJ = pickle.load(f)
-
-    # ------------------------- SANITY CHECKS -------------------------
-#     print("Network type:", type(UMLS_NETWORK_OBJ))
-#     if not isinstance(UMLS_NETWORK_OBJ, nx.DiGraph):
-#         raise TypeError(
-#             f"Expected networkx.DiGraph, got {type(UMLS_NETWORK_OBJ)}"
-#         )
-
-#     print(f"Network nodes: {UMLS_NETWORK_OBJ.number_of_nodes()}")
-#     print(f"Network edges: {UMLS_NETWORK_OBJ.number_of_edges()}")
-
-    # ------------------------- INIT PIPELINE -------------------------
-    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
-    engine = ReductionEngineAdaptive(hierarchy)
-    extractor = CUIExtractor(API_URL)
-
-    all_rows = []
-
-    for text in texts:
-        print(f"\n===== Processing: {text} =====")
-
-        # Step 1: Extract
-        extracted = extractor.extract_for_text(text)
-        n_extracted = len(extracted)
-
-        # Step 2: Filter by SAB
-        filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID)
-        n_filtered = len(filtered)
-
-        # Step 3: IC stats
-        ic_scores = [hierarchy.get_ic_score(c) for c in filtered]
-        ic_min = min(ic_scores) if ic_scores else 0
-        ic_max = max(ic_scores) if ic_scores else 0
-        ic_mean = sum(ic_scores)/len(ic_scores) if ic_scores else 0
-
-        # Step 4: Hierarchy reduction
-        reduced, num_clusters = engine.reduce_cuis(filtered)
-        n_reduced = len(reduced)
-
-        # Step 5: Embedding-based clustering
-        if reduced:
-            embeddings = fetch_cui_embeddings(reduced, PROJECT_ID, DATASET_ID)
-            clusters = cluster_cuis_by_embedding(reduced, embeddings)
-            n_embedding_clusters = len(clusters)
-            final_reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
-        else:
-            n_embedding_clusters = 0
-            final_reduced = []
-
-        n_final = len(final_reduced)
-
-        # ------------------------- PRINT SUMMARY -------------------------
-        print(f"Extracted CUIs: {n_extracted}")
-        print(f"Filtered CUIs:  {n_filtered}")
-        print(f"IC scores: min={ic_min:.2f}, max={ic_max:.2f}, mean={ic_mean:.2f}")
-        print(f"Reduced CUIs:   {n_reduced} across {num_clusters} hierarchy clusters")
-        print(f"Embedding clusters: {n_embedding_clusters}")
-        print(f"Final CUIs: {n_final}")
-
-        # ------------------------- COLLECT FOR TABLE -------------------------
-        all_rows.append({
+        final_reduced = pick_representative_per_embedding_cluster(clusters, embeddings)
+    else:
+        final_reduced = []
+    
+    all_rows.append({
         "Text": text,
-
-        # CUI lists
         "Extracted CUIs": extracted,
         "Filtered CUIs": filtered,
         "Hierarchy Reduced CUIs": reduced,
-        "Final CUIs": final_reduced,        
-        "IC min": ic_min,
-        "IC max": ic_max,
-        "IC mean": ic_mean,
+        "Final CUIs": final_reduced,
         "Hierarchy Clusters": num_clusters,
-        "Embedding Clusters": n_embedding_clusters
+        "Embedding Clusters": len(clusters) if reduced else 0
     })
 
-   
-    df = pd.DataFrame(all_rows)
-    print("\n===== PIPELINE SUMMARY =====")
-    print(df)
+df = pd.DataFrame(all_rows)
+
+print(f"\n{'='*70}")
+print("MODULE 1 OUTPUT")
+print(f"{'='*70}")
+print(df)
