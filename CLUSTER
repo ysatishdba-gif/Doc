@@ -1,50 +1,312 @@
-Building upon our existing capability to distill document-extracted CUIs into a concise, representative set, this user story addresses the next phase of summarization. The current refined CUI set, though comprehensive and potentially distinct from Nature Breakdown API results, can still contain multiple items. The goal is to implement a topic model to categorize this refined set of CUIs into standard, predefined topics, thereby providing a higher-level summary for matching with user search query.
+"""
+MODULE 2: CUI CLUSTERING, TOPIC DISCOVERY & STANDARD TOPIC CLASSIFICATION
 
-Dev Notes
-(Later) Once we know associated CUIs, we would work on creating another cluster set representing the Topics.
+Input:
+- DataFrame from Module 1 with columns:
+    set_id | cui
 
+Output:
+- Discovered topics
+- Per-CUI standard topic assignment with confidence
+"""
 
-AC: A topic model is implemented to group the refined representative CUIs into predefined standard topics.
+import pickle
+import time
+import numpy as np
+import pandas as pd
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
+from collections import Counter, defaultdict
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from google.cloud import bigquery
 
-Each refined CUI is mapped to:
+# ══════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ══════════════════════════════════════════════════════════════════
 
-One primary topic, and
+DEFAULT_N_TOPICS = 10
+MIN_CUIS_PER_TOPIC = 2
+MIN_PRIMARY_TOPIC_CONF = 0.70
+MIN_SECONDARY_TOPIC_CONF = 0.55
 
-Optional secondary topic(s) if confidence thresholds allow.
+# ══════════════════════════════════════════════════════════════════
+# DATA STRUCTURES
+# ══════════════════════════════════════════════════════════════════
 
-Topic definitions and mappings are driven by a configurable reference (not hard-coded).
+@dataclass
+class CUISet:
+    set_id: str
+    cuis: List[str]
 
-The output includes:
+@dataclass
+class Topic:
+    topic_id: int
+    primary_label: str
+    representative_cuis: List[str]
+    cui_set_ids: List[str]
+    set_count: int
+    all_cuis: List[str]
 
-Topic name/ID
+@dataclass
+class StandardTopic:
+    topic_id: str
+    name: str
+    description: str
+    anchor_cuis: List[str]
 
-Associated CUI list
+@dataclass
+class CUITopicAssignment:
+    cui: str
+    primary_topic: Optional[str]
+    primary_confidence: float
+    secondary_topics: List[Tuple[str, float]]
 
-Confidence score per topic
+@dataclass
+class TopicResult:
+    topics: List[Topic]
+    set_to_topic: Dict[str, int]
+    n_topics: int
+    silhouette_score: Optional[float]
+    processing_time: float
+    cui_topic_assignments: Dict[str, CUITopicAssignment]
 
-Topic modeling works independently of, but is compatible with, Nature Breakdown API outputs.
+# ══════════════════════════════════════════════════════════════════
+# EMBEDDING STORE
+# ══════════════════════════════════════════════════════════════════
 
-Results are consumable by downstream search and matching workflows.
+class MemMapEmbeddingStore:
+    def __init__(self, memmap_file: str, dict_file: str, dim: int = 768):
+        with open(dict_file, "rb") as f:
+            self.cui_to_idx = pickle.load(f)
+        self.embeddings = np.memmap(
+            memmap_file,
+            dtype="float32",
+            mode="r",
+            shape=(len(self.cui_to_idx), dim)
+        )
 
-System logs include:
+    def get(self, cui: str) -> Optional[np.ndarray]:
+        idx = self.cui_to_idx.get(cui)
+        return self.embeddings[idx].copy() if idx is not None else None
 
-CUIs processed
+    def get_batch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        return {c: self.get(c) for c in cuis if self.get(c) is not None}
 
-Topics assigned
+# ══════════════════════════════════════════════════════════════════
+# CUI DETAILS
+# ══════════════════════════════════════════════════════════════════
 
-Confidence scores
+class CUIDetailsStore:
+    def __init__(self, project_id: str, dataset_id: str):
+        client = bigquery.Client(project=project_id)
+        query = f"""
+        SELECT CUI, CUIName
+        FROM `{project_id}.{dataset_id}.CUI_DETAILS`
+        """
+        self.df = client.query(query).to_dataframe().set_index("CUI")
 
-Unit tests validate:
+    def get_name(self, cui: str) -> str:
+        return self.df.loc[cui, "CUIName"] if cui in self.df.index else cui
 
-Deterministic topic assignment for known CUI sets
+# ══════════════════════════════════════════════════════════════════
+# TOPIC REFERENCE (CONFIG-DRIVEN)
+# ══════════════════════════════════════════════════════════════════
 
-Graceful handling of CUIs with no strong topic match
+class TopicReferenceStore:
+    def __init__(self, topics: List[StandardTopic]):
+        self.topics = topics
 
-Documentation updated describing:
+    def get_topics(self) -> List[StandardTopic]:
+        return self.topics
 
-Topic model approach
+# ══════════════════════════════════════════════════════════════════
+# EMBEDDING HELPERS
+# ══════════════════════════════════════════════════════════════════
 
-Topic definitions
+class CUISetEmbedder:
+    def __init__(self, store: MemMapEmbeddingStore):
+        self.store = store
 
-Integration points with search and summarization
+    def embed(self, cui_sets: List[CUISet]) -> Dict[str, np.ndarray]:
+        out = {}
+        for s in cui_sets:
+            vecs = self.store.get_batch(s.cuis)
+            out[s.set_id] = (
+                np.mean(list(vecs.values()), axis=0)
+                if vecs else np.zeros(768, dtype=np.float32)
+            )
+        return out
 
+# ══════════════════════════════════════════════════════════════════
+# STANDARD TOPIC CLASSIFIER
+# ══════════════════════════════════════════════════════════════════
+
+class CUITopicClassifier:
+    def __init__(self, store: MemMapEmbeddingStore, topic_store: TopicReferenceStore):
+        self.store = store
+        self.topic_store = topic_store
+        self.centroids = self._build_centroids()
+
+    def _build_centroids(self):
+        centroids = {}
+        for t in self.topic_store.get_topics():
+            vecs = self.store.get_batch(t.anchor_cuis)
+            if vecs:
+                centroids[t.topic_id] = np.mean(list(vecs.values()), axis=0)
+        return centroids
+
+    def classify(self, cui: str) -> CUITopicAssignment:
+        v = self.store.get(cui)
+        if v is None:
+            return CUITopicAssignment(cui, None, 0.0, [])
+
+        v = v / (np.linalg.norm(v) + 1e-10)
+        scores = {}
+        for tid, c in self.centroids.items():
+            c = c / (np.linalg.norm(c) + 1e-10)
+            scores[tid] = float(np.dot(v, c))
+
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        primary, conf = ranked[0]
+
+        if conf < MIN_PRIMARY_TOPIC_CONF:
+            return CUITopicAssignment(cui, None, conf, [])
+
+        secondary = [(t, s) for t, s in ranked[1:] if s >= MIN_SECONDARY_TOPIC_CONF]
+        return CUITopicAssignment(cui, primary, conf, secondary)
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN MODELER
+# ══════════════════════════════════════════════════════════════════
+
+class CUITopicModeler:
+    def __init__(
+        self,
+        embedding_store: MemMapEmbeddingStore,
+        topic_store: TopicReferenceStore
+    ):
+        self.embedder = CUISetEmbedder(embedding_store)
+        self.classifier = CUITopicClassifier(embedding_store, topic_store)
+
+    def discover_topics(self, cui_sets: List[CUISet], n_topics: int) -> TopicResult:
+        start = time.time()
+
+        embeds = self.embedder.embed(cui_sets)
+        X = np.stack(list(embeds.values()))
+        ids = list(embeds.keys())
+
+        kmeans = KMeans(
+            n_clusters=min(n_topics, len(X)),
+            random_state=42,
+            n_init=10
+        )
+        labels = kmeans.fit_predict(X)
+
+        topics = []
+        for tid in set(labels):
+            idxs = [i for i, l in enumerate(labels) if l == tid]
+            cluster_sets = [cui_sets[i] for i in idxs]
+            if len(cluster_sets) < MIN_CUIS_PER_TOPIC:
+                continue
+
+            cuis = [c for s in cluster_sets for c in s.cuis]
+            top_cuis = [c for c, _ in Counter(cuis).most_common(5)]
+
+            topics.append(Topic(
+                topic_id=tid,
+                primary_label=" + ".join(top_cuis[:3]),
+                representative_cuis=top_cuis,
+                cui_set_ids=[ids[i] for i in idxs],
+                set_count=len(cluster_sets),
+                all_cuis=list(set(cuis))
+            ))
+
+        all_cuis = {c for s in cui_sets for c in s.cuis}
+        cui_assignments = {c: self.classifier.classify(c) for c in all_cuis}
+
+        return TopicResult(
+            topics=topics,
+            set_to_topic=dict(zip(ids, labels)),
+            n_topics=len(topics),
+            silhouette_score=float(
+                silhouette_score(X, labels, metric="cosine")
+            ) if len(set(labels)) > 1 else None,
+            processing_time=time.time() - start,
+            cui_topic_assignments=cui_assignments
+        )
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN FUNCTION (EXPECTED ENTRY POINT)
+# ══════════════════════════════════════════════════════════════════
+
+def run_module_2_from_df(
+    df: pd.DataFrame,
+    memmap_file: str,
+    dict_file: str,
+    standard_topics: List[StandardTopic],
+    n_topics: int = DEFAULT_N_TOPICS
+) -> TopicResult:
+    """
+    df columns required:
+      - set_id
+      - cui
+    """
+
+    cui_sets = (
+        df.groupby("set_id")["cui"]
+        .apply(list)
+        .reset_index()
+        .apply(lambda r: CUISet(r["set_id"], r["cui"]), axis=1)
+        .tolist()
+    )
+
+    embedding_store = MemMapEmbeddingStore(memmap_file, dict_file)
+    topic_store = TopicReferenceStore(standard_topics)
+
+    modeler = CUITopicModeler(embedding_store, topic_store)
+    return modeler.discover_topics(cui_sets, n_topics)
+
+# ══════════════════════════════════════════════════════════════════
+# SAMPLE USAGE
+# ══════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+
+    # Sample output from Module 1 (CUI reduction)
+    df_reduced = pd.DataFrame({
+        "set_id": ["q1", "q1", "q2", "q2", "q3"],
+        "cui": ["C0030193", "C0000737", "C0018681", "C0030193", "C0205191"]
+    })
+
+    # Example standard topics (normally from YAML / DB)
+    standard_topics = [
+        StandardTopic(
+            topic_id="MSK_PAIN",
+            name="Musculoskeletal Pain",
+            description="Pain related to muscles, bones, joints",
+            anchor_cuis=["C0030193", "C0000737"]
+        ),
+        StandardTopic(
+            topic_id="HEADACHE",
+            name="Headache Disorders",
+            description="Headache and cranial pain",
+            anchor_cuis=["C0018681"]
+        )
+    ]
+
+    result = run_module_2_from_df(
+        df=df_reduced,
+        memmap_file="embeddings.memmap",
+        dict_file="cui_to_idx.pkl",
+        standard_topics=standard_topics,
+        n_topics=2
+    )
+
+    print("\n=== DISCOVERED TOPICS ===")
+    for t in result.topics:
+        print(t.topic_id, t.primary_label, t.set_count)
+
+    print("\n=== CUI → STANDARD TOPIC ASSIGNMENT ===")
+    for c, a in result.cui_topic_assignments.items():
+        print(c, "→", a.primary_topic, f"{a.primary_confidence:.2f}")
