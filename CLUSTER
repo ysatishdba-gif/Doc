@@ -248,31 +248,36 @@ def run_module_2_from_df(
     n_topics: int = DEFAULT_N_TOPICS
 ) -> TopicResult:
     """
-    Input df schema (from Module 1):
-      - cui: List[str]   # reduced CUIs
+    Adapter for Module 2.
+    
+    Input DF schema (from Module 1):
+      - cui: List[str]
     """
 
+    # ---------- Validate input ----------
     if "cui" not in df.columns:
-        raise ValueError("Input df must contain column: 'cui'")
+        raise ValueError("Input DataFrame must contain column: 'cui'")
 
     if len(df) != 1:
         raise ValueError(
-            "Expected a single-row dataframe with a reduced CUI list"
+            "Expected a single-row DataFrame with reduced CUI list"
         )
 
     cuis = df.iloc[0]["cui"]
 
-    if not isinstance(cuis, list) or not cuis:
-        raise ValueError("Column 'cui' must be a non-empty list")
+    if not isinstance(cuis, list):
+        raise ValueError("Column 'cui' must be a list of CUIs")
 
-    # Build a single synthetic CUISet
-    cui_sets = [
-        CUISet(
-            set_id="QUERY_0",   # synthetic, internal only
-            cuis=list(set(cuis))  # defensive dedupe
-        )
-    ]
+    if not cuis:
+        raise ValueError("CUI list is empty")
 
+    # ---------- Build CUISet (internal only) ----------
+    cui_set = CUISet(
+        set_id=None,                 # internal, ignored externally
+        cuis=list(dict.fromkeys(cuis))  # stable dedupe, preserves order
+    )
+
+    # ---------- Load stores ----------
     embedding_store = MemMapEmbeddingStore(
         memmap_file=memmap_file,
         dict_file=dict_file
@@ -280,15 +285,17 @@ def run_module_2_from_df(
 
     topic_store = TopicReferenceStore(standard_topics)
 
+    # ---------- Run model ----------
     modeler = CUITopicModeler(
         embedding_store=embedding_store,
         topic_store=topic_store
     )
 
     return modeler.discover_topics(
-        cui_sets=cui_sets,
-        n_topics=min(n_topics, 1)  # only one set exists
+        cui_sets=[cui_set],
+        n_topics=1
     )
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -297,41 +304,27 @@ def run_module_2_from_df(
 
 if __name__ == "__main__":
 
-    # Output from Module 1
-    df_cui_reduced = pd.DataFrame({
-        "cui": [[
-            "C0030193",  # Pain
-            "C0000737",  # Musculoskeletal pain
-            "C0018681"   # Headache
-        ]]
-    })
-
-    standard_topics = [
-        StandardTopic(
-            topic_id="MSK_PAIN",
-            name="Musculoskeletal Pain",
-            description="Muscle, bone, joint pain",
-            anchor_cuis=["C0030193", "C0000737"]
-        ),
-        StandardTopic(
-            topic_id="HEADACHE",
-            name="Headache Disorders",
-            description="Headache-related conditions",
-            anchor_cuis=["C0018681"]
-        )
-    ]
+    # df is produced by Module 1 (CUI reduction)
+    df = previous_cui_reduction_output_df  # ← real pipeline output
 
     result = run_module_2_from_df(
-        df=df_cui_reduced,
+        df=df,
         memmap_file="embeddings.memmap",
         dict_file="cui_to_idx.pkl",
-        standard_topics=standard_topics,
+        standard_topics=standard_topics_config,  # loaded from config / DB
         n_topics=1
     )
 
-    print("\n=== PER-CUI STANDARD TOPIC ASSIGNMENT ===")
-    for cui, a in result.cui_topic_assignments.items():
+    # Downstream consumption
+    topic_summary = result.topics[0]
+
+    print("Primary topic:", topic_summary.primary_label)
+    print("Confidence:", topic_summary.primary_confidence)
+
+    print("\nPer-CUI classification:")
+    for cui, assignment in result.cui_topic_assignments.items():
         print(
-            f"{cui} → {a.primary_topic} "
-            f"(conf={a.primary_confidence:.2f})"
+            cui,
+            assignment.primary_topic,
+            assignment.primary_confidence
         )
