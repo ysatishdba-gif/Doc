@@ -20,7 +20,7 @@ INSTRUCTIONS:
 6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
 7. DO NOT hallucinate information not implied by the query
 8. Maintain the original query's intent and scope
-9.Make sure the Temporal accept is relevant to the Query context
+9. Make sure the Temporal aspect is relevant to the Query context
 
 EXAMPLES:
 - "Pt with DM" → "Patient with Diabetes Mellitus"
@@ -236,18 +236,147 @@ OUTPUT FORMAT
 User Input: {expanded_query}
 Timestamp: {timestamp}
 """
+
+
+CONTEXTUAL_ENVIRONMENT_PROMPT = """
+You are a clinical informatics expert specializing in medical documentation patterns.
+
+TASK: For each clinical intent, identify the contextual environment where answers would be documented.
+
+====================================================
+CONTEXT VS NATURE - CRITICAL DISTINCTION
+====================================================
+
+**NATURE/SUB-NATURE** = WHAT the intent is about (diagnosis, treatment, medication)
+**CONTEXTUAL ENVIRONMENT** = WHERE/WHO/WHEN answers are found (document types, authors, timeframes)
+
+Example:
+- Intent: "Glioblastoma Diagnosis History"
+- Nature: "Diagnostic Medical History" ← WHAT it is
+- Context: "Pathology reports by pathologists during diagnostic workup" ← WHERE it's found
+
+DO NOT confuse these! Context describes the documentation environment, NOT the medical concept.
+
+====================================================
+CONTEXTUAL FACETS TO IDENTIFY
+====================================================
+
+For each intent, identify:
+
+1. **DOCUMENT TYPES**
+   - What types of clinical documents would contain this information?
+   - Examples: pathology_report, radiology_report, consultation_note, operative_note, 
+     discharge_summary, progress_note, lab_report, medication_order, etc.
+   - Think: "Where is this documented in the medical record?"
+
+2. **AUTHOR ROLES**
+   - What healthcare provider roles typically document this?
+   - Examples: pathologist, radiologist, oncologist, surgeon, nurse, pharmacist, 
+     primary_care_physician, specialist, etc.
+   - Think: "Who writes this information?"
+
+3. **TEMPORAL SCOPE**
+   - What time period is relevant for this information?
+   - Categories: 
+     * diagnostic_period: Initial workup and diagnosis
+     * active_treatment: During ongoing treatment
+     * post_treatment: After treatment completion
+     * surveillance: Follow-up monitoring
+     * acute_event: Emergency or urgent timeframe
+     * chronic_management: Long-term ongoing care
+     * historical: Past medical history
+     * recent: Last 30-90 days
+     * longitudinal: Extended time period
+   - Think: "When would this be documented?"
+
+4. **CONTENT SIGNALS**
+   - What content markers validate this is the right information?
+   - Examples: 
+     * diagnosis_code_present: ICD codes mentioned
+     * procedure_code_present: CPT codes mentioned
+     * lab_values_present: Numerical test results
+     * imaging_findings: Radiological descriptions
+     * medication_names: Drug names mentioned
+     * histology_mentioned: Pathological findings
+     * vital_signs: BP, HR, temp, RR
+     * treatment_plan: Therapeutic recommendations
+   - Think: "What confirms this document answers the intent?"
+
+====================================================
+INSTRUCTIONS
+====================================================
+
+1. For EACH intent provided:
+   - Analyze what the intent is asking for
+   - Identify document types where this would be found (top 3-5)
+   - Identify author roles who would document this (top 3-5)
+   - Determine temporal scope (1-2 categories)
+   - List content signals that validate relevance (top 3-5)
+
+2. Be SPECIFIC but not overly restrictive:
+   - Include primary document types, but also consider secondary ones
+   - Focus on roles that DIRECTLY document this (not just "anyone who might see it")
+   - Temporal scope should reflect when this info is TYPICALLY documented
+   - Content signals should be CONCRETE markers, not vague descriptions
+
+3. Think about MEDICAL DOCUMENTATION PATTERNS:
+   - Diagnosis → pathology, radiology, specialist consults
+   - Treatment → treatment plans, orders, progress notes
+   - Labs → lab reports, progress notes
+   - Medications → medication orders, pharmacy notes, discharge summaries
+   - Procedures → operative notes, procedure reports
+   - History → intake forms, consultation notes
+
+4. Avoid OVER-CONSTRAINING:
+   - Don't require ALL facets to match perfectly
+   - Include likely alternatives
+   - Consider that documentation varies by institution
+
+====================================================
+INPUT
+====================================================
+
+Original Query: {original_query}
+Expanded Query: {expanded_query}
+
+Extracted Intents:
+{intents_json}
+
+====================================================
+OUTPUT FORMAT
+====================================================
+
+Return valid JSON with this structure:
+{{
+  "intents_with_context": [
+    {{
+      "intent_title": "exact title from input",
+      "contextual_environment": {{
+        "document_types": ["type1", "type2", "type3"],
+        "author_roles": ["role1", "role2", "role3"],
+        "temporal_scope": ["category1", "category2"],
+        "content_signals": ["signal1", "signal2", "signal3"]
+      }}
+    }}
+  ]
+}}
+
+Return ONLY valid JSON (no markdown, no explanation).
+"""
+
+
 # Pipeline
 
 
 class ContextualIntentPipeline:    
     def __init__(self, project: str, location: str = "us-central1", 
-                 model: str = MODEL_VERSION):
+                 model: str = "gemini-1.5-pro-002"):
 
         aiplatform.init(project=project, location=location)
         self.model = GenerativeModel(model)        
         
     def _call_model(self, prompt: str, temperature: float = 0.0, max_tokens: int = 8096) -> str:
-
+        """Call the model with given prompt"""
         try:
             # Reset session to avoid context carryover
             if hasattr(self.model, "session") and self.model.session is not None:
@@ -256,11 +385,11 @@ class ContextualIntentPipeline:
             response = self.model.generate_content(
                 prompt,
                 generation_config={
-                    "temperature": 0.0,
+                    "temperature": temperature,
                     "max_output_tokens": max_tokens,
                     "top_p": 1.0,
                     "top_k": 1,
-                    "seed":34
+                    "seed": 34
                 }
             )
             return response.text.strip()
@@ -269,7 +398,7 @@ class ContextualIntentPipeline:
             return "{}"
     
     def _safe_json(self, text: str) -> Dict[str, Any]:
-
+        """Parse JSON from model response with fallbacks"""
         # Remove markdown code blocks if present
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text)
@@ -296,13 +425,13 @@ class ContextualIntentPipeline:
             return {}
     
     def _validate_json_structure(self, data: Dict, required_keys: List[str]) -> bool:
-
+        """Validate that required keys exist in the data"""
         return all(key in data for key in required_keys)
     
     # STEP 1: Query Expansion
     
     def expand_query(self, query: str) -> Dict[str, Any]:
-
+        """Expand medical abbreviations and add clinical context"""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
         raw_response = self._call_model(prompt)
         data = self._safe_json(raw_response)
@@ -311,20 +440,18 @@ class ContextualIntentPipeline:
             # Fallback to original query if expansion fails
             return {
                 "expanded_query": query,
-                "abbreviations_expanded": [],
-                # "concepts_added": []
+                "abbreviations_expanded": []
             }
         
         return {
             "expanded_query": data.get("expanded_query", query),
-            "abbreviations_expanded": data.get("abbreviations_expanded", []),
-            # "concepts_added": data.get("concepts_added", [])
+            "abbreviations_expanded": data.get("abbreviations_expanded", [])
         }
     
     # STEP 2: Intent Extraction
     
     def extract_intents(self, original_query: str, expanded_query: str) -> Dict[str, Any]:
-
+        """Extract clinical intents with natures and sub-natures"""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
@@ -362,7 +489,6 @@ class ContextualIntentPipeline:
                 print(f"  Warning: Intent {idx + 1} '{intent.get('intent_title', 'Unknown')}' has no final_queries. Skipping.")
                 continue
             
-            # No minimum requirement - let LLM decide based on complexity
             validated_intents.append(intent)
         
         return {
@@ -371,13 +497,53 @@ class ContextualIntentPipeline:
             "is_clinical": True,
             "original_query": data.get("original_query", original_query),
             "expanded_query": data.get("expanded_query", expanded_query)
-        }    
-          
+        }
     
-    # Pipeline exec
+    # STEP 3: Contextual Environment Generation (NEW)
+    
+    def generate_contextual_environment(
+        self, 
+        original_query: str,
+        expanded_query: str,
+        intents: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Generate contextual environment for each intent"""
+        
+        if not intents:
+            return {"intents_with_context": []}
+        
+        # Prepare intents for prompt (without final_queries to reduce tokens)
+        intents_for_prompt = []
+        for intent in intents:
+            intent_data = {
+                "intent_title": intent.get("intent_title", ""),
+                "description": intent.get("description", ""),
+                "nature": intent.get("nature", ""),
+                "sub_natures": intent.get("sub_natures", [])
+            }
+            intents_for_prompt.append(intent_data)
+        
+        intents_json = json.dumps(intents_for_prompt, indent=2)
+        
+        prompt = CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            intents_json=intents_json
+        )
+        
+        raw_response = self._call_model(prompt, max_tokens=8096)
+        data = self._safe_json(raw_response)
+        
+        if not self._validate_json_structure(data, ["intents_with_context"]):
+            print("Warning: Failed to generate contextual environment")
+            return {"intents_with_context": []}
+        
+        return data
+    
+    # Pipeline execution
     
     def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
-
+        """Run the complete pipeline with contextual environment generation"""
         start_time = datetime.utcnow()
         
         if verbose:
@@ -393,7 +559,7 @@ class ContextualIntentPipeline:
         # Step 2: Intent Extraction
         intent_result = self.extract_intents(query, expanded_query)
         
-       
+        # Handle non-clinical queries
         if not intent_result.get("is_clinical", True):
             processing_time = (datetime.utcnow() - start_time).total_seconds()
             
@@ -404,49 +570,83 @@ class ContextualIntentPipeline:
             return {
                 "original_query": query,
                 "expanded_query": expanded_query,
-                "intents": [],
                 "is_clinical": False,
                 "rejected_reason": intent_result.get("rejected_reason", "Query is not clinical"),
+                "intents": [],
                 "timestamp": datetime.utcnow().isoformat(),
                 "processing_time_seconds": processing_time
             }
         
-        intents = intent_result.get("intents", [])        
+        intents = intent_result.get("intents", [])
+        
+        # Step 3: Generate Contextual Environment (NEW)
+        context_result = self.generate_contextual_environment(
+            query, 
+            expanded_query, 
+            intents
+        )
+        
+        # Merge intents with their contextual environments
+        intents_with_context_map = {}
+        for ic in context_result.get("intents_with_context", []):
+            intents_with_context_map[ic["intent_title"]] = ic.get("contextual_environment", {})
+        
+        # Build final output with context integrated
+        final_intents = []
+        for intent in intents:
+            intent_with_context = {
+                "intent_title": intent.get("intent_title", ""),
+                "description": intent.get("description", ""),
+                "nature": intent.get("nature", ""),
+                "sub_natures": intent.get("sub_natures", []),
+                "final_queries": intent.get("final_queries", [])
+            }
+            
+            # Add contextual environment if available
+            if intent["intent_title"] in intents_with_context_map:
+                intent_with_context["contextual_environment"] = intents_with_context_map[intent["intent_title"]]
+            
+            final_intents.append(intent_with_context)
         
         # Calculate statistics
         total_queries = sum(len(intent.get('final_queries', [])) for intent in intents)
-        total_sub_natures = sum(len(intent.get('sub_nature', [])) for intent in intents)
+        total_sub_natures = sum(len(intent.get('sub_natures', [])) for intent in intents)
+        contexts_generated = len([i for i in final_intents if "contextual_environment" in i])
+        
         processing_time = (datetime.utcnow() - start_time).total_seconds()
         
         if verbose:
             print(f"Status: Clinical")
             print(f"Intents: {len(intents)} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
+            print(f"Contextual Environments: {contexts_generated}")
             print(f"Processing Time: {processing_time:.2f}s\n")
         
         return {
             "original_query": query,
-            # "expanded_query": expanded_query,
-            # "abbreviations_expanded": expansion_result.get("abbreviations_expanded", []),
-            # "concepts_added": expansion_result.get("concepts_added", []),
+            "expanded_query": expanded_query,
             "is_clinical": True,
-            "intents": intents,            
-            # "timestamp": datetime.utcnow().isoformat(),
+            "total_intents_detected": len(intents),
+            "intents": final_intents,
+            "timestamp": datetime.utcnow().isoformat(),
             "processing_time_seconds": processing_time
-            }
-        
+        }
+
 
 if __name__ == "__main__":
-    PROJECT_ID = PROJECT_ID    
+    PROJECT_ID = "your-project-id"  # Replace with your project ID
+    MODEL_VERSION = "gemini-1.5-pro-002"
+    
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID,
         location="us-central1",
         model=MODEL_VERSION
-
     )
     
-# Test queries
+    # Test queries - diverse examples for spike
     test_queries = [
-       "Patient with DM"
+        "Patient with glioblastoma diagnosis",
+        "Recent hemoglobin A1c results",
+        "Metformin 500mg dosing history"
     ]
     
     for idx, query in enumerate(test_queries, 1):
@@ -456,8 +656,100 @@ if __name__ == "__main__":
         
         result = pipeline.run(query, verbose=True)
         
-        output_filename = f"query_result_{idx}.json"
+        output_filename = f"query_result_{idx}_with_context.json"
         with open(output_filename, 'w') as f:
             json.dump(result, f, indent=2)
         
         print(f"Saved to: {output_filename}")
+        
+        # Pretty print for demo
+        if result.get("is_clinical") and result.get("intents"):
+            print(f"\n--- DEMO OUTPUT ---")
+            for intent in result["intents"]:
+                print(f"\nINTENT: {intent['intent_title']}")
+                print(f"Nature: {intent['nature']}")
+                print(f"\nSub-natures:")
+                for sn in intent.get("sub_natures", []):
+                    print(f"  • {sn['category_path']}")
+                    print(f"    Concepts: {', '.join(sn['atomic_concepts'])}")
+                
+                if "contextual_environment" in intent:
+                    ctx = intent["contextual_environment"]
+                    print(f"\nContextual Environment:")
+                    print(f"  Document Types: {', '.join(ctx.get('document_types', []))}")
+                    print(f"  Author Roles: {', '.join(ctx.get('author_roles', []))}")
+                    print(f"  Temporal Scope: {', '.join(ctx.get('temporal_scope', []))}")
+                    print(f"  Content Signals: {', '.join(ctx.get('content_signals', []))}")
+                
+                print(f"\nFinal Queries ({len(intent.get('final_queries', []))}):")
+                for q in intent.get("final_queries", [])[:5]:  # Show first 5
+                    print(f"  • {q}")
+                if len(intent.get("final_queries", [])) > 5:
+                    print(f"  ... and {len(intent['final_queries']) - 5} more")
+```
+
+---
+
+## **Key Changes Explained:**
+
+### **1. Added CONTEXTUAL_ENVIRONMENT_PROMPT**
+- Comprehensive prompt that teaches the LLM to distinguish context from nature
+- Four facet categories: document types, author roles, temporal scope, content signals
+- Clear instructions and examples
+
+### **2. New Method: `generate_contextual_environment()`**
+- Takes intents as input
+- Strips out `final_queries` to save tokens
+- Calls LLM with contextual environment prompt
+- Returns structured context for each intent
+
+### **3. Modified `run()` Method**
+- Added Step 3: calls `generate_contextual_environment()`
+- Merges contextual environment back into intents
+- Returns unified output with intent + nature + context together
+- Added verbose output showing contexts generated
+
+### **4. Demo-Friendly Output**
+- Pretty prints showing:
+  - Intent title and nature
+  - Sub-natures with atomic concepts
+  - **Contextual environment (NEW)**
+  - Final queries
+- Saves JSON files with `_with_context` suffix
+
+---
+
+## **Expected Demo Output:**
+
+For query: `"Patient with glioblastoma diagnosis"`
+
+**Console Output:**
+```
+Original Query: Patient with glioblastoma diagnosis
+Expanded Query: Patient with Glioblastoma diagnosis
+Status: Clinical
+Intents: 1 | Sub-natures: 2 | Queries: 5
+Contextual Environments: 1
+Processing Time: 3.45s
+
+--- DEMO OUTPUT ---
+
+INTENT: Glioblastoma Diagnosis
+Nature: Diagnostic Information / Oncological Diagnosis
+
+Sub-natures:
+  • Neoplasm >> Brain Tumor >> Malignant Glioma
+    Concepts: glioblastoma, diagnosis, patient
+
+Contextual Environment:
+  Document Types: pathology_report, radiology_report, neurology_consultation, oncology_consultation, neurosurgery_consultation
+  Author Roles: pathologist, neuroradiologist, neurologist, neuro_oncologist, neurosurgeon
+  Temporal Scope: diagnostic_period, acute_event
+  Content Signals: diagnosis_code_present, histology_mentioned, imaging_findings, treatment_plan
+
+Final Queries (5):
+  • glioblastoma
+  • brain tumor diagnosis
+  • malignant glioma
+  • patient diagnosis
+  • glioblastoma patient
