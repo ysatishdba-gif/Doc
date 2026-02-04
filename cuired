@@ -1,21 +1,23 @@
 """
-PRODUCTION CUI REDUCTION SYSTEM v2.0
+PRODUCTION CUI REDUCTION SYSTEM v3.0
 =====================================
-Works with EXISTING UMLS tables only
-No new BigQuery tables required
-Configuration in YAML files
+✓ Single file - no external dependencies
+✓ Auto-computes configuration from UMLS on startup
+✓ Caches everything in memory
+✓ Works with existing UMLS tables only
+✓ Zero manual configuration required
 
-Author: Clinical Intelligence Team
+Usage:
+    pipeline = CUIReductionSystem(project_id, dataset_id, network_path)
+    result = pipeline.reduce(cuis, embeddings, UsageContext.QUERY)
 """
 
 import time
 import threading
 import logging
 import traceback
-import os
-import yaml
 from typing import List, Dict, Optional, Set, Tuple, Any
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from collections import defaultdict
 from enum import Enum
 import numpy as np
@@ -23,15 +25,12 @@ import networkx as nx
 import pickle
 import psutil
 import requests
-import json
+import subprocess
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import subprocess
-
 from google.cloud import bigquery
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import pandas as pd
 
 # ========================= LOGGING =========================
 
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 print_lock = threading.Lock()
 
-def thread_safe_print(msg: str, level: str = "INFO"):
+def log(msg: str, level: str = "INFO"):
     """Thread-safe logging"""
     with print_lock:
         if level == "ERROR":
@@ -57,7 +56,6 @@ def thread_safe_print(msg: str, level: str = "INFO"):
 
 class PerformanceMonitor:
     """Track performance metrics"""
-    
     def __init__(self):
         self.metrics = defaultdict(list)
         self.lock = threading.Lock()
@@ -67,8 +65,8 @@ class PerformanceMonitor:
             self.metrics[metric_name].append(value)
     
     def get_summary(self) -> Dict[str, Dict[str, float]]:
-        summary = {}
         with self.lock:
+            summary = {}
             for name, values in self.metrics.items():
                 if values:
                     summary[name] = {
@@ -78,11 +76,12 @@ class PerformanceMonitor:
                         'min': np.min(values),
                         'max': np.max(values)
                     }
-        return summary
+            return summary
 
 perf_monitor = PerformanceMonitor()
 
-def monitor_performance(metric_name: str):
+def monitor_perf(metric_name: str):
+    """Decorator to monitor function performance"""
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
@@ -92,7 +91,7 @@ def monitor_performance(metric_name: str):
                 elapsed = (time.time() - start) * 1000
                 perf_monitor.record(metric_name, elapsed)
                 return result
-            except Exception as e:
+            except Exception:
                 elapsed = (time.time() - start) * 1000
                 perf_monitor.record(f"{metric_name}_error", elapsed)
                 raise
@@ -101,9 +100,8 @@ def monitor_performance(metric_name: str):
 
 # ========================= ADAPTIVE CACHING =========================
 
-class FullyAdaptiveLRUCache:
-    """Memory-aware LRU cache"""
-    
+class AdaptiveLRUCache:
+    """Memory-aware LRU cache that adapts to system pressure"""
     def __init__(self, memory_threshold: float = 0.2):
         self.cache = {}
         self.order = []
@@ -137,19 +135,23 @@ class FullyAdaptiveLRUCache:
                 oldest = self.order.pop(0)
                 del self.cache[oldest]
                 mem = psutil.virtual_memory()
-        except Exception as e:
-            logger.warning(f"Cache eviction error: {e}")
+        except Exception:
+            pass
     
     def get_stats(self) -> Dict:
         with self.lock:
             total = self.hits + self.misses
-            hit_rate = self.hits / total if total > 0 else 0.0
             return {
                 'size': len(self.cache),
                 'hits': self.hits,
                 'misses': self.misses,
-                'hit_rate': hit_rate
+                'hit_rate': self.hits / total if total > 0 else 0.0
             }
+    
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+            self.order.clear()
 
 # ========================= ENUMS =========================
 
@@ -199,25 +201,6 @@ class CUIScore:
     component_scores: List[ComponentScore]
     retained_cuis: List[str]
     ranking: Optional[int] = None
-    
-    def to_dict(self) -> Dict:
-        return {
-            'cui': self.cui,
-            'preferred_term': self.preferred_term,
-            'completeness_score': self.completeness_score,
-            'ranking': self.ranking,
-            'components': [
-                {
-                    'name': c.name,
-                    'score': c.score,
-                    'weight': c.weight,
-                    'contribution': c.weighted_score,
-                    'explanation': c.explanation
-                }
-                for c in self.component_scores
-            ],
-            'retained_cuis': self.retained_cuis
-        }
 
 @dataclass
 class ReductionResult:
@@ -229,549 +212,19 @@ class ReductionResult:
     retention_map: Dict[str, List[str]]
     processing_time_ms: float
     metadata: Dict = field(default_factory=dict)
-    
-    def to_dict(self) -> Dict:
-        return {
-            'mode': self.mode.value,
-            'context': self.usage_context.value,
-            'input_count': len(self.input_cuis),
-            'output_count': len(self.output_cuis),
-            'reduction_rate': 1 - len(self.output_cuis) / len(self.input_cuis) if self.input_cuis else 0,
-            'processing_time_ms': self.processing_time_ms,
-            'output_cuis': self.output_cuis,
-            'metadata': self.metadata
-        }
 
-@dataclass
-class LearnedConfiguration:
-    """Configuration computed from UMLS data"""
-    config_name: str
-    weights: Dict[str, float]
-    params: Dict[str, float]
-    modifiers: Dict[str, Set[str]]  # modifier_type -> set of terms
-    statistics: Dict[str, Any]
-    computed_at: float
-    
-    def save_to_yaml(self, filepath: str):
-        """Save configuration to YAML file"""
-        output = {
-            'config_name': self.config_name,
-            'computed_at': self.computed_at,
-            'weights': self.weights,
-            'params': self.params,
-            'modifiers': {k: list(v) for k, v in self.modifiers.items()},
-            'statistics': self.statistics
-        }
-        
-        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
-        with open(filepath, 'w') as f:
-            yaml.dump(output, f, default_flow_style=False, sort_keys=False)
-        
-        thread_safe_print(f"[Config] Saved to: {filepath}")
-    
-    @classmethod
-    def load_from_yaml(cls, filepath: str) -> 'LearnedConfiguration':
-        """Load configuration from YAML file"""
-        with open(filepath, 'r') as f:
-            data = yaml.safe_load(f)
-        
-        return cls(
-            config_name=data['config_name'],
-            weights=data['weights'],
-            params=data['params'],
-            modifiers={k: set(v) for k, v in data['modifiers'].items()},
-            statistics=data.get('statistics', {}),
-            computed_at=data.get('computed_at', time.time())
-        )
-
-# ========================= UMLS STATISTICS COMPUTER =========================
-
-class UMLSStatisticsComputer:
-    """
-    Compute all parameters from UMLS tables.
-    NO new tables created - only reads from MRCONSO, MRREL, MRSTY.
-    """
-    
-    def __init__(
-        self,
-        bq_client: bigquery.Client,
-        project_id: str,
-        dataset_id: str
-    ):
-        self.bq = bq_client
-        self.project_id = project_id
-        self.dataset_id = dataset_id
-    
-    @monitor_performance("compute_configuration")
-    def compute_configuration(
-        self,
-        config_name: str = "learned_from_umls_v1",
-        sample_size: int = 10000
-    ) -> LearnedConfiguration:
-        """
-        Compute complete configuration from UMLS.
-        
-        Args:
-            config_name: Name for this configuration
-            sample_size: Sample size for analysis
-        
-        Returns:
-            LearnedConfiguration object
-        """
-        thread_safe_print(f"[UMLS Stats] Computing configuration from UMLS...")
-        thread_safe_print(f"[UMLS Stats] Sample size: {sample_size}")
-        
-        start_time = time.time()
-        
-        try:
-            # Compute statistics
-            ic_stats = self._compute_ic_distribution(sample_size)
-            relationship_stats = self._compute_relationship_stats(sample_size)
-            hierarchy_stats = self._compute_hierarchy_stats(sample_size)
-            modifier_stats = self._discover_modifiers()
-            
-            # Derive parameters from statistics
-            params = self._derive_parameters(
-                ic_stats,
-                relationship_stats,
-                hierarchy_stats
-            )
-            
-            # Derive weights from correlations
-            weights = self._derive_weights(sample_size)
-            
-            # Prepare modifiers dictionary
-            modifiers = self._prepare_modifiers(modifier_stats)
-            
-            config = LearnedConfiguration(
-                config_name=config_name,
-                weights=weights,
-                params=params,
-                modifiers=modifiers,
-                statistics={
-                    'ic_distribution': ic_stats,
-                    'relationship_patterns': relationship_stats,
-                    'hierarchy_depth': hierarchy_stats,
-                    'modifier_discovery': modifier_stats,
-                    'sample_size': sample_size
-                },
-                computed_at=time.time()
-            )
-            
-            elapsed = time.time() - start_time
-            thread_safe_print(f"[UMLS Stats] Configuration computed in {elapsed:.1f}s")
-            
-            return config
-            
-        except Exception as e:
-            logger.error(f"Failed to compute configuration: {e}")
-            logger.error(traceback.format_exc())
-            raise
-    
-    def _compute_ic_distribution(self, sample_size: int) -> Dict:
-        """Compute IC score distribution from UMLS"""
-        query = f"""
-        WITH sampled_cuis AS (
-          SELECT DISTINCT CUI
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
-          WHERE LAT = 'ENG' AND ISPREF = 'Y'
-          LIMIT {sample_size}
-        ),
-        cui_frequency AS (
-          SELECT 
-            c.CUI,
-            COUNT(DISTINCT c.STR) as term_count,
-            (SELECT COUNT(DISTINCT STR) 
-             FROM `{self.project_id}.{self.dataset_id}.MRCONSO` 
-             WHERE LAT = 'ENG') as total_terms
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
-          JOIN sampled_cuis s ON c.CUI = s.CUI
-          WHERE c.LAT = 'ENG'
-          GROUP BY c.CUI
-        ),
-        ic_scores AS (
-          SELECT 
-            CUI,
-            -LOG(SAFE_DIVIDE(term_count, total_terms)) as ic
-          FROM cui_frequency
-        )
-        SELECT 
-          APPROX_QUANTILES(ic, 100) as percentiles,
-          AVG(ic) as mean_ic,
-          STDDEV(ic) as std_ic
-        FROM ic_scores
-        WHERE ic IS NOT NULL
-        """
-        
-        try:
-            result = self.bq.query(query, timeout=300).result()
-            row = next(result)
-            
-            percentiles = [float(p) if p is not None else 0.0 for p in row.percentiles]
-            
-            return {
-                'mean': float(row.mean_ic or 3.5),
-                'std': float(row.std_ic or 1.5),
-                'percentiles': percentiles
-            }
-        except Exception as e:
-            logger.warning(f"IC computation failed, using defaults: {e}")
-            # Sensible defaults based on typical UMLS
-            return {
-                'mean': 3.5,
-                'std': 1.5,
-                'percentiles': [i * 0.08 for i in range(101)]
-            }
-    
-    def _compute_relationship_stats(self, sample_size: int) -> Dict:
-        """Compute relationship statistics"""
-        query = f"""
-        WITH sampled_cuis AS (
-          SELECT DISTINCT CUI
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
-          WHERE LAT = 'ENG' AND ISPREF = 'Y'
-          LIMIT {sample_size}
-        ),
-        cui_relationships AS (
-          SELECT 
-            r.CUI1,
-            COUNT(DISTINCT r.CUI2) as related_count
-          FROM `{self.project_id}.{self.dataset_id}.MRREL` r
-          JOIN sampled_cuis s ON r.CUI1 = s.CUI
-          WHERE r.REL IN ('PAR', 'CHD', 'RB', 'RN')
-          GROUP BY r.CUI1
-        )
-        SELECT 
-          APPROX_QUANTILES(related_count, 100) as percentiles,
-          AVG(related_count) as mean_count
-        FROM cui_relationships
-        """
-        
-        try:
-            result = self.bq.query(query, timeout=300).result()
-            row = next(result)
-            
-            percentiles = [int(p) if p is not None else 0 for p in row.percentiles]
-            
-            return {
-                'mean_related': float(row.mean_count or 25.0),
-                'percentiles': percentiles
-            }
-        except Exception as e:
-            logger.warning(f"Relationship stats failed, using defaults: {e}")
-            return {
-                'mean_related': 25.0,
-                'percentiles': [int(i * 0.5) for i in range(101)]
-            }
-    
-    def _compute_hierarchy_stats(self, sample_size: int) -> Dict:
-        """Compute hierarchy depth statistics"""
-        query = f"""
-        WITH sampled_cuis AS (
-          SELECT DISTINCT CUI
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
-          WHERE LAT = 'ENG' AND ISPREF = 'Y'
-          LIMIT {sample_size}
-        ),
-        parent_counts AS (
-          SELECT 
-            s.CUI,
-            COUNT(DISTINCT r.CUI2) as parent_count
-          FROM sampled_cuis s
-          LEFT JOIN `{self.project_id}.{self.dataset_id}.MRREL` r 
-            ON s.CUI = r.CUI1 AND r.REL = 'PAR'
-          GROUP BY s.CUI
-        )
-        SELECT 
-          AVG(parent_count) as mean_depth,
-          MAX(parent_count) as max_depth
-        FROM parent_counts
-        """
-        
-        try:
-            result = self.bq.query(query, timeout=300).result()
-            row = next(result)
-            
-            return {
-                'mean_depth': float(row.mean_depth or 3.5),
-                'max_depth': int(row.max_depth or 10)
-            }
-        except Exception as e:
-            logger.warning(f"Hierarchy stats failed, using defaults: {e}")
-            return {
-                'mean_depth': 3.5,
-                'max_depth': 10
-            }
-    
-    def _discover_modifiers(self) -> Dict:
-        """Discover modifier terms from UMLS semantic types"""
-        query = f"""
-        WITH modifier_semantic_types AS (
-          SELECT 
-            s.TUI,
-            s.STY,
-            COUNT(DISTINCT c.CUI) as cui_count,
-            COUNT(DISTINCT c.STR) as term_count
-          FROM `{self.project_id}.{self.dataset_id}.MRSTY` s
-          JOIN `{self.project_id}.{self.dataset_id}.MRCONSO` c ON s.CUI = c.CUI
-          WHERE c.LAT = 'ENG'
-            AND LENGTH(c.STR) BETWEEN 3 AND 20
-          GROUP BY s.TUI, s.STY
-          HAVING cui_count > 10 AND term_count > 20
-          ORDER BY cui_count DESC
-          LIMIT 20
-        )
-        SELECT 
-          TUI as semantic_type,
-          STY as semantic_type_name,
-          cui_count,
-          term_count
-        FROM modifier_semantic_types
-        """
-        
-        try:
-            result = self.bq.query(query, timeout=300).result()
-            
-            discovered_types = []
-            for row in result:
-                discovered_types.append({
-                    'tui': row.semantic_type,
-                    'name': row.semantic_type_name,
-                    'cui_count': row.cui_count,
-                    'term_count': row.term_count
-                })
-            
-            thread_safe_print(f"[Modifiers] Discovered {len(discovered_types)} modifier types")
-            
-            return {
-                'types': discovered_types,
-                'count': len(discovered_types)
-            }
-        except Exception as e:
-            logger.warning(f"Modifier discovery failed: {e}")
-            return {'types': [], 'count': 0}
-    
-    def _derive_parameters(
-        self,
-        ic_stats: Dict,
-        relationship_stats: Dict,
-        hierarchy_stats: Dict
-    ) -> Dict[str, float]:
-        """Derive parameters from statistics"""
-        
-        ic_percentiles = ic_stats['percentiles']
-        rel_percentiles = relationship_stats['percentiles']
-        
-        params = {
-            # IC threshold: 25th percentile
-            'ic_min_threshold': ic_percentiles[25],
-            
-            # Prefilter target: 75th percentile × 15
-            'prefilter_target_size': rel_percentiles[75] * 15,
-            
-            # Max clusters: 60th percentile × 3
-            'max_clusters': rel_percentiles[60] * 3,
-            
-            # Hierarchy sample: mean depth × 15
-            'hierarchy_sample_size': hierarchy_stats['mean_depth'] * 15,
-            
-            # Embedding sample: hierarchy sample × 0.5
-            'embedding_sample_size': hierarchy_stats['mean_depth'] * 7.5,
-            
-            # Final CUI counts
-            'final_cui_count_query': min(5, max(2, relationship_stats['mean_related'] * 0.15)),
-            'final_cui_count_document': min(8, max(3, relationship_stats['mean_related'] * 0.25)),
-            
-            # Retention top K
-            'retention_top_k': rel_percentiles[60] * 0.9
-        }
-        
-        thread_safe_print(f"[Params] Derived parameters:")
-        for k, v in params.items():
-            thread_safe_print(f"  {k}: {v:.2f}")
-        
-        return params
-    
-    def _derive_weights(self, sample_size: int) -> Dict[str, float]:
-        """Derive component weights from feature correlations"""
-        query = f"""
-        WITH sampled_cuis AS (
-          SELECT DISTINCT CUI
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
-          WHERE LAT = 'ENG' AND ISPREF = 'Y'
-          LIMIT {sample_size}
-        ),
-        cui_features AS (
-          SELECT 
-            c.CUI,
-            ARRAY_LENGTH(SPLIT(c.STR, ' ')) as token_count,
-            (SELECT COUNT(*) 
-             FROM `{self.project_id}.{self.dataset_id}.MRREL` r 
-             WHERE r.CUI1 = c.CUI AND r.REL IN ('PAR', 'CHD')) as relationship_count,
-            (SELECT COUNT(DISTINCT TUI) 
-             FROM `{self.project_id}.{self.dataset_id}.MRSTY` s 
-             WHERE s.CUI = c.CUI) as semantic_diversity,
-            -LOG(SAFE_DIVIDE(
-              COUNT(*) OVER (PARTITION BY c.STR),
-              {sample_size}
-            )) as ic
-          FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
-          JOIN sampled_cuis s ON c.CUI = s.CUI
-          WHERE c.LAT = 'ENG' AND c.ISPREF = 'Y'
-        )
-        SELECT 
-          CORR(token_count, ic) as token_ic_corr,
-          CORR(relationship_count, ic) as hierarchy_ic_corr,
-          CORR(semantic_diversity, ic) as diversity_ic_corr
-        FROM cui_features
-        WHERE token_count IS NOT NULL 
-          AND relationship_count IS NOT NULL
-          AND semantic_diversity IS NOT NULL
-          AND ic IS NOT NULL
-        """
-        
-        try:
-            result = self.bq.query(query, timeout=300).result()
-            row = next(result)
-            
-            # Use absolute correlations
-            correlations = {
-                'token': max(0.1, abs(row.token_ic_corr or 0.3)),
-                'hierarchy': max(0.1, abs(row.hierarchy_ic_corr or 0.3)),
-                'diversity': max(0.1, abs(row.diversity_ic_corr or 0.2))
-            }
-            
-            total_corr = sum(correlations.values())
-            base_total = 0.85  # Reserve 15% for embeddings
-            
-            weights = {
-                'token_subsumption': (correlations['token'] / total_corr) * base_total * 0.4,
-                'umls_hierarchy': (correlations['hierarchy'] / total_corr) * base_total * 0.4,
-                'term_specificity': (correlations['token'] / total_corr) * base_total * 0.3,
-                'modifier_presence': (correlations['diversity'] / total_corr) * base_total * 0.3,
-                'semantic_similarity': 0.15
-            }
-            
-            # Normalize
-            weight_sum = sum(weights.values())
-            weights = {k: v / weight_sum for k, v in weights.items()}
-            
-            thread_safe_print(f"[Weights] Derived from correlations:")
-            for k, v in weights.items():
-                thread_safe_print(f"  {k}: {v:.3f}")
-            
-            return weights
-            
-        except Exception as e:
-            logger.warning(f"Weight derivation failed, using equal weights: {e}")
-            return {
-                'token_subsumption': 0.20,
-                'umls_hierarchy': 0.20,
-                'term_specificity': 0.20,
-                'modifier_presence': 0.20,
-                'semantic_similarity': 0.20
-            }
-    
-    def _prepare_modifiers(self, modifier_stats: Dict) -> Dict[str, Set[str]]:
-        """Prepare modifier terms dictionary"""
-        modifiers = {}
-        
-        for mod_type in modifier_stats['types'][:10]:  # Top 10 types
-            query = f"""
-            SELECT DISTINCT LOWER(c.STR) as term
-            FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
-            JOIN `{self.project_id}.{self.dataset_id}.MRSTY` s ON c.CUI = s.CUI
-            WHERE s.TUI = '{mod_type['tui']}'
-              AND c.LAT = 'ENG'
-              AND LENGTH(c.STR) BETWEEN 3 AND 20
-            LIMIT 100
-            """
-            
-            try:
-                result = self.bq.query(query, timeout=60).result()
-                
-                # Normalize modifier type name
-                type_name = mod_type['name'].lower().replace(' ', '_')
-                terms = {row.term for row in result}
-                
-                if terms:
-                    modifiers[type_name] = terms
-                    
-            except Exception as e:
-                logger.warning(f"Failed to fetch terms for {mod_type['name']}: {e}")
-        
-        thread_safe_print(f"[Modifiers] Prepared {len(modifiers)} modifier types")
-        return modifiers
-
-# ========================= CONFIGURATION MANAGER =========================
-
-class SimpleConfigManager:
-    """
-    Manage configuration from YAML files.
-    No BigQuery tables required.
-    """
-    
-    def __init__(self, config_dir: str = "./config"):
-        self.config_dir = config_dir
-        os.makedirs(config_dir, exist_ok=True)
-        self._cache = {}
-    
-    def get_configuration(
-        self,
-        config_name: str = "default",
-        force_recompute: bool = False
-    ) -> LearnedConfiguration:
-        """
-        Get configuration - load from YAML or use cached.
-        
-        Args:
-            config_name: Configuration name
-            force_recompute: Force recomputation from UMLS
-        
-        Returns:
-            LearnedConfiguration
-        """
-        config_path = os.path.join(self.config_dir, f"{config_name}.yaml")
-        
-        # Check cache
-        if not force_recompute and config_name in self._cache:
-            thread_safe_print(f"[Config] Using cached: {config_name}")
-            return self._cache[config_name]
-        
-        # Try to load from file
-        if not force_recompute and os.path.exists(config_path):
-            thread_safe_print(f"[Config] Loading from file: {config_path}")
-            config = LearnedConfiguration.load_from_yaml(config_path)
-            self._cache[config_name] = config
-            return config
-        
-        raise FileNotFoundError(
-            f"Configuration '{config_name}' not found at {config_path}. "
-            f"Please run initialization first to compute configuration from UMLS."
-        )
-    
-    def save_configuration(self, config: LearnedConfiguration):
-        """Save configuration to YAML"""
-        config_path = os.path.join(self.config_dir, f"{config.config_name}.yaml")
-        config.save_to_yaml(config_path)
-        self._cache[config.config_name] = config
-
-# ========================= HIERARCHY CLIENT (Same as before) =========================
+# ========================= HIERARCHY CLIENT =========================
 
 class HierarchyClient:
-    """NetworkX-based hierarchy with caching"""
+    """NetworkX-based hierarchy management with aggressive caching"""
     
-    def __init__(
-        self,
-        network_obj: nx.DiGraph,
-        ic_scores: Optional[Dict[str, float]] = None
-    ):
+    def __init__(self, network_obj: nx.DiGraph, ic_scores: Optional[Dict[str, float]] = None):
         self.network = network_obj
         self.ic_scores = ic_scores or {}
-        self.ancestors_cache = FullyAdaptiveLRUCache()
-        self.children_cache = FullyAdaptiveLRUCache()
-        self.ic_cache = FullyAdaptiveLRUCache()
-        self.hierarchy_relation_cache = FullyAdaptiveLRUCache()
+        self.ancestors_cache = AdaptiveLRUCache()
+        self.children_cache = AdaptiveLRUCache()
+        self.ic_cache = AdaptiveLRUCache()
+        self.hierarchy_cache = AdaptiveLRUCache()
         self.lock = threading.RLock()
     
     def get_children(self, cui: str) -> List[str]:
@@ -798,7 +251,6 @@ class HierarchyClient:
         while queue:
             depth, path = queue.pop(0)
             node = path[-1]
-            
             if node in visited:
                 continue
             visited.add(node)
@@ -836,8 +288,8 @@ class HierarchyClient:
         return ic
     
     def is_hierarchical_descendant(self, cui_child: str, cui_parent: str) -> bool:
-        cache_key = (cui_child, cui_parent)
-        cached = self.hierarchy_relation_cache.get(cache_key)
+        key = (cui_child, cui_parent)
+        cached = self.hierarchy_cache.get(key)
         if cached is not None:
             return cached
         
@@ -849,522 +301,596 @@ class HierarchyClient:
         except Exception:
             has_path = False
         
-        self.hierarchy_relation_cache.put(cache_key, has_path)
+        self.hierarchy_cache.put(key, has_path)
         return has_path
-    
-    def get_cache_stats(self) -> Dict:
-        return {
-            'ancestors': self.ancestors_cache.get_stats(),
-            'children': self.children_cache.get_stats(),
-            'ic': self.ic_cache.get_stats(),
-            'hierarchy_relations': self.hierarchy_relation_cache.get_stats()
-        }
 
-# ========================= PRE-FILTER, CLUSTERER, SCORER =========================
-# (Keep all the FastCUIPreFilter, FastHierarchicalClusterer, OptimizedCUIScorer 
-#  classes from the previous version - they work the same)
+# ========================= AUTO CONFIGURATION =========================
 
-class FastCUIPreFilter:
-    """Stage 1: Pre-filtering"""
+class AutoConfiguration:
+    """
+    Automatically computes optimal configuration from UMLS on first use.
+    Caches in memory for the session.
+    """
     
-    def __init__(self, hierarchy: HierarchyClient):
-        self.hierarchy = hierarchy
-    
-    @monitor_performance("prefilter")
-    def prefilter(
-        self,
-        cuis: List[str],
-        params: Dict[str, float]
-    ) -> Tuple[List[str], Dict]:
-        start_time = time.time()
-        stats = {'input_count': len(cuis)}
-        
-        ic_min_threshold = params.get('ic_min_threshold', 2.0)
-        target_size = int(params.get('prefilter_target_size', 1000))
-        
-        thread_safe_print(f"[PreFilter] Input: {len(cuis)}, Target: {target_size}")
-        
-        # Filter by IC
-        cuis = [cui for cui in cuis if self.hierarchy.get_ic_score(cui) >= ic_min_threshold]
-        stats['after_ic_filter'] = len(cuis)
-        
-        # Remove ancestors
-        cui_set = set(cuis)
-        to_remove = set()
-        for cui in cuis:
-            parents = self.hierarchy.get_parents(cui)
-            for parent in parents:
-                if parent in cui_set:
-                    to_remove.add(parent)
-        cuis = [cui for cui in cuis if cui not in to_remove]
-        stats['after_ancestor_filter'] = len(cuis)
-        
-        # Sample if needed
-        if len(cuis) > target_size:
-            import random
-            buckets = defaultdict(list)
-            for cui in cuis:
-                ic = self.hierarchy.get_ic_score(cui)
-                buckets[int(ic)].append(cui)
-            
-            sampled = []
-            for bucket_key in sorted(buckets.keys()):
-                bucket_cuis = buckets[bucket_key]
-                bucket_proportion = len(bucket_cuis) / len(cuis)
-                bucket_sample_size = max(1, int(target_size * bucket_proportion))
-                
-                if len(bucket_cuis) <= bucket_sample_size:
-                    sampled.extend(bucket_cuis)
-                else:
-                    sampled.extend(random.sample(bucket_cuis, bucket_sample_size))
-            
-            if len(sampled) > target_size:
-                sampled.sort(key=lambda c: self.hierarchy.get_ic_score(c), reverse=True)
-                sampled = sampled[:target_size]
-            
-            cuis = sampled
-            stats['after_sampling'] = len(cuis)
-        
-        stats['processing_time_ms'] = (time.time() - start_time) * 1000
-        thread_safe_print(f"[PreFilter] Output: {len(cuis)}")
-        
-        return cuis, stats
-
-class FastHierarchicalClusterer:
-    """Stage 2: Clustering"""
-    
-    def __init__(self, hierarchy: HierarchyClient):
-        self.hierarchy = hierarchy
-    
-    @monitor_performance("clustering")
-    def cluster(
-        self,
-        cuis: List[str],
-        params: Dict[str, float]
-    ) -> Dict[str, List[str]]:
-        max_clusters = int(params.get('max_clusters', 200))
-        
-        ancestor_groups = defaultdict(list)
-        for cui in cuis:
-            paths = self.hierarchy.get_ancestors(cui, max_depth=5)
-            if paths and len(paths[0]) >= 3:
-                ancestor = paths[0][min(3, len(paths[0]) - 1)]
-            else:
-                ancestor = cui
-            ancestor_groups[ancestor].append(cui)
-        
-        if len(ancestor_groups) > max_clusters:
-            sorted_clusters = sorted(ancestor_groups.items(), key=lambda x: len(x[1]))
-            large_clusters = {k: v for k, v in sorted_clusters[-(max_clusters - 1):]}
-            small_cluster_cuis = []
-            for k, v in sorted_clusters[:-(max_clusters - 1)]:
-                small_cluster_cuis.extend(v)
-            large_clusters['MERGED_SMALL'] = small_cluster_cuis
-            ancestor_groups = large_clusters
-        
-        thread_safe_print(f"[Clustering] Created {len(ancestor_groups)} clusters")
-        return dict(ancestor_groups)
-
-class OptimizedCUIScorer:
-    """Stage 3: Scoring"""
-    
-    def __init__(
-        self,
-        config: LearnedConfiguration,
-        hierarchy: HierarchyClient,
-        bq_client: bigquery.Client,
-        project_id: str,
-        dataset_id: str
-    ):
-        self.config = config
-        self.hierarchy = hierarchy
+    def __init__(self, bq_client: bigquery.Client, project_id: str, dataset_id: str):
         self.bq = bq_client
         self.project_id = project_id
         self.dataset_id = dataset_id
-        self.metadata_cache = FullyAdaptiveLRUCache()
+        self._config_cache = None
+        self._lock = threading.Lock()
+    
+    def get_config(self, sample_size: int = 5000) -> Dict:
+        """Get configuration - compute once, cache forever"""
+        with self._lock:
+            if self._config_cache is not None:
+                return self._config_cache
+            
+            log("[AutoConfig] Computing configuration from UMLS...")
+            start = time.time()
+            
+            config = {
+                'weights': self._compute_weights(sample_size),
+                'params': self._compute_params(sample_size),
+                'modifiers': self._discover_modifiers()
+            }
+            
+            elapsed = time.time() - start
+            log(f"[AutoConfig] Configuration ready in {elapsed:.1f}s")
+            
+            self._config_cache = config
+            return config
+    
+    def _compute_weights(self, sample_size: int) -> Dict[str, float]:
+        """Compute component weights from feature correlations"""
+        query = f"""
+        WITH sample AS (
+          SELECT DISTINCT CUI 
+          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
+          WHERE LAT = 'ENG' AND ISPREF = 'Y'
+          LIMIT {sample_size}
+        ),
+        features AS (
+          SELECT 
+            c.CUI,
+            ARRAY_LENGTH(SPLIT(c.STR, ' ')) as tokens,
+            (SELECT COUNT(*) FROM `{self.project_id}.{self.dataset_id}.MRREL` r 
+             WHERE r.CUI1 = c.CUI AND r.REL IN ('PAR','CHD')) as rels,
+            (SELECT COUNT(DISTINCT TUI) FROM `{self.project_id}.{self.dataset_id}.MRSTY` s 
+             WHERE s.CUI = c.CUI) as types,
+            -LOG(SAFE_DIVIDE(COUNT(*) OVER (PARTITION BY c.STR), {sample_size})) as ic
+          FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
+          JOIN sample s ON c.CUI = s.CUI
+          WHERE c.LAT = 'ENG' AND c.ISPREF = 'Y'
+        )
+        SELECT 
+          CORR(tokens, ic) as token_corr,
+          CORR(rels, ic) as rel_corr,
+          CORR(types, ic) as type_corr
+        FROM features
+        WHERE tokens IS NOT NULL AND rels IS NOT NULL AND types IS NOT NULL AND ic IS NOT NULL
+        """
+        
+        try:
+            row = next(self.bq.query(query, timeout=300).result())
+            corrs = {
+                'token': max(0.1, abs(row.token_corr or 0.3)),
+                'hierarchy': max(0.1, abs(row.rel_corr or 0.3)),
+                'diversity': max(0.1, abs(row.type_corr or 0.2))
+            }
+            total = sum(corrs.values())
+            base = 0.85
+            
+            weights = {
+                'token_subsumption': (corrs['token'] / total) * base * 0.4,
+                'umls_hierarchy': (corrs['hierarchy'] / total) * base * 0.4,
+                'term_specificity': (corrs['token'] / total) * base * 0.3,
+                'modifier_presence': (corrs['diversity'] / total) * base * 0.3,
+                'semantic_similarity': 0.15
+            }
+            
+            total_weight = sum(weights.values())
+            weights = {k: v / total_weight for k, v in weights.items()}
+            
+            log(f"[Weights] Learned from UMLS correlations")
+            return weights
+            
+        except Exception as e:
+            log(f"[Weights] Using defaults due to error: {e}", "WARNING")
+            return {
+                'token_subsumption': 0.20,
+                'umls_hierarchy': 0.20,
+                'term_specificity': 0.20,
+                'modifier_presence': 0.20,
+                'semantic_similarity': 0.20
+            }
+    
+    def _compute_params(self, sample_size: int) -> Dict[str, float]:
+        """Compute parameters from UMLS statistics"""
+        query = f"""
+        WITH sample AS (
+          SELECT DISTINCT CUI 
+          FROM `{self.project_id}.{self.dataset_id}.MRCONSO`
+          WHERE LAT = 'ENG' AND ISPREF = 'Y'
+          LIMIT {sample_size}
+        ),
+        ic_dist AS (
+          SELECT APPROX_QUANTILES(
+            -LOG(SAFE_DIVIDE(COUNT(*) OVER (PARTITION BY c.STR), {sample_size})), 100
+          ) as ic_percentiles
+          FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
+          JOIN sample s ON c.CUI = s.CUI
+          WHERE c.LAT = 'ENG' AND c.ISPREF = 'Y'
+        ),
+        rel_dist AS (
+          SELECT 
+            APPROX_QUANTILES(related_count, 100) as rel_percentiles,
+            AVG(related_count) as mean_rels
+          FROM (
+            SELECT COUNT(DISTINCT r.CUI2) as related_count
+            FROM `{self.project_id}.{self.dataset_id}.MRREL` r
+            JOIN sample s ON r.CUI1 = s.CUI
+            WHERE r.REL IN ('PAR','CHD','RB','RN')
+            GROUP BY r.CUI1
+          )
+        ),
+        depth_stats AS (
+          SELECT AVG(parent_count) as mean_depth
+          FROM (
+            SELECT COUNT(DISTINCT r.CUI2) as parent_count
+            FROM sample s
+            LEFT JOIN `{self.project_id}.{self.dataset_id}.MRREL` r 
+              ON s.CUI = r.CUI1 AND r.REL = 'PAR'
+            GROUP BY s.CUI
+          )
+        )
+        SELECT 
+          ic.ic_percentiles,
+          rel.rel_percentiles,
+          rel.mean_rels,
+          depth.mean_depth
+        FROM ic_dist ic, rel_dist rel, depth_stats depth
+        """
+        
+        try:
+            row = next(self.bq.query(query, timeout=300).result())
+            ic_p = row.ic_percentiles
+            rel_p = row.rel_percentiles
+            
+            params = {
+                'ic_min_threshold': float(ic_p[25]),
+                'prefilter_target_size': float(rel_p[75] * 15),
+                'max_clusters': float(rel_p[60] * 3),
+                'hierarchy_sample_size': float(row.mean_depth * 15),
+                'embedding_sample_size': float(row.mean_depth * 7.5),
+                'final_cui_count_query': float(min(5, max(2, row.mean_rels * 0.15))),
+                'final_cui_count_document': float(min(8, max(3, row.mean_rels * 0.25))),
+                'retention_top_k': float(rel_p[60] * 0.9)
+            }
+            
+            log(f"[Params] Computed from UMLS distributions")
+            return params
+            
+        except Exception as e:
+            log(f"[Params] Using defaults due to error: {e}", "WARNING")
+            return {
+                'ic_min_threshold': 2.0,
+                'prefilter_target_size': 1000.0,
+                'max_clusters': 200.0,
+                'hierarchy_sample_size': 100.0,
+                'embedding_sample_size': 50.0,
+                'final_cui_count_query': 3.0,
+                'final_cui_count_document': 5.0,
+                'retention_top_k': 50.0
+            }
+    
+    def _discover_modifiers(self) -> Dict[str, Set[str]]:
+        """Discover modifier terms from UMLS semantic types"""
+        query = f"""
+        WITH top_types AS (
+          SELECT s.TUI, s.STY, COUNT(DISTINCT c.CUI) as cui_count
+          FROM `{self.project_id}.{self.dataset_id}.MRSTY` s
+          JOIN `{self.project_id}.{self.dataset_id}.MRCONSO` c ON s.CUI = c.CUI
+          WHERE c.LAT = 'ENG' AND LENGTH(c.STR) BETWEEN 3 AND 20
+          GROUP BY s.TUI, s.STY
+          HAVING cui_count > 10
+          ORDER BY cui_count DESC
+          LIMIT 10
+        )
+        SELECT TUI, STY FROM top_types
+        """
+        
+        modifiers = {}
+        try:
+            for row in self.bq.query(query, timeout=60).result():
+                term_query = f"""
+                SELECT DISTINCT LOWER(c.STR) as term
+                FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
+                JOIN `{self.project_id}.{self.dataset_id}.MRSTY` s ON c.CUI = s.CUI
+                WHERE s.TUI = '{row.TUI}' AND c.LAT = 'ENG' AND LENGTH(c.STR) BETWEEN 3 AND 20
+                LIMIT 100
+                """
+                terms = {r.term for r in self.bq.query(term_query, timeout=60).result()}
+                if terms:
+                    type_name = row.STY.lower().replace(' ', '_')
+                    modifiers[type_name] = terms
+            
+            log(f"[Modifiers] Discovered {len(modifiers)} types")
+        except Exception as e:
+            log(f"[Modifiers] Discovery failed: {e}", "WARNING")
+        
+        return modifiers
+
+# ========================= PIPELINE STAGES =========================
+
+class PreFilter:
+    """Stage 1: Fast pre-filtering"""
+    def __init__(self, hierarchy: HierarchyClient):
+        self.hierarchy = hierarchy
+    
+    @monitor_perf("prefilter")
+    def filter(self, cuis: List[str], params: Dict) -> Tuple[List[str], Dict]:
+        start = time.time()
+        stats = {'input': len(cuis)}
+        
+        ic_thresh = params.get('ic_min_threshold', 2.0)
+        target = int(params.get('prefilter_target_size', 1000))
+        
+        log(f"[PreFilter] {len(cuis)} → target {target}")
+        
+        # IC filter
+        cuis = [c for c in cuis if self.hierarchy.get_ic_score(c) >= ic_thresh]
+        stats['after_ic'] = len(cuis)
+        
+        # Remove direct ancestors
+        cui_set = set(cuis)
+        to_remove = set()
+        for cui in cuis:
+            for parent in self.hierarchy.get_parents(cui):
+                if parent in cui_set:
+                    to_remove.add(parent)
+        cuis = [c for c in cuis if c not in to_remove]
+        stats['after_ancestors'] = len(cuis)
+        
+        # Stratified sample
+        if len(cuis) > target:
+            import random
+            buckets = defaultdict(list)
+            for c in cuis:
+                buckets[int(self.hierarchy.get_ic_score(c))].append(c)
+            
+            sampled = []
+            for bucket_key in sorted(buckets.keys()):
+                bucket = buckets[bucket_key]
+                prop = len(bucket) / len(cuis)
+                n = max(1, int(target * prop))
+                sampled.extend(random.sample(bucket, min(n, len(bucket))))
+            
+            if len(sampled) > target:
+                sampled.sort(key=lambda c: self.hierarchy.get_ic_score(c), reverse=True)
+                sampled = sampled[:target]
+            cuis = sampled
+        
+        stats['output'] = len(cuis)
+        stats['time_ms'] = (time.time() - start) * 1000
+        log(f"[PreFilter] Output: {len(cuis)}")
+        return cuis, stats
+
+class Clusterer:
+    """Stage 2: Hierarchical clustering"""
+    def __init__(self, hierarchy: HierarchyClient):
+        self.hierarchy = hierarchy
+    
+    @monitor_perf("clustering")
+    def cluster(self, cuis: List[str], params: Dict) -> Dict[str, List[str]]:
+        max_clusters = int(params.get('max_clusters', 200))
+        
+        groups = defaultdict(list)
+        for cui in cuis:
+            paths = self.hierarchy.get_ancestors(cui, max_depth=5)
+            ancestor = paths[0][min(3, len(paths[0]) - 1)] if paths and len(paths[0]) >= 3 else cui
+            groups[ancestor].append(cui)
+        
+        if len(groups) > max_clusters:
+            sorted_groups = sorted(groups.items(), key=lambda x: len(x[1]))
+            large = {k: v for k, v in sorted_groups[-(max_clusters - 1):]}
+            small = []
+            for k, v in sorted_groups[:-(max_clusters - 1)]:
+                small.extend(v)
+            large['MERGED'] = small
+            groups = large
+        
+        log(f"[Clustering] {len(groups)} clusters")
+        return dict(groups)
+
+class Scorer:
+    """Stage 3: CUI scoring"""
+    def __init__(self, config: Dict, hierarchy: HierarchyClient, bq: bigquery.Client, proj: str, ds: str):
+        self.config = config
+        self.hierarchy = hierarchy
+        self.bq = bq
+        self.project_id = proj
+        self.dataset_id = ds
+        self.metadata_cache = AdaptiveLRUCache()
         self.token_index = defaultdict(set)
     
-    @monitor_performance("scoring")
-    def score_batch(
-        self,
-        cuis: List[str],
-        embeddings: Dict[str, np.ndarray]
-    ) -> Dict[str, CUIScore]:
-        start_time = time.time()
+    @monitor_perf("scoring")
+    def score(self, cuis: List[str], embeddings: Dict[str, np.ndarray]) -> Dict[str, CUIScore]:
+        start = time.time()
         
-        cui_metadata = self._fetch_cui_metadata(cuis)
-        self._build_token_index(cui_metadata)
+        metadata = self._fetch_metadata(cuis)
+        self._build_index(metadata)
         self._embeddings = embeddings
         
         scored = {}
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {
-                executor.submit(self._score_single_cui, cui, cui_metadata): cui
-                for cui in cuis
-            }
-            
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(self._score_cui, c, metadata): c for c in cuis}
             for future in as_completed(futures, timeout=300):
                 cui = futures[future]
                 try:
                     scored[cui] = future.result()
                 except Exception as e:
-                    logger.error(f"Error scoring {cui}: {e}")
+                    log(f"Error scoring {cui}: {e}", "ERROR")
         
-        processing_time = (time.time() - start_time) * 1000
-        thread_safe_print(f"[Scoring] Scored {len(scored)} CUIs in {processing_time:.0f}ms")
-        
+        log(f"[Scoring] {len(scored)} CUIs in {(time.time()-start)*1000:.0f}ms")
         return scored
     
-    def _build_token_index(self, cui_metadata: Dict[str, CUIMetadata]):
+    def _build_index(self, metadata: Dict):
         self.token_index.clear()
-        for cui, metadata in cui_metadata.items():
-            for token in metadata.tokens:
+        for cui, meta in metadata.items():
+            for token in meta.tokens:
                 self.token_index[token].add(cui)
     
-    def _score_single_cui(
-        self,
-        cui: str,
-        all_metadata: Dict[str, CUIMetadata]
-    ) -> CUIScore:
-        metadata = all_metadata[cui]
-        components = []
-        weights = self.config.weights
+    def _score_cui(self, cui: str, all_meta: Dict) -> CUIScore:
+        meta = all_meta[cui]
+        comps = []
+        weights = self.config['weights']
+        params = self.config['params']
         
-        # Token Subsumption
-        token_sub = self._fast_token_subsumption(metadata, all_metadata)
-        components.append(ComponentScore(
-            name="Token Subsumption",
-            score=token_sub['score'],
-            weight=weights.get('token_subsumption', 0.2),
-            explanation=token_sub['explanation'],
-            details=token_sub['details']
-        ))
+        # Token subsumption
+        cui_tokens = set(meta.tokens)
+        candidates = set()
+        for t in cui_tokens:
+            candidates.update(self.token_index.get(t, set()))
+        candidates.discard(cui)
         
-        # UMLS Hierarchy
-        umls_hier = self._sampled_hierarchy_check(metadata, all_metadata)
-        components.append(ComponentScore(
-            name="UMLS Hierarchy",
-            score=umls_hier['score'],
-            weight=weights.get('umls_hierarchy', 0.2),
-            explanation=umls_hier['explanation'],
-            details=umls_hier['details']
-        ))
+        subsumed = sum(1 for oc in candidates 
+                       if (ot := set(all_meta[oc].tokens)) and ot.issubset(cui_tokens) and len(cui_tokens) > len(ot))
+        total = len(all_meta) - 1
+        token_score = subsumed / total if total > 0 else 0.0
         
-        # Term Specificity
-        term_spec = self._calculate_term_specificity(metadata)
-        components.append(ComponentScore(
-            name="Term Specificity",
-            score=term_spec['score'],
-            weight=weights.get('term_specificity', 0.2),
-            explanation=term_spec['explanation'],
-            details=term_spec['details']
-        ))
+        comps.append(ComponentScore("Token Subsumption", token_score, weights['token_subsumption'], 
+                                    f"Subsumes {subsumed}/{total}", {}))
         
-        # Modifier Presence
-        modifier = self._calculate_modifier_presence(metadata)
-        components.append(ComponentScore(
-            name="Clinical Modifiers",
-            score=modifier['score'],
-            weight=weights.get('modifier_presence', 0.2),
-            explanation=modifier['explanation'],
-            details=modifier['details']
-        ))
-        
-        # Semantic Similarity
-        semantic = self._fast_semantic_similarity(metadata, all_metadata)
-        components.append(ComponentScore(
-            name="Semantic Similarity",
-            score=semantic['score'],
-            weight=weights.get('semantic_similarity', 0.2),
-            explanation=semantic['explanation'],
-            details=semantic['details']
-        ))
-        
-        final_score = sum(comp.weighted_score for comp in components)
-        
-        return CUIScore(
-            cui=cui,
-            preferred_term=metadata.preferred_term,
-            completeness_score=final_score,
-            component_scores=components,
-            retained_cuis=[]
-        )
-    
-    def _fast_token_subsumption(self, cui_metadata, all_metadata) -> Dict:
-        cui_tokens = set(cui_metadata.tokens)
-        candidate_cuis = set()
-        for token in cui_tokens:
-            candidate_cuis.update(self.token_index.get(token, set()))
-        candidate_cuis.discard(cui_metadata.cui)
-        
-        if not candidate_cuis:
-            return {'score': 0.0, 'explanation': "No overlapping CUIs", 'details': {}}
-        
-        subsumed_count = sum(
-            1 for other_cui in candidate_cuis
-            if (other_tokens := set(all_metadata[other_cui].tokens))
-            and other_tokens.issubset(cui_tokens) 
-            and len(cui_tokens) > len(other_tokens)
-        )
-        
-        total_other = len(all_metadata) - 1
-        score = subsumed_count / total_other if total_other > 0 else 0.0
-        
-        return {
-            'score': score,
-            'explanation': f"Subsumes {subsumed_count}/{total_other}",
-            'details': {'subsumed_count': subsumed_count}
-        }
-    
-    def _sampled_hierarchy_check(self, cui_metadata, all_metadata) -> Dict:
+        # Hierarchy
         import random
-        sample_size = int(self.config.params.get('hierarchy_sample_size', 100))
-        cui = cui_metadata.cui
-        other_cuis = [c for c in all_metadata.keys() if c != cui]
+        others = [c for c in all_meta if c != cui]
+        sample_size = int(params.get('hierarchy_sample_size', 100))
+        sampled = random.sample(others, min(sample_size, len(others))) if others else []
+        hier_count = sum(1 for oc in sampled if self.hierarchy.is_hierarchical_descendant(cui, oc))
+        hier_score = hier_count / len(sampled) if sampled else 0.0
         
-        if not other_cuis:
-            return {'score': 0.0, 'explanation': "No other CUIs", 'details': {}}
+        comps.append(ComponentScore("UMLS Hierarchy", hier_score, weights['umls_hierarchy'],
+                                    f"Subsumes ~{hier_score:.0%}", {}))
         
-        sampled_cuis = random.sample(other_cuis, min(sample_size, len(other_cuis)))
+        # Specificity
+        ic = meta.ic_score
+        tokens = meta.token_count
+        spec_score = 0.6 * min(ic / 10, 1.0) + 0.4 * min(tokens / 6, 1.0)
         
-        hierarchical_count = sum(
-            1 for other_cui in sampled_cuis
-            if self.hierarchy.is_hierarchical_descendant(cui, other_cui)
-        )
+        comps.append(ComponentScore("Term Specificity", spec_score, weights['term_specificity'],
+                                    f"IC={ic:.1f}, {tokens} tokens", {}))
         
-        score = hierarchical_count / len(sampled_cuis)
+        # Modifiers
+        cui_tok_set = set(meta.tokens)
+        mod_types = [mt for mt, terms in self.config['modifiers'].items() if cui_tok_set & terms]
+        total_types = len(self.config['modifiers'])
+        mod_score = len(mod_types) / total_types if total_types > 0 else 0.0
         
-        return {
-            'score': score,
-            'explanation': f"Subsumes ~{score:.0%}",
-            'details': {'sampled': len(sampled_cuis)}
-        }
-    
-    def _calculate_term_specificity(self, cui_metadata) -> Dict:
-        ic = cui_metadata.ic_score
-        tokens = cui_metadata.token_count
-        ic_norm = min(ic / 10.0, 1.0)
-        token_norm = min(tokens / 6.0, 1.0)
-        score = 0.6 * ic_norm + 0.4 * token_norm
+        comps.append(ComponentScore("Clinical Modifiers", mod_score, weights['modifier_presence'],
+                                    f"{len(mod_types)} types", {}))
         
-        return {
-            'score': score,
-            'explanation': f"IC={ic:.1f}, {tokens} tokens",
-            'details': {'ic': ic, 'tokens': tokens}
-        }
-    
-    def _calculate_modifier_presence(self, cui_metadata) -> Dict:
-        tokens = set(cui_metadata.tokens)
-        detected_types = []
-        
-        for mod_type, terms in self.config.modifiers.items():
-            if tokens & terms:
-                detected_types.append(mod_type)
-        
-        total_types = len(self.config.modifiers)
-        score = len(detected_types) / total_types if total_types > 0 else 0.0
-        
-        return {
-            'score': score,
-            'explanation': f"{len(detected_types)} modifier types",
-            'details': {'modifiers': detected_types}
-        }
-    
-    def _fast_semantic_similarity(self, cui_metadata, all_metadata) -> Dict:
-        import random
-        
-        if not hasattr(self, '_embeddings') or cui_metadata.cui not in self._embeddings:
-            return {'score': 0.5, 'explanation': "No embedding", 'details': {}}
-        
-        cui_emb = self._embeddings[cui_metadata.cui]
-        sample_size = int(self.config.params.get('embedding_sample_size', 50))
-        
-        other_cuis = [c for c in all_metadata.keys() 
-                      if c != cui_metadata.cui and c in self._embeddings]
-        
-        if not other_cuis:
-            return {'score': 0.5, 'explanation': "No comparable embeddings", 'details': {}}
-        
-        sampled = random.sample(other_cuis, min(sample_size, len(other_cuis)))
-        
-        similarities = [
-            np.dot(cui_emb, self._embeddings[other_cui]) / (
-                np.linalg.norm(cui_emb) * np.linalg.norm(self._embeddings[other_cui])
-            )
-            for other_cui in sampled
-        ]
-        
-        score = float(np.mean(similarities))
-        
-        return {
-            'score': score,
-            'explanation': f"Avg similarity: {score:.2f}",
-            'details': {'sampled': len(sampled)}
-        }
-    
-    def _fetch_cui_metadata(self, cui_list: List[str]) -> Dict[str, CUIMetadata]:
-        cached = {}
-        missing = []
-        
-        for cui in cui_list:
-            cached_meta = self.metadata_cache.get(cui)
-            if cached_meta:
-                cached[cui] = cached_meta
+        # Semantic similarity
+        if hasattr(self, '_embeddings') and cui in self._embeddings:
+            cui_emb = self._embeddings[cui]
+            other_embs = [c for c in all_meta if c != cui and c in self._embeddings]
+            emb_sample_size = int(params.get('embedding_sample_size', 50))
+            sampled_embs = random.sample(other_embs, min(emb_sample_size, len(other_embs))) if other_embs else []
+            
+            if sampled_embs:
+                sims = [np.dot(cui_emb, self._embeddings[oc]) / 
+                        (np.linalg.norm(cui_emb) * np.linalg.norm(self._embeddings[oc]))
+                        for oc in sampled_embs]
+                sem_score = float(np.mean(sims))
             else:
-                missing.append(cui)
+                sem_score = 0.5
+        else:
+            sem_score = 0.5
+        
+        comps.append(ComponentScore("Semantic Similarity", sem_score, weights['semantic_similarity'],
+                                    f"Avg: {sem_score:.2f}", {}))
+        
+        final = sum(c.weighted_score for c in comps)
+        return CUIScore(cui, meta.preferred_term, final, comps, [])
+    
+    def _fetch_metadata(self, cuis: List[str]) -> Dict[str, CUIMetadata]:
+        cached = {c: self.metadata_cache.get(c) for c in cuis if self.metadata_cache.get(c)}
+        missing = [c for c in cuis if c not in cached]
         
         if missing:
             query = f"""
-            SELECT 
-                c.CUI as cui,
-                c.STR as preferred_term,
-                ARRAY_AGG(DISTINCT s.TUI) as semantic_types
+            SELECT c.CUI as cui, c.STR as term, ARRAY_AGG(DISTINCT s.TUI) as types
             FROM `{self.project_id}.{self.dataset_id}.MRCONSO` c
             LEFT JOIN `{self.project_id}.{self.dataset_id}.MRSTY` s ON c.CUI = s.CUI
-            WHERE c.CUI IN UNNEST(@cui_list)
-              AND c.LAT = 'ENG'
-              AND c.ISPREF = 'Y'
+            WHERE c.CUI IN UNNEST(@cuis) AND c.LAT = 'ENG' AND c.ISPREF = 'Y'
             GROUP BY c.CUI, c.STR
             """
             
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ArrayQueryParameter("cui_list", "STRING", missing)]
-            )
-            
             try:
-                results = self.bq.query(query, job_config=job_config, timeout=300).result()
+                res = self.bq.query(query, query_parameters=[
+                    bigquery.ArrayQueryParameter("cuis", "STRING", missing)
+                ], timeout=300).result()
                 
-                for row in results:
-                    tokens = CUIMetadata.tokenize(row.preferred_term)
-                    ic_score = self.hierarchy.get_ic_score(row.cui)
-                    
-                    metadata = CUIMetadata(
-                        cui=row.cui,
-                        preferred_term=row.preferred_term,
-                        semantic_types=row.semantic_types or [],
-                        tokens=tokens,
-                        token_count=len(tokens),
-                        ic_score=ic_score
-                    )
-                    
-                    self.metadata_cache.put(row.cui, metadata)
-                    cached[row.cui] = metadata
-                    
+                for row in res:
+                    tokens = CUIMetadata.tokenize(row.term)
+                    ic = self.hierarchy.get_ic_score(row.cui)
+                    meta = CUIMetadata(row.cui, row.term, row.types or [], tokens, len(tokens), ic)
+                    self.metadata_cache.put(row.cui, meta)
+                    cached[row.cui] = meta
             except Exception as e:
-                logger.error(f"Error fetching metadata: {e}")
+                log(f"Metadata fetch error: {e}", "ERROR")
         
         return cached
 
-# ========================= HIGH-PERFORMANCE PIPELINE =========================
+# ========================= MAIN SYSTEM =========================
 
-class HighPerformanceReductionPipeline:
-    """Complete pipeline"""
+class CUIReductionSystem:
+    """
+    Complete CUI reduction system.
+    Auto-configures from UMLS on first use.
+    """
     
     def __init__(
         self,
-        hierarchy: HierarchyClient,
-        config: LearnedConfiguration,
-        bq_client: bigquery.Client,
         project_id: str,
-        dataset_id: str
+        dataset_id: str,
+        network_path: str,
+        ic_scores: Optional[Dict[str, float]] = None
     ):
-        self.pre_filter = FastCUIPreFilter(hierarchy)
-        self.clusterer = FastHierarchicalClusterer(hierarchy)
-        self.scorer = OptimizedCUIScorer(config, hierarchy, bq_client, project_id, dataset_id)
-        self.hierarchy = hierarchy
-        self.config = config
+        """
+        Initialize system.
+        
+        Args:
+            project_id: GCP project ID
+            dataset_id: UMLS dataset ID
+            network_path: Path to NetworkX pickle file
+            ic_scores: Optional pre-computed IC scores
+        """
+        log("="*70)
+        log("INITIALIZING CUI REDUCTION SYSTEM")
+        log("="*70)
+        
+        # Load network
+        log("Loading UMLS network...")
+        with open(network_path, 'rb') as f:
+            network = pickle.load(f)
+        log(f"Network loaded: {network.number_of_nodes()} nodes")
+        
+        # Initialize components
+        self.bq = bigquery.Client(project=project_id)
+        self.hierarchy = HierarchyClient(network, ic_scores)
+        self.auto_config = AutoConfiguration(self.bq, project_id, dataset_id)
+        self.project_id = project_id
+        self.dataset_id = dataset_id
+        
+        # Get configuration (computes on first call, cached after)
+        self.config = self.auto_config.get_config()
+        
+        # Initialize pipeline stages
+        self.prefilter = PreFilter(self.hierarchy)
+        self.clusterer = Clusterer(self.hierarchy)
+        self.scorer = Scorer(self.config, self.hierarchy, self.bq, project_id, dataset_id)
+        
+        log("="*70)
+        log("SYSTEM READY")
+        log("="*70)
     
-    @monitor_performance("full_pipeline")
+    @monitor_perf("full_pipeline")
     def reduce(
         self,
         cuis: List[str],
         embeddings: Dict[str, np.ndarray],
         usage_context: UsageContext = UsageContext.QUERY
     ) -> ReductionResult:
-        overall_start = time.time()
+        """
+        Reduce CUI set.
         
-        thread_safe_print(f"\n{'='*70}")
-        thread_safe_print(f"REDUCTION PIPELINE: {len(cuis)} CUIs")
-        thread_safe_print(f"{'='*70}")
+        Args:
+            cuis: List of CUI identifiers
+            embeddings: CUI embeddings dictionary
+            usage_context: Query or document context
         
-        try:
-            # Stage 1
-            filtered_cuis, prefilter_stats = self.pre_filter.prefilter(cuis, self.config.params)
-            
-            # Stage 2
-            clusters = self.clusterer.cluster(filtered_cuis, self.config.params)
-            cluster_representatives = []
-            for cluster_cuis in clusters.values():
-                if len(cluster_cuis) == 1:
-                    cluster_representatives.append(cluster_cuis[0])
-                else:
-                    best_cui = max(cluster_cuis, key=lambda c: self.hierarchy.get_ic_score(c))
-                    cluster_representatives.append(best_cui)
-            
-            # Stage 3
-            scored_embeddings = {cui: emb for cui, emb in embeddings.items() if cui in cluster_representatives}
-            scored_cuis = self.scorer.score_batch(cluster_representatives, scored_embeddings)
-            
-            # Stage 4
-            retention_map = self._build_retention_map(scored_cuis)
-            
-            # Stage 5
-            sorted_cuis = sorted(scored_cuis.keys(), key=lambda c: scored_cuis[c].completeness_score, reverse=True)
-            max_final = int(self.config.params.get(f'final_cui_count_{usage_context.value}', 3))
-            selected_cuis = self._select_final_cuis(sorted_cuis, scored_cuis, retention_map, max_final)
-            
-            total_time = (time.time() - overall_start) * 1000
-            
-            thread_safe_print(f"COMPLETE: {len(cuis)} → {len(selected_cuis)} in {total_time:.0f}ms")
-            
-            return ReductionResult(
-                mode=ScoringMode.REDUCTION,
-                usage_context=usage_context,
-                input_cuis=cuis,
-                output_cuis=selected_cuis,
-                scores=scored_cuis,
-                retention_map=retention_map,
-                processing_time_ms=total_time,
-                metadata={'prefilter_stats': prefilter_stats}
-            )
-            
-        except Exception as e:
-            logger.error(f"Pipeline failed: {e}")
-            raise
+        Returns:
+            ReductionResult with selected CUIs and scoring details
+        """
+        start = time.time()
+        
+        log(f"\n{'='*70}")
+        log(f"REDUCTION: {len(cuis)} CUIs ({usage_context.value})")
+        log(f"{'='*70}")
+        
+        # Stage 1: Pre-filter
+        filtered, stats = self.prefilter.filter(cuis, self.config['params'])
+        
+        # Stage 2: Cluster
+        clusters = self.clusterer.cluster(filtered, self.config['params'])
+        reps = []
+        for cluster in clusters.values():
+            reps.append(max(cluster, key=lambda c: self.hierarchy.get_ic_score(c)) if len(cluster) > 1 else cluster[0])
+        
+        log(f"[Clustering] {len(reps)} representatives")
+        
+        # Stage 3: Score
+        scored_embs = {c: e for c, e in embeddings.items() if c in reps}
+        scored = self.scorer.score(reps, scored_embs)
+        
+        # Stage 4: Retention map
+        retention = self._build_retention_map(scored)
+        
+        # Stage 5: Select final
+        sorted_cuis = sorted(scored.keys(), key=lambda c: scored[c].completeness_score, reverse=True)
+        max_final = int(self.config['params'].get(f'final_cui_count_{usage_context.value}', 3))
+        selected = self._select_final(sorted_cuis, scored, retention, max_final)
+        
+        elapsed = (time.time() - start) * 1000
+        
+        log(f"\n{'='*70}")
+        log(f"COMPLETE: {len(cuis)} → {len(selected)} in {elapsed:.0f}ms")
+        log(f"{'='*70}")
+        
+        return ReductionResult(
+            ScoringMode.REDUCTION,
+            usage_context,
+            cuis,
+            selected,
+            scored,
+            retention,
+            elapsed,
+            {'prefilter_stats': stats}
+        )
     
-    def _build_retention_map(self, scored_cuis: Dict[str, CUIScore]) -> Dict[str, List[str]]:
-        retention_top_k = int(self.config.params.get('retention_top_k', 50))
-        top_cuis = sorted(scored_cuis.keys(), key=lambda c: scored_cuis[c].completeness_score, reverse=True)[:retention_top_k]
+    def _build_retention_map(self, scored: Dict[str, CUIScore]) -> Dict[str, List[str]]:
+        top_k = int(self.config['params'].get('retention_top_k', 50))
+        top = sorted(scored.keys(), key=lambda c: scored[c].completeness_score, reverse=True)[:top_k]
         
-        retention_map = {}
-        for cui_a in top_cuis:
-            metadata_a = self.scorer.metadata_cache.get(cui_a)
-            if not metadata_a:
+        ret_map = {}
+        for cui_a in top:
+            meta_a = self.scorer.metadata_cache.get(cui_a)
+            if not meta_a:
                 continue
             
-            tokens_a = set(metadata_a.tokens)
+            tokens_a = set(meta_a.tokens)
             retained = []
             
-            for cui_b in top_cuis:
+            for cui_b in top:
                 if cui_a == cui_b:
                     continue
-                metadata_b = self.scorer.metadata_cache.get(cui_b)
-                if not metadata_b:
+                meta_b = self.scorer.metadata_cache.get(cui_b)
+                if not meta_b:
                     continue
                 
-                tokens_b = set(metadata_b.tokens)
+                tokens_b = set(meta_b.tokens)
                 if tokens_b and tokens_b.issubset(tokens_a) and len(tokens_a) > len(tokens_b):
                     retained.append(cui_b)
             
-            retention_map[cui_a] = retained
+            ret_map[cui_a] = retained
         
-        return retention_map
+        return ret_map
     
-    def _select_final_cuis(
+    def _select_final(
         self,
         sorted_cuis: List[str],
-        scored_cuis: Dict[str, CUIScore],
-        retention_map: Dict[str, List[str]],
+        scored: Dict[str, CUIScore],
+        retention: Dict[str, List[str]],
         max_cuis: int
     ) -> List[str]:
         if len(sorted_cuis) <= max_cuis:
@@ -1376,221 +902,156 @@ class HighPerformanceReductionPipeline:
             if len(selected) >= max_cuis:
                 break
             
-            is_retained = any(cui in retention_map.get(sel, []) for sel in selected)
-            
-            if not is_retained:
+            if not any(cui in retention.get(s, []) for s in selected):
                 selected.append(cui)
         
         return selected
+    
+    def get_performance_summary(self) -> Dict:
+        """Get performance metrics"""
+        return perf_monitor.get_summary()
+    
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics"""
+        return {
+            'hierarchy_ancestors': self.hierarchy.ancestors_cache.get_stats(),
+            'hierarchy_ic': self.hierarchy.ic_cache.get_stats(),
+            'metadata': self.scorer.metadata_cache.get_stats()
+        }
 
-# ========================= UTILITY FUNCTIONS =========================
+# ========================= UTILITIES =========================
 
 class CUIExtractor:
+    """CUI extraction via API"""
     def __init__(self, api_url: str):
         self.api_url = api_url
         self.session = requests.Session()
         
         try:
-            tmp = subprocess.run(
+            token = subprocess.run(
                 ['gcloud', 'auth', 'print-identity-token'],
-                stdout=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=30
-            )
-            token = tmp.stdout.strip()
-            self.headers = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json"
-            }
-        except Exception as e:
-            logger.error(f"Failed to get auth token: {e}")
+                stdout=subprocess.PIPE, universal_newlines=True, timeout=30
+            ).stdout.strip()
+            self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        except Exception:
             self.headers = {"Content-Type": "application/json"}
         
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
     
-    @monitor_performance("cui_extraction")
-    def extract_for_text(self, text: str) -> List[str]:
+    def extract(self, text: str) -> List[str]:
         try:
-            payload = {"query_texts": [text], "top_k": 3}
-            resp = self.session.post(self.api_url, headers=self.headers, json=payload, timeout=200)
+            resp = self.session.post(self.api_url, headers=self.headers, 
+                                     json={"query_texts": [text], "top_k": 3}, timeout=200)
             resp.raise_for_status()
-            data = resp.json()
-            
             cuis = []
-            for v in data.values():
+            for v in resp.json().values():
                 if isinstance(v, list):
                     cuis.extend(v)
-            
             return list(set(map(str, cuis)))
         except Exception as e:
-            logger.error(f"CUI extraction failed: {e}")
+            log(f"Extraction failed: {e}", "ERROR")
             return []
 
-def filter_by_sab(cuis: List[str], project_id: str, dataset_id: str, allowed_sabs: List[str]) -> List[str]:
+def filter_by_sab(cuis: List[str], proj: str, ds: str, sabs: List[str]) -> List[str]:
+    """Filter CUIs by source vocabulary"""
     if not cuis:
         return []
     
-    try:
-        client = bigquery.Client(project=project_id)
-        filtered = []
+    client = bigquery.Client(project=proj)
+    filtered = []
+    
+    for i in range(0, len(cuis), 2000):
+        batch = cuis[i:i+2000]
+        query = f"SELECT DISTINCT CUI FROM `{proj}.{ds}.MRCONSO` WHERE CUI IN UNNEST(@c) AND SAB IN UNNEST(@s)"
+        res = client.query(query, query_parameters=[
+            bigquery.ArrayQueryParameter("c", "STRING", batch),
+            bigquery.ArrayQueryParameter("s", "STRING", sabs)
+        ], timeout=200).result()
+        filtered.extend([r.CUI for r in res])
+    
+    return filtered
+
+def fetch_embeddings(cuis: List[str], proj: str, ds: str, table: str) -> Dict[str, np.ndarray]:
+    """Fetch CUI embeddings"""
+    client = bigquery.Client(project=proj)
+    embs = {}
+    
+    for i in range(0, len(cuis), 2000):
+        batch = cuis[i:i+2000]
+        query = f"SELECT CUI, embedding FROM `{proj}.{ds}.{table}` WHERE CUI IN UNNEST(@c)"
+        res = client.query(query, query_parameters=[
+            bigquery.ArrayQueryParameter("c", "STRING", batch)
+        ], timeout=200).result()
         
-        for i in range(0, len(cuis), 2000):
-            batch = cuis[i:i+2000]
-            query = f"""
-            SELECT DISTINCT CUI
-            FROM `{project_id}.{dataset_id}.MRCONSO`
-            WHERE CUI IN UNNEST(@cuis) AND SAB IN UNNEST(@sabs)
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("cuis", "STRING", batch),
-                    bigquery.ArrayQueryParameter("sabs", "STRING", allowed_sabs)
-                ]
-            )
-            
-            results = client.query(query, job_config=job_config, timeout=200).result()
-            filtered.extend([row.CUI for row in results])
-        
-        return filtered
-    except Exception as e:
-        logger.error(f"SAB filter failed: {e}")
-        return []
+        for r in res:
+            embs[r.CUI] = np.array(r.embedding)
+    
+    return embs
 
-def fetch_cui_embeddings(
-    cuis: List[str],
-    project_id: str,
-    dataset_id: str,
-    table_name: str
-) -> Dict[str, np.ndarray]:
-    client = bigquery.Client(project=project_id)
-    embeddings = {}
-    
-    try:
-        for i in range(0, len(cuis), 2000):
-            batch = cuis[i:i+2000]
-            query = f"""
-            SELECT CUI, embedding
-            FROM `{project_id}.{dataset_id}.{table_name}`
-            WHERE CUI IN UNNEST(@cuis)
-            """
-            
-            job_config = bigquery.QueryJobConfig(
-                query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)]
-            )
-            
-            results = client.query(query, job_config=job_config, timeout=200).result()
-            
-            for row in results:
-                embeddings[row.CUI] = np.array(row.embedding)
-    except Exception as e:
-        logger.error(f"Embedding fetch failed: {e}")
-    
-    return embeddings
-
-# ========================= INITIALIZATION & USAGE =========================
-
-def initialize_system(
-    project_id: str,
-    dataset_id: str,
-    config_dir: str = "./config",
-    sample_size: int = 10000
-):
-    """
-    Initialize system by computing configuration from UMLS.
-    Run this ONCE to create configuration files.
-    """
-    thread_safe_print("="*70)
-    thread_safe_print("INITIALIZING CUI REDUCTION SYSTEM")
-    thread_safe_print("="*70)
-    
-    # Compute configuration from UMLS
-    bq_client = bigquery.Client(project=project_id)
-    stats_computer = UMLSStatisticsComputer(bq_client, project_id, dataset_id)
-    
-    config = stats_computer.compute_configuration(
-        config_name="default",
-        sample_size=sample_size
-    )
-    
-    # Save to YAML
-    config_manager = SimpleConfigManager(config_dir)
-    config_manager.save_configuration(config)
-    
-    thread_safe_print("="*70)
-    thread_safe_print("INITIALIZATION COMPLETE")
-    thread_safe_print(f"Configuration saved to: {config_dir}/default.yaml")
-    thread_safe_print("="*70)
-    
-    return config
+# ========================= EXAMPLE USAGE =========================
 
 def main():
     """Example usage"""
     
     # Configuration
-    PROJECT_ID = "your-project"
+    PROJECT_ID = "your-project-id"
     DATASET_ID = "umls_dataset"
     API_URL = "your-api-url"
     EMBEDDING_TABLE = "cui_embeddings"
-    NETWORK_PKL_PATH = "/path/to/network.pkl"
+    NETWORK_PATH = "/path/to/network.pkl"
     ALLOWED_SABS = ['ICD10CM', 'ICD10PCS', 'ICD9CM', 'SNOMEDCT_US', 'LOINC']
-    CONFIG_DIR = "./config"
     
-    # Step 1: Initialize (RUN ONCE)
-    # Uncomment to compute configuration from UMLS
-    # initialize_system(PROJECT_ID, DATASET_ID, CONFIG_DIR, sample_size=10000)
+    # Initialize system (auto-configures from UMLS)
+    system = CUIReductionSystem(PROJECT_ID, DATASET_ID, NETWORK_PATH)
     
-    # Step 2: Load network
-    thread_safe_print("Loading UMLS network...")
-    with open(NETWORK_PKL_PATH, "rb") as f:
-        UMLS_NETWORK_OBJ = pickle.load(f)
-    thread_safe_print(f"Network loaded: {UMLS_NETWORK_OBJ.number_of_nodes()} nodes")
-    
-    # Step 3: Load configuration
-    bq_client = bigquery.Client(project=PROJECT_ID)
-    hierarchy = HierarchyClient(UMLS_NETWORK_OBJ)
-    config_manager = SimpleConfigManager(CONFIG_DIR)
-    config = config_manager.get_configuration("default")
-    
-    # Step 4: Initialize pipeline
-    pipeline = HighPerformanceReductionPipeline(
-        hierarchy=hierarchy,
-        config=config,
-        bq_client=bq_client,
-        project_id=PROJECT_ID,
-        dataset_id=DATASET_ID
-    )
-    
+    # Initialize extractor
     extractor = CUIExtractor(API_URL)
     
-    # Step 5: Process
+    # Process examples
     texts = [
         "Patient has severe pain in left knee with swelling",
-        "Chest pain radiating to left arm"
+        "Chest pain radiating to left arm",
+        "Diabetes mellitus type 2 with hyperglycemia"
     ]
     
     for text in texts:
-        thread_safe_print(f"\nProcessing: {text}")
+        log(f"\nProcessing: {text}")
         
-        extracted = extractor.extract_for_text(text)
+        # Extract CUIs
+        extracted = extractor.extract(text)
+        log(f"Extracted: {len(extracted)} CUIs")
+        
+        # Filter by SAB
         filtered = filter_by_sab(extracted, PROJECT_ID, DATASET_ID, ALLOWED_SABS)
-        embeddings = fetch_cui_embeddings(filtered, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
+        log(f"Filtered: {len(filtered)} CUIs")
         
-        result = pipeline.reduce(filtered, embeddings, UsageContext.QUERY)
+        # Fetch embeddings
+        embeddings = fetch_embeddings(filtered, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
+        log(f"Embeddings: {len(embeddings)} CUIs")
         
-        thread_safe_print(f"\nFinal CUIs:")
+        # Reduce
+        result = system.reduce(filtered, embeddings, UsageContext.QUERY)
+        
+        # Output
+        log(f"\nFinal CUIs:")
         for cui in result.output_cuis:
-            score_obj = result.scores[cui]
-            thread_safe_print(f"  {score_obj.preferred_term}: {score_obj.completeness_score:.3f}")
+            score = result.scores[cui]
+            log(f"  {score.preferred_term} ({cui}): {score.completeness_score:.3f}")
     
     # Performance summary
-    thread_safe_print("\n" + "="*70)
-    thread_safe_print("PERFORMANCE SUMMARY")
-    thread_safe_print("="*70)
-    summary = perf_monitor.get_summary()
-    for metric, stats in summary.items():
-        thread_safe_print(f"{metric}: Mean={stats['mean']:.0f}ms, P95={stats['p95']:.0f}ms")
+    log("\n" + "="*70)
+    log("PERFORMANCE SUMMARY")
+    log("="*70)
+    for metric, stats in system.get_performance_summary().items():
+        log(f"{metric}: {stats['mean']:.0f}ms (p95: {stats['p95']:.0f}ms)")
+    
+    # Cache stats
+    log("\n" + "="*70)
+    log("CACHE STATISTICS")
+    log("="*70)
+    for name, stats in system.get_cache_stats().items():
+        log(f"{name}: {stats['hit_rate']:.1%} hit rate, {stats['size']} items")
 
 if __name__ == "__main__":
     main()
