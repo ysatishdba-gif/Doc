@@ -1,26 +1,27 @@
 """
-CUI Reduction System — Semantic Group + Tree + IC
-==================================================
-Reduces 20K+ extracted CUIs to a clean set for search and topics.
+CUI Reduction System — Semantic Group + Tree + IC + Embedding Sub-Clusters
+==========================================================================
+Reduces 20K+ extracted CUIs and organizes into topics.
 
 Pipeline:
-  1. CUI extraction API → raw CUIs (count logged)
-  2. SAB filter → keep target vocabularies (count logged)
-  3. Semantic type grouping → query BQ MRSTY, separate CUIs into
-     clinical categories (Diagnosis, Procedure, Finding, etc.)
-  4. Per group: build full hierarchy (no depth limit) from
-     SAB-filtered CUIs only
-  5. Per group: cluster related CUIs via shared ancestry
-  6. Per cluster: keep CUIs by IC — remove ancestors subsumed by
-     more specific descendants, keep ALL specific CUIs (not just
-     one representative)
-  7. Ungroup all semantic groups → merge → deduplicate → final set
+  1. CUI extraction API → raw CUIs
+  2. SAB filter → keep target vocabularies
+  3. Semantic type grouping → separate Diagnosis, Procedure, Finding, etc.
+  4. Per group: cluster related CUIs via shared ancestry (union-find)
+  5. Per cluster: remove ancestors subsumed by higher-IC descendants
+     ** only two removal points: step 2 and step 5 **
+  6. Fetch pre-computed embeddings for surviving CUIs (one BQ query)
+  7. Per cluster: sub-cluster survivors by embedding cosine similarity
+     using agglomerative clustering (no CUIs removed, purely organizational)
+  8. Each sub-cluster = one topic containing its CUIs
+  9. Ungroup all → deduplicate → final output
 
-No tokenization. No embeddings. No hardcoded thresholds.
-UMLS hierarchy + IC + semantic types = full signal.
+Output:
+  topics: {topic_id: [cui1, cui2, ...]}
+  All CUIs across all topics = reduced CUIs for search
 
 Requirements:
-  pip install google-cloud-bigquery networkx numpy requests
+  pip install google-cloud-bigquery networkx numpy scipy requests
 """
 
 import time
@@ -29,7 +30,6 @@ import logging
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, deque, OrderedDict
-from enum import Enum
 from functools import wraps
 
 import numpy as np
@@ -37,6 +37,8 @@ import networkx as nx
 import requests
 import subprocess
 from google.cloud import bigquery
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 
 # ========================= LOGGING =========================
@@ -144,14 +146,12 @@ class CUIMetadata:
 
 
 @dataclass
-class CUIAssessment:
-    cui: str
-    preferred_term: str
-    specificity: float              # IC / max_IC in set
-    semantic_group: str             # which group this came from
-    cluster_id: str = ""
-    retained_cuis: List[str] = field(default_factory=list)
-    explanation: str = ""
+class TopicInfo:
+    """One topic = one sub-cluster of semantically similar CUIs."""
+    topic_id: str
+    semantic_group: str
+    cuis: List[str]
+    cui_terms: Dict[str, str]   # cui → preferred_term
 
 
 @dataclass
@@ -159,67 +159,12 @@ class ReductionResult:
     context_string: str
     input_count: int
     after_sab_count: int
-    semantic_groups: Dict[str, int]         # group_name → count
-    cluster_counts: Dict[str, int]          # group_name → cluster count
-    reduced_cuis: List[str]
-    assessments: Dict[str, CUIAssessment]
-    removed: Dict[str, str]
+    semantic_groups: Dict[str, int]     # group → count before reduction
+    reduced_count: int
+    topics: Dict[str, TopicInfo]        # topic_id → TopicInfo
+    all_reduced_cuis: List[str]         # flat list, deduplicated
+    removed: Dict[str, str]             # cui → removal reason
     processing_time_ms: float
-
-
-# ========================= SEMANTIC GROUP MAPPING =========================
-# Maps TUI prefixes to clinical categories.
-# Derived from UMLS Semantic Network — not hardcoded thresholds,
-# these are structural ontology categories.
-
-_SEMANTIC_GROUPS = {
-    # Disorders
-    "T019": "Diagnosis", "T020": "Diagnosis", "T037": "Diagnosis",
-    "T046": "Diagnosis", "T047": "Diagnosis", "T048": "Diagnosis",
-    "T049": "Diagnosis", "T050": "Diagnosis", "T190": "Diagnosis",
-    "T191": "Diagnosis",   # Neoplastic Process (cancer)
-    # Procedures
-    "T058": "Procedure", "T059": "Procedure", "T060": "Procedure",
-    "T061": "Procedure",
-    # Findings
-    "T033": "Finding", "T034": "Finding", "T184": "Finding",
-    # Anatomy
-    "T017": "Anatomy", "T021": "Anatomy", "T022": "Anatomy",
-    "T023": "Anatomy", "T024": "Anatomy", "T025": "Anatomy",
-    "T026": "Anatomy", "T029": "Anatomy", "T030": "Anatomy",
-    # Chemicals & Drugs
-    "T109": "Substance", "T110": "Substance", "T114": "Substance",
-    "T115": "Substance", "T116": "Substance", "T118": "Substance",
-    "T119": "Substance", "T121": "Substance", "T122": "Substance",
-    "T123": "Substance", "T124": "Substance", "T125": "Substance",
-    "T126": "Substance", "T127": "Substance", "T129": "Substance",
-    "T130": "Substance", "T131": "Substance", "T195": "Substance",
-    "T196": "Substance", "T197": "Substance", "T200": "Substance",
-    # Physiology
-    "T032": "Physiology", "T039": "Physiology", "T040": "Physiology",
-    "T041": "Physiology", "T042": "Physiology", "T043": "Physiology",
-    "T044": "Physiology", "T045": "Physiology",
-    # Living Beings
-    "T004": "Organism", "T005": "Organism", "T007": "Organism",
-    "T008": "Organism", "T010": "Organism", "T011": "Organism",
-    "T012": "Organism", "T013": "Organism", "T014": "Organism",
-    "T015": "Organism", "T016": "Organism",
-    # Concepts
-    "T078": "Concept", "T079": "Concept", "T080": "Concept",
-    "T081": "Concept", "T082": "Concept", "T089": "Concept",
-    "T102": "Concept", "T169": "Concept", "T170": "Concept",
-    "T171": "Concept", "T185": "Concept",
-    # Objects & Devices
-    "T073": "Object", "T074": "Object", "T075": "Object",
-}
-
-
-def get_semantic_group(tuis: List[str]) -> str:
-    """Map a list of TUIs to a semantic group. First match wins."""
-    for tui in tuis:
-        if tui in _SEMANTIC_GROUPS:
-            return _SEMANTIC_GROUPS[tui]
-    return "Other"
 
 
 # ========================= HIERARCHY CLIENT =========================
@@ -252,7 +197,6 @@ class HierarchyClient:
         return ic
 
     def _depth_to_root(self, cui: str) -> int:
-        """Full BFS to root — no depth limit."""
         if not self.network.has_node(cui):
             return 0
         visited, q, depth = {cui}, deque([cui]), 0
@@ -314,7 +258,7 @@ _BQ_BATCH_SIZE = 5000
 
 
 class MetadataFetcher:
-    """Batched BQ fetch — gets preferred term, semantic types, SABs."""
+    """Batched BQ fetch — preferred term, semantic types, SABs."""
 
     def __init__(self, bq: bigquery.Client, pid: str, did: str,
                  hierarchy: HierarchyClient, cache_size: int):
@@ -372,6 +316,57 @@ class MetadataFetcher:
         return result
 
 
+# ========================= EMBEDDING FETCHER =========================
+
+class EmbeddingFetcher:
+    """Fetches pre-computed CUI embeddings from BQ."""
+
+    def __init__(self, bq: bigquery.Client, pid: str, did: str,
+                 embedding_table: str):
+        self.bq = bq
+        self.pid = pid
+        self.did = did
+        self.embedding_table = embedding_table
+        self._cache = Cache(50_000)
+
+    @timed("embedding_fetch")
+    def fetch(self, cuis: List[str]) -> Dict[str, np.ndarray]:
+        result, missing = {}, []
+        for c in cuis:
+            cached = self._cache.get(c)
+            if cached is not None:
+                result[c] = cached
+            else:
+                missing.append(c)
+
+        if not missing:
+            return result
+
+        for i in range(0, len(missing), _BQ_BATCH_SIZE):
+            batch = missing[i:i + _BQ_BATCH_SIZE]
+            query = f"""
+            SELECT cui, embedding
+            FROM `{self.pid}.{self.did}.{self.embedding_table}`
+            WHERE cui IN UNNEST(@cuis)
+            """
+            jc = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+            ])
+            try:
+                for row in self.bq.query(
+                        query, job_config=jc, timeout=300).result():
+                    vec = np.array(row.embedding, dtype=np.float32)
+                    norm = np.linalg.norm(vec)
+                    if norm > 0:
+                        vec = vec / norm
+                    self._cache.put(row.cui, vec)
+                    result[row.cui] = vec
+            except Exception as e:
+                log(f"Embedding fetch error (batch {i}): {e}", "ERROR")
+
+        return result
+
+
 # ========================= SAB FILTER =========================
 
 class SABFilter:
@@ -395,24 +390,28 @@ class SABFilter:
         return kept, removed
 
 
-# ========================= SEMANTIC GROUPER =========================
+# ========================= SEMANTIC GROUPER =============================
+# No hardcoded mapping. Semantic type names (STY) come directly from
+# BigQuery MRSTY table via metadata. Each CUI's first semantic type
+# name becomes its group. Examples from BQ: "Disease or Syndrome",
+# "Therapeutic or Preventive Procedure", "Finding", "Body Part, Organ,
+# or Organ Component", etc.
 
 class SemanticGrouper:
-    """Groups CUIs by semantic type category from BQ metadata."""
-
     @staticmethod
     @timed("semantic_grouping")
     def group(cuis: List[str],
               metadata: Dict[str, CUIMetadata]
               ) -> Dict[str, List[str]]:
-        """Returns {group_name: [cuis]}. A CUI goes into its
-        primary semantic group based on TUI mapping."""
+        """Groups CUIs by their first semantic type name from BQ MRSTY."""
         groups: Dict[str, List[str]] = defaultdict(list)
         for cui in cuis:
             meta = metadata.get(cui)
             if not meta:
                 continue
-            grp = get_semantic_group(meta.semantic_type_ids)
+            # Use first semantic type name directly from BQ
+            grp = (meta.semantic_types[0]
+                   if meta.semantic_types else "Unknown")
             groups[grp].append(cui)
         return dict(groups)
 
@@ -420,8 +419,6 @@ class SemanticGrouper:
 # ========================= UNION-FIND =========================
 
 class _UnionFind:
-    """Path-compressed union-find for clustering."""
-
     def __init__(self, items):
         self._parent = {x: x for x in items}
         self._rank = {x: 0 for x in items}
@@ -449,42 +446,35 @@ class _UnionFind:
         return dict(clusters)
 
 
-# ========================= CLUSTER + IC SELECT =========================
+# ========================= HIERARCHY CLUSTER + IC REMOVAL ===========
 
-class ClusterAndSelect:
+class HierarchyClusterAndRemove:
     """
     Per semantic group:
-      1. Build clusters via shared ancestry (union-find)
-      2. Within each cluster, remove ancestors that are subsumed
-         by more specific descendants (higher IC)
-      3. Keep ALL surviving CUIs — not just one representative
-
-    "Subsumed" means: if child has IC >= ancestor IC and child
-    is a descendant of ancestor in the hierarchy, ancestor is
-    redundant within this cluster.
+      1. Cluster via shared ancestry (union-find)
+      2. Within each cluster, remove ancestors subsumed by
+         higher-IC descendants
+      3. Keep ALL surviving CUIs (not just representative)
     """
 
     def __init__(self, hierarchy: HierarchyClient):
         self.hierarchy = hierarchy
 
-    @timed("cluster_and_select")
+    @timed("hierarchy_cluster_remove")
     def run(
         self,
         cuis: List[str],
         metadata: Dict[str, CUIMetadata],
         group_name: str,
-    ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str], int]:
+    ) -> Tuple[Dict[str, List[str]], Dict[str, str]]:
         """
         Returns:
-          surviving: CUIs kept from this group
-          retention_map: surviving_cui → [ancestors it subsumes]
-          removed: removed_cui → explanation
-          cluster_count: number of clusters formed
+          clusters: {cluster_id: [surviving cuis]}
+          removed: {cui: reason}
         """
         if not cuis:
-            return [], {}, {}, 0
+            return {}, {}
 
-        # --- Step 1: Cluster via hierarchy ---
         cui_set = set(cuis)
         uf = _UnionFind(cuis)
 
@@ -495,21 +485,19 @@ class ClusterAndSelect:
                     uf.union(cui, p)
                 parent_to_children[p].append(cui)
 
-        # Siblings (shared parent in FULL graph) → same cluster
         for p, children in parent_to_children.items():
             if len(children) > 1:
                 first = children[0]
                 for other in children[1:]:
                     uf.union(first, other)
 
-        clusters = uf.groups()
+        raw_clusters = uf.groups()
 
-        # --- Step 2: Within each cluster, IC-based selection ---
-        all_surviving: List[str] = []
-        retention_map: Dict[str, List[str]] = {}
+        # IC-based ancestor removal within each cluster
+        final_clusters: Dict[str, List[str]] = {}
         all_removed: Dict[str, str] = {}
 
-        for _, members in clusters.items():
+        for cid, members in raw_clusters.items():
             member_set = set(members)
             ancestor_retainers: Dict[str, Set[str]] = defaultdict(set)
 
@@ -526,17 +514,12 @@ class ClusterAndSelect:
 
             to_remove = set(ancestor_retainers.keys())
             surviving = [c for c in members if c not in to_remove]
+
+            if surviving:
+                final_clusters[f"{group_name}_{cid}"] = surviving
+
+            # Removal explanations
             surviving_set = set(surviving)
-
-            all_surviving.extend(surviving)
-
-            for cui in surviving:
-                retention_map[cui] = []
-            for anc, retainers in ancestor_retainers.items():
-                for r in retainers:
-                    if r in surviving_set:
-                        retention_map[r].append(anc)
-
             for anc, retainers in ancestor_retainers.items():
                 best_retainers = [r for r in retainers
                                   if r in surviving_set]
@@ -555,7 +538,99 @@ class ClusterAndSelect:
                     all_removed[anc] = (
                         f"[{group_name}] subsumed by descendant")
 
-        return all_surviving, retention_map, all_removed, len(clusters)
+        return final_clusters, all_removed
+
+
+# ========================= EMBEDDING SUB-CLUSTERING ================
+
+class EmbeddingSubClusterer:
+    """
+    Takes a cluster of surviving CUIs and sub-clusters them
+    by embedding cosine similarity using agglomerative clustering.
+
+    No CUIs are removed — this is purely organizational.
+
+    Distance threshold is derived from the data:
+      mean pairwise distance within the cluster.
+    """
+
+    def __init__(self, embedding_fetcher: EmbeddingFetcher):
+        self.fetcher = embedding_fetcher
+
+    @timed("embedding_subcluster")
+    def subcluster_all(
+        self,
+        clusters: Dict[str, List[str]],
+        embeddings: Dict[str, np.ndarray],
+    ) -> Dict[str, List[str]]:
+        """
+        Input:  {cluster_id: [cuis]}
+        Output: {topic_id: [cuis]}  (sub-clusters become topics)
+
+        CUIs without embeddings stay in their own singleton topic.
+        """
+        topics: Dict[str, List[str]] = {}
+        topic_counter = 0
+
+        for cid, cuis in clusters.items():
+            # Separate CUIs with and without embeddings
+            with_emb = [c for c in cuis if c in embeddings]
+            without_emb = [c for c in cuis if c not in embeddings]
+
+            if len(with_emb) <= 1:
+                # 0 or 1 CUI with embedding — one topic per cluster
+                topic_id = f"topic_{topic_counter}"
+                topics[topic_id] = cuis
+                topic_counter += 1
+                continue
+
+            # Build embedding matrix
+            emb_matrix = np.array([embeddings[c] for c in with_emb])
+
+            # Cosine similarity → cosine distance
+            # embeddings are pre-normalized, so dot product = cosine
+            sim_matrix = emb_matrix @ emb_matrix.T
+            np.clip(sim_matrix, -1, 1, out=sim_matrix)
+            dist_matrix = 1.0 - sim_matrix
+            np.fill_diagonal(dist_matrix, 0)
+            # Fix floating point noise
+            dist_matrix = np.maximum(dist_matrix, 0)
+
+            # Derive threshold from data: mean pairwise distance
+            n = len(with_emb)
+            upper_tri = dist_matrix[np.triu_indices(n, k=1)]
+            if len(upper_tri) == 0 or np.std(upper_tri) < 1e-9:
+                # All identical — one topic
+                topic_id = f"topic_{topic_counter}"
+                topics[topic_id] = cuis
+                topic_counter += 1
+                continue
+
+            threshold = float(np.mean(upper_tri))
+
+            # Agglomerative clustering
+            condensed = squareform(dist_matrix, checks=False)
+            Z = linkage(condensed, method="average")
+            labels = fcluster(Z, t=threshold, criterion="distance")
+
+            # Group CUIs by sub-cluster label
+            sub_groups: Dict[int, List[str]] = defaultdict(list)
+            for cui, label in zip(with_emb, labels):
+                sub_groups[label].append(cui)
+
+            # Assign each sub-group as a topic
+            for sub_cuis in sub_groups.values():
+                topic_id = f"topic_{topic_counter}"
+                topics[topic_id] = sub_cuis
+                topic_counter += 1
+
+            # CUIs without embeddings — each gets its own topic
+            for cui in without_emb:
+                topic_id = f"topic_{topic_counter}"
+                topics[topic_id] = [cui]
+                topic_counter += 1
+
+        return topics
 
 
 # ========================= MAIN SYSTEM =========================
@@ -566,8 +641,13 @@ class CUIReductionSystem:
 
     Usage:
         system = CUIReductionSystem(project_id, dataset_id,
-                                     network, allowed_sabs)
+                                     network, allowed_sabs,
+                                     embedding_table)
         result = system.reduce(cuis, context_string)
+
+        result.topics         → {topic_id: TopicInfo}
+        result.all_reduced_cuis → flat deduplicated list for search
+        result.removed        → {cui: reason}
     """
 
     def __init__(
@@ -576,6 +656,7 @@ class CUIReductionSystem:
         dataset_id: str,
         network: nx.DiGraph,
         allowed_sabs: List[str],
+        embedding_table: str,
         ic_scores: Optional[Dict[str, float]] = None,
     ):
         self.bq = bigquery.Client(project=project_id)
@@ -586,9 +667,13 @@ class CUIReductionSystem:
             self.bq, project_id, dataset_id,
             self.hierarchy, cache_size)
         self.sab_filter = SABFilter(set(allowed_sabs))
-        self.selector = ClusterAndSelect(self.hierarchy)
+        self.cluster_remover = HierarchyClusterAndRemove(self.hierarchy)
+        self.emb_fetcher = EmbeddingFetcher(
+            self.bq, project_id, dataset_id, embedding_table)
+        self.sub_clusterer = EmbeddingSubClusterer(self.emb_fetcher)
 
-        log(f"System ready | sabs={allowed_sabs}")
+        log(f"System ready | sabs={allowed_sabs} | "
+            f"embeddings={embedding_table}")
 
     @timed("full_pipeline")
     def reduce(
@@ -622,93 +707,95 @@ class CUIReductionSystem:
         group_counts = {g: len(c) for g, c in sem_groups.items()}
         log(f"  Semantic groups: {group_counts}")
 
-        # ---- Step 4 + 5 + 6: Per group — hierarchy, cluster, IC select ----
-        all_surviving: List[str] = []
-        all_retention: Dict[str, List[str]] = {}
-        cluster_counts: Dict[str, int] = {}
-        all_assessments: Dict[str, CUIAssessment] = {}
+        # ---- Step 4 + 5: Per group — hierarchy cluster + IC removal ----
+        all_clusters: Dict[str, List[str]] = {}
+        total_removed = 0
 
         for group_name, group_cuis in sem_groups.items():
-            surviving, rmap, removed, n_clusters = self.selector.run(
+            clusters, removed = self.cluster_remover.run(
                 group_cuis, metadata, group_name)
-
-            all_surviving.extend(surviving)
-            all_retention.update(rmap)
             all_removed.update(removed)
-            cluster_counts[group_name] = n_clusters
+            total_removed += len(removed)
 
+            surviving = sum(len(c) for c in clusters.values())
             log(f"    {group_name}: {len(group_cuis)} -> "
-                f"{len(surviving)} ({n_clusters} clusters, "
+                f"{surviving} ({len(clusters)} clusters, "
                 f"{len(removed)} subsumed)")
 
-            # Build assessments for surviving CUIs from this group
-            group_ics = [metadata[c].ic_score
-                         for c in surviving if c in metadata]
-            max_ic = max(group_ics) if group_ics else 1.0
-            if max_ic <= 0 or not np.isfinite(max_ic):
-                max_ic = 1.0
+            all_clusters.update(clusters)
 
-            for cui in surviving:
-                meta = metadata.get(cui)
-                if not meta:
-                    continue
-                spec = meta.ic_score / max_ic
-                all_assessments[cui] = CUIAssessment(
-                    cui=cui,
-                    preferred_term=meta.preferred_term,
-                    specificity=spec if np.isfinite(spec) else 0.0,
-                    semantic_group=group_name,
-                    retained_cuis=rmap.get(cui, []),
-                )
+        # Collect all surviving CUIs
+        all_surviving = []
+        for cluster_cuis in all_clusters.values():
+            all_surviving.extend(cluster_cuis)
+        log(f"  After IC removal: {len(after_sab)} -> "
+            f"{len(all_surviving)}")
 
-        # ---- Step 7: Ungroup and deduplicate ----
-        seen = set()
-        reduced: List[str] = []
-        for cui in all_surviving:
-            if cui not in seen:
-                seen.add(cui)
-                reduced.append(cui)
+        if not all_surviving:
+            return self._empty(context_string, cuis, t0,
+                               removed=all_removed,
+                               after_sab=len(after_sab))
 
-        # Sort by specificity
-        reduced.sort(
-            key=lambda c: (all_assessments[c].specificity
-                           if c in all_assessments else 0),
-            reverse=True)
+        # ---- Step 6: Fetch embeddings for survivors only ----
+        embeddings = self.emb_fetcher.fetch(all_surviving)
+        emb_coverage = len(embeddings) / len(all_surviving)
+        log(f"  Embeddings: {len(embeddings)}/{len(all_surviving)} "
+            f"({emb_coverage:.0%} coverage)")
 
-        # Generate explanations
-        for cui in reduced:
-            a = all_assessments.get(cui)
-            if not a:
-                continue
-            meta = metadata.get(cui)
-            parts = [
-                f"Group: {a.semantic_group}",
-                f"IC ratio: {a.specificity:.2f}",
-            ]
-            if meta:
-                parts.append(f"Types: {meta.semantic_types}")
-            if a.retained_cuis:
-                n = len(a.retained_cuis)
-                names = [metadata[r].preferred_term
-                         for r in a.retained_cuis[:3]
-                         if r in metadata]
-                extra = f" +{n-3} more" if n > 3 else ""
-                parts.append(f"Subsumes: {names}{extra}")
-            a.explanation = " | ".join(parts)
+        # ---- Step 7: Sub-cluster by embedding similarity ----
+        topic_cuis = self.sub_clusterer.subcluster_all(
+            all_clusters, embeddings)
+        log(f"  Sub-clusters: {len(all_clusters)} clusters -> "
+            f"{len(topic_cuis)} topics")
+
+        # ---- Step 8 + 9: Build topics and deduplicate ----
+        # Map clusters back to semantic groups
+        cluster_to_group: Dict[str, str] = {}
+        for group_name in sem_groups:
+            for cid in all_clusters:
+                if cid.startswith(group_name + "_"):
+                    cluster_to_group[cid] = group_name
+
+        topics: Dict[str, TopicInfo] = {}
+        seen: Set[str] = set()
+        all_reduced: List[str] = []
+
+        for topic_id, t_cuis in topic_cuis.items():
+            cui_terms = {}
+            for c in t_cuis:
+                m = metadata.get(c)
+                cui_terms[c] = m.preferred_term if m else c
+                if c not in seen:
+                    seen.add(c)
+                    all_reduced.append(c)
+
+            # Semantic group from BQ metadata directly
+            sem_grp = "Unknown"
+            for c in t_cuis:
+                m = metadata.get(c)
+                if m and m.semantic_types:
+                    sem_grp = m.semantic_types[0]
+                    break
+
+            topics[topic_id] = TopicInfo(
+                topic_id=topic_id,
+                semantic_group=sem_grp,
+                cuis=t_cuis,
+                cui_terms=cui_terms,
+            )
 
         elapsed = (time.perf_counter() - t0) * 1000
-        log(f"  Final: {len(cuis)} -> {len(reduced)} "
-            f"({elapsed:.0f}ms)")
+        log(f"  Final: {len(cuis)} -> {len(all_reduced)} CUIs "
+            f"in {len(topics)} topics ({elapsed:.0f}ms)")
 
         return ReductionResult(
             context_string=context_string,
             input_count=len(cuis),
             after_sab_count=len(after_sab),
             semantic_groups=group_counts,
-            cluster_counts=cluster_counts,
-            reduced_cuis=reduced,
-            assessments={c: all_assessments[c] for c in reduced
-                         if c in all_assessments},
+            reduced_count=len(all_reduced),
+            topics=topics,
+            all_reduced_cuis=all_reduced,
             removed=all_removed,
             processing_time_ms=elapsed,
         )
@@ -720,9 +807,9 @@ class CUIReductionSystem:
             input_count=len(cuis),
             after_sab_count=after_sab,
             semantic_groups={},
-            cluster_counts={},
-            reduced_cuis=[],
-            assessments={},
+            reduced_count=0,
+            topics={},
+            all_reduced_cuis=[],
             removed=removed or {},
             processing_time_ms=(time.perf_counter() - t0) * 1000,
         )
@@ -794,6 +881,7 @@ def main():
     DATASET_ID = "your-dataset"
     API_URL = "https://your-api/extract"
     NETWORK_PATH = "networkx_cui_context_v1_1_0.pkl"
+    EMBEDDING_TABLE = "cui_embeddings"
     ALLOWED_SABS = ["ICD10CM", "ICD10PCS", "ICD9CM",
                      "SNOMEDCT_US", "LOINC"]
 
@@ -806,7 +894,8 @@ def main():
 
     # ---- Initialize ----
     system = CUIReductionSystem(
-        PROJECT_ID, DATASET_ID, network, ALLOWED_SABS)
+        PROJECT_ID, DATASET_ID, network, ALLOWED_SABS,
+        EMBEDDING_TABLE)
     extractor = CUIExtractor(API_URL)
 
     # ---- Process texts ----
@@ -826,10 +915,8 @@ def main():
             continue
 
         result = system.reduce(cuis, text)
-
-        log(f"  Result: {len(result.reduced_cuis)} reduced CUIs")
-        log(f"  Validation: {len(result.removed)} removed, "
-            f"{'CLEAN' if len(result.reduced_cuis) > 0 else 'EMPTY'}")
+        log(f"  {len(result.topics)} topics, "
+            f"{result.reduced_count} total CUIs")
 
     log(f"\n{'='*60}")
     log("PERFORMANCE:")
