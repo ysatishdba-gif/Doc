@@ -1,39 +1,36 @@
 """
-CUI Reduction System
-====================
+CUI Reduction System — Tree & IC Approach
+==========================================
 Reduces 20K+ extracted CUIs to two actionable tiers:
 
-  Search CUIs — mid-level concepts for document retrieval
+  Search CUIs — specific leaf concepts for document retrieval
   Topic CUIs  — broad cluster-head concepts for topic labels
 
-Scoring uses two signals:
-  1. Relevance  — cosine(text embedding, CUI embedding)
-     "Is this concept about what the clinical text says?"
-  2. Specificity — IC ratio within this CUI set
-     "Among relevant concepts, which is most precise?"
+Signal chain:
+  Extraction API → CUIs
+  UMLS hierarchy → tree structure (parent/child edges)
+  UMLS hierarchy → IC (information content = specificity)
+  Tree structure → clusters (shared ancestry groups related concepts)
+  IC → ranking (higher IC = more specific = better representative)
 
-Weights derived per-request from score variance (no BQ config query).
-Hierarchy edges handle deduplication — children retain ancestors.
-Every CUI gets a human-readable explanation of its fate.
-
-No tokenization. No stopwords. No text matching.
-The extraction API bridges text→CUI. Embeddings bridge CUI→relevance.
-UMLS hierarchy bridges CUI→specificity. That's the full signal chain.
+No tokenization. No stopwords. No text matching. No embeddings.
+The extraction API bridges text→CUI.
+The UMLS hierarchy provides everything else.
 
 Stages:
   1. Metadata fetch (batched BQ)
   2. SAB filter (keep target vocabularies)
-  3. Embed clinical text (Gemini embedding-001)
-  4. Score each CUI — relevance + specificity, variance-weighted
-  5. Remove noise (mean - std of score distribution)
-  6. Hierarchy retention (children retain ancestors)
-  7. Tier classification (depth from leaf in hierarchy)
+  3. Tree clustering (group related CUIs by shared ancestry)
+  4. Hierarchy retention (children retain ancestors, IC validated)
+  5. Tier classification (depth from leaf in hierarchy)
+
+Every CUI — surviving or removed — gets a traceable explanation.
 
 Requirements:
-  pip install google-cloud-bigquery google-genai networkx numpy requests
+  pip install google-cloud-bigquery networkx numpy requests
 """
 
-import math
+import os
 import time
 import threading
 import logging
@@ -48,6 +45,7 @@ import networkx as nx
 import requests
 import subprocess
 from google.cloud import bigquery
+
 
 # ========================= LOGGING =========================
 
@@ -167,14 +165,25 @@ class CUIAssessment:
     """Full assessment with explainability."""
     cui: str
     preferred_term: str
-    confidence: float           # combined score, 0-1
-    relevance: float            # text↔CUI cosine, 0-1
-    specificity: float          # IC / max_IC, 0-1
+    specificity: float          # IC / max_IC in set, 0-1
     tier: Tier = Tier.SEARCH
     depth_from_leaf: int = 0
+    cluster_id: str = ""
+    cluster_label: str = ""
     retained_cuis: List[str] = field(default_factory=list)
     explanation: str = ""
     ranking: int = 0
+
+
+@dataclass
+class ClusterInfo:
+    """Describes one semantic cluster."""
+    cluster_id: str
+    label: str
+    member_count: int
+    surviving_count: int
+    retained_count: int
+    ic_range: Tuple[float, float] = (0.0, 0.0)
 
 
 @dataclass
@@ -187,10 +196,10 @@ class ReductionResult:
     assessments: Dict[str, CUIAssessment]
     retention_map: Dict[str, List[str]]
     removed: Dict[str, str]
+    clusters: Dict[str, ClusterInfo]
     input_count: int
     processing_time_ms: float
     stage_counts: Dict[str, int] = field(default_factory=dict)
-    weights: Dict[str, float] = field(default_factory=dict)
 
 
 # ========================= HIERARCHY CLIENT =========================
@@ -304,75 +313,13 @@ class HierarchyClient:
         return found
 
 
-# ========================= TEXT EMBEDDER =========================
-
-class TextEmbedder:
-    """
-    Embeds clinical text using Gemini embedding-001 via Vertex AI.
-    - 3072 dimensions (matches pre-computed CUI embeddings)
-    - Pre-normalized by Gemini API (cosine = dot product)
-    - task_type configurable to match how CUIs were embedded
-    """
-
-    def __init__(self, project_id: str, location: str = "us-central1",
-                 task_type: str = "SEMANTIC_SIMILARITY"):
-        from google import genai
-        self._client = genai.Client(
-            vertexai=True,
-            project=project_id,
-            location=location,
-        )
-        self._model = "gemini-embedding-001"
-        self._task_type = task_type
-        self._expected_dim = 3072
-
-    @timed("text_embedding")
-    def embed(self, text: str,
-              cui_embeddings: Optional[Dict[str, np.ndarray]] = None
-              ) -> Optional[np.ndarray]:
-        """Embed clinical text. Optionally validates dimension match
-        against CUI embeddings."""
-        try:
-            from google.genai import types
-            resp = self._client.models.embed_content(
-                model=self._model,
-                contents=text,
-                config=types.EmbedContentConfig(
-                    task_type=self._task_type,
-                    output_dimensionality=self._expected_dim,
-                ),
-            )
-            emb = np.array(resp.embeddings[0].values, dtype=np.float64)
-
-            if emb.ndim != 1 or not np.all(np.isfinite(emb)):
-                log("Text embedding returned invalid array", "WARNING")
-                return None
-
-            # Dimension validation against CUI embeddings
-            if cui_embeddings:
-                sample_cui_emb = next(iter(cui_embeddings.values()))
-                if emb.shape[0] != sample_cui_emb.shape[0]:
-                    log(f"DIMENSION MISMATCH: text={emb.shape[0]}, "
-                        f"CUI={sample_cui_emb.shape[0]}. "
-                        f"Cosine comparisons will be invalid!", "ERROR")
-                    return None
-
-            log(f"  Text embedded: dim={emb.shape[0]}, "
-                f"norm={np.linalg.norm(emb):.4f}")
-            return emb
-
-        except Exception as e:
-            log(f"Text embedding failed: {e}", "ERROR")
-            return None
-
-
 # ========================= METADATA FETCHER =========================
 
 _BQ_BATCH_SIZE = 5000
 
 
 class MetadataFetcher:
-    """Batched BQ fetch for CUI metadata. No tokenization."""
+    """Batched BQ fetch for CUI metadata."""
 
     def __init__(self, bq: bigquery.Client, pid: str, did: str,
                  hierarchy: HierarchyClient, cache_size: int):
@@ -448,188 +395,125 @@ class SABFilter:
             if not meta:
                 removed[cui] = "no_metadata"
             elif not (set(meta.source_vocabs) & self.allowed):
-                sabs = meta.source_vocabs
-                removed[cui] = f"sab_not_allowed (has {sabs})"
+                removed[cui] = (f"sab_not_allowed "
+                                f"(has {meta.source_vocabs})")
             else:
                 kept.append(cui)
         return kept, removed
 
 
-# ========================= COSINE UTILITY =========================
+# ========================= TREE CLUSTERING =========================
 
-def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity with zero/NaN guard.
-    Gemini embedding-001 outputs are pre-normalized (L2 norm ≈ 1.0),
-    so cosine ≈ dot product. We still compute full cosine for safety.
-    Returns [0, 1] range by shifting from [-1, 1]."""
-    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-    if na == 0 or nb == 0:
-        return 0.0
-    raw = float(np.dot(a, b) / (na * nb))
-    # Shift [-1, 1] → [0, 1] so scores are always non-negative
-    return max(0.0, min(1.0, (raw + 1.0) / 2.0))
+class _UnionFind:
+    """Path-compressed union-find for clustering."""
+
+    def __init__(self, items):
+        self._parent = {x: x for x in items}
+        self._rank = {x: 0 for x in items}
+
+    def find(self, x):
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]
+            x = self._parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return
+        if self._rank[ra] < self._rank[rb]:
+            ra, rb = rb, ra
+        self._parent[rb] = ra
+        if self._rank[ra] == self._rank[rb]:
+            self._rank[ra] += 1
+
+    def groups(self) -> Dict[str, List[str]]:
+        clusters: Dict[str, List[str]] = defaultdict(list)
+        for item in self._parent:
+            clusters[self.find(item)].append(item)
+        return dict(clusters)
 
 
-# ========================= SCORER =========================
-
-class RelevanceSpecificityScorer:
+class TreeClusterer:
     """
-    Two-component scoring:
-      1. Relevance — cosine(text_embedding, cui_embedding)
-      2. Specificity — IC / max_IC in this set
+    Groups CUIs into semantic clusters using UMLS hierarchy.
 
-    Weights derived per-request from score variance:
-      Higher variance = more discriminative = higher weight.
-      This is the same principle as TF-IDF — features that
-      spread out carry more information.
+    Algorithm:
+      1. For each CUI, get parents from the FULL graph
+      2. If a parent is also in the CUI set -> union(CUI, parent)
+      3. If two CUIs share a parent (even if parent NOT in set)
+         -> union them (siblings = same cluster)
+      4. Connected components = clusters
     """
 
-    @staticmethod
-    @timed("scoring")
-    def score(
-        cuis: List[str],
-        metadata: Dict[str, CUIMetadata],
-        text_embedding: Optional[np.ndarray],
-        cui_embeddings: Dict[str, np.ndarray],
-    ) -> Tuple[Dict[str, CUIAssessment], Dict[str, float]]:
-        """Returns (assessments, weights_used)."""
+    def __init__(self, hierarchy: HierarchyClient):
+        self.hierarchy = hierarchy
 
-        # --- Compute raw scores ---
+    @timed("tree_clustering")
+    def cluster(self, cuis: List[str],
+                metadata: Dict[str, CUIMetadata]
+                ) -> Tuple[Dict[str, List[str]], Dict[str, ClusterInfo]]:
 
-        # Max IC from THIS set for normalization
-        ic_vals = [metadata[c].ic_score for c in cuis if c in metadata]
-        max_ic = max(ic_vals) if ic_vals else 1.0
-        if max_ic <= 0 or not np.isfinite(max_ic):
-            max_ic = 1.0
+        if not cuis:
+            return {}, {}
 
-        raw_relevance: Dict[str, float] = {}
-        raw_specificity: Dict[str, float] = {}
-        _MISSING = float("nan")
+        cui_set = set(cuis)
+        uf = _UnionFind(cuis)
+
+        parent_to_children: Dict[str, List[str]] = defaultdict(list)
 
         for cui in cuis:
-            meta = metadata.get(cui)
-            if not meta:
-                continue
+            for p in self.hierarchy.get_parents(cui):
+                if p in cui_set:
+                    uf.union(cui, p)
+                parent_to_children[p].append(cui)
 
-            # Specificity: always computable from UMLS
-            spec = meta.ic_score / max_ic
-            raw_specificity[cui] = spec if np.isfinite(spec) else 0.0
+        for p, children in parent_to_children.items():
+            if len(children) > 1:
+                first = children[0]
+                for other in children[1:]:
+                    uf.union(first, other)
 
-            # Relevance: needs both embeddings
-            if text_embedding is not None and cui in cui_embeddings:
-                raw_relevance[cui] = safe_cosine(
-                    text_embedding, cui_embeddings[cui])
-            else:
-                raw_relevance[cui] = _MISSING
+        groups = uf.groups()
+        clusters: Dict[str, List[str]] = {}
+        infos: Dict[str, ClusterInfo] = {}
 
-        # --- Backfill missing relevance with median ---
-        computed = [v for v in raw_relevance.values() if np.isfinite(v)]
-        median_rel = float(np.median(computed)) if computed else 0.5
-        for cui in raw_relevance:
-            if not np.isfinite(raw_relevance[cui]):
-                raw_relevance[cui] = median_rel
+        for root_id, members in groups.items():
+            best = max(members,
+                       key=lambda c: (metadata[c].ic_score
+                                      if c in metadata else 0))
+            best_meta = metadata.get(best)
+            label = best_meta.preferred_term if best_meta else best
 
-        # --- Derive weights from variance ---
-        scored_cuis = [c for c in cuis if c in raw_relevance
-                       and c in raw_specificity]
-        if not scored_cuis:
-            weights = {"relevance": 0.5, "specificity": 0.5}
-        else:
-            rel_vals = [raw_relevance[c] for c in scored_cuis]
-            spec_vals = [raw_specificity[c] for c in scored_cuis]
-            var_rel = float(np.std(rel_vals))
-            var_spec = float(np.std(spec_vals))
-            total_var = var_rel + var_spec
-            if total_var > 1e-10:
-                weights = {
-                    "relevance": var_rel / total_var,
-                    "specificity": var_spec / total_var,
-                }
-            else:
-                weights = {"relevance": 0.5, "specificity": 0.5}
+            ic_scores = [metadata[c].ic_score
+                         for c in members if c in metadata]
+            ic_range = ((min(ic_scores), max(ic_scores))
+                        if ic_scores else (0.0, 0.0))
 
-        # --- Combine into assessments ---
-        assessments: Dict[str, CUIAssessment] = {}
-        for cui in cuis:
-            meta = metadata.get(cui)
-            if not meta or cui not in raw_relevance:
-                continue
-
-            rel = raw_relevance[cui]
-            spec = raw_specificity[cui]
-            conf = (weights["relevance"] * rel
-                    + weights["specificity"] * spec)
-
-            assessments[cui] = CUIAssessment(
-                cui=cui,
-                preferred_term=meta.preferred_term,
-                confidence=conf,
-                relevance=rel,
-                specificity=spec,
+            cid = f"cluster_{root_id}"
+            clusters[cid] = members
+            infos[cid] = ClusterInfo(
+                cluster_id=cid,
+                label=label,
+                member_count=len(members),
+                surviving_count=0,
+                retained_count=0,
+                ic_range=ic_range,
             )
 
-        return assessments, weights
+        sizes = sorted([len(m) for m in clusters.values()], reverse=True)
+        log(f"  Clusters: {len(clusters)} groups from {len(cuis)} CUIs "
+            f"(top sizes: {sizes[:10]})")
 
-
-# ========================= NOISE REMOVAL =========================
-
-class NoiseRemover:
-    """
-    Threshold = mean - std of score distribution.
-    Guards: skip if < 3 CUIs or std ≈ 0.
-    """
-
-    @staticmethod
-    @timed("noise_removal")
-    def run(cuis: List[str],
-            assessments: Dict[str, CUIAssessment]
-            ) -> Tuple[List[str], Dict[str, str]]:
-
-        if len(cuis) < 3:
-            return cuis, {}
-
-        scores = [assessments[c].confidence
-                  for c in cuis
-                  if c in assessments
-                  and np.isfinite(assessments[c].confidence)]
-        if not scores:
-            return cuis, {}
-
-        mean_s = float(np.mean(scores))
-        std_s = float(np.std(scores))
-        if std_s < 1e-10:
-            return cuis, {}
-
-        threshold = max(mean_s - std_s, 0.0)
-
-        kept, removed = [], {}
-        for cui in cuis:
-            a = assessments.get(cui)
-            if not a:
-                removed[cui] = "no_assessment"
-            elif not np.isfinite(a.confidence):
-                removed[cui] = "non_finite_score"
-            elif a.confidence < threshold:
-                removed[cui] = (
-                    f"noise (score={a.confidence:.3f} < "
-                    f"threshold={threshold:.3f}, "
-                    f"relevance={a.relevance:.2f}, "
-                    f"specificity={a.specificity:.2f})")
-            else:
-                kept.append(cui)
-        return kept, removed
+        return clusters, infos
 
 
 # ========================= HIERARCHY RETENTION =========================
 
 class HierarchyRetainer:
     """
-    Removes redundant ancestors using hierarchy edges.
+    Within each cluster, removes redundant ancestors.
     A specific child retains (explains away) its less-specific ancestors.
-    BFS up from each CUI finds all ancestors in the surviving set.
-
-    This replaces both token-based deduplication and token-based
-    retention mapping — the hierarchy IS the redundancy map.
     """
 
     def __init__(self, hierarchy: HierarchyClient):
@@ -637,69 +521,75 @@ class HierarchyRetainer:
 
     @timed("hierarchy_retention")
     def run(
-        self, cuis: List[str], metadata: Dict[str, CUIMetadata],
+        self,
+        clusters: Dict[str, List[str]],
+        cluster_infos: Dict[str, ClusterInfo],
+        metadata: Dict[str, CUIMetadata],
     ) -> Tuple[List[str], Dict[str, List[str]], Dict[str, str]]:
-        """Returns (surviving, retention_map, removed)."""
 
-        cui_set = set(cuis)
-        # Track which ancestors are retained and by whom
-        ancestor_retainers: Dict[str, Set[str]] = defaultdict(set)
+        all_surviving: List[str] = []
+        retention_map: Dict[str, List[str]] = {}
+        all_removed: Dict[str, str] = {}
 
-        for cui in cuis:
-            meta = metadata.get(cui)
-            if not meta:
-                continue
+        for cid, members in clusters.items():
+            member_set = set(members)
+            ancestor_retainers: Dict[str, Set[str]] = defaultdict(set)
 
-            # Find all ancestors of this CUI in the surviving set
-            ancestors = self.hierarchy.find_ancestors_in_set(cui, cui_set)
+            for cui in members:
+                meta = metadata.get(cui)
+                if not meta:
+                    continue
+                ancestors = self.hierarchy.find_ancestors_in_set(
+                    cui, member_set)
+                for anc in ancestors:
+                    anc_meta = metadata.get(anc)
+                    if anc_meta and meta.ic_score >= anc_meta.ic_score:
+                        ancestor_retainers[anc].add(cui)
 
-            for anc in ancestors:
-                anc_meta = metadata.get(anc)
-                if anc_meta and meta.ic_score >= anc_meta.ic_score:
-                    ancestor_retainers[anc].add(cui)
+            to_remove = set(ancestor_retainers.keys())
+            surviving = [c for c in members if c not in to_remove]
+            surviving_set = set(surviving)
 
-        # Build results
-        to_remove = set(ancestor_retainers.keys())
-        surviving = [c for c in cuis if c not in to_remove]
-        surviving_set = set(surviving)
+            all_surviving.extend(surviving)
 
-        # Retention map: surviving CUI → list of ancestors it retains
-        retention_map: Dict[str, List[str]] = {c: [] for c in surviving}
-        for anc, retainers in ancestor_retainers.items():
-            for r in retainers:
-                if r in surviving_set:
-                    retention_map[r].append(anc)
+            for cui in surviving:
+                retention_map[cui] = []
+            for anc, retainers in ancestor_retainers.items():
+                for r in retainers:
+                    if r in surviving_set:
+                        retention_map[r].append(anc)
 
-        # Removed dict with explanation
-        removed: Dict[str, str] = {}
-        for anc, retainers in ancestor_retainers.items():
-            # Pick highest-IC retainer for the explanation
-            surviving_retainers = [r for r in retainers
-                                   if r in surviving_set]
-            if surviving_retainers:
-                best = max(surviving_retainers,
-                           key=lambda c: (metadata[c].ic_score
-                                          if c in metadata else 0))
-                b_meta = metadata.get(best)
-                a_meta = metadata.get(anc)
-                removed[anc] = (
-                    f"redundant — retained by {best} "
-                    f"'{b_meta.preferred_term if b_meta else '?'}' "
-                    f"(IC {b_meta.ic_score:.1f if b_meta else 0} > "
-                    f"{a_meta.ic_score:.1f if a_meta else 0})")
-            else:
-                removed[anc] = "redundant — retained by more specific CUI"
+            for anc, retainers in ancestor_retainers.items():
+                surviving_retainers = [r for r in retainers
+                                       if r in surviving_set]
+                if surviving_retainers:
+                    best = max(surviving_retainers,
+                               key=lambda c: (metadata[c].ic_score
+                                              if c in metadata else 0))
+                    b_meta = metadata.get(best)
+                    a_meta = metadata.get(anc)
+                    all_removed[anc] = (
+                        f"retained by {best} "
+                        f"'{b_meta.preferred_term if b_meta else '?'}' "
+                        f"(IC {b_meta.ic_score:.2f if b_meta else 0} >= "
+                        f"{a_meta.ic_score:.2f if a_meta else 0})")
+                else:
+                    all_removed[anc] = "retained by more specific descendant"
 
-        return surviving, retention_map, removed
+            info = cluster_infos.get(cid)
+            if info:
+                info.surviving_count = len(surviving)
+                info.retained_count = len(to_remove)
+
+        return all_surviving, retention_map, all_removed
 
 
 # ========================= TIER CLASSIFICATION =========================
 
 class TierClassifier:
     """
-    Search: leaves / near-leaves (depth ≤ median).
+    Search: leaves / near-leaves (depth <= median).
     Topic:  broad ancestors (depth > median).
-    Guard: if all depths identical → all SEARCH.
     """
 
     def __init__(self, hierarchy: HierarchyClient):
@@ -736,38 +626,26 @@ class TierClassifier:
 
 # ========================= EXPLANATION GENERATOR =========================
 
-def generate_explanation(a: CUIAssessment,
-                         weights: Dict[str, float],
-                         metadata: Dict[str, CUIMetadata]) -> str:
+def generate_explanation(
+    a: CUIAssessment,
+    metadata: Dict[str, CUIMetadata],
+) -> str:
     """Builds human-readable explanation for a surviving CUI."""
-
     parts = []
 
-    # Relevance interpretation
-    if a.relevance >= 0.8:
-        parts.append(f"High relevance to text ({a.relevance:.2f})")
-    elif a.relevance >= 0.6:
-        parts.append(f"Moderate relevance to text ({a.relevance:.2f})")
-    else:
-        parts.append(f"Low relevance ({a.relevance:.2f}, kept by specificity)")
-
-    # Specificity interpretation
     if a.specificity >= 0.8:
-        parts.append(f"Highly specific concept (IC ratio={a.specificity:.2f})")
+        parts.append(f"Highly specific (IC ratio={a.specificity:.2f})")
     elif a.specificity >= 0.5:
         parts.append(f"Moderately specific (IC ratio={a.specificity:.2f})")
     else:
         parts.append(f"Broad concept (IC ratio={a.specificity:.2f})")
 
-    # Weights used
-    parts.append(
-        f"Weights: relevance={weights.get('relevance', 0.5):.2f}, "
-        f"specificity={weights.get('specificity', 0.5):.2f}")
+    if a.cluster_label:
+        parts.append(f"Cluster: {a.cluster_label}")
 
-    # What it retains
     if a.retained_cuis:
         names = []
-        for r in a.retained_cuis[:5]:  # cap display at 5
+        for r in a.retained_cuis[:5]:
             m = metadata.get(r)
             names.append(f"'{m.preferred_term}'" if m else r)
         retains_str = ", ".join(names)
@@ -775,33 +653,151 @@ def generate_explanation(a: CUIAssessment,
             retains_str += f" (+{len(a.retained_cuis) - 5} more)"
         parts.append(f"Retains: {retains_str}")
 
-    # Tier
-    tier_desc = ("leaf/near-leaf → document retrieval"
+    tier_desc = ("leaf/near-leaf -> document retrieval"
                  if a.tier == Tier.SEARCH
-                 else "broad ancestor → topic label")
-    parts.append(f"Tier: {a.tier.value} (depth={a.depth_from_leaf}, "
-                 f"{tier_desc})")
+                 else "broad ancestor -> topic label")
+    parts.append(f"Tier: {a.tier.value} "
+                 f"(depth={a.depth_from_leaf}, {tier_desc})")
 
     return " | ".join(parts)
+
+
+# ========================= DYNAMIC VALIDATION =========================
+
+@dataclass
+class ValidationReport:
+    """Self-assessment of reduction quality — no ground truth needed."""
+    reduction_ratio: float
+    is_healthy: bool
+    specificity_gain: float
+    specificity_favored: bool
+    residual_parent_child_pairs: int
+    hierarchy_clean: bool
+    search_count: int
+    topic_count: int
+    tier_degenerate: bool
+    cluster_count: int
+    singleton_clusters: int
+    issues: List[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        status = "HEALTHY" if self.is_healthy else "ISSUES DETECTED"
+        lines = [
+            f"Validation: {status}",
+            f"  Reduction: {self.reduction_ratio:.1%} survived",
+            f"  Specificity gain: {self.specificity_gain:+.3f} "
+            f"({'favored' if self.specificity_favored else 'NOT favored'})",
+            f"  Hierarchy: {self.residual_parent_child_pairs} residual pairs "
+            f"({'clean' if self.hierarchy_clean else 'DIRTY'})",
+            f"  Tiers: {self.search_count} search, {self.topic_count} topic "
+            f"({'balanced' if not self.tier_degenerate else 'DEGENERATE'})",
+            f"  Clusters: {self.cluster_count} total, "
+            f"{self.singleton_clusters} singletons",
+        ]
+        if self.issues:
+            lines.append("  Issues:")
+            for issue in self.issues:
+                lines.append(f"    - {issue}")
+        return "\n".join(lines)
+
+
+class DynamicValidator:
+    """Validates reduction quality using internal consistency."""
+
+    @staticmethod
+    def validate(
+        result: ReductionResult,
+        metadata: Dict[str, CUIMetadata],
+        hierarchy: HierarchyClient,
+    ) -> ValidationReport:
+
+        issues: List[str] = []
+        surviving_set = set(result.all_surviving)
+
+        # Reduction ratio
+        ratio = (len(result.all_surviving) / result.input_count
+                 if result.input_count > 0 else 0)
+        if ratio > 0.5:
+            issues.append(
+                f"High survival rate ({ratio:.0%}) — "
+                f"may not be reducing enough")
+        elif ratio < 0.01 and result.input_count > 50:
+            issues.append(
+                f"Very low survival ({ratio:.0%}) — "
+                f"too aggressive")
+
+        # Specificity: are survivors more specific than input average?
+        surv_spec = [result.assessments[c].specificity
+                     for c in result.all_surviving
+                     if c in result.assessments]
+        mean_surv = float(np.mean(surv_spec)) if surv_spec else 0
+
+        all_ic = [metadata[c].ic_score for c in metadata]
+        max_ic = max(all_ic) if all_ic else 1.0
+        mean_all_norm = ((float(np.mean(all_ic)) / max_ic)
+                         if max_ic > 0 else 0)
+        spec_gain = mean_surv - mean_all_norm
+        spec_favored = spec_gain > 0
+        if not spec_favored:
+            issues.append(
+                f"Survivors not more specific than input "
+                f"(gain={spec_gain:+.3f})")
+
+        # Residual parent-child pairs (should be 0)
+        residual = 0
+        for cui in result.all_surviving:
+            for p in hierarchy.get_parents(cui):
+                if p in surviving_set:
+                    residual += 1
+        if residual > 0:
+            issues.append(
+                f"{residual} parent-child pairs remain — "
+                f"hierarchy retention has gaps")
+
+        # Tier balance
+        n_s = len(result.search_cuis)
+        n_t = len(result.topic_cuis)
+        tier_degen = ((n_s == 0 or n_t == 0)
+                      and (n_s + n_t) > 5)
+        if tier_degen:
+            issues.append(
+                f"Degenerate tiers: {n_s} search, {n_t} topic")
+
+        # Cluster health
+        n_clusters = len(result.clusters)
+        singletons = sum(1 for c in result.clusters.values()
+                         if c.surviving_count <= 1)
+        if n_clusters > 0 and singletons / n_clusters > 0.8:
+            issues.append(
+                f"Mostly singleton clusters "
+                f"({singletons}/{n_clusters})")
+
+        return ValidationReport(
+            reduction_ratio=ratio,
+            is_healthy=len(issues) == 0,
+            specificity_gain=spec_gain,
+            specificity_favored=spec_favored,
+            residual_parent_child_pairs=residual,
+            hierarchy_clean=residual == 0,
+            search_count=n_s,
+            topic_count=n_t,
+            tier_degenerate=tier_degen,
+            cluster_count=n_clusters,
+            singleton_clusters=singletons,
+            issues=issues,
+        )
 
 
 # ========================= MAIN SYSTEM =========================
 
 class CUIReductionSystem:
     """
-    Production CUI reduction pipeline.
+    Production CUI reduction pipeline using IC + tree structure.
 
     Usage:
         system = CUIReductionSystem(project_id, dataset_id,
                                      network, allowed_sabs)
-        result = system.reduce(cuis, text, cui_embeddings)
-
-        result.search_cuis         → document retrieval
-        result.topic_cuis          → topic labels
-        result.assessments         → per-CUI scores + explanation
-        result.removed             → every removed CUI + reason
-        result.retention_map       → which ancestors each CUI explains
-        result.weights             → variance-derived weights used
+        result = system.reduce(cuis, context_string)
     """
 
     def __init__(
@@ -811,8 +807,6 @@ class CUIReductionSystem:
         network: nx.DiGraph,
         allowed_sabs: List[str],
         ic_scores: Optional[Dict[str, float]] = None,
-        location: str = "us-central1",
-        task_type: str = "SEMANTIC_SIMILARITY",
     ):
         self.bq = bigquery.Client(project=project_id)
         cache_size = network.number_of_nodes() * 2
@@ -822,7 +816,7 @@ class CUIReductionSystem:
             self.bq, project_id, dataset_id,
             self.hierarchy, cache_size)
         self.sab_filter = SABFilter(set(allowed_sabs))
-        self.embedder = TextEmbedder(project_id, location, task_type)
+        self.clusterer = TreeClusterer(self.hierarchy)
         self.retainer = HierarchyRetainer(self.hierarchy)
         self.tier_classifier = TierClassifier(self.hierarchy)
 
@@ -833,7 +827,6 @@ class CUIReductionSystem:
         self,
         cuis: List[str],
         context_string: str,
-        cui_embeddings: Dict[str, np.ndarray],
         usage_context: UsageContext = UsageContext.QUERY,
     ) -> ReductionResult:
 
@@ -862,73 +855,88 @@ class CUIReductionSystem:
             return self._empty(context_string, usage_context, cuis,
                                all_removed, t0, sc)
 
-        # Stage 3: Embed clinical text (validates dim against CUI embeddings)
-        text_emb = self.embedder.embed(context_string, cui_embeddings)
-        if text_emb is None:
-            log("  WARNING: text embedding failed, using specificity only")
-
-        # Stage 4: Score — relevance + specificity
+        # Stage 3: Tree clustering
         sab_meta = {c: metadata[c] for c in after_sab if c in metadata}
-        assessments, weights = RelevanceSpecificityScorer.score(
-            after_sab, sab_meta, text_emb, cui_embeddings)
-        sc["scored"] = len(assessments)
-        log(f"  Weights: {weights}")
+        clusters, cluster_infos = self.clusterer.cluster(
+            after_sab, sab_meta)
+        sc["clusters"] = len(clusters)
 
-        # Stage 5: Noise removal
-        after_noise, noise_rm = NoiseRemover.run(after_sab, assessments)
-        all_removed.update(noise_rm)
-        sc["after_noise"] = len(after_noise)
-        log(f"  Noise: {len(after_sab)} -> {len(after_noise)}")
-
-        if not after_noise:
-            return self._empty(context_string, usage_context, cuis,
-                               all_removed, t0, sc, weights)
-
-        # Stage 6: Hierarchy retention
-        after_hier, rmap, hier_rm = self.retainer.run(
-            after_noise, metadata)
+        # Stage 4: Hierarchy retention within clusters
+        surviving, rmap, hier_rm = self.retainer.run(
+            clusters, cluster_infos, metadata)
         all_removed.update(hier_rm)
-        sc["after_hierarchy"] = len(after_hier)
-        log(f"  Hierarchy: {len(after_noise)} -> {len(after_hier)}")
+        sc["after_retention"] = len(surviving)
+        log(f"  Retention: {len(after_sab)} -> {len(surviving)} "
+            f"({len(hier_rm)} ancestors removed)")
 
-        if not after_hier:
+        if not surviving:
             return self._empty(context_string, usage_context, cuis,
-                               all_removed, t0, sc, weights)
+                               all_removed, t0, sc)
 
-        # Stage 7: Tier classification
+        # Build assessments
+        ic_vals = [metadata[c].ic_score
+                   for c in surviving if c in metadata]
+        max_ic = max(ic_vals) if ic_vals else 1.0
+        if max_ic <= 0 or not np.isfinite(max_ic):
+            max_ic = 1.0
+
+        cui_to_cluster: Dict[str, str] = {}
+        for cid, members in clusters.items():
+            for m in members:
+                cui_to_cluster[m] = cid
+
+        assessments: Dict[str, CUIAssessment] = {}
+        for cui in surviving:
+            meta = metadata.get(cui)
+            if not meta:
+                continue
+            spec = meta.ic_score / max_ic
+            if not np.isfinite(spec):
+                spec = 0.0
+
+            cid = cui_to_cluster.get(cui, "")
+            cinfo = cluster_infos.get(cid)
+
+            assessments[cui] = CUIAssessment(
+                cui=cui,
+                preferred_term=meta.preferred_term,
+                specificity=spec,
+                cluster_id=cid,
+                cluster_label=cinfo.label if cinfo else "",
+                retained_cuis=rmap.get(cui, []),
+            )
+
+        # Stage 5: Tier classification
         assessments = self.tier_classifier.classify(
-            after_hier, assessments)
-
-        # Attach retention info to assessments
-        for cui, retained in rmap.items():
-            if cui in assessments:
-                assessments[cui].retained_cuis = retained
+            surviving, assessments)
 
         # Generate explanations
-        for cui in after_hier:
+        for cui in surviving:
             if cui in assessments:
                 assessments[cui].explanation = generate_explanation(
-                    assessments[cui], weights, metadata)
+                    assessments[cui], metadata)
 
-        # Sort tiers by confidence
+        # Sort by specificity within tiers
         search, topics = [], []
-        for cui in after_hier:
+        for cui in surviving:
             a = assessments.get(cui)
             if not a:
                 continue
             (search if a.tier == Tier.SEARCH else topics).append(cui)
 
-        search.sort(key=lambda c: assessments[c].confidence,
+        search.sort(key=lambda c: assessments[c].specificity,
                     reverse=True)
-        topics.sort(key=lambda c: assessments[c].confidence,
+        topics.sort(key=lambda c: assessments[c].specificity,
                     reverse=True)
         all_surv = sorted(
-            after_hier,
-            key=lambda c: assessments[c].confidence,
+            surviving,
+            key=lambda c: (assessments[c].specificity
+                           if c in assessments else 0),
             reverse=True)
 
         for rank, cui in enumerate(all_surv, 1):
-            assessments[cui].ranking = rank
+            if cui in assessments:
+                assessments[cui].ranking = rank
 
         sc.update({"search": len(search), "topics": len(topics),
                    "total_surviving": len(all_surv)})
@@ -944,230 +952,36 @@ class CUIReductionSystem:
             search_cuis=search,
             topic_cuis=topics,
             all_surviving=all_surv,
-            assessments={c: assessments[c] for c in all_surv},
+            assessments={c: assessments[c] for c in all_surv
+                         if c in assessments},
             retention_map=rmap,
             removed=all_removed,
+            clusters=cluster_infos,
             input_count=len(cuis),
             processing_time_ms=elapsed,
             stage_counts=sc,
-            weights=weights,
         )
 
     @staticmethod
-    def _empty(ctx, uc, cuis, removed, t0, sc, weights=None):
+    def _empty(ctx, uc, cuis, removed, t0, sc):
         return ReductionResult(
-            ctx, uc, [], [], [], {}, {}, removed,
+            ctx, uc, [], [], [], {}, {}, removed, {},
             len(cuis), (time.perf_counter() - t0) * 1000, sc,
-            weights or {},
         )
+
+    def validate(self, result: ReductionResult) -> ValidationReport:
+        """Run dynamic validation on a reduction result."""
+        metadata = self.fetcher.fetch(
+            list(set(result.all_surviving)
+                 | set(result.removed.keys())))
+        return DynamicValidator.validate(
+            result, metadata, self.hierarchy)
 
     def get_stats(self) -> Dict:
         return get_timings()
 
 
-# ========================= DYNAMIC VALIDATION =========================
-
-@dataclass
-class ValidationReport:
-    """
-    Self-assessment of reduction quality — no ground truth needed.
-    Every metric is interpretable and has expected ranges.
-    """
-    # Overall
-    reduction_ratio: float              # surviving / input (expect 0.05-0.40)
-    is_healthy: bool                    # all checks passed
-
-    # Relevance discrimination
-    relevance_gap: float                # mean(survived) - mean(removed) relevance
-    relevance_discriminative: bool      # gap > 0.05
-
-    # Specificity gain
-    specificity_gain: float             # mean(survived) - mean(removed) IC ratio
-    specificity_favored: bool           # survivors are more specific
-
-    # Hierarchy cleanliness
-    residual_parent_child_pairs: int    # should be 0 after retention
-    hierarchy_clean: bool
-
-    # Tier balance
-    search_count: int
-    topic_count: int
-    tier_degenerate: bool               # one tier has zero
-
-    # Embedding coverage
-    embedding_coverage: float           # fraction of CUIs with embeddings
-    embedding_sufficient: bool          # > 50%
-
-    # Weight balance
-    weight_relevance: float
-    weight_specificity: float
-    weight_degenerate: bool             # one weight > 0.9
-
-    # Component summary
-    issues: List[str] = field(default_factory=list)
-
-    def summary(self) -> str:
-        status = "HEALTHY" if self.is_healthy else "ISSUES DETECTED"
-        lines = [
-            f"Validation: {status}",
-            f"  Reduction: {self.reduction_ratio:.1%} survived",
-            f"  Relevance gap: {self.relevance_gap:+.3f} "
-            f"({'discriminative' if self.relevance_discriminative else 'WEAK'})",
-            f"  Specificity gain: {self.specificity_gain:+.3f} "
-            f"({'favored' if self.specificity_favored else 'NOT favored'})",
-            f"  Hierarchy: {self.residual_parent_child_pairs} residual pairs "
-            f"({'clean' if self.hierarchy_clean else 'DIRTY'})",
-            f"  Tiers: {self.search_count} search, {self.topic_count} topic "
-            f"({'balanced' if not self.tier_degenerate else 'DEGENERATE'})",
-            f"  Embeddings: {self.embedding_coverage:.0%} coverage "
-            f"({'sufficient' if self.embedding_sufficient else 'LOW'})",
-            f"  Weights: rel={self.weight_relevance:.2f}, "
-            f"spec={self.weight_specificity:.2f} "
-            f"({'balanced' if not self.weight_degenerate else 'ONE-SIDED'})",
-        ]
-        if self.issues:
-            lines.append(f"  Issues:")
-            for issue in self.issues:
-                lines.append(f"    - {issue}")
-        return "\n".join(lines)
-
-
-class DynamicValidator:
-    """
-    Validates reduction quality using internal consistency.
-    No ground truth required — uses statistical properties
-    of the output to detect problems.
-    """
-
-    @staticmethod
-    def validate(
-        result: ReductionResult,
-        metadata: Dict[str, CUIMetadata],
-        cui_embeddings: Dict[str, np.ndarray],
-        hierarchy: 'HierarchyClient',
-    ) -> ValidationReport:
-
-        issues: List[str] = []
-        surviving_set = set(result.all_surviving)
-        removed_set = set(result.removed.keys())
-
-        # --- Reduction ratio ---
-        ratio = (len(result.all_surviving) / result.input_count
-                 if result.input_count > 0 else 0)
-        if ratio > 0.5:
-            issues.append(
-                f"High survival rate ({ratio:.0%}) — "
-                f"system may not be reducing aggressively enough")
-        elif ratio < 0.01 and result.input_count > 50:
-            issues.append(
-                f"Very low survival ({ratio:.0%}) — "
-                f"scoring or noise threshold may be too aggressive")
-
-        # --- Relevance discrimination ---
-        surv_rel = [result.assessments[c].relevance
-                    for c in result.all_surviving
-                    if c in result.assessments]
-        # For removed CUIs that had assessments (noise-removed, not sab/metadata)
-        removed_rel = []
-        for c in removed_set:
-            reason = result.removed.get(c, "")
-            if "noise" in reason or "redundant" in reason:
-                # These had scores — estimate from the reason string
-                pass
-        # Use a simpler approach: check if surviving relevance is well above 0.5
-        mean_surv_rel = float(np.mean(surv_rel)) if surv_rel else 0
-        rel_gap = mean_surv_rel - 0.5  # above random baseline
-        rel_discriminative = rel_gap > 0.05
-        if not rel_discriminative:
-            issues.append(
-                f"Relevance scores near baseline (mean={mean_surv_rel:.3f}) — "
-                f"text embedding may not match CUI embedding space")
-
-        # --- Specificity gain ---
-        surv_spec = [result.assessments[c].specificity
-                     for c in result.all_surviving
-                     if c in result.assessments]
-        mean_surv_spec = float(np.mean(surv_spec)) if surv_spec else 0
-
-        all_spec = [metadata[c].ic_score for c in metadata]
-        mean_all_spec_norm = (float(np.mean(all_spec)) / max(all_spec)
-                              if all_spec and max(all_spec) > 0 else 0)
-        spec_gain = mean_surv_spec - mean_all_spec_norm
-        spec_favored = spec_gain > 0
-        if not spec_favored:
-            issues.append(
-                f"Survivors not more specific than input average "
-                f"(gain={spec_gain:+.3f}) — hierarchy retention "
-                f"may not be removing enough ancestors")
-
-        # --- Hierarchy cleanliness ---
-        residual_pairs = 0
-        for cui in result.all_surviving:
-            parents = hierarchy.get_parents(cui)
-            for p in parents:
-                if p in surviving_set:
-                    residual_pairs += 1
-        hier_clean = residual_pairs == 0
-        if not hier_clean:
-            issues.append(
-                f"{residual_pairs} parent-child pairs remain in output — "
-                f"hierarchy retention has gaps")
-
-        # --- Tier balance ---
-        n_search = len(result.search_cuis)
-        n_topic = len(result.topic_cuis)
-        tier_degenerate = (n_search == 0 or n_topic == 0) and (
-            n_search + n_topic > 5)
-        if tier_degenerate:
-            issues.append(
-                f"Degenerate tiers: {n_search} search, {n_topic} topic — "
-                f"all CUIs at same hierarchy depth")
-
-        # --- Embedding coverage ---
-        total_after_sab = result.stage_counts.get("after_sab", 1)
-        emb_coverage = (len(cui_embeddings) / total_after_sab
-                        if total_after_sab > 0 else 0)
-        emb_sufficient = emb_coverage > 0.5
-        if not emb_sufficient:
-            issues.append(
-                f"Low embedding coverage ({emb_coverage:.0%}) — "
-                f"relevance scoring is degraded for {100 - emb_coverage * 100:.0f}% of CUIs")
-
-        # --- Weight balance ---
-        w_rel = result.weights.get("relevance", 0.5)
-        w_spec = result.weights.get("specificity", 0.5)
-        weight_degen = max(w_rel, w_spec) > 0.9
-        if weight_degen:
-            dominant = "relevance" if w_rel > w_spec else "specificity"
-            issues.append(
-                f"Weights heavily skewed to {dominant} "
-                f"({w_rel:.2f}/{w_spec:.2f}) — "
-                f"one signal has very low variance")
-
-        is_healthy = len(issues) == 0
-
-        return ValidationReport(
-            reduction_ratio=ratio,
-            is_healthy=is_healthy,
-            relevance_gap=rel_gap,
-            relevance_discriminative=rel_discriminative,
-            specificity_gain=spec_gain,
-            specificity_favored=spec_favored,
-            residual_parent_child_pairs=residual_pairs,
-            hierarchy_clean=hier_clean,
-            search_count=n_search,
-            topic_count=n_topic,
-            tier_degenerate=tier_degenerate,
-            embedding_coverage=emb_coverage,
-            embedding_sufficient=emb_sufficient,
-            weight_relevance=w_rel,
-            weight_specificity=w_spec,
-            weight_degenerate=weight_degen,
-            issues=issues,
-        )
-
-
-# ========================= UTILITIES =========================
+# ========================= CUI EXTRACTOR =========================
 
 class CUIExtractor:
     """Calls CUI extraction API. Returns list of CUI strings."""
@@ -1220,124 +1034,126 @@ class CUIExtractor:
             return []
 
 
-def fetch_cui_embeddings(
-    cuis: List[str], pid: str, did: str, table: str,
-) -> Dict[str, np.ndarray]:
-    """Fetch pre-computed CUI embeddings from BigQuery."""
-    if not cuis:
-        return {}
-    client = bigquery.Client(project=pid)
-    embs: Dict[str, np.ndarray] = {}
-    for i in range(0, len(cuis), _BQ_BATCH_SIZE):
-        batch = cuis[i:i + _BQ_BATCH_SIZE]
-        q = (f"SELECT CUI, embedding FROM `{pid}.{did}.{table}` "
-             f"WHERE CUI IN UNNEST(@c)")
-        jc = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("c", "STRING", batch)])
-        try:
-            for r in client.query(q, job_config=jc, timeout=200).result():
-                arr = np.asarray(r.embedding, dtype=np.float64)
-                if arr.ndim == 1 and np.all(np.isfinite(arr)):
-                    embs[r.CUI] = arr
-        except Exception as e:
-            log(f"Embedding fetch error (batch {i}): {e}", "ERROR")
-    return embs
-
-
 # ========================= MAIN =========================
 
 def main():
-    """Run CUI reduction for clinical texts."""
+    """
+    Run CUI reduction pipeline.
+
+    All configuration via environment variables:
+      CUI_PROJECT_ID       — GCP project ID
+      CUI_DATASET_ID       — BigQuery dataset with UMLS tables
+      CUI_API_URL          — CUI extraction API endpoint
+      CUI_NETWORK_PATH     — path to NetworkX .pkl hierarchy
+      CUI_ALLOWED_SABS     — comma-separated SABs (optional,
+                              defaults to ICD10CM,ICD10PCS,ICD9CM,
+                              SNOMEDCT_US,LOINC)
+    """
     import pickle
+    import sys
 
-    # ---- Configuration ----
-    PROJECT_ID = "your-project-id"
-    DATASET_ID = "your-dataset"
-    API_URL = "https://your-api/extract"
-    EMBEDDING_TABLE = "cui_embeddings"
-    NETWORK_PATH = "networkx_cui_context_v1_1_0.pkl"
-    ALLOWED_SABS = ["ICD10CM", "ICD10PCS", "ICD9CM",
-                     "SNOMEDCT_US", "LOINC"]
-    LOCATION = "us-central1"
+    project_id = os.environ.get("CUI_PROJECT_ID")
+    dataset_id = os.environ.get("CUI_DATASET_ID")
+    api_url = os.environ.get("CUI_API_URL")
+    network_path = os.environ.get("CUI_NETWORK_PATH")
 
-    # ---- Load hierarchy ----
-    log("Loading hierarchy...")
-    with open(NETWORK_PATH, "rb") as f:
+    missing = []
+    if not project_id:
+        missing.append("CUI_PROJECT_ID")
+    if not dataset_id:
+        missing.append("CUI_DATASET_ID")
+    if not api_url:
+        missing.append("CUI_API_URL")
+    if not network_path:
+        missing.append("CUI_NETWORK_PATH")
+    if missing:
+        log(f"Missing required env vars: {missing}", "ERROR")
+        sys.exit(1)
+
+    sabs_str = os.environ.get(
+        "CUI_ALLOWED_SABS",
+        "ICD10CM,ICD10PCS,ICD9CM,SNOMEDCT_US,LOINC")
+    allowed_sabs = [s.strip() for s in sabs_str.split(",") if s.strip()]
+
+    # Load hierarchy
+    log(f"Loading hierarchy from {network_path}...")
+    with open(network_path, "rb") as f:
         network = pickle.load(f)
     log(f"Loaded: {network.number_of_nodes()} nodes, "
         f"{network.number_of_edges()} edges")
 
-    # ---- Initialize ----
+    # Initialize
     system = CUIReductionSystem(
-        PROJECT_ID, DATASET_ID, network, ALLOWED_SABS,
-        location=LOCATION)
-    extractor = CUIExtractor(API_URL)
+        project_id, dataset_id, network, allowed_sabs)
+    extractor = CUIExtractor(api_url)
 
-    # ---- Process ----
-    texts = [
-        "Patient has severe pain in left knee with swelling",
-        "History of type 2 diabetes mellitus with peripheral neuropathy",
-        "Acute exacerbation of chronic obstructive pulmonary disease",
-    ]
+    # Read text from stdin or args
+    if len(sys.argv) > 1:
+        texts = sys.argv[1:]
+    else:
+        log("Reading clinical text from stdin (one per line, "
+            "Ctrl+D to finish)...")
+        texts = [line.strip() for line in sys.stdin
+                 if line.strip()]
+
+    if not texts:
+        log("No input texts provided", "ERROR")
+        sys.exit(1)
 
     for text in texts:
         log(f"\n{'='*60}")
         log(f"TEXT: {text}")
         log(f"{'='*60}")
 
-        # Extract CUIs
+        # Extract
         cuis = extractor.extract(text)
         if not cuis:
             log("  No CUIs extracted")
             continue
         log(f"  Extracted: {len(cuis)} CUIs")
 
-        # Fetch CUI embeddings
-        cui_embs = fetch_cui_embeddings(
-            cuis, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
-        log(f"  Embeddings: {len(cui_embs)}/{len(cuis)}")
-
         # Reduce
-        result = system.reduce(cuis, text, cui_embs)
+        result = system.reduce(cuis, text)
 
-        # ---- Dynamic Validation (no ground truth needed) ----
-        metadata = system.fetcher.fetch(cuis)
-        report = DynamicValidator.validate(
-            result, metadata, cui_embs, system.hierarchy)
+        # Validate
+        report = system.validate(result)
         log(f"\n{report.summary()}")
 
-        # ---- Display results ----
+        # Display
         log(f"\n  Stage counts: {result.stage_counts}")
-        log(f"  Weights used: {result.weights}")
+
+        log(f"\n  --- Clusters ({len(result.clusters)}) ---")
+        for cid, info in sorted(
+                result.clusters.items(),
+                key=lambda x: x[1].surviving_count, reverse=True):
+            if info.surviving_count > 0:
+                log(f"    {info.label}: "
+                    f"{info.member_count} -> "
+                    f"{info.surviving_count} survived, "
+                    f"{info.retained_count} retained")
 
         log(f"\n  --- Search CUIs ({len(result.search_cuis)}) ---")
         for cui in result.search_cuis:
             a = result.assessments[cui]
             log(f"    #{a.ranking} {a.preferred_term} ({cui})")
-            log(f"      confidence={a.confidence:.3f} "
-                f"relevance={a.relevance:.3f} "
-                f"specificity={a.specificity:.3f}")
             log(f"      {a.explanation}")
 
         log(f"\n  --- Topic CUIs ({len(result.topic_cuis)}) ---")
         for cui in result.topic_cuis:
             a = result.assessments[cui]
             log(f"    #{a.ranking} {a.preferred_term} ({cui})")
-            log(f"      confidence={a.confidence:.3f} "
-                f"relevance={a.relevance:.3f} "
-                f"specificity={a.specificity:.3f}")
             log(f"      {a.explanation}")
 
         log(f"\n  --- Removed ({len(result.removed)}) ---")
         reasons = defaultdict(int)
         for cui, reason in result.removed.items():
-            category = reason.split(" ")[0].split("(")[0].strip()
+            category = reason.split(" ")[0]
             reasons[category] += 1
         for reason, count in sorted(reasons.items(),
                                      key=lambda x: -x[1]):
             log(f"    {reason}: {count} CUIs")
 
-    # Stats
+    # Performance
     log(f"\n{'='*60}")
     log("PERFORMANCE:")
     for name, stats in system.get_stats().items():
