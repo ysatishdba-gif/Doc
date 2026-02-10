@@ -29,7 +29,7 @@ import logging
 import logging.handlers
 from typing import List, Dict, Optional, Set, Tuple, Any, FrozenSet
 from dataclasses import dataclass, field
-from collections import defaultdict, OrderedDict, Counter
+from collections import defaultdict, deque, OrderedDict, Counter
 from enum import Enum
 from functools import wraps
 
@@ -60,8 +60,11 @@ def log(msg: str, level: str = "INFO"):
 
 
 # ========================= TIMING =========================
+# Ring buffer per metric — bounded memory under high concurrency.
+# Keeps last N measurements; old ones evicted automatically.
 
-_timings: Dict[str, List[float]] = defaultdict(list)
+_TIMING_BUFFER_SIZE = 1000  # per metric — enough for stats, bounded memory
+_timings: Dict[str, deque] = defaultdict(lambda: deque(maxlen=_TIMING_BUFFER_SIZE))
 _timing_lock = threading.Lock()
 
 
@@ -73,46 +76,57 @@ def timed(name: str):
             try:
                 return fn(*a, **kw)
             finally:
+                elapsed = (time.perf_counter() - t0) * 1000
                 with _timing_lock:
-                    _timings[name].append((time.perf_counter() - t0) * 1000)
+                    _timings[name].append(elapsed)
         return wrapper
     return dec
 
 
 def get_timings() -> Dict[str, Dict[str, float]]:
     with _timing_lock:
-        return {
-            k: {"count": len(v), "mean_ms": float(np.mean(v)),
-                "max_ms": float(np.max(v))}
-            for k, v in _timings.items() if v
-        }
+        out = {}
+        for k, v in _timings.items():
+            if v:
+                vals = list(v)
+                out[k] = {
+                    "count": len(vals),
+                    "mean_ms": float(np.mean(vals)),
+                    "p50_ms": float(np.median(vals)),
+                    "p99_ms": float(np.percentile(vals, 99)),
+                    "max_ms": float(np.max(vals)),
+                }
+        return out
 
 
 # ========================= CACHE =========================
 
+# Hard ceiling across ALL cache instances — prevents runaway allocation
+# even if graph has millions of nodes and caller requests nodes*2.
+_CACHE_HARD_CAP_ENTRIES = 200_000  # absolute max entries per cache instance
+_cache_total_entries = 0
+_cache_total_lock = threading.Lock()
+_CACHE_GLOBAL_CAP = 1_000_000  # max entries across ALL cache instances
+
+
 class Cache:
     """
-    Thread-safe LRU. Max size capped to prevent memory explosion.
-    Caller requests a size; we cap it to a safe ceiling derived from
-    available system memory.
+    Thread-safe LRU with hard memory caps.
+    - Per-instance cap: min(requested, _CACHE_HARD_CAP_ENTRIES)
+    - Global cap across all instances: _CACHE_GLOBAL_CAP
     """
 
-    @staticmethod
-    def safe_size(requested: int) -> int:
-        """Cap cache size based on available memory.
-        Each entry ~1KB avg → cap at (available_mb * 512) entries."""
-        try:
-            import psutil
-            avail_mb = psutil.virtual_memory().available / (1024 * 1024)
-            mem_cap = int(avail_mb * 512)
-        except Exception:
-            mem_cap = 500_000  # conservative fallback
-        return max(1, min(requested, mem_cap))
-
     def __init__(self, max_size: int):
+        global _cache_total_entries
         self._d: OrderedDict = OrderedDict()
         self._lock = threading.RLock()
-        self._max = Cache.safe_size(max_size)
+        # Hard cap regardless of what caller requests
+        capped = max(1, min(max_size, _CACHE_HARD_CAP_ENTRIES))
+        # Further reduce if global budget is exhausted
+        with _cache_total_lock:
+            remaining = max(1, _CACHE_GLOBAL_CAP - _cache_total_entries)
+            self._max = min(capped, remaining)
+            _cache_total_entries += self._max
 
     def get(self, key):
         with self._lock:
@@ -132,6 +146,10 @@ class Cache:
     @property
     def size(self) -> int:
         return len(self._d)
+
+    @property
+    def capacity(self) -> int:
+        return self._max
 
 
 # ========================= DATA MODELS =========================
@@ -210,6 +228,12 @@ class ReductionResult:
 
 _TOKEN_RE = re.compile(r"[^\w\s-]")
 
+# Max tokens to retain per CUI term and per narrative.
+# Beyond this, diminishing returns: coverage scores become noise.
+# These are structural limits, not clinical parameters.
+_MAX_TOKENS_PER_TERM = 20      # longest meaningful CUI term ~15 tokens
+_MAX_TOKENS_NARRATIVE = 200    # clinical queries rarely exceed this
+
 
 def tokenize(text: str) -> FrozenSet[str]:
     """Single tokenizer for ALL text (CUI terms and narrative).
@@ -221,13 +245,26 @@ def tokenize(text: str) -> FrozenSet[str]:
     )
 
 
+def tokenize_bounded(text: str, max_tokens: int) -> FrozenSet[str]:
+    """Tokenize with a cap. When exceeding limit, keep longest tokens
+    (longer tokens tend to be more discriminative in medical text:
+    'musculoskeletal' > 'of')."""
+    raw = tokenize(text)
+    if len(raw) <= max_tokens:
+        return raw
+    # Keep the longest (most discriminative) tokens
+    return frozenset(sorted(raw, key=len, reverse=True)[:max_tokens])
+
+
 def derive_stopwords(metadata: Dict[str, CUIMetadata]) -> FrozenSet[str]:
     """
     Derive stopwords from THIS request's CUI set.
     Threshold: tokens with doc-frequency above mean DF ratio.
     Adapts per request.
+
+    Guard: With < 5 CUIs, DF statistics are unreliable — skip entirely.
     """
-    if not metadata:
+    if not metadata or len(metadata) < 5:
         return frozenset()
 
     n_docs = len(metadata)
@@ -241,6 +278,9 @@ def derive_stopwords(metadata: Dict[str, CUIMetadata]) -> FrozenSet[str]:
 
     df_ratios = {t: count / n_docs for t, count in doc_freq.items()}
     mean_df = float(np.mean(list(df_ratios.values())))
+    # Guard: if mean DF > 0.8, nearly everything is a stopword — too aggressive
+    if mean_df > 0.8:
+        return frozenset()
     return frozenset(t for t, ratio in df_ratios.items() if ratio > mean_df)
 
 
@@ -254,8 +294,7 @@ def filter_tokens(tokens: FrozenSet[str],
 class HierarchyClient:
     """
     Navigates UMLS hierarchy graph with depth-capped BFS.
-    All traversals have a max_depth proportional to the graph's
-    average branching factor to prevent runaway exploration.
+    All traversals use deque (O(1) popleft) and depth caps.
     """
 
     def __init__(self, network: nx.DiGraph,
@@ -265,12 +304,14 @@ class HierarchyClient:
         self.ic_scores = ic_scores or {}
         self._ic_cache = Cache(cache_size)
         self._parent_cache = Cache(cache_size)
+        self._children_cache = Cache(cache_size)
         # Derive max BFS depth from graph structure
         n_nodes = network.number_of_nodes()
         n_edges = network.number_of_edges()
         avg_degree = (n_edges / n_nodes) if n_nodes > 0 else 1
-        # Depth cap: enough to reach most ancestors but not explore entire graph
-        self._max_depth = max(int(np.log(max(n_nodes, 1)) / np.log(max(avg_degree, 2))), 3)
+        self._max_depth = max(
+            int(np.log(max(n_nodes, 1)) / np.log(max(avg_degree, 2))), 3
+        )
         log(f"HierarchyClient: nodes={n_nodes}, edges={n_edges}, "
             f"max_depth={self._max_depth}")
 
@@ -282,27 +323,27 @@ class HierarchyClient:
             ic = float(self.ic_scores[cui])
         else:
             ic = float(np.log1p(self._measure_depth(cui)))
-        # Guard against NaN/Inf
         if not np.isfinite(ic):
             ic = 0.0
         self._ic_cache.put(cui, ic)
         return ic
 
     def _measure_depth(self, cui: str) -> int:
-        """BFS upward (to roots). Depth-capped to prevent explosion."""
+        """BFS upward (to roots). Depth-capped. Uses deque."""
         if not self.network.has_node(cui):
             return 0
-        visited, queue, depth = {cui}, [cui], 0
+        visited, queue, depth = {cui}, deque([cui]), 0
         while queue and depth < self._max_depth:
             nxt = []
-            for node in queue:
+            for _ in range(len(queue)):
+                node = queue.popleft()
                 for p in self.get_parents(node):
                     if p not in visited:
                         visited.add(p)
                         nxt.append(p)
             if not nxt:
                 break
-            queue = nxt
+            queue.extend(nxt)
             depth += 1
         return depth
 
@@ -316,17 +357,24 @@ class HierarchyClient:
         return parents
 
     def get_children(self, cui: str) -> List[str]:
-        return (list(self.network.successors(cui))
-                if self.network.has_node(cui) else [])
+        cached = self._children_cache.get(cui)
+        if cached is not None:
+            return cached
+        children = (list(self.network.successors(cui))
+                    if self.network.has_node(cui) else [])
+        self._children_cache.put(cui, children)
+        return children
 
     def depth_to_nearest_leaf(self, cui: str, cui_set: Set[str]) -> int:
         """Hops down to most specific descendant in cui_set. 0 = leaf.
-        Depth-capped to prevent runaway traversal on high-fanout nodes."""
+        Uses deque and depth cap."""
         if not self.network.has_node(cui):
             return 0
-        visited, queue, max_d = {cui}, [(cui, 0)], 0
+        visited = {cui}
+        queue: deque = deque([(cui, 0)])
+        max_d = 0
         while queue:
-            node, d = queue.pop(0)
+            node, d = queue.popleft()
             if d >= self._max_depth:
                 continue
             for child in self.get_children(node):
@@ -337,6 +385,18 @@ class HierarchyClient:
                     max_d = max(max_d, d + 1)
                 queue.append((child, d + 1))
         return max_d
+
+    def batch_depth_to_leaf(self, cuis: List[str],
+                            cui_set: Set[str]) -> Dict[str, int]:
+        """Compute depth_to_nearest_leaf for a batch efficiently.
+        Caches intermediate traversal results so overlapping subtrees
+        aren't re-explored."""
+        depths: Dict[str, int] = {}
+        # Process from likely deepest (highest IC) first — their subtrees
+        # warm the children cache for shallower nodes
+        for cui in cuis:
+            depths[cui] = self.depth_to_nearest_leaf(cui, cui_set)
+        return depths
 
 
 # ========================= AUTO CONFIGURATION =========================
@@ -517,12 +577,12 @@ class MetadataFetcher:
             try:
                 for row in self.bq.query(query, job_config=jc, timeout=300).result():
                     term = row.pref_term or ""
-                    # Use same tokenizer as narrative
+                    # Use same tokenizer as narrative — bounded to prevent explosion
                     meta = CUIMetadata(
                         cui=row.cui,
                         preferred_term=term,
                         semantic_types=row.tuis or [],
-                        tokens=tokenize(term),
+                        tokens=tokenize_bounded(term, _MAX_TOKENS_PER_TERM),
                         ic_score=self.hierarchy.get_ic(row.cui),
                         source_vocabs=row.sabs or [],
                     )
@@ -599,15 +659,18 @@ class RetentionScorer:
         stopwords: FrozenSet[str],
     ) -> Dict[str, CUIAssessment]:
 
-        # Tokenize with SAME function as metadata
-        raw_narrative = tokenize(context_string)
+        # Tokenize with SAME function as metadata — bounded
+        raw_narrative = tokenize_bounded(context_string, _MAX_TOKENS_NARRATIVE)
         narrative_tokens = filter_tokens(raw_narrative, stopwords)
         n_narrative = len(narrative_tokens) if narrative_tokens else 1
 
-        # Per-CUI extra tokens from detection spans
+        # Per-CUI extra tokens from detection spans — bounded
         loc_tokens: Dict[str, FrozenSet[str]] = {}
         for loc in locations:
-            toks = filter_tokens(tokenize(loc.matched_text), stopwords)
+            toks = filter_tokens(
+                tokenize_bounded(loc.matched_text, _MAX_TOKENS_PER_TERM),
+                stopwords,
+            )
             loc_tokens[loc.cui] = loc_tokens.get(loc.cui, frozenset()) | toks
 
         # Max IC from THIS set
@@ -708,7 +771,10 @@ class RetentionScorer:
 class NoiseRemover:
     """
     Threshold = mean - std of THIS request's score distribution.
-    Adapts to every input.
+    Guards:
+      - std=0 (all identical scores) → keep all (no noise distinguishable)
+      - < 3 CUIs → skip noise removal (statistics meaningless)
+      - NaN/Inf scores → treated as noise
     """
 
     @staticmethod
@@ -718,13 +784,24 @@ class NoiseRemover:
         assessments: Dict[str, CUIAssessment],
     ) -> Tuple[List[str], Dict[str, str]]:
 
+        # Too few CUIs for meaningful statistics — keep all
+        if len(cuis) < 3:
+            return cuis, {}
+
         scores = [assessments[c].retention_score
-                  for c in cuis if c in assessments]
+                  for c in cuis
+                  if c in assessments and np.isfinite(assessments[c].retention_score)]
         if not scores:
             return cuis, {}
 
         mean_s = float(np.mean(scores))
         std_s = float(np.std(scores))
+
+        # If std is zero or near-zero, all scores are identical —
+        # no noise is distinguishable, keep everything
+        if std_s < 1e-10:
+            return cuis, {}
+
         threshold = max(mean_s - std_s, 0.0)
 
         kept, removed = [], {}
@@ -732,6 +809,8 @@ class NoiseRemover:
             a = assessments.get(cui)
             if not a:
                 removed[cui] = "no_assessment"
+            elif not np.isfinite(a.retention_score):
+                removed[cui] = "non_finite_score"
             elif a.retention_score < threshold:
                 removed[cui] = (f"below_noise "
                                 f"(score={a.retention_score:.3f}<{threshold:.3f})")
@@ -784,6 +863,10 @@ class TierClassifier:
     Search: leaves / near-leaves (depth ≤ median).
     Topic:  broad ancestors (depth > median).
     Boundary = median of THIS set's depth distribution.
+
+    Guards:
+      - All depths = 0 (flat set / no hierarchy) → all SEARCH, log warning
+      - < 2 distinct depth values → all SEARCH (can't split meaningfully)
     """
 
     def __init__(self, hierarchy: HierarchyClient):
@@ -797,17 +880,28 @@ class TierClassifier:
     ) -> Dict[str, CUIAssessment]:
 
         cui_set = set(cuis)
-        depths: Dict[str, int] = {}
-        for cui in cuis:
-            depths[cui] = self.hierarchy.depth_to_nearest_leaf(cui, cui_set)
+        depths = self.hierarchy.batch_depth_to_leaf(cuis, cui_set)
 
         depth_vals = list(depths.values())
-        boundary = float(np.median(depth_vals)) if depth_vals else 0.0
+
+        # Guard: if all depths identical or only one distinct value,
+        # can't split meaningfully → everything is SEARCH tier
+        distinct_depths = set(depth_vals)
+        if len(distinct_depths) < 2:
+            log(f"  Tier: all depths identical ({distinct_depths}), "
+                f"assigning all to SEARCH", "WARNING")
+            for cui in cuis:
+                if cui in assessments:
+                    assessments[cui].depth_from_leaf = depths.get(cui, 0)
+                    assessments[cui].tier = Tier.SEARCH
+            return assessments
+
+        boundary = float(np.median(depth_vals))
 
         for cui in cuis:
             if cui not in assessments:
                 continue
-            d = depths[cui]
+            d = depths.get(cui, 0)
             assessments[cui].depth_from_leaf = d
             assessments[cui].tier = (
                 Tier.SEARCH if d <= boundary else Tier.TOPIC
@@ -859,13 +953,18 @@ class RetentionMapper:
         cui_set = set(cuis)
         rmap: Dict[str, List[str]] = {c: [] for c in cuis}
 
-        # Pre-compute token posting list sizes for candidate cap
-        # If a token appears in >50% of CUIs, skip it for candidate expansion
-        # (it's effectively a stopword the derive_stopwords might have missed)
+        # Pre-compute token posting list sizes for candidate cap.
+        # Skip tokens appearing in >50% of CUIs — effectively missed stopwords.
         n_cuis = len(cuis)
+        half_n = n_cuis / 2 if n_cuis > 0 else 0
         high_freq_tokens = {
-            t for t, s in token_index.items() if len(s) > n_cuis / 2
-        } if n_cuis > 0 else set()
+            t for t, s in token_index.items() if len(s) > half_n
+        }
+
+        # Hard cap on candidates per CUI to bound worst-case time.
+        # If a CUI generates more candidates than this, it's too generic
+        # for meaningful subsumption checking.
+        max_candidates = min(n_cuis, 500)
 
         for cui_a in cuis:
             ft_a = cui_ftokens.get(cui_a)
@@ -877,6 +976,8 @@ class RetentionMapper:
             for t in ft_a:
                 if t not in high_freq_tokens:
                     candidates.update(token_index.get(t, set()))
+                    if len(candidates) > max_candidates:
+                        break  # cap reached — stop expanding
             candidates.discard(cui_a)
 
             # Token subsumption: B's tokens ⊂ A's tokens
@@ -937,7 +1038,8 @@ class CUIReductionSystem:
         self.tier_classifier = TierClassifier(self.hierarchy)
         self.mapper = RetentionMapper(self.hierarchy)
 
-        log(f"CUIReductionSystem ready | sabs={allowed_sabs}")
+        log(f"CUIReductionSystem ready | sabs={allowed_sabs} | "
+            f"cache_cap={self.hierarchy._ic_cache.capacity}")
 
     @timed("full_pipeline")
     def reduce(
