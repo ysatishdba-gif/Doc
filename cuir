@@ -30,7 +30,6 @@ Requirements:
   pip install google-cloud-bigquery networkx numpy requests
 """
 
-import os
 import time
 import threading
 import logging
@@ -501,9 +500,7 @@ class TreeClusterer:
                 ic_range=ic_range,
             )
 
-        sizes = sorted([len(m) for m in clusters.values()], reverse=True)
-        log(f"  Clusters: {len(clusters)} groups from {len(cuis)} CUIs "
-            f"(top sizes: {sizes[:10]})")
+        log(f"  Clusters: {len(clusters)} groups from {len(cuis)} CUIs")
 
         return clusters, infos
 
@@ -1037,128 +1034,62 @@ class CUIExtractor:
 # ========================= MAIN =========================
 
 def main():
-    """
-    Run CUI reduction pipeline.
-
-    All configuration via environment variables:
-      CUI_PROJECT_ID       — GCP project ID
-      CUI_DATASET_ID       — BigQuery dataset with UMLS tables
-      CUI_API_URL          — CUI extraction API endpoint
-      CUI_NETWORK_PATH     — path to NetworkX .pkl hierarchy
-      CUI_ALLOWED_SABS     — comma-separated SABs (optional,
-                              defaults to ICD10CM,ICD10PCS,ICD9CM,
-                              SNOMEDCT_US,LOINC)
-    """
+    """Run CUI reduction for clinical texts."""
     import pickle
-    import sys
 
-    project_id = os.environ.get("CUI_PROJECT_ID")
-    dataset_id = os.environ.get("CUI_DATASET_ID")
-    api_url = os.environ.get("CUI_API_URL")
-    network_path = os.environ.get("CUI_NETWORK_PATH")
+    # ---- Configuration (replace with your values) ----
+    PROJECT_ID = "your-project-id"
+    DATASET_ID = "your-dataset"
+    API_URL = "https://your-api/extract"
+    NETWORK_PATH = "networkx_cui_context_v1_1_0.pkl"
+    ALLOWED_SABS = ["ICD10CM", "ICD10PCS", "ICD9CM",
+                     "SNOMEDCT_US", "LOINC"]
 
-    missing = []
-    if not project_id:
-        missing.append("CUI_PROJECT_ID")
-    if not dataset_id:
-        missing.append("CUI_DATASET_ID")
-    if not api_url:
-        missing.append("CUI_API_URL")
-    if not network_path:
-        missing.append("CUI_NETWORK_PATH")
-    if missing:
-        log(f"Missing required env vars: {missing}", "ERROR")
-        sys.exit(1)
-
-    sabs_str = os.environ.get(
-        "CUI_ALLOWED_SABS",
-        "ICD10CM,ICD10PCS,ICD9CM,SNOMEDCT_US,LOINC")
-    allowed_sabs = [s.strip() for s in sabs_str.split(",") if s.strip()]
-
-    # Load hierarchy
-    log(f"Loading hierarchy from {network_path}...")
-    with open(network_path, "rb") as f:
+    # ---- Load hierarchy ----
+    log("Loading hierarchy...")
+    with open(NETWORK_PATH, "rb") as f:
         network = pickle.load(f)
     log(f"Loaded: {network.number_of_nodes()} nodes, "
         f"{network.number_of_edges()} edges")
 
-    # Initialize
+    # ---- Initialize ----
     system = CUIReductionSystem(
-        project_id, dataset_id, network, allowed_sabs)
-    extractor = CUIExtractor(api_url)
+        PROJECT_ID, DATASET_ID, network, ALLOWED_SABS)
+    extractor = CUIExtractor(API_URL)
 
-    # Read text from stdin or args
-    if len(sys.argv) > 1:
-        texts = sys.argv[1:]
-    else:
-        log("Reading clinical text from stdin (one per line, "
-            "Ctrl+D to finish)...")
-        texts = [line.strip() for line in sys.stdin
-                 if line.strip()]
-
-    if not texts:
-        log("No input texts provided", "ERROR")
-        sys.exit(1)
+    # ---- Process texts ----
+    texts = [
+        "Patient has severe pain in left knee with swelling",
+        "History of type 2 diabetes mellitus with peripheral neuropathy",
+        "Acute exacerbation of chronic obstructive pulmonary disease",
+    ]
 
     for text in texts:
         log(f"\n{'='*60}")
         log(f"TEXT: {text}")
-        log(f"{'='*60}")
 
-        # Extract
         cuis = extractor.extract(text)
         if not cuis:
             log("  No CUIs extracted")
             continue
-        log(f"  Extracted: {len(cuis)} CUIs")
 
-        # Reduce
         result = system.reduce(cuis, text)
-
-        # Validate
         report = system.validate(result)
-        log(f"\n{report.summary()}")
 
-        # Display
-        log(f"\n  Stage counts: {result.stage_counts}")
+        log(f"  {result.input_count} -> {len(result.all_surviving)} "
+            f"(search={len(result.search_cuis)}, "
+            f"topic={len(result.topic_cuis)}, "
+            f"clusters={len(result.clusters)}) "
+            f"[{result.processing_time_ms:.0f}ms]")
+        log(f"  Validation: {'HEALTHY' if report.is_healthy else 'ISSUES'}")
+        if report.issues:
+            for issue in report.issues:
+                log(f"    - {issue}")
 
-        log(f"\n  --- Clusters ({len(result.clusters)}) ---")
-        for cid, info in sorted(
-                result.clusters.items(),
-                key=lambda x: x[1].surviving_count, reverse=True):
-            if info.surviving_count > 0:
-                log(f"    {info.label}: "
-                    f"{info.member_count} -> "
-                    f"{info.surviving_count} survived, "
-                    f"{info.retained_count} retained")
-
-        log(f"\n  --- Search CUIs ({len(result.search_cuis)}) ---")
-        for cui in result.search_cuis:
-            a = result.assessments[cui]
-            log(f"    #{a.ranking} {a.preferred_term} ({cui})")
-            log(f"      {a.explanation}")
-
-        log(f"\n  --- Topic CUIs ({len(result.topic_cuis)}) ---")
-        for cui in result.topic_cuis:
-            a = result.assessments[cui]
-            log(f"    #{a.ranking} {a.preferred_term} ({cui})")
-            log(f"      {a.explanation}")
-
-        log(f"\n  --- Removed ({len(result.removed)}) ---")
-        reasons = defaultdict(int)
-        for cui, reason in result.removed.items():
-            category = reason.split(" ")[0]
-            reasons[category] += 1
-        for reason, count in sorted(reasons.items(),
-                                     key=lambda x: -x[1]):
-            log(f"    {reason}: {count} CUIs")
-
-    # Performance
     log(f"\n{'='*60}")
     log("PERFORMANCE:")
     for name, stats in system.get_stats().items():
-        log(f"  {name}: mean={stats['mean_ms']:.1f}ms, "
-            f"p99={stats['p99_ms']:.1f}ms")
+        log(f"  {name}: mean={stats['mean_ms']:.1f}ms")
 
 
 if __name__ == "__main__":
