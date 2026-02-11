@@ -261,7 +261,7 @@ class ICComputer:
             result[cui] = ic
             m = metadata.get(cui)
             if m:
-                object.__setattr__(m, "ic_score", ic)
+                m.ic_score = ic
         return result
 
     def _descendants(self, cui: str) -> int:
@@ -463,10 +463,16 @@ class EmbeddingFetcher:
             ])
             for row in self.bq.query(
                     query, job_config=jc, timeout=300).result():
-                vec = np.array(row.embedding, dtype=np.float32)
+                raw = row.embedding
+                if raw is None or len(raw) == 0:
+                    continue
+                vec = np.array(raw, dtype=np.float32)
+                if not np.all(np.isfinite(vec)):
+                    continue
                 norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
+                if norm == 0:
+                    continue
+                vec = vec / norm
                 self._cache.put(row.cui, vec)
                 result[row.cui] = vec
 
@@ -488,29 +494,57 @@ class TopicBuilder:
         matrix = np.array([embeddings[c] for c in cuis],
                           dtype=np.float32)
         n = len(cuis)
-        k = min(k_neighbors, n - 1)
+        dim = matrix.shape[1] if matrix.ndim == 2 else 0
 
+        # Guard: need at least 2 points for KNN
+        if n < 2 or dim == 0:
+            return {i: [c] for i, c in enumerate(cuis)}
+
+        k = min(k_neighbors, n - 1)
+        k = max(k, 1)
+
+        # AH quantization needs:
+        #   - >= 16 points to train codebook
+        #   - embedding dim >= dimensions_per_block (2)
+        _AH_MIN = 16
         num_leaves = max(2, int(np.sqrt(n)))
-        searcher = (
-            scann.scann_ops_pybind.builder(matrix, k, "dot_product")
-            .tree(
-                num_leaves=num_leaves,
-                num_leaves_to_search=max(1, num_leaves // 5),
-                training_sample_size=min(n, 250_000))
-            .score_ah(2, anisotropic_quantization_threshold=0.2)
-            .reorder(min(k * 4, n))
-            .build()
-        )
+        num_leaves = min(num_leaves, n)
+        builder = scann.scann_ops_pybind.builder(
+            matrix, k, "dot_product")
+
+        if n >= _AH_MIN and dim >= 2:
+            dims_per_block = 2 if dim % 2 == 0 else 1
+            builder = (
+                builder
+                .tree(
+                    num_leaves=num_leaves,
+                    num_leaves_to_search=max(1, num_leaves // 5),
+                    training_sample_size=min(n, 250_000))
+                .score_ah(dims_per_block,
+                          anisotropic_quantization_threshold=0.2)
+                .reorder(min(k * 4, n))
+            )
+        else:
+            builder = builder.score_brute_force()
+
+        searcher = builder.build()
 
         neighbors, scores = searcher.search_batched(matrix)
 
-        # Threshold from data: mean of each point's farthest neighbor
+        # Threshold from data: mean of each point's farthest neighbor distance
         kth_dists = []
         for i in range(n):
             valid = scores[i][scores[i] > -1e30]
             if len(valid) > 0:
                 kth_dists.append(1.0 - float(valid[-1]))
-        threshold = float(np.mean(kth_dists)) if kth_dists else 0.5
+
+        if kth_dists:
+            threshold = float(np.mean(kth_dists))
+        else:
+            # All scores invalid — compute from raw dot products
+            all_sims = (matrix @ matrix.T)
+            np.fill_diagonal(all_sims, -np.inf)
+            threshold = float(1.0 - np.mean(all_sims[all_sims > -np.inf]))
 
         # Connected components from KNN adjacency
         adj: Dict[int, Set[int]] = defaultdict(set)
@@ -668,6 +702,10 @@ def _reduce_topic(
     np.fill_diagonal(dist, 0)
     dist = np.maximum(dist, 0)
 
+    # Guard: NaN from degenerate vectors
+    if np.any(~np.isfinite(dist)):
+        dist = np.nan_to_num(dist, nan=1.0, posinf=1.0, neginf=0.0)
+
     n = len(t_cuis)
     idx = {c: i for i, c in enumerate(t_cuis)}
     upper = dist[np.triu_indices(n, k=1)]
@@ -789,8 +827,8 @@ class CUIReductionSystem:
         self.emb_fetcher = EmbeddingFetcher(
             self.bq, project_id, dataset_id, embedding_table)
 
-        log(f"System ready | sabs={allowed_sabs} | "
-            f"graph={full_network.number_of_nodes()} nodes")
+        log(f"[Stage 0] System Init         : graph={full_network.number_of_nodes()} nodes | "
+            f"sabs={allowed_sabs}")
 
     @timed("full_pipeline")
     def reduce(self, cuis: List[str],
@@ -802,37 +840,41 @@ class CUIReductionSystem:
         if not cuis:
             return self._empty(context_string, t0)
 
-        log(f"  Input: {len(cuis)} CUIs")
+        log(f"[Stage 1] API Extraction     : {len(cuis)} CUIs")
 
         # Step 2: Metadata
         metadata = self.fetcher.fetch(cuis)
         meta_cov = len(metadata) / len(cuis) if cuis else 0
-        log(f"  Metadata: {len(metadata)}/{len(cuis)} ({meta_cov:.0%})")
+        log(f"[Stage 2] Metadata Enrichment : {len(metadata)}/{len(cuis)} "
+            f"matched ({meta_cov:.0%})")
 
         # Step 2B: IC
         ic_map = self.ic_computer.compute(cuis, metadata)
+        log(f"[Stage 2B] IC Scores          : {len(ic_map)} computed")
 
         # Step 3A: SAB filter
         after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
         all_audit.extend(sab_audit)
-        log(f"  SAB filter: {len(cuis)} → {len(after_sab)}")
+        log(f"[Stage 3A] SAB Filter         : {len(cuis)} → {len(after_sab)} "
+            f"(removed {len(cuis) - len(after_sab)})")
 
         if not after_sab:
+            log(f"[Stage 3A] All CUIs filtered out — stopping")
             return self._empty(context_string, t0, all_audit,
                                meta_cov=meta_cov)
 
         # Step 3B: Semantic type filter
         after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
         all_audit.extend(sty_audit)
-        if sty_audit:
-            log(f"  Semtype filter: {len(after_sab)} → {len(after_sty)}")
+        log(f"[Stage 3B] Semtype Filter     : {len(after_sab)} → {len(after_sty)} "
+            f"(removed {len(after_sab) - len(after_sty)})")
 
         # Step 3C: Term dedup
         after_term, term_audit = TermDeduplicator.run(
             after_sty, metadata, ic_map)
         all_audit.extend(term_audit)
-        if term_audit:
-            log(f"  Term dedup: {len(after_sty)} → {len(after_term)}")
+        log(f"[Stage 3C] Term Dedup         : {len(after_sty)} → {len(after_term)} "
+            f"(removed {len(after_sty) - len(after_term)})")
 
         after_filter = len(after_term)
 
@@ -840,18 +882,21 @@ class CUIReductionSystem:
         after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
             after_term, ic_map, metadata)
         all_audit.extend(hier_audit)
-        log(f"  Hierarchy: {len(after_term)} → {len(after_hier)}")
+        log(f"[Stage 4] Hierarchy Reduction : {len(after_term)} → {len(after_hier)} "
+            f"(removed {len(after_term) - len(after_hier)})")
 
         # Step 5A: Embeddings
         embeddings = self.emb_fetcher.fetch(after_hier)
         emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
-        log(f"  Embeddings: {len(embeddings)}/{len(after_hier)} ({emb_cov:.0%})")
+        log(f"[Stage 5A] Embedding Fetch    : {len(embeddings)}/{len(after_hier)} "
+            f"matched ({emb_cov:.0%})")
 
         # Step 5B-G: Embedding reduction (ScaNN topics + dense redundancy)
         topics, surviving, emb_audit = EmbeddingReducer.run(
             after_hier, metadata, embeddings, ic_map, hier_edges)
         all_audit.extend(emb_audit)
-        log(f"  Redundancy: {len(after_hier)} → {len(surviving)}")
+        log(f"[Stage 5] Embedding Reduction : {len(after_hier)} → {len(surviving)} "
+            f"(removed {len(after_hier) - len(surviving)})")
 
         # Step 6: Build topic output
         topics_out: Dict[str, TopicInfo] = {}
@@ -871,20 +916,34 @@ class CUIReductionSystem:
                 cuis=t_cuis,
                 cui_terms=cui_terms)
 
+        log(f"[Stage 6] Topic Grouping      : {len(surviving)} CUIs → "
+            f"{len(topics_out)} topics")
+
         # Step 7: 100% accounting
         audited = {e.removed_cui for e in all_audit}
         survived = set(surviving)
         unaccounted = set(cuis) - survived - audited
         if unaccounted:
-            log(f"  WARNING: {len(unaccounted)} unaccounted", "WARNING")
+            log(f"[Stage 7] WARNING: {len(unaccounted)} unaccounted CUIs",
+                "WARNING")
             for cui in unaccounted:
                 m = metadata.get(cui)
                 all_audit.append(AuditEntry(
                     cui, m.preferred_term if m else "",
                     "", "", "unaccounted",
                     "CUI not in surviving or audit trail"))
+        else:
+            log(f"[Stage 7] Audit              : 100% accounted "
+                f"({len(survived)} survived + {len(audited)} removed "
+                f"= {len(survived) + len(audited)})")
 
         elapsed = (time.perf_counter() - t0) * 1000
+
+        log(f"")
+        log(f"{'─' * 55}")
+        log(f"  SUMMARY: {len(cuis)} → {len(surviving)} CUIs "
+            f"in {len(topics_out)} topics ({elapsed:.0f}ms)")
+        log(f"{'─' * 55}")
 
         return ReductionResult(
             context_string=context_string,
@@ -963,8 +1022,12 @@ class CUIExtractor:
                     continue
                 for item in val:
                     if isinstance(item, dict) and "cui" in item:
-                        score = float(item.get("score",
-                                      item.get("confidence", 1.0)))
+                        raw_score = item.get("score",
+                                    item.get("confidence", 1.0))
+                        try:
+                            score = float(raw_score)
+                        except (ValueError, TypeError):
+                            score = 0.0
                         if score >= self.min_confidence:
                             cuis.append(str(item["cui"]))
                     elif isinstance(item, str) and item.strip():
@@ -987,7 +1050,8 @@ def main():
     log("Loading hierarchy...")
     with open(NETWORK_PATH, "rb") as f:
         network = pickle.load(f)
-    log(f"Loaded: {network.number_of_nodes()} nodes")
+    log(f"[Pickle] Hierarchy loaded     : {network.number_of_nodes()} nodes, "
+        f"{network.number_of_edges()} edges")
 
     system = CUIReductionSystem(
         PROJECT_ID, DATASET_ID, network, ALLOWED_SABS,
@@ -1003,8 +1067,9 @@ def main():
     ]
 
     for text in texts:
-        log(f"\n{'='*60}")
+        log(f"\n{'=' * 60}")
         log(f"TEXT: {text}")
+        log(f"{'=' * 60}")
 
         cuis = extractor.extract(text)
         if not cuis:
@@ -1013,15 +1078,8 @@ def main():
 
         result = system.reduce(cuis, text)
 
-        log(f"  Pipeline: {result.input_count} → "
-            f"{result.after_filter_count} → "
-            f"{result.after_hierarchy_count} → "
-            f"{result.after_redundancy_count}")
-        log(f"  Topics: {len(result.topics)}")
-        log(f"  Time: {result.processing_time_ms:.0f}ms")
-
         for tid, topic in result.topics.items():
-            log(f"    {tid}: {topic.semantic_types} "
+            log(f"  {tid}: {topic.semantic_types} "
                 f"→ {list(topic.cui_terms.values())}")
 
 
