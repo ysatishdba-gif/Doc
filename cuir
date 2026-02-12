@@ -873,17 +873,25 @@ class CUIReductionSystem:
                 per_text.append((context_string, [], [], set(), []))
                 continue
 
+            label = context_string[:50]
+            log(f"\n  [{label}] {len(cuis)} input CUIs")
+
             after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
+            log(f"  [{label}] SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
+
             after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
+            log(f"  [{label}] Semtype Filter: {len(after_sab)} -> {len(after_sty)} (removed {len(after_sab) - len(after_sty)})")
+
             after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
+            log(f"  [{label}] Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
+
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
                 after_term, ic_map, metadata)
+            log(f"  [{label}] Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
 
             audit = sab_audit + sty_audit + term_audit + hier_audit
             all_post_hier.update(after_hier)
             per_text.append((context_string, cuis, after_hier, hier_edges, audit))
-
-            log(f"  [{context_string[:50]}] {len(cuis)} -> {len(after_hier)} after hierarchy")
 
         # ONE embedding fetch for all post-hierarchy CUIs
         log(f"[Batch] Fetching embeddings for {len(all_post_hier)} unique post-hierarchy CUIs")
@@ -894,6 +902,7 @@ class CUIReductionSystem:
         results = []
         for context_string, cuis, after_hier, hier_edges, all_audit in per_text:
             t_start = time.perf_counter()
+            label = context_string[:50]
 
             if not after_hier:
                 results.append(self._empty(context_string, t_start, all_audit))
@@ -902,11 +911,13 @@ class CUIReductionSystem:
             # filter embeddings to this text's CUIs
             embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
             emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
+            log(f"\n  [{label}] Embeddings: {len(embeddings)}/{len(after_hier)} matched ({emb_cov:.0%})")
 
             # embedding reduction
             topics, surviving, emb_audit = EmbeddingReducer.run(
                 after_hier, metadata, embeddings, ic_map, hier_edges)
             all_audit.extend(emb_audit)
+            log(f"  [{label}] Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
 
             # topic info
             topics_out = {}
@@ -926,9 +937,13 @@ class CUIReductionSystem:
                     cuis=t_cuis,
                     cui_terms=cui_terms)
 
+            log(f"  [{label}] Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
+
             # retention scoring
             sorted_cuis, retention = self.retention_scorer.score(
                 context_string, surviving, embeddings, metadata, all_audit)
+            if retention:
+                log(f"  [{label}] Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
 
             # audit accounting
             audited = {e.removed_cui for e in all_audit}
