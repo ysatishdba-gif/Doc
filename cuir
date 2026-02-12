@@ -961,11 +961,15 @@ class RetentionScorer:
 
 # %% [14B] Relevance Filter
 class RelevanceFilter:
-    """Post-retention cleanup: removes only clearly irrelevant CUIs.
+    """Post-retention cleanup using text embedding alignment.
 
-    Detects the natural alignment gap between relevant concepts and
-    distant noise. Very conservative — prefers recall over precision.
-    No hardcoded rules, no laterality assumptions.
+    Adaptive threshold derived from the alignment distribution itself:
+    - Compute alignment stats from top CUIs (the 'anchor' cluster)
+    - CUIs below (anchor_mean - anchor_range) are noise
+    - No hardcoded threshold — adapts per query
+
+    Prefers recall: only removes CUIs significantly below the
+    relevant cluster, not borderline cases.
     """
 
     @staticmethod
@@ -976,38 +980,40 @@ class RelevanceFilter:
             return sorted_cuis, retention, []
 
         scores = np.array([e.alignment for e in retention])
-        gaps = np.abs(np.diff(scores))
 
-        if len(gaps) == 0:
-            sorted_cuis = [e.cui for e in retention]
-            return sorted_cuis, retention, []
+        # anchor cluster: top 10% of CUIs define what "relevant" looks like
+        anchor_n = max(10, int(len(scores) * 0.10))
+        anchor_scores = scores[:anchor_n]
+        anchor_mean = float(np.mean(anchor_scores))
+        anchor_min = float(np.min(anchor_scores))
 
-        # very conservative: gap must be 3x the median to trigger
-        median_gap = float(np.median(gaps))
+        # range of the anchor cluster
+        anchor_range = anchor_mean - anchor_min
+
+        # cutoff: below the anchor cluster minus its own spread
+        # this means a CUI must be further from the anchor than
+        # the anchor's internal variation — generous for recall
+        cutoff = anchor_min - anchor_range
+
+        # safety: never cut more than 50% of CUIs (recall priority)
+        min_keep = len(retention) // 2
+
         audit = []
+        kept = []
+        for entry in retention:
+            if entry.alignment >= cutoff or len(kept) < min_keep:
+                kept.append(entry)
+            else:
+                audit.append(AuditEntry(
+                    removed_cui=entry.cui,
+                    removed_term=entry.term,
+                    kept_cui="", kept_term="",
+                    reason="below_relevance_threshold",
+                    detail=f"alignment {entry.alignment:.4f} < cutoff {cutoff:.4f} "
+                           f"(anchor_mean={anchor_mean:.4f}, anchor_min={anchor_min:.4f})"))
 
-        if median_gap > 0:
-            cutoff_idx = None
-            for i in range(len(gaps)):
-                if gaps[i] > median_gap * 3:
-                    cutoff_idx = i + 1
-                    break
-
-            if cutoff_idx and cutoff_idx < len(retention):
-                removed_entries = retention[cutoff_idx:]
-                retention = retention[:cutoff_idx]
-
-                for entry in removed_entries:
-                    audit.append(AuditEntry(
-                        removed_cui=entry.cui,
-                        removed_term=entry.term,
-                        kept_cui="", kept_term="",
-                        reason="below_alignment_gap",
-                        detail=f"alignment {entry.alignment} below gap at "
-                               f"position {cutoff_idx}"))
-
-        sorted_cuis = [e.cui for e in retention]
-        return sorted_cuis, retention, audit
+        sorted_cuis = [e.cui for e in kept]
+        return sorted_cuis, kept, audit
 
 
 # %% [15] Pipeline
