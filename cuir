@@ -1,13 +1,111 @@
-# %% Check: does your API return scores per CUI?
-resp = extractor.session.post(
-    extractor.url, headers=extractor.headers,
-    json={"query_texts": [text], "top_k": 3},
-    timeout=200)
-data = resp.json()
+# %% Retention scoring — zero additional API calls, uses only pipeline outputs
 
-# show first 5 items from each key
-for key, val in data.items():
-    if isinstance(val, list):
-        print(f"\n{key} (first 5):")
-        for item in val[:5]:
-            print(f"  {item}")
+def compute_retention(result, embs, ic_precomputed, metadata_cache):
+    """Post-processing only. Uses data already computed by the pipeline."""
+
+    surviving = result.all_reduced_cuis
+    if not surviving:
+        return []
+
+    # 1. explains map from audit trail (already computed)
+    explains = defaultdict(set)
+    for entry in result.audit_trail:
+        if entry.kept_cui and entry.removed_cui:
+            explains[entry.kept_cui].add(entry.removed_cui)
+
+    # 2. within-topic centrality (from existing embeddings + topics)
+    topic_centrality = {}
+    for tid, topic in result.topics.items():
+        members = [c for c in topic.cuis if c in embs]
+        if len(members) < 2:
+            for c in members:
+                topic_centrality[c] = 1.0
+            continue
+        vecs = np.array([embs[c] for c in members])
+        sims = vecs @ vecs.T
+        np.fill_diagonal(sims, 0)
+        avg_sim = sims.mean(axis=1)
+        best = avg_sim.max()
+        for i, c in enumerate(members):
+            topic_centrality[c] = float(avg_sim[i] / best) if best > 0 else 0.0
+
+    # 3. IC percentile WITHIN surviving set (not global)
+    ic_vals = [ic_precomputed.get(c, 0.0) for c in surviving]
+    ic_min, ic_max = min(ic_vals), max(ic_vals)
+    ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
+
+    # 4. score each CUI
+    retention = {}
+    for cui in surviving:
+        m = metadata_cache.get(cui)
+        if not m:
+            continue
+
+        # how many CUIs does this one explain? (from audit trail)
+        explains_count = len(explains.get(cui, set()))
+
+        # how central is it within its topic? (from existing embeddings)
+        centrality = topic_centrality.get(cui, 0.0)
+
+        # IC within this result set
+        ic_raw = ic_precomputed.get(cui, 0.0)
+        ic_local = (ic_raw - ic_min) / ic_range
+
+        retention[cui] = {
+            "explains_count": explains_count,
+            "centrality": round(centrality, 3),
+            "ic_local": round(ic_local, 3),
+            "term": m.preferred_term,
+            "semantic_types": m.semantic_types,
+            "explains_cuis": list(explains.get(cui, set())),
+        }
+
+    # 5. data-driven weights from variance
+    if retention:
+        ec = np.array([r["explains_count"] for r in retention.values()], dtype=float)
+        ct = np.array([r["centrality"] for r in retention.values()])
+        ic = np.array([r["ic_local"] for r in retention.values()])
+
+        # normalize each to 0-1
+        for arr in [ec, ct, ic]:
+            mx = arr.max()
+            if mx > 0:
+                arr /= mx
+
+        features = np.column_stack([ec, ct, ic])
+        var = features.var(axis=0)
+        weights = var / (var.sum() + 1e-10)
+        print(f"Data-derived weights: explains={weights[0]:.3f}, "
+              f"centrality={weights[1]:.3f}, specificity={weights[2]:.3f}")
+
+        scores = features @ weights
+        for i, cui in enumerate(retention):
+            retention[cui]["score"] = round(float(scores[i]), 4)
+
+    # 6. sort
+    sorted_cuis = sorted(retention.keys(),
+                          key=lambda c: retention[c]["score"], reverse=True)
+
+    return sorted_cuis, retention
+
+
+# %% Run it
+metadata_cache = {c: system.fetcher._cache.get(c)
+                  for c in result.all_reduced_cuis
+                  if system.fetcher._cache.get(c)}
+
+sorted_cuis, retention = compute_retention(
+    result, embs, ic_precomputed, metadata_cache)
+
+print(f"\nTop 25 CUIs by retention score:")
+for c in sorted_cuis[:25]:
+    r = retention[c]
+    stys = ", ".join(r["semantic_types"][:2]) if r["semantic_types"] else "?"
+    line = (f"  {c} | score={r['score']} "
+            f"(explains={r['explains_count']}, "
+            f"central={r['centrality']}, "
+            f"spec={r['ic_local']}) "
+            f"| [{stys}] {r['term']}")
+    if r["explains_count"] > 0:
+        line += f" | explains {r['explains_count']} CUIs"
+    print(line)
