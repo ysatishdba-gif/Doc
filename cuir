@@ -1,49 +1,113 @@
-Data-derived weights: explains=0.039, centrality=0.017, specificity=0.943
+# %% Retention: 1 embedding call + existing pipeline data
 
-Top 25 CUIs by retention score:
-  C4720946 | score=0.9986 (explains=333, central=0.92, spec=1.0) | [Disease or Syndrome] Rheumatoid arthritis of left foot (diagnosis) | explains 333 CUIs
-  C4545096 | score=0.9899 (explains=256, central=0.938, spec=1.0) | [Disease or Syndrome] arthritis due to gout of left foot (diagnosis) | explains 256 CUIs
-  C0409237 | score=0.9895 (explains=249, central=0.962, spec=1.0) | [Disease or Syndrome] Unspecified polyarthropathy of the pelvic region and thigh (disorder) | explains 249 CUIs
-  C0003874 | score=0.9834 (explains=207, central=0.897, spec=1.0) | [Disease or Syndrome] Acute suppurative arthritis caused by bacteria (disorder) | explains 207 CUIs
-  C0157838 | score=0.9781 (explains=159, central=0.919, spec=1.0) | [Disease or Syndrome] Arthropathy involving pelvic region and thigh associated with other infectious and parasitic diseases | explains 159 CUIs
-  C2895873 | score=0.9772 (explains=146, central=0.953, spec=1.0) | [Disease or Syndrome] Other infective (teno)synovitis, right hip | explains 146 CUIs
-  C2902580 | score=0.9755 (explains=143, central=0.879, spec=1.0) | [Disease or Syndrome] Juvenile osteochondrosis of metatarsus, left foot | explains 143 CUIs
-  C2881078 | score=0.974 (explains=129, central=0.886, spec=1.0) | [Disease or Syndrome] Panophthalmitis (acute), left eye | explains 129 CUIs
-  C5767578 | score=0.9716 (explains=103, central=0.923, spec=1.0) | [Disease or Syndrome] Chronic ulcer of right ankle (disorder) | explains 103 CUIs
-  C2864512 | score=0.9713 (explains=100, central=0.925, spec=1.0) | [Injury or Poisoning] Sprain of medial collateral ligament of right knee, sequela | explains 100 CUIs
-  C2443404 | score=0.9701 (explains=79, central=1.0, spec=1.0) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Removal @ Knee Joint, Left @ Open @ Autologous Tissue Substitute @ No Qualifier | explains 79 CUIs
-  C2896247 | score=0.9689 (explains=81, central=0.918, spec=1.0) | [Disease or Syndrome] abscess of left ankle and foot bursa (diagnosis) | explains 81 CUIs
-  C4039139 | score=0.9686 (explains=76, central=0.935, spec=1.0) | [Injury or Poisoning] Derangement of posterior horn of lateral meniscus due to injury of knee (disorder) | explains 76 CUIs
-  C4544634 | score=0.9684 (explains=67, central=0.984, spec=1.0) | [Disease or Syndrome] Arthritis of left foot due to trauma (disorder) | explains 67 CUIs
-  C2902343 | score=0.9671 (explains=61, central=0.947, spec=1.0) | [Pathologic Function] Osteolysis, left shoulder | explains 61 CUIs
-  C0409903 | score=0.9669 (explains=64, central=0.917, spec=1.0) | [Disease or Syndrome] arthritis due to gout of pelvic region and thigh (diagnosis) | explains 64 CUIs
-  C5921905 | score=0.9665 (explains=60, central=0.92, spec=1.0) | [Disease or Syndrome] Chronic rupture of lateral collateral ligament of bilateral knee joints (disorder) | explains 60 CUIs
-  C4039130 | score=0.9661 (explains=60, central=0.898, spec=1.0) | [Disease or Syndrome] Subcutaneous abscess of knee (disorder) | explains 60 CUIs
-  C2864306 | score=0.966 (explains=50, central=0.958, spec=1.0) | [Injury or Poisoning] Lateral dislocation of proximal end of tibia, right knee, initial encounter | explains 50 CUIs
-  C2444196 | score=0.9659 (explains=46, central=0.979, spec=1.0) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Resection @ Knee Joint, Right @ Open @ No Device @ No Qualifier | explains 46 CUIs
-  C0158377 | score=0.9657 (explains=59, central=0.882, spec=1.0) | [Disease or Syndrome] Acute osteomyelitis involving lower leg | explains 59 CUIs
-  C4081760 | score=0.9656 (explains=56, central=0.896, spec=1.0) | [Finding] Mass of joint of left shoulder (finding) | explains 56 CUIs
-  C0158158 | score=0.9655 (explains=48, central=0.946, spec=1.0) | [Pathologic Function] Effusion of joint of multiple sites (disorder) | explains 48 CUIs
-  C2895064 | score=0.965 (explains=46, central=0.929, spec=1.0) | [Disease or Syndrome] Stiffness of left hip, not elsewhere classified | explains 46 CUIs
-  C2889511 | score=0.9649 (explains=44, central=0.938, spec=1.0) | [Disease or Syndrome] enteropathic arthropathy of right hip (diagnosis) | explains 44 CUIs
+from google import genai
+from collections import defaultdict
 
-As an ODE clinical intelligence system,
+client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
 
-I want to leverage a CUI summarizing method to assess the information retention capacity of each CUI. This will enable the team to select CUIs that encompass the most information from other related CUIs. For instance, 'Pain in left arm' should be prioritized over 'Arm Pain.' Currently, our search method might prioritize 'Arm Pain' because its constituent terms ('arm' and 'pain') are more broadly supported. However, from an information retention perspective, 'Pain in left arm' clearly retains more specific contextual information.
+def compute_retention(text, result, embs, ic_precomputed, metadata_cache):
+    """
+    Information Retention Scoring.
 
-I want to assess how much meaningful information each detected CUI retains from the user’s narrative within a single clinical intent,
-so that downstream components can understand the relative completeness of each concept before any prioritization or ranking is applied.
+    Measures how much of the user's narrative each CUI retains,
+    considering specificity, qualifiers, and semantic alignment.
 
-This assessment evaluates whether a CUI meaningfully captures the core health concern expressed by the user, considering specificity, qualifiers (e.g., anatomical site, laterality), and alignment with the narrative—without making decisions about which CUI should be preferred.
+    Input:  CUIs, context_string, existing pipeline data
+    Output: sorted CUIs with retention scores + explains sets
 
-Dev Notes:
+    Cost: 1 embedding API call (~100ms, ~$0.0001)
+    Everything else reuses data already in memory.
+    """
+
+    surviving = result.all_reduced_cuis
+    if not surviving:
+        return [], {}
+
+    # ── ONE embedding call: text -> 3072-dim vector ──
+    response = client.models.embed_content(
+        model="gemini-embedding-001",
+        contents=text,
+    )
+    text_vec = np.array(response.embeddings[0].values, dtype=np.float32)
+    text_vec = text_vec / (np.linalg.norm(text_vec) + 1e-10)
+
+    # ── Narrative alignment: cosine(text_vec, cui_vec) ──
+    # This is what actually answers "does this CUI match what the patient said?"
+    # Handles synonyms: "swelling" matches "edema", "pain" matches "arthralgia"
+    # Handles qualifiers: "left knee" scores higher than "right hip"
+    alignments = {}
+    for cui in surviving:
+        if cui in embs:
+            alignments[cui] = max(0.0, float(np.dot(text_vec, embs[cui])))
+        else:
+            alignments[cui] = 0.0
+
+    # ── Explains map from audit trail (already computed) ──
+    explains = defaultdict(set)
+    for entry in result.audit_trail:
+        if entry.kept_cui and entry.removed_cui:
+            explains[entry.kept_cui].add(entry.removed_cui)
+
+    # ── IC within surviving set (already computed) ──
+    ic_vals = {c: ic_precomputed.get(c, 0.0) for c in surviving}
+    ic_arr = list(ic_vals.values())
+    ic_min, ic_max = min(ic_arr), max(ic_arr)
+    ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
+
+    # ── Score: alignment-first, IC as tiebreaker ──
+    # No hardcoded weights: derive from variance
+    align_arr = np.array([alignments.get(c, 0.0) for c in surviving])
+    ic_norm = np.array([(ic_vals[c] - ic_min) / ic_range for c in surviving])
+    explain_arr = np.array([len(explains.get(c, set())) for c in surviving], dtype=float)
+    ex_max = explain_arr.max() if explain_arr.max() > 0 else 1.0
+    explain_arr = explain_arr / ex_max
+
+    features = np.column_stack([align_arr, ic_norm, explain_arr])
+    var = features.var(axis=0)
+    weights = var / (var.sum() + 1e-10)
+    print(f"Data-derived weights: alignment={weights[0]:.3f}, "
+          f"specificity={weights[1]:.3f}, explains={weights[2]:.3f}")
+
+    scores = features @ weights
+
+    # ── Build output ──
+    retention = {}
+    for i, cui in enumerate(surviving):
+        m = metadata_cache.get(cui)
+        if not m:
+            continue
+        retention[cui] = {
+            "score": round(float(scores[i]), 4),
+            "alignment": round(float(alignments.get(cui, 0.0)), 3),
+            "ic_local": round(float(ic_norm[i]), 3),
+            "explains_count": len(explains.get(cui, set())),
+            "term": m.preferred_term,
+            "semantic_types": m.semantic_types,
+            "explains_cuis": list(explains.get(cui, set())),
+        }
+
+    sorted_cuis = sorted(retention.keys(),
+                          key=lambda c: retention[c]["score"], reverse=True)
+
+    return sorted_cuis, retention
 
 
-Input:
-A set of CUIs
-Their detected locations
-A context_string
-Output: 
-A sorted list of the input CUIs
-Information-retention related scores. 
-For each CUI in the sorted list, an accompanying set of other CUIs whose information is explained or retained by that CUI.
+# %% Run
+metadata_cache = {c: system.fetcher._cache.get(c)
+                  for c in result.all_reduced_cuis
+                  if system.fetcher._cache.get(c)}
+
+sorted_cuis, retention = compute_retention(
+    text, result, embs, ic_precomputed, metadata_cache)
+
+print(f"\nTop 30 CUIs by retention score:")
+for c in sorted_cuis[:30]:
+    r = retention[c]
+    stys = ", ".join(r["semantic_types"][:2]) if r["semantic_types"] else "?"
+    line = (f"  {c} | score={r['score']} "
+            f"(align={r['alignment']}, spec={r['ic_local']}, "
+            f"explains={r['explains_count']}) "
+            f"| [{stys}] {r['term']}")
+    if r["explains_count"] > 0:
+        line += f" | explains {r['explains_count']}"
+    print(line)
