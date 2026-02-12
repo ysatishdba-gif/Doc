@@ -140,6 +140,41 @@ def terms_diverge(tokens_a, tokens_b):
     return len(tokens_a & tokens_b) == 0
 
 
+def qualifier_conflict(tokens_a, tokens_b):
+    """Block collapse when terms are nearly identical but differ by 1-2 tokens.
+
+    If 80%+ of tokens overlap but a small set differs, those differing
+    tokens are likely clinical qualifiers (left/right, upper/lower,
+    front/back, acute/chronic, mild/severe, etc).
+
+    No hardcoded list — works for any qualifier pattern:
+      "left knee pain" vs "right knee pain" → 2/3 overlap, differ by left/right → block
+      "upper abdomen pain" vs "lower abdomen pain" → same logic
+      "acute sinusitis" vs "chronic sinusitis" → same logic
+      "knee pain" vs "elbow pain" → same logic (different body part)
+    """
+    if not tokens_a or not tokens_b:
+        return False
+
+    shared = tokens_a & tokens_b
+    only_a = tokens_a - tokens_b
+    only_b = tokens_b - tokens_a
+
+    # no difference — identical terms, not a conflict
+    if not only_a and not only_b:
+        return False
+
+    # high overlap with small difference = qualifier distinction
+    total = len(tokens_a | tokens_b)
+    overlap_ratio = len(shared) / total if total > 0 else 0
+
+    # 50%+ overlap and differ by 1-2 tokens each side → qualifier conflict
+    if overlap_ratio >= 0.5 and len(only_a) <= 2 and len(only_b) <= 2:
+        return True
+
+    return False
+
+
 # %% [5] LRU Cache (thread-safe)
 class Cache:
     def __init__(self, max_size):
@@ -575,27 +610,35 @@ class EmbeddingReducer:
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges):
 
-        with_emb = [c for c in cuis if c in embeddings]
-        without_emb = [c for c in cuis if c not in embeddings]
+        type_groups = defaultdict(list)
+        for cui in cuis:
+            meta = metadata.get(cui)
+            if meta and meta.semantic_types:
+                for sty in meta.semantic_types:
+                    type_groups[sty].append(cui)
+            else:
+                type_groups["Unknown"].append(cui)
 
         all_topics = {}
         globally_surviving = set()
         removal_candidates = {}
         tid = 0
 
-        # CUIs without embeddings survive as singleton topics
-        for c in without_emb:
-            globally_surviving.add(c)
-            all_topics[f"topic_{tid}"] = [c]
-            tid += 1
+        for sty in sorted(type_groups):
+            group_cuis = sorted(set(type_groups[sty]))
+            with_emb = [c for c in group_cuis if c in embeddings]
+            without_emb = [c for c in group_cuis if c not in embeddings]
 
-        if len(with_emb) <= 1:
-            for c in with_emb:
+            for c in without_emb:
                 globally_surviving.add(c)
-                all_topics[f"topic_{tid}"] = [c]
+
+            if len(with_emb) <= 1:
+                all_topics[f"topic_{tid}"] = group_cuis
+                for c in group_cuis:
+                    globally_surviving.add(c)
                 tid += 1
-        else:
-            # ONE ScaNN run on all CUIs — embeddings decide natural topics
+                continue
+
             scann_topics = TopicBuilder.build(with_emb, embeddings)
 
             for t_cuis in scann_topics.values():
@@ -608,8 +651,6 @@ class EmbeddingReducer:
                         globally_surviving.add(c)
                     continue
 
-                # redundancy removal within topic
-                # semantic type check stays as safety guard in _resolve_group
                 surviving, removed = _reduce_topic(
                     t_cuis, embeddings, metadata, ic_map, hierarchy_edges)
                 all_topics[topic_id] = surviving
@@ -617,6 +658,10 @@ class EmbeddingReducer:
                     globally_surviving.add(c)
                 for entry in removed:
                     removal_candidates[entry.removed_cui] = entry
+
+            for cui in without_emb:
+                all_topics[f"topic_{tid}"] = [cui]
+                tid += 1
 
         final_audit = []
         for cui, entry in removal_candidates.items():
@@ -718,6 +763,10 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, t
             kept.append(c)
             continue
 
+        if c_meta and b_meta and qualifier_conflict(c_meta.term_tokens, b_meta.term_tokens):
+            kept.append(c)
+            continue
+
         ci = index_map.get(c)
         bi = index_map.get(best)
         pair_dist = dist[ci, bi] if ci is not None and bi is not None else 0.0
@@ -794,6 +843,17 @@ class CrossTopicDedup:
                     continue
 
                 ci, cj = with_emb[i], with_emb[j]
+
+                # safety guards — don't collapse qualifier variants or divergent terms
+                ci_meta = metadata.get(ci)
+                cj_meta = metadata.get(cj)
+                ci_tok = ci_meta.term_tokens if ci_meta else frozenset()
+                cj_tok = cj_meta.term_tokens if cj_meta else frozenset()
+                if qualifier_conflict(ci_tok, cj_tok):
+                    continue
+                if terms_diverge(ci_tok, cj_tok):
+                    continue
+
                 # keep higher alignment, break ties by IC
                 if (alignments.get(ci, 0), ic_map.get(ci, 0)) >= \
                    (alignments.get(cj, 0), ic_map.get(cj, 0)):
