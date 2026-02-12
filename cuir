@@ -1,91 +1,31 @@
-# %% Retention v5: fully data-driven, no hardcoded values
+Data-derived weights: alignment=0.011, specificity=0.699, explanation=0.289
 
-from collections import defaultdict
+Core context from 36 densest CUIs out of 1304
+Median similarity threshold: 0.641
 
-embs = system.emb_fetcher.fetch(result.all_reduced_cuis)
-embedded_cuis = [c for c in result.all_reduced_cuis if c in embs]
-n = len(embedded_cuis)
-
-if n < 2:
-    print("Too few embedded CUIs")
-else:
-    matrix = np.array([embs[c] for c in embedded_cuis], dtype=np.float32)
-
-    # --- STEP 1: find dense core (data-driven context) ---
-    # each CUI's average similarity to all others
-    sim_matrix = matrix @ matrix.T
-    np.fill_diagonal(sim_matrix, 0)
-    avg_sims = sim_matrix.mean(axis=1)
-
-    # top-K = sqrt(n) most central CUIs define the context
-    k_core = max(5, int(np.sqrt(n)))
-    core_idx = np.argsort(avg_sims)[-k_core:]
-    ctx_vec = matrix[core_idx].mean(axis=0)
-    ctx_vec = ctx_vec / (np.linalg.norm(ctx_vec) + 1e-10)
-
-    # --- STEP 2: compute all scores from data ---
-    # alignment: cosine to dense core (semantic match, handles synonyms)
-    alignments = matrix @ ctx_vec
-
-    # specificity: IC percentile WITHIN this result set (not global)
-    ic_vals = np.array([ic_precomputed.get(c, 0.0) for c in embedded_cuis])
-    ic_min, ic_max = ic_vals.min(), ic_vals.max()
-    ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
-    ic_norm = (ic_vals - ic_min) / ic_range
-
-    # explanation power: how many nearby CUIs does each one "cover"?
-    # use per-CUI count of neighbors above median similarity
-    median_sim = np.median(sim_matrix[sim_matrix > 0])
-    explain_counts = (sim_matrix > median_sim).sum(axis=1).astype(float)
-    ec_max = explain_counts.max() if explain_counts.max() > 0 else 1.0
-    explain_norm = explain_counts / ec_max
-
-    # --- STEP 3: data-driven weights from variance ---
-    # features that vary more across CUIs carry more signal
-    features = np.column_stack([alignments, ic_norm, explain_norm])
-    variances = features.var(axis=0)
-    variances = variances / (variances.sum() + 1e-10)  # normalize to sum=1
-    print(f"Data-derived weights: alignment={variances[0]:.3f}, "
-          f"specificity={variances[1]:.3f}, explanation={variances[2]:.3f}")
-
-    # weighted score
-    scores = features @ variances
-
-    # --- STEP 4: build output ---
-    # audit-based explains map
-    explains = defaultdict(list)
-    for entry in result.audit_trail:
-        if entry.kept_cui and entry.removed_cui:
-            explains[entry.kept_cui].append(entry.removed_cui)
-
-    retention = {}
-    for i, cui in enumerate(embedded_cuis):
-        m = system.fetcher._cache.get(cui)
-        if not m:
-            continue
-        retention[cui] = {
-            "score": round(float(scores[i]), 4),
-            "alignment": round(float(alignments[i]), 3),
-            "specificity": round(float(ic_norm[i]), 3),
-            "explain_power": round(float(explain_norm[i]), 3),
-            "term": m.preferred_term,
-            "semantic_types": m.semantic_types,
-            "explains_cuis": explains.get(cui, []),
-        }
-
-    sorted_cuis = sorted(retention.keys(),
-                          key=lambda c: retention[c]["score"], reverse=True)
-
-    print(f"\nCore context from {k_core} densest CUIs out of {n}")
-    print(f"Median similarity threshold: {median_sim:.3f}")
-    print(f"\nTop 25 CUIs by retention score:")
-    for c in sorted_cuis[:25]:
-        r = retention[c]
-        stys = ", ".join(r["semantic_types"][:2]) if r["semantic_types"] else "?"
-        line = (f"  {c} | score={r['score']} "
-                f"(align={r['alignment']}, spec={r['specificity']}, "
-                f"expl={r['explain_power']}) "
-                f"| [{stys}] {r['term']}")
-        if r["explains_cuis"]:
-            line += f" | explains {len(r['explains_cuis'])}"
-        print(line)
+Top 25 CUIs by retention score:
+  C0409812 | score=0.9985 (align=0.865, spec=1.0, expl=1.0) | [Disease or Syndrome] Transient arthropathy of the lower leg (disorder) | explains 5
+  C2893757 | score=0.9971 (align=0.888, spec=1.0, expl=0.994) | [Injury or Poisoning] Traumatic arthropathy, right knee | explains 18
+  C2896043 | score=0.9967 (align=0.877, spec=1.0, expl=0.993) | [Pathologic Function] Synovial hypertrophy, not elsewhere classified, left lower leg
+  C0409236 | score=0.9952 (align=0.887, spec=1.0, expl=0.988) | [Disease or Syndrome] Unspecified polyarthropathy of the lower leg (disorder)
+  C2893941 | score=0.9937 (align=0.885, spec=1.0, expl=0.983) | [Disease or Syndrome] Unilateral post-traumatic osteoarthritis, left knee
+  C2893779 | score=0.9929 (align=0.898, spec=1.0, expl=0.979) | [Disease or Syndrome] Other specific arthropathies, not elsewhere classified, right hip
+  C2070985 | score=0.9916 (align=0.869, spec=1.0, expl=0.976) | [Finding] Charcot's joint of right knee (physical finding) | explains 17
+  C5921946 | score=0.9911 (align=0.865, spec=1.0, expl=0.974) | [Congenital Abnormality] Congenital dysplasia of joint of right knee (disorder) | explains 9
+  C2893935 | score=0.9896 (align=0.883, spec=1.0, expl=0.969) | [Disease or Syndrome] Unilateral primary osteoarthritis, left knee | explains 1
+  C2896136 | score=0.9895 (align=0.87, spec=1.0, expl=0.969) | [Disease or Syndrome] Unspecified disorder of synovium and tendon, left thigh
+  C2896045 | score=0.9884 (align=0.858, spec=1.0, expl=0.965) | [Pathologic Function] Synovial hypertrophy, not elsewhere classified, left ankle and foot
+  C2893934 | score=0.9882 (align=0.886, spec=1.0, expl=0.964) | [Disease or Syndrome] Unilateral primary osteoarthritis, right knee
+  C2893810 | score=0.9843 (align=0.894, spec=1.0, expl=0.95) | [Disease or Syndrome] Monoarthritis, not elsewhere classified, right knee | explains 1
+  C2893622 | score=0.984 (align=0.871, spec=1.0, expl=0.95) | [Disease or Syndrome] Other specified crystal arthropathies, left knee | explains 1
+  C2896139 | score=0.9831 (align=0.87, spec=1.0, expl=0.947) | [Disease or Syndrome] Unspecified disorder of synovium and tendon, left lower leg
+  C5437379 | score=0.9791 (align=0.879, spec=1.0, expl=0.933) | [Disease or Syndrome] Synovitis of joint of left foot (disorder) | explains 1
+  C2902717 | score=0.9773 (align=0.883, spec=1.0, expl=0.926) | [Disease or Syndrome] Chondrolysis, left hip
+  C2893621 | score=0.9768 (align=0.865, spec=1.0, expl=0.925) | [Disease or Syndrome] Other specified crystal arthropathies, right knee
+  C4081547 | score=0.9756 (align=0.882, spec=1.0, expl=0.92) | [Disease or Syndrome] Synovitis of joint of left knee (disorder)
+  C2893925 | score=0.975 (align=0.873, spec=1.0, expl=0.919) | [Disease or Syndrome] Unilateral post-traumatic osteoarthritis, left hip
+  C2896142 | score=0.9731 (align=0.87, spec=1.0, expl=0.912) | [Disease or Syndrome] Unspecified disorder of synovium and tendon, left ankle and foot
+  C4545266 | score=0.9716 (align=0.87, spec=1.0, expl=0.907) | [Disease or Syndrome] Synovitis of left ankle joint (disorder) | explains 1
+  C2895120 | score=0.9716 (align=0.89, spec=1.0, expl=0.906) | [Disease or Syndrome] Other specified joint disorders, left hip
+  C2896040 | score=0.9707 (align=0.846, spec=1.0, expl=0.905) | [Disease or Syndrome] Synovial hypertrophy, not elsewhere classified, left thigh
+  C2893812 | score=0.9703 (align=0.881, spec=1.0, expl=0.902) | [Disease or Syndrome] Monoarthritis, not elsewhere classified, unspecified knee
