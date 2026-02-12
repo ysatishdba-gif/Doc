@@ -1,113 +1,33 @@
-# %% Retention: 1 embedding call + existing pipeline data
+Data-derived weights: alignment=0.015, specificity=0.946, explains=0.039
 
-from google import genai
-from collections import defaultdict
-
-client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
-
-def compute_retention(text, result, embs, ic_precomputed, metadata_cache):
-    """
-    Information Retention Scoring.
-
-    Measures how much of the user's narrative each CUI retains,
-    considering specificity, qualifiers, and semantic alignment.
-
-    Input:  CUIs, context_string, existing pipeline data
-    Output: sorted CUIs with retention scores + explains sets
-
-    Cost: 1 embedding API call (~100ms, ~$0.0001)
-    Everything else reuses data already in memory.
-    """
-
-    surviving = result.all_reduced_cuis
-    if not surviving:
-        return [], {}
-
-    # ── ONE embedding call: text -> 3072-dim vector ──
-    response = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text,
-    )
-    text_vec = np.array(response.embeddings[0].values, dtype=np.float32)
-    text_vec = text_vec / (np.linalg.norm(text_vec) + 1e-10)
-
-    # ── Narrative alignment: cosine(text_vec, cui_vec) ──
-    # This is what actually answers "does this CUI match what the patient said?"
-    # Handles synonyms: "swelling" matches "edema", "pain" matches "arthralgia"
-    # Handles qualifiers: "left knee" scores higher than "right hip"
-    alignments = {}
-    for cui in surviving:
-        if cui in embs:
-            alignments[cui] = max(0.0, float(np.dot(text_vec, embs[cui])))
-        else:
-            alignments[cui] = 0.0
-
-    # ── Explains map from audit trail (already computed) ──
-    explains = defaultdict(set)
-    for entry in result.audit_trail:
-        if entry.kept_cui and entry.removed_cui:
-            explains[entry.kept_cui].add(entry.removed_cui)
-
-    # ── IC within surviving set (already computed) ──
-    ic_vals = {c: ic_precomputed.get(c, 0.0) for c in surviving}
-    ic_arr = list(ic_vals.values())
-    ic_min, ic_max = min(ic_arr), max(ic_arr)
-    ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
-
-    # ── Score: alignment-first, IC as tiebreaker ──
-    # No hardcoded weights: derive from variance
-    align_arr = np.array([alignments.get(c, 0.0) for c in surviving])
-    ic_norm = np.array([(ic_vals[c] - ic_min) / ic_range for c in surviving])
-    explain_arr = np.array([len(explains.get(c, set())) for c in surviving], dtype=float)
-    ex_max = explain_arr.max() if explain_arr.max() > 0 else 1.0
-    explain_arr = explain_arr / ex_max
-
-    features = np.column_stack([align_arr, ic_norm, explain_arr])
-    var = features.var(axis=0)
-    weights = var / (var.sum() + 1e-10)
-    print(f"Data-derived weights: alignment={weights[0]:.3f}, "
-          f"specificity={weights[1]:.3f}, explains={weights[2]:.3f}")
-
-    scores = features @ weights
-
-    # ── Build output ──
-    retention = {}
-    for i, cui in enumerate(surviving):
-        m = metadata_cache.get(cui)
-        if not m:
-            continue
-        retention[cui] = {
-            "score": round(float(scores[i]), 4),
-            "alignment": round(float(alignments.get(cui, 0.0)), 3),
-            "ic_local": round(float(ic_norm[i]), 3),
-            "explains_count": len(explains.get(cui, set())),
-            "term": m.preferred_term,
-            "semantic_types": m.semantic_types,
-            "explains_cuis": list(explains.get(cui, set())),
-        }
-
-    sorted_cuis = sorted(retention.keys(),
-                          key=lambda c: retention[c]["score"], reverse=True)
-
-    return sorted_cuis, retention
-
-
-# %% Run
-metadata_cache = {c: system.fetcher._cache.get(c)
-                  for c in result.all_reduced_cuis
-                  if system.fetcher._cache.get(c)}
-
-sorted_cuis, retention = compute_retention(
-    text, result, embs, ic_precomputed, metadata_cache)
-
-print(f"\nTop 30 CUIs by retention score:")
-for c in sorted_cuis[:30]:
-    r = retention[c]
-    stys = ", ".join(r["semantic_types"][:2]) if r["semantic_types"] else "?"
-    line = (f"  {c} | score={r['score']} "
-            f"(align={r['alignment']}, spec={r['ic_local']}, "
-            f"explains={r['explains_count']}) "
-            f"| [{stys}] {r['term']}")
-    if r["explains_count"] > 0:
-        line += f" | explains {r['explains_count']}"
-    print(line)
+Top 30 CUIs by retention score:
+  C4720946 | score=0.995 (align=0.661, spec=1.0, explains=333) | [Disease or Syndrome] Rheumatoid arthritis of left foot (diagnosis) | explains 333
+  C4545096 | score=0.9859 (align=0.662, spec=1.0, explains=256) | [Disease or Syndrome] arthritis due to gout of left foot (diagnosis) | explains 256
+  C0409237 | score=0.9847 (align=0.637, spec=1.0, explains=249) | [Disease or Syndrome] Unspecified polyarthropathy of the pelvic region and thigh (disorder) | explains 249
+  C0003874 | score=0.9803 (align=0.675, spec=1.0, explains=207) | [Disease or Syndrome] Acute suppurative arthritis caused by bacteria (disorder) | explains 207
+  C0157838 | score=0.9738 (align=0.616, spec=1.0, explains=159) | [Disease or Syndrome] Arthropathy involving pelvic region and thigh associated with other infectious and parasitic diseases | explains 159
+  C2895873 | score=0.973 (align=0.667, spec=1.0, explains=146) | [Disease or Syndrome] Other infective (teno)synovitis, right hip | explains 146
+  C2902580 | score=0.972 (align=0.619, spec=1.0, explains=143) | [Disease or Syndrome] Juvenile osteochondrosis of metatarsus, left foot | explains 143
+  C2881078 | score=0.9711 (align=0.67, spec=1.0, explains=129) | [Disease or Syndrome] Panophthalmitis (acute), left eye | explains 129
+  C5767578 | score=0.9677 (align=0.648, spec=1.0, explains=103) | [Disease or Syndrome] Chronic ulcer of right ankle (disorder) | explains 103
+  C2864512 | score=0.9675 (align=0.66, spec=1.0, explains=100) | [Injury or Poisoning] Sprain of medial collateral ligament of right knee, sequela | explains 100
+  C2896247 | score=0.9655 (align=0.673, spec=1.0, explains=81) | [Disease or Syndrome] abscess of left ankle and foot bursa (diagnosis) | explains 81
+  C2443404 | score=0.9654 (align=0.682, spec=1.0, explains=79) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Removal @ Knee Joint, Left @ Open @ Autologous Tissue Substitute @ No Qualifier | explains 79
+  C4039139 | score=0.965 (align=0.681, spec=1.0, explains=76) | [Injury or Poisoning] Derangement of posterior horn of lateral meniscus due to injury of knee (disorder) | explains 76
+  C4544634 | score=0.9639 (align=0.68, spec=1.0, explains=67) | [Disease or Syndrome] Arthritis of left foot due to trauma (disorder) | explains 67
+  C4039130 | score=0.9636 (align=0.714, spec=1.0, explains=60) | [Disease or Syndrome] Subcutaneous abscess of knee (disorder) | explains 60
+  C5921905 | score=0.9631 (align=0.682, spec=1.0, explains=60) | [Disease or Syndrome] Chronic rupture of lateral collateral ligament of bilateral knee joints (disorder) | explains 60
+  C0409903 | score=0.9628 (align=0.632, spec=1.0, explains=64) | [Disease or Syndrome] arthritis due to gout of pelvic region and thigh (diagnosis) | explains 64
+  C0158377 | score=0.9627 (align=0.662, spec=1.0, explains=59) | [Disease or Syndrome] Acute osteomyelitis involving lower leg | explains 59
+  C2902343 | score=0.9625 (align=0.635, spec=1.0, explains=61) | [Pathologic Function] Osteolysis, left shoulder | explains 61
+  C4081760 | score=0.9624 (align=0.668, spec=1.0, explains=56) | [Finding] Mass of joint of left shoulder (finding) | explains 56
+  C2864306 | score=0.962 (align=0.687, spec=1.0, explains=50) | [Injury or Poisoning] Lateral dislocation of proximal end of tibia, right knee, initial encounter | explains 50
+  C0158158 | score=0.9611 (align=0.642, spec=1.0, explains=48) | [Pathologic Function] Effusion of joint of multiple sites (disorder) | explains 48
+  C2444196 | score=0.961 (align=0.648, spec=1.0, explains=46) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Resection @ Knee Joint, Right @ Open @ No Device @ No Qualifier | explains 46
+  C2895064 | score=0.9609 (align=0.642, spec=1.0, explains=46) | [Disease or Syndrome] Stiffness of left hip, not elsewhere classified | explains 46
+  C5768137 | score=0.9605 (align=0.594, spec=1.0, explains=49) | [Disease or Syndrome] infection of transplanted cornea of left eye (diagnosis) | explains 49
+  C2889511 | score=0.9604 (align=0.627, spec=1.0, explains=44) | [Disease or Syndrome] enteropathic arthropathy of right hip (diagnosis) | explains 44
+  C2444612 | score=0.9604 (align=0.689, spec=1.0, explains=36) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Revision @ Knee Joint, Left @ External @ Spacer @ No Qualifier | explains 36
+  C2417668 | score=0.9601 (align=0.668, spec=1.0, explains=36) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Bursae and Ligaments @ Excision @ Knee Bursa and Ligament, Left @ Percutaneous @ No Device @ No Qualifier | explains 36
+  C2441726 | score=0.96 (align=0.68, spec=1.0, explains=34) | [Therapeutic or Preventive Procedure] Medical and Surgical @ Lower Joints @ Drainage @ Knee Joint, Right @ Open @ Drainage Device @ No Qualifier | explains 34
+  C2894795 | score=0.9599 (align=0.623, spec=1.0, explains=40) | [Pathologic Function] Pathological dislocation of left shoulder, not elsewhere classified | explains 40
