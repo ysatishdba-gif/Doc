@@ -1,47 +1,54 @@
-# %% IC scores on real hierarchy — run ONCE
+# %% Fast IC — single pass, no BFS. ~2-3 min for 2.67M nodes
 import pickle
 import numpy as np
+import networkx as nx
 from collections import deque
 
 with open("umls_hierarchy.pkl", "rb") as f:
     hierarchy = pickle.load(f)
 
 total = max(hierarchy.number_of_nodes(), 1)
-print(f"Computing IC for {total} nodes...")
+print(f"Nodes: {total}, Edges: {hierarchy.number_of_edges()}")
 
-ic_scores = {}
-for i, node in enumerate(hierarchy.nodes()):
-    visited = set()
-    q = deque([node])
-    while q:
-        n = q.popleft()
-        for child in hierarchy.successors(n):
-            if child not in visited:
-                visited.add(child)
-                q.append(child)
-    ic_scores[node] = float(-np.log((len(visited) + 1) / total))
+# Count descendants bottom-up using reverse topological sort
+print("Computing descendant counts...")
+desc_count = {n: 0 for n in hierarchy.nodes()}
+
+# Process leaves first, work up
+# Use in-degree for reverse topo order via Kahn's algorithm
+in_degree = {n: 0 for n in hierarchy.nodes()}
+for u, v in hierarchy.edges():
+    in_degree[v] = in_degree.get(v, 0) + 1
+
+# Start from leaves (nodes with no children)
+q = deque(n for n in hierarchy.nodes() if hierarchy.out_degree(n) == 0)
+processed = 0
+
+while q:
+    node = q.popleft()
+    processed += 1
     
-    if (i + 1) % 100_000 == 0:
-        print(f"  {i+1}/{total} done")
+    # Pass my count up to all parents
+    for parent in hierarchy.predecessors(node):
+        desc_count[parent] += desc_count[node] + 1
+        in_degree[parent] -= 1
+        if in_degree[parent] == 0:
+            q.append(parent)
+    
+    if processed % 500_000 == 0:
+        print(f"  {processed}/{total} done")
+
+# Handle cycles (if any remain)
+remaining = total - processed
+if remaining > 0:
+    print(f"  {remaining} nodes in cycles — assigning desc_count=0")
+
+print("Computing IC scores...")
+ic_scores = {}
+for node, desc in desc_count.items():
+    ic_scores[node] = float(-np.log((desc + 1) / total))
 
 print(f"Done. {len(ic_scores)} IC scores")
 with open("ic_precomputed.pkl", "wb") as f:
     pickle.dump(ic_scores, f)
 print("Saved: ic_precomputed.pkl")
-
-
-
-with open("umls_hierarchy.pkl", "rb") as f:
-    hierarchy = pickle.load(f)
-with open("ic_precomputed.pkl", "rb") as f:
-    ic_precomputed = pickle.load(f)
-
-system = CUIReductionSystem(
-    PROJECT_ID, DATASET_ID,
-    hierarchy,
-    ALLOWED_SABS,
-    EMBEDDING_TABLE,
-    ic_scores=ic_precomputed,
-)
-
-result = system.reduce(cuis, "your text")
