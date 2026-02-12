@@ -169,8 +169,10 @@ def qualifier_conflict(tokens_a, tokens_b):
     total = len(tokens_a | tokens_b)
     overlap_ratio = len(shared) / total if total > 0 else 0
 
-    # 50%+ overlap and differ by 1-2 tokens each side → qualifier conflict
-    if overlap_ratio >= 0.5 and len(only_a) <= 2 and len(only_b) <= 2:
+    # 50%+ overlap and BOTH sides differ by 1-2 tokens = qualifier distinction
+    # requires both sides to have unique tokens — "knee pain" vs "knee pain syndrome"
+    # has only_a=0, so it's not a qualifier swap, just extra detail
+    if overlap_ratio >= 0.5 and 1 <= len(only_a) <= 2 and 1 <= len(only_b) <= 2:
         return True
 
     return False
@@ -240,6 +242,18 @@ class MetadataFetcher:
                 ) AS rn
               FROM `{self.pid}.{self.did}.MRCONSO`
               WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+            ),
+            sab_pref AS (
+              SELECT CUI, SAB, STR,
+                ROW_NUMBER() OVER (
+                  PARTITION BY CUI, SAB
+                  ORDER BY
+                    CASE WHEN ISPREF='Y' THEN 0 ELSE 1 END,
+                    LENGTH(STR) DESC
+                ) AS sab_rn
+              FROM `{self.pid}.{self.did}.MRCONSO`
+              WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+                AND SAB IN ('SNOMEDCT_US','ICD10CM','ICD10PCS','ICD9CM','LNC')
             )
             SELECT
               r.CUI AS cui,
@@ -247,12 +261,14 @@ class MetadataFetcher:
               ARRAY_AGG(DISTINCT s.TUI IGNORE NULLS) AS tuis,
               ARRAY_AGG(DISTINCT s.STY IGNORE NULLS) AS stys,
               ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs,
-              ARRAY_AGG(DISTINCT c2.STR IGNORE NULLS) AS all_terms
+              ARRAY_AGG(DISTINCT sp.STR IGNORE NULLS) AS sab_terms
             FROM ranked r
             LEFT JOIN `{self.pid}.{self.did}.MRSTY` s
               ON r.CUI = s.CUI
             LEFT JOIN `{self.pid}.{self.did}.MRCONSO` c2
               ON r.CUI = c2.CUI AND c2.LAT = 'ENG'
+            LEFT JOIN sab_pref sp
+              ON r.CUI = sp.CUI AND sp.sab_rn = 1
             WHERE r.rn = 1
             GROUP BY r.CUI
             """
@@ -263,16 +279,19 @@ class MetadataFetcher:
                     query, job_config=jc, timeout=300).result():
                 term = row.pref_term or row.cui
                 norm = normalize_term(term)
-                # build token set from ALL English synonyms
-                all_tok = set()
-                for t in (row.all_terms or []):
-                    all_tok.update(tokenize_term(normalize_term(t)))
+                # tokens from preferred term per allowed SAB (3-5 terms, not 50)
+                sab_tok = set()
+                for t in (row.sab_terms or []):
+                    sab_tok.update(tokenize_term(normalize_term(t)))
+                # include the preferred term tokens too
+                pref_tok = tokenize_term(norm)
+                combined = frozenset(sab_tok | pref_tok) if sab_tok else pref_tok
                 meta = CUIMetadata(
                     cui=row.cui,
                     preferred_term=term,
                     normalized_term=norm,
-                    term_tokens=tokenize_term(norm),
-                    all_tokens=frozenset(all_tok) if all_tok else tokenize_term(norm),
+                    term_tokens=pref_tok,
+                    all_tokens=combined,
                     semantic_types=list(row.stys or []),
                     semantic_type_ids=list(row.tuis or []),
                     ic_score=0.0,
@@ -766,11 +785,11 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, t
             kept.append(c)
             continue
 
-        if c_meta and b_meta and terms_diverge(c_meta.term_tokens, b_meta.term_tokens):
+        if c_meta and b_meta and terms_diverge(c_meta.all_tokens, b_meta.all_tokens):
             kept.append(c)
             continue
 
-        if c_meta and b_meta and qualifier_conflict(c_meta.term_tokens, b_meta.term_tokens):
+        if c_meta and b_meta and qualifier_conflict(c_meta.all_tokens, b_meta.all_tokens):
             kept.append(c)
             continue
 
@@ -854,8 +873,8 @@ class CrossTopicDedup:
                 # safety guards — don't collapse qualifier variants or divergent terms
                 ci_meta = metadata.get(ci)
                 cj_meta = metadata.get(cj)
-                ci_tok = ci_meta.term_tokens if ci_meta else frozenset()
-                cj_tok = cj_meta.term_tokens if cj_meta else frozenset()
+                ci_tok = ci_meta.all_tokens if ci_meta else frozenset()
+                cj_tok = cj_meta.all_tokens if cj_meta else frozenset()
                 if qualifier_conflict(ci_tok, cj_tok):
                     continue
                 if terms_diverge(ci_tok, cj_tok):
