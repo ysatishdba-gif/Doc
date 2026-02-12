@@ -575,35 +575,27 @@ class EmbeddingReducer:
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges):
 
-        type_groups = defaultdict(list)
-        for cui in cuis:
-            meta = metadata.get(cui)
-            if meta and meta.semantic_types:
-                for sty in meta.semantic_types:
-                    type_groups[sty].append(cui)
-            else:
-                type_groups["Unknown"].append(cui)
+        with_emb = [c for c in cuis if c in embeddings]
+        without_emb = [c for c in cuis if c not in embeddings]
 
         all_topics = {}
         globally_surviving = set()
         removal_candidates = {}
         tid = 0
 
-        for sty in sorted(type_groups):
-            group_cuis = sorted(set(type_groups[sty]))
-            with_emb = [c for c in group_cuis if c in embeddings]
-            without_emb = [c for c in group_cuis if c not in embeddings]
+        # CUIs without embeddings survive as singleton topics
+        for c in without_emb:
+            globally_surviving.add(c)
+            all_topics[f"topic_{tid}"] = [c]
+            tid += 1
 
-            for c in without_emb:
+        if len(with_emb) <= 1:
+            for c in with_emb:
                 globally_surviving.add(c)
-
-            if len(with_emb) <= 1:
-                all_topics[f"topic_{tid}"] = group_cuis
-                for c in group_cuis:
-                    globally_surviving.add(c)
+                all_topics[f"topic_{tid}"] = [c]
                 tid += 1
-                continue
-
+        else:
+            # ONE ScaNN run on all CUIs — embeddings decide natural topics
             scann_topics = TopicBuilder.build(with_emb, embeddings)
 
             for t_cuis in scann_topics.values():
@@ -616,6 +608,8 @@ class EmbeddingReducer:
                         globally_surviving.add(c)
                     continue
 
+                # redundancy removal within topic
+                # semantic type check stays as safety guard in _resolve_group
                 surviving, removed = _reduce_topic(
                     t_cuis, embeddings, metadata, ic_map, hierarchy_edges)
                 all_topics[topic_id] = surviving
@@ -623,10 +617,6 @@ class EmbeddingReducer:
                     globally_surviving.add(c)
                 for entry in removed:
                     removal_candidates[entry.removed_cui] = entry
-
-            for cui in without_emb:
-                all_topics[f"topic_{tid}"] = [cui]
-                tid += 1
 
         final_audit = []
         for cui, entry in removal_candidates.items():
