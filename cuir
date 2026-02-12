@@ -70,6 +70,7 @@ class CUIMetadata:
     preferred_term: str
     normalized_term: str
     term_tokens: FrozenSet[str]
+    all_tokens: FrozenSet[str]  # tokens from ALL English synonyms
     semantic_types: List[str]
     semantic_type_ids: List[str]
     ic_score: float
@@ -245,7 +246,8 @@ class MetadataFetcher:
               MAX(CASE WHEN r.rn = 1 THEN r.STR END) AS pref_term,
               ARRAY_AGG(DISTINCT s.TUI IGNORE NULLS) AS tuis,
               ARRAY_AGG(DISTINCT s.STY IGNORE NULLS) AS stys,
-              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs
+              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs,
+              ARRAY_AGG(DISTINCT c2.STR IGNORE NULLS) AS all_terms
             FROM ranked r
             LEFT JOIN `{self.pid}.{self.did}.MRSTY` s
               ON r.CUI = s.CUI
@@ -261,11 +263,16 @@ class MetadataFetcher:
                     query, job_config=jc, timeout=300).result():
                 term = row.pref_term or row.cui
                 norm = normalize_term(term)
+                # build token set from ALL English synonyms
+                all_tok = set()
+                for t in (row.all_terms or []):
+                    all_tok.update(tokenize_term(normalize_term(t)))
                 meta = CUIMetadata(
                     cui=row.cui,
                     preferred_term=term,
                     normalized_term=norm,
                     term_tokens=tokenize_term(norm),
+                    all_tokens=frozenset(all_tok) if all_tok else tokenize_term(norm),
                     semantic_types=list(row.stys or []),
                     semantic_type_ids=list(row.tuis or []),
                     ic_score=0.0,
@@ -759,11 +766,11 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, t
             kept.append(c)
             continue
 
-        if c_meta and b_meta and terms_diverge(c_meta.term_tokens, b_meta.term_tokens):
+        if c_meta and b_meta and terms_diverge(c_meta.all_tokens, b_meta.all_tokens):
             kept.append(c)
             continue
 
-        if c_meta and b_meta and qualifier_conflict(c_meta.term_tokens, b_meta.term_tokens):
+        if c_meta and b_meta and qualifier_conflict(c_meta.all_tokens, b_meta.all_tokens):
             kept.append(c)
             continue
 
@@ -847,8 +854,8 @@ class CrossTopicDedup:
                 # safety guards — don't collapse qualifier variants or divergent terms
                 ci_meta = metadata.get(ci)
                 cj_meta = metadata.get(cj)
-                ci_tok = ci_meta.term_tokens if ci_meta else frozenset()
-                cj_tok = cj_meta.term_tokens if cj_meta else frozenset()
+                ci_tok = ci_meta.all_tokens if ci_meta else frozenset()
+                cj_tok = cj_meta.all_tokens if cj_meta else frozenset()
                 if qualifier_conflict(ci_tok, cj_tok):
                     continue
                 if terms_diverge(ci_tok, cj_tok):
