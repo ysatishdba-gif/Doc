@@ -111,6 +111,7 @@ class ReductionResult:
     after_filter_count: int
     after_hierarchy_count: int
     after_redundancy_count: int
+    after_relevance_count: int
     topics: Dict[str, TopicInfo]
     all_reduced_cuis: List[str]
     retention: List[RetentionEntry]
@@ -958,6 +959,64 @@ class RetentionScorer:
         return sorted_cuis, entries
 
 
+# %% [14B] Relevance Filter
+class RelevanceFilter:
+    """Post-retention cleanup: removes only clearly irrelevant CUIs.
+
+    Detects the natural alignment gap between relevant concepts and
+    distant noise. Very conservative — prefers recall over precision.
+    No hardcoded rules, no laterality assumptions.
+    """
+
+    @staticmethod
+    @timed("relevance_filter")
+    def run(retention, context_string, metadata):
+        if len(retention) < 10:
+            sorted_cuis = [e.cui for e in retention]
+            return sorted_cuis, retention, []
+
+        scores = np.array([e.alignment for e in retention])
+        gaps = np.abs(np.diff(scores))
+
+        # only look at the bottom 25% — protect everything above
+        quarter = int(len(gaps) * 0.75)
+        if quarter >= len(gaps):
+            sorted_cuis = [e.cui for e in retention]
+            return sorted_cuis, retention, []
+
+        bottom_gaps = gaps[quarter:]
+        if len(bottom_gaps) == 0:
+            sorted_cuis = [e.cui for e in retention]
+            return sorted_cuis, retention, []
+
+        # very conservative: gap must be 3x the median to trigger
+        median_gap = float(np.median(bottom_gaps))
+        audit = []
+
+        if median_gap > 0:
+            cutoff_idx = None
+            for i in range(quarter, len(gaps)):
+                if gaps[i] > median_gap * 3:
+                    cutoff_idx = i + 1
+                    break
+
+            if cutoff_idx and cutoff_idx < len(retention):
+                removed_entries = retention[cutoff_idx:]
+                retention = retention[:cutoff_idx]
+
+                for entry in removed_entries:
+                    audit.append(AuditEntry(
+                        removed_cui=entry.cui,
+                        removed_term=entry.term,
+                        kept_cui="", kept_term="",
+                        reason="below_alignment_gap",
+                        detail=f"alignment {entry.alignment} below gap at "
+                               f"position {cutoff_idx}"))
+
+        sorted_cuis = [e.cui for e in retention]
+        return sorted_cuis, retention, audit
+
+
 # %% [15] Pipeline
 class CUIReductionSystem:
 
@@ -1098,7 +1157,15 @@ class CUIReductionSystem:
             sorted_cuis, retention = self.retention_scorer.score(
                 text_vec, surviving, embeddings, metadata, all_audit)
             if retention:
-                log(f"    Retention: top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f}")
+                log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
+
+            # relevance filter (laterality mismatch + alignment gap)
+            before_rel = len(retention)
+            sorted_cuis, retention, rel_audit = RelevanceFilter.run(
+                retention, context_string, metadata)
+            all_audit.extend(rel_audit)
+            if before_rel != len(retention):
+                log(f"    Relevance Filter: {before_rel} -> {len(retention)} (removed {before_rel - len(retention)})")
 
             audited = {e.removed_cui for e in all_audit}
             survived = set(surviving)
@@ -1112,7 +1179,7 @@ class CUIReductionSystem:
                         "CUI not in surviving or audit trail"))
 
             elapsed = (time.perf_counter() - t_start) * 1000
-            log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
+            log(f"    DONE: {len(cuis)} -> {len(surviving)} -> {len(retention)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
 
             results.append(ReductionResult(
                 context_string=context_string,
@@ -1120,6 +1187,7 @@ class CUIReductionSystem:
                 after_filter_count=len(after_hier),
                 after_hierarchy_count=len(after_hier),
                 after_redundancy_count=len(surviving),
+                after_relevance_count=len(retention),
                 topics=topics_out,
                 all_reduced_cuis=sorted_cuis,
                 retention=retention,
@@ -1135,7 +1203,7 @@ class CUIReductionSystem:
 
     def _empty(self, ctx, t0, audit=None, meta_cov=0.0):
         return ReductionResult(
-            ctx, 0, 0, 0, 0, {}, [], [], audit or [],
+            ctx, 0, 0, 0, 0, 0, {}, [], [], audit or [],
             (time.perf_counter() - t0) * 1000, meta_cov, 0.0)
 
     def get_stats(self):
@@ -1259,7 +1327,7 @@ results = system.reduce_batch(inputs)
 for result in results:
     log(f"\n{'=' * 60}")
     log(f"TEXT: {result.context_string}")
-    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
+    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} (reduction) -> {result.after_relevance_count} (relevance) CUIs, "
         f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
 
     log(f"\n-- Top 20 CUIs by retention (of {len(result.retention)}) --")
