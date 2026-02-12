@@ -428,6 +428,32 @@ class EmbeddingFetcher:
         self.table = embedding_table
         self._cache = Cache(50_000)
 
+    def _fetch_batch(self, batch):
+        """Fetch one batch from BQ. Called in parallel."""
+        rows = []
+        query = f"""
+        SELECT cui, embedding
+        FROM `{self.pid}.{self.did}.{self.table}`
+        WHERE cui IN UNNEST(@cuis)
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)
+        ])
+        for row in self.bq.query(
+                query, job_config=jc, timeout=300).result():
+            raw = row.embedding
+            if raw is None or len(raw) == 0:
+                continue
+            vec = np.array(raw, dtype=np.float32)
+            if not np.all(np.isfinite(vec)):
+                continue
+            norm = np.linalg.norm(vec)
+            if norm == 0:
+                continue
+            vec = vec / norm
+            rows.append((row.cui, vec))
+        return rows
+
     @timed("embedding_fetch")
     def fetch(self, cuis):
         result, missing = {}, []
@@ -441,30 +467,17 @@ class EmbeddingFetcher:
         if not missing:
             return result
 
-        for i in range(0, len(missing), _BQ_BATCH):
-            batch = missing[i:i + _BQ_BATCH]
-            query = f"""
-            SELECT cui, embedding
-            FROM `{self.pid}.{self.did}.{self.table}`
-            WHERE cui IN UNNEST(@cuis)
-            """
-            jc = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", batch)
-            ])
-            for row in self.bq.query(
-                    query, job_config=jc, timeout=300).result():
-                raw = row.embedding
-                if raw is None or len(raw) == 0:
-                    continue
-                vec = np.array(raw, dtype=np.float32)
-                if not np.all(np.isfinite(vec)):
-                    continue
-                norm = np.linalg.norm(vec)
-                if norm == 0:
-                    continue
-                vec = vec / norm
-                self._cache.put(row.cui, vec)
-                result[row.cui] = vec
+        # split into batches and run in parallel
+        batches = [missing[i:i + _BQ_BATCH]
+                    for i in range(0, len(missing), _BQ_BATCH)]
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+            futures = [pool.submit(self._fetch_batch, b) for b in batches]
+            for f in futures:
+                for cui, vec in f.result():
+                    self._cache.put(cui, vec)
+                    result[cui] = vec
 
         return result
 
@@ -860,7 +873,7 @@ class CUIReductionSystem:
         all_audit.extend(hier_audit)
         log(f"[Stage 4] Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
 
-        # fetch embeddings
+        # fetch embeddings (batches run in parallel within fetcher)
         embeddings = self.emb_fetcher.fetch(after_hier)
         emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
         log(f"[Stage 5A] Embeddings: {len(embeddings)}/{len(after_hier)} matched ({emb_cov:.0%})")
