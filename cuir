@@ -1,84 +1,28 @@
-# %% Retention v3: token F1 alignment + embedding as tiebreaker
+Input tokens: frozenset({'left', 'pain', 'swelling', 'knee', 'severe'})
 
-# extract meaningful tokens from input text (drop stopwords)
-stopwords = {"a","an","the","in","of","with","has","had","is","was","for",
-             "to","and","or","on","at","by","no","not","patient","history"}
-
-def text_tokens(text):
-    tokens = tokenize_term(normalize_term(text))
-    return tokens - stopwords
-
-input_tokens = text_tokens(text)
-print(f"Input tokens: {input_tokens}")
-
-# build focused context vector from top token-matching CUIs
-embs = system.emb_fetcher.fetch(result.all_reduced_cuis)
-
-token_scores = {}
-for cui in result.all_reduced_cuis:
-    m = system.fetcher._cache.get(cui)
-    if not m or not m.term_tokens:
-        continue
-    cui_tokens = m.term_tokens - stopwords
-    if not cui_tokens:
-        continue
-    overlap = cui_tokens & input_tokens
-    precision = len(overlap) / len(cui_tokens)       # CUI tokens found in input
-    recall = len(overlap) / len(input_tokens)         # input tokens found in CUI
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    token_scores[cui] = (f1, precision, recall)
-
-# context vector from top-20 token-matching CUIs (focused, not generic centroid)
-top_token = sorted(token_scores.keys(), key=lambda c: token_scores[c][0], reverse=True)[:20]
-focus_vecs = [embs[c] for c in top_token if c in embs]
-if focus_vecs:
-    ctx_vec = np.mean(focus_vecs, axis=0)
-    ctx_vec = ctx_vec / (np.linalg.norm(ctx_vec) + 1e-10)
-
-retention = {}
-for cui in result.all_reduced_cuis:
-    m = system.fetcher._cache.get(cui)
-    if not m:
-        continue
-
-    # token F1 (primary: does CUI match the actual narrative?)
-    f1, prec, rec = token_scores.get(cui, (0.0, 0.0, 0.0))
-
-    # embedding alignment to focused context (secondary: synonym handling)
-    if cui in embs and ctx_vec is not None:
-        emb_sim = max(0.0, float(np.dot(embs[cui], ctx_vec)))
-    else:
-        emb_sim = 0.0
-
-    # IC rank among surviving CUIs (tiebreaker only)
-    ic_raw = m.ic_score
-
-    # weighted: 50% token F1, 35% embedding, 15% IC-based
-    score = 0.50 * f1 + 0.35 * emb_sim + 0.15 * min(ic_raw / 14.80, 1.0)
-
-    retention[cui] = {
-        "score": round(score, 4),
-        "f1": round(f1, 3),
-        "precision": round(prec, 3),
-        "recall": round(rec, 3),
-        "emb_sim": round(emb_sim, 3),
-        "term": m.preferred_term,
-    }
-
-explains = defaultdict(list)
-for entry in result.audit_trail:
-    if entry.kept_cui and entry.removed_cui:
-        explains[entry.kept_cui].append(entry.removed_cui)
-
-sorted_cuis = sorted(retention.keys(), key=lambda c: retention[c]["score"], reverse=True)
-
-print(f"\nTop 25 CUIs by retention score:")
-for c in sorted_cuis[:25]:
-    r = retention[c]
-    explained = explains.get(c, [])
-    line = (f"  {c} | score={r['score']} "
-            f"(F1={r['f1']}, P={r['precision']}, R={r['recall']}, emb={r['emb_sim']}) "
-            f"| {r['term']}")
-    if explained:
-        line += f" | explains {len(explained)}"
-    print(line)
+Top 25 CUIs by retention score:
+  C5551296 | score=0.7048 (F1=0.5, P=0.667, R=0.4, emb=0.871) | Knee pain severity
+  C2895042 | score=0.6847 (F1=0.5, P=0.667, R=0.4, emb=0.814) | Pain in left elbow | explains 2
+  C0230432 | score=0.6784 (F1=0.5, P=0.667, R=0.4, emb=0.796) | Structure of left knee | explains 3
+  C2896399 | score=0.674 (F1=0.444, P=0.5, R=0.4, emb=0.862) | Patellar tendinitis, left knee
+  C2893597 | score=0.673 (F1=0.444, P=0.5, R=0.4, emb=0.859) | Other chondrocalcinosis, left knee
+  C0409326 | score=0.6673 (F1=0.444, P=0.5, R=0.4, emb=0.843) | Anterior knee pain (finding)
+  C2893941 | score=0.6598 (F1=0.4, P=0.4, R=0.4, emb=0.885) | Unilateral post-traumatic osteoarthritis, left knee
+  C2893935 | score=0.6578 (F1=0.4, P=0.4, R=0.4, emb=0.879) | Unilateral primary osteoarthritis, left knee | explains 1
+  C4081547 | score=0.6557 (F1=0.4, P=0.4, R=0.4, emb=0.873) | Synovitis of joint of left knee (disorder)
+  C2893811 | score=0.6524 (F1=0.4, P=0.4, R=0.4, emb=0.864) | Monoarthritis, not elsewhere classified, left knee
+  C2896461 | score=0.6524 (F1=0.444, P=0.5, R=0.4, emb=0.801) | pain in left toe (diagnosis) | explains 4
+  C5575233 | score=0.6494 (F1=0.4, P=0.4, R=0.4, emb=0.855) | Knee pain severity with level walking
+  C5923557 | score=0.6494 (F1=0.4, P=0.4, R=0.4, emb=0.855) | acute lymphangitis of left knee (diagnosis) | explains 1
+  C4283837 | score=0.6484 (F1=0.444, P=0.5, R=0.4, emb=0.809) | Disarticulation of left knee (procedure)
+  C5575856 | score=0.6454 (F1=0.4, P=0.4, R=0.4, emb=0.844) | Knee pain severity with stairs or inclines
+  C0576087 | score=0.6427 (F1=0.4, P=0.4, R=0.4, emb=0.836) | Bony swelling of knee joint (finding)
+  C0565853 | score=0.6395 (F1=0.4, P=0.4, R=0.4, emb=0.827) | Foreign body left in knee (disorder)
+  C5940186 | score=0.6373 (F1=0.4, P=0.4, R=0.4, emb=0.853) | Knee - left &#x7C; Ultrasound &#x7C; Radiology | explains 3
+  C4280831 | score=0.6357 (F1=0.364, P=0.333, R=0.4, emb=0.868) | Pain of joint of left lower leg (finding) | explains 9
+  C2893622 | score=0.6308 (F1=0.364, P=0.333, R=0.4, emb=0.854) | Other specified crystal arthropathies, left knee | explains 1
+  C4543313 | score=0.629 (F1=0.4, P=0.4, R=0.4, emb=0.817) | Fluoroscopic arthrography of left knee (procedure) | explains 2
+  C4509718 | score=0.6283 (F1=0.4, P=0.4, R=0.4, emb=0.815) | Chronic pain of left foot (finding)
+  C2865501 | score=0.6255 (F1=0.364, P=0.333, R=0.4, emb=0.839) | Crushing injury of left knee, initial encounter | explains 10
+  C5170187 | score=0.6228 (F1=0.364, P=0.333, R=0.4, emb=0.851) | Knee - left &#x7C; Radio fluoroscopy &#x7C; Radiology
+  C2894598 | score=0.6225 (F1=0.364, P=0.333, R=0.4, emb=0.831) | Cystic meniscus, unspecified lateral meniscus, left knee | explains 16
