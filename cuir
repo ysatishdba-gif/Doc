@@ -1,99 +1,46 @@
-# %% Retention v6: alignment-first, no tricks
+Alignment range: 0.555 to 0.760
+Mean: 0.648, Std: 0.035
 
-from google import genai
-from collections import defaultdict
+Top 30 CUIs by narrative retention:
+  C0576087 | align=0.76 | [Disease or Syndrome] Bony swelling of knee joint (finding)
+  C2865501 | align=0.7519 | [Injury or Poisoning] Crushing injury of left knee, initial encounter | explains 10
+  C5689621 | align=0.7507 | [Finding] Cannot walk
+  C2896399 | align=0.7482 | [Disease or Syndrome] Patellar tendinitis, left knee
+  C2893622 | align=0.7406 | [Disease or Syndrome] Other specified crystal arthropathies, left knee | explains 1
+  C0551684 | align=0.7406 | [Clinical Attribute] Physical findings:Finding:To identify measures at a point in time:Knee:Nominal:Observed
+  C5545755 | align=0.7387 | [Disease or Syndrome] Arthritis of knee joint caused by Borrelia burgdorferi (disorder)
+  C2456360 | align=0.7377 | [Diagnostic Procedure] Imaging @ Non-Axial Lower Bones @ Plain Radiography @ Knee, Left @ None @ None @ None | explains 3
+  C0409326 | align=0.7341 | [Sign or Symptom] Anterior knee pain (finding)
+  C5788251 | align=0.7332 | [Injury or Poisoning] Traumatic blister of right knee (disorder) | explains 10
+  C2893941 | align=0.7329 | [Disease or Syndrome] Unilateral post-traumatic osteoarthritis, left knee
+  C4695245 | align=0.7325 | [Intellectual Product] How often do you experience knee pain
+  C5170192 | align=0.7317 | [Body Part, Organ, or Organ Component] Knee - right &#x7C; NM &#x7C; Radiology | explains 3
+  C0576139 | align=0.7302 | [Finding] Knee joint - painful on movement (finding) | explains 13
+  C4081547 | align=0.73 | [Disease or Syndrome] Synovitis of joint of left knee (disorder)
+  C2893757 | align=0.7262 | [Injury or Poisoning] Traumatic arthropathy, right knee | explains 18
+  C5551296 | align=0.7253 | [Clinical Attribute] Knee pain severity
+  C5923557 | align=0.7251 | [Disease or Syndrome] acute lymphangitis of left knee (diagnosis) | explains 1
+  C2889015 | align=0.7248 | [Pathologic Function] Postdysenteric arthropathy, unspecified knee
+  C2893810 | align=0.7234 | [Disease or Syndrome] Monoarthritis, not elsewhere classified, right knee | explains 1
+  C2893811 | align=0.723 | [Disease or Syndrome] Monoarthritis, not elsewhere classified, left knee
+  C2893812 | align=0.7212 | [Disease or Syndrome] Monoarthritis, not elsewhere classified, unspecified knee
+  C2888952 | align=0.7203 | [Disease or Syndrome] Direct Infection of Left Knee in Infectious and Parasitic Diseases Classified Elsewhere | explains 1
+  C5880335 | align=0.7199 | [Pathologic Function] Rupture of synovial popliteal cyst of left knee (disorder) | explains 1
+  C2425319 | align=0.7199 | [Diagnostic Procedure] Medical and Surgical @ Lower Bones @ Drainage @ Patella, Left @ Open @ No Device @ Diagnostic
+  C2889126 | align=0.7196 | [Disease or Syndrome] Felty's Syndrome, Right Knee | explains 1
+  C4299111 | align=0.7189 | [Body Location or Region] Lower extremity.left>Knee | explains 1
+  C2896271 | align=0.7179 | [Acquired Abnormality] Synovial cyst of popliteal space [Baker], right knee | explains 1
+  C2893621 | align=0.7178 | [Disease or Syndrome] Other specified crystal arthropathies, right knee
+  C3177121 | align=0.7177 | [Finding] Knee scanned | explains 11
 
-client = genai.Client(vertexai=True, project=PROJECT_ID, location="us-central1")
-
-def compute_retention(text, result, embs, ic_precomputed, metadata_cache):
-    """
-    Information Retention Scoring
-
-    Measures how much of the user's narrative each CUI retains.
-    
-    Primary signal: cosine(text_embedding, cui_embedding) in the same
-    3072 gemini-embedding-001 space. This captures specificity, qualifiers,
-    laterality, and semantic alignment in one number — no token matching,
-    no stemming, no hardcoded weights.
-
-    Secondary: explains_count from audit trail (tiebreaker only).
-
-    Cost: 1 embedding call (~100ms, ~$0.0001). Rest is in memory.
-    """
-
-    surviving = result.all_reduced_cuis
-    if not surviving:
-        return [], {}
-
-    # one embedding call
-    response = client.models.embed_content(
-        model="gemini-embedding-001",
-        contents=text,
-    )
-    text_vec = np.array(response.embeddings[0].values, dtype=np.float32)
-    text_vec = text_vec / (np.linalg.norm(text_vec) + 1e-10)
-
-    # alignment: cosine(text, cui) — this IS the retention score
-    alignments = {}
-    for cui in surviving:
-        if cui in embs:
-            alignments[cui] = float(np.dot(text_vec, embs[cui]))
-        else:
-            alignments[cui] = 0.0
-
-    # explains map from audit trail
-    explains = defaultdict(set)
-    for entry in result.audit_trail:
-        if entry.kept_cui and entry.removed_cui:
-            explains[entry.kept_cui].add(entry.removed_cui)
-
-    # build output
-    retention = {}
-    for cui in surviving:
-        m = metadata_cache.get(cui)
-        if not m:
-            continue
-        retention[cui] = {
-            "alignment": round(alignments.get(cui, 0.0), 4),
-            "explains_count": len(explains.get(cui, set())),
-            "term": m.preferred_term,
-            "semantic_types": m.semantic_types,
-            "explains_cuis": list(explains.get(cui, set())),
-        }
-
-    # sort: alignment first, explains_count as tiebreaker
-    sorted_cuis = sorted(
-        retention.keys(),
-        key=lambda c: (retention[c]["alignment"], retention[c]["explains_count"]),
-        reverse=True)
-
-    return sorted_cuis, retention
-
-
-# %% Run
-metadata_cache = {c: system.fetcher._cache.get(c)
-                  for c in result.all_reduced_cuis
-                  if system.fetcher._cache.get(c)}
-
-sorted_cuis, retention = compute_retention(
-    text, result, embs, ic_precomputed, metadata_cache)
-
-# show alignment distribution
-all_align = [retention[c]["alignment"] for c in sorted_cuis]
-print(f"Alignment range: {min(all_align):.3f} to {max(all_align):.3f}")
-print(f"Mean: {np.mean(all_align):.3f}, Std: {np.std(all_align):.3f}")
-
-print(f"\nTop 30 CUIs by narrative retention:")
-for c in sorted_cuis[:30]:
-    r = retention[c]
-    stys = ", ".join(r["semantic_types"][:2]) if r["semantic_types"] else "?"
-    line = (f"  {c} | align={r['alignment']} "
-            f"| [{stys}] {r['term']}")
-    if r["explains_count"] > 0:
-        line += f" | explains {r['explains_count']}"
-    print(line)
-
-print(f"\nBottom 10 (least aligned):")
-for c in sorted_cuis[-10:]:
-    r = retention[c]
-    print(f"  {c} | align={r['alignment']} | {r['term']}")
+Bottom 10 (least aligned):
+  C4047602 | align=0.5692 | Trigger finger of left hand (disorder)
+  C0184775 | align=0.5686 | Disease condition determination, slightly controlled (finding)
+  C2558215 | align=0.5658 | Medical and Surgical @ Lower Joints @ Destruction @ Tarsal Joint, Left
+  C5395509 | align=0.5639 | Superior limbic keratoconjunctivitis of left eye (disorder)
+  C2894950 | align=0.563 | Fistula, right hand
+  C2894501 | align=0.5624 | Foot drop, left foot
+  C0277565 | align=0.5606 | Local disease (finding)
+  C4699609 | align=0.5586 | Early disease stage
+  C3872567 | align=0.5585 | Lesion of degenerative abnormality (morphologic abnormality)
+  C2894873 | align=0.555 | Ankylosis, right wrist
