@@ -427,6 +427,8 @@ class EmbeddingFetcher:
         self.did = did
         self.table = embedding_table
         self._cache = Cache(50_000)
+        from concurrent.futures import ThreadPoolExecutor
+        self._pool = ThreadPoolExecutor(max_workers=4)
 
     def _fetch_batch(self, batch):
         """Fetch one batch from BQ. Called in parallel."""
@@ -471,13 +473,11 @@ class EmbeddingFetcher:
         batches = [missing[i:i + _BQ_BATCH]
                     for i in range(0, len(missing), _BQ_BATCH)]
 
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-            futures = [pool.submit(self._fetch_batch, b) for b in batches]
-            for f in futures:
-                for cui, vec in f.result():
-                    self._cache.put(cui, vec)
-                    result[cui] = vec
+        futures = [self._pool.submit(self._fetch_batch, b) for b in batches]
+        for f in futures:
+            for cui, vec in f.result():
+                self._cache.put(cui, vec)
+                result[cui] = vec
 
         return result
 
@@ -828,121 +828,141 @@ class CUIReductionSystem:
 
     @timed("full_pipeline")
     def reduce(self, cuis, context_string):
+        """Reduce a single text. For multiple texts, use reduce_batch."""
+        results = self.reduce_batch([(cuis, context_string)])
+        return results[0]
+
+    @timed("batch_pipeline")
+    def reduce_batch(self, inputs):
+        """Reduce multiple texts efficiently.
+
+        Args:
+            inputs: list of (cuis, context_string) tuples
+
+        Batches the expensive BQ calls (metadata, embeddings) across
+        all texts, then runs per-text filtering and reduction.
+
+        10 texts with 80% CUI overlap:
+          - Single mode: 10 metadata calls + 10 embedding calls
+          - Batch mode:  1 metadata call + 1 embedding call
+        """
 
         t0 = time.perf_counter()
-        all_audit = []
 
-        if not cuis:
-            return self._empty(context_string, t0)
+        # collect all unique CUIs across all texts
+        all_cuis = set()
+        for cuis, _ in inputs:
+            all_cuis.update(cuis)
+        log(f"[Batch] {len(inputs)} texts, {len(all_cuis)} unique CUIs total")
 
-        log(f"[Stage 1] API Extraction: {len(cuis)} CUIs")
+        # ONE metadata fetch for all CUIs
+        metadata = self.fetcher.fetch(list(all_cuis))
+        log(f"[Batch] Metadata: {len(metadata)}/{len(all_cuis)} matched")
 
-        # metadata
-        metadata = self.fetcher.fetch(cuis)
-        meta_cov = len(metadata) / len(cuis) if cuis else 0
-        log(f"[Stage 2] Metadata: {len(metadata)}/{len(cuis)} matched ({meta_cov:.0%})")
+        # ONE IC computation for all CUIs
+        ic_map = self.ic_computer.compute(list(all_cuis), metadata)
+        log(f"[Batch] IC Scores: {len(ic_map)} computed")
 
-        # IC scores
-        ic_map = self.ic_computer.compute(cuis, metadata)
-        log(f"[Stage 2B] IC Scores: {len(ic_map)} computed")
+        # per-text: cheap in-memory filtering + hierarchy
+        # also collect all post-hierarchy CUIs for a single embedding fetch
+        per_text = []
+        all_post_hier = set()
 
-        # SAB filter
-        after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
-        all_audit.extend(sab_audit)
-        log(f"[Stage 3A] SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
-
-        if not after_sab:
-            log("[Stage 3A] All CUIs filtered out")
-            return self._empty(context_string, t0, all_audit, meta_cov=meta_cov)
-
-        # semantic type filter
-        after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
-        all_audit.extend(sty_audit)
-        log(f"[Stage 3B] Semtype Filter: {len(after_sab)} -> {len(after_sty)} (removed {len(after_sab) - len(after_sty)})")
-
-        # term dedup
-        after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
-        all_audit.extend(term_audit)
-        log(f"[Stage 3C] Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
-
-        after_filter = len(after_term)
-
-        # hierarchy reduction
-        after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
-            after_term, ic_map, metadata)
-        all_audit.extend(hier_audit)
-        log(f"[Stage 4] Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
-
-        # fetch embeddings (batches run in parallel within fetcher)
-        embeddings = self.emb_fetcher.fetch(after_hier)
-        emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
-        log(f"[Stage 5A] Embeddings: {len(embeddings)}/{len(after_hier)} matched ({emb_cov:.0%})")
-
-        # embedding reduction
-        topics, surviving, emb_audit = EmbeddingReducer.run(
-            after_hier, metadata, embeddings, ic_map, hier_edges)
-        all_audit.extend(emb_audit)
-        log(f"[Stage 5] Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
-
-        # topic info
-        topics_out = {}
-        for topic_id, t_cuis in topics.items():
-            if not t_cuis:
+        for cuis, context_string in inputs:
+            if not cuis:
+                per_text.append((context_string, [], [], set(), []))
                 continue
-            topic_types = set()
-            cui_terms = {}
-            for c in t_cuis:
-                m = metadata.get(c)
-                if m and m.semantic_types:
-                    topic_types.update(m.semantic_types)
-                cui_terms[c] = m.preferred_term if m else c
-            topics_out[topic_id] = TopicInfo(
-                topic_id=topic_id,
-                semantic_types=topic_types or {"Unknown"},
-                cuis=t_cuis,
-                cui_terms=cui_terms)
 
-        log(f"[Stage 6] Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
+            after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
+            after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
+            after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
+            after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
+                after_term, ic_map, metadata)
 
-        # retention scoring
-        sorted_cuis, retention = self.retention_scorer.score(
-            context_string, surviving, embeddings, metadata, all_audit)
-        log(f"[Stage 6B] Retention: scored {len(retention)} CUIs "
-            f"(top={retention[0].alignment:.3f}, "
-            f"bottom={retention[-1].alignment:.3f})" if retention else
-            "[Stage 6B] Retention: no CUIs to score")
+            audit = sab_audit + sty_audit + term_audit + hier_audit
+            all_post_hier.update(after_hier)
+            per_text.append((context_string, cuis, after_hier, hier_edges, audit))
 
-        # audit accounting
-        audited = {e.removed_cui for e in all_audit}
-        survived = set(surviving)
-        unaccounted = set(cuis) - survived - audited
-        if unaccounted:
-            log(f"[Stage 7] WARNING: {len(unaccounted)} unaccounted CUIs", "WARNING")
-            for cui in unaccounted:
-                m = metadata.get(cui)
-                all_audit.append(AuditEntry(
-                    cui, m.preferred_term if m else "",
-                    "", "", "unaccounted",
-                    "CUI not in surviving or audit trail"))
-        else:
-            log(f"[Stage 7] Audit: 100% accounted ({len(survived)} survived + {len(audited)} removed = {len(survived) + len(audited)})")
+            log(f"  [{context_string[:50]}] {len(cuis)} -> {len(after_hier)} after hierarchy")
 
-        elapsed = (time.perf_counter() - t0) * 1000
-        log(f"SUMMARY: {len(cuis)} -> {len(surviving)} CUIs in {len(topics_out)} topics ({elapsed:.0f}ms)")
+        # ONE embedding fetch for all post-hierarchy CUIs
+        log(f"[Batch] Fetching embeddings for {len(all_post_hier)} unique post-hierarchy CUIs")
+        all_embeddings = self.emb_fetcher.fetch(list(all_post_hier))
+        log(f"[Batch] Embeddings: {len(all_embeddings)}/{len(all_post_hier)} matched")
 
-        return ReductionResult(
-            context_string=context_string,
-            input_count=len(cuis),
-            after_filter_count=after_filter,
-            after_hierarchy_count=len(after_hier),
-            after_redundancy_count=len(surviving),
-            topics=topics_out,
-            all_reduced_cuis=sorted_cuis,
-            retention=retention,
-            audit_trail=all_audit,
-            processing_time_ms=elapsed,
-            metadata_coverage=meta_cov,
-            embedding_coverage=emb_cov)
+        # per-text: embedding reduction + topics + retention
+        results = []
+        for context_string, cuis, after_hier, hier_edges, all_audit in per_text:
+            t_start = time.perf_counter()
+
+            if not after_hier:
+                results.append(self._empty(context_string, t_start, all_audit))
+                continue
+
+            # filter embeddings to this text's CUIs
+            embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
+            emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
+
+            # embedding reduction
+            topics, surviving, emb_audit = EmbeddingReducer.run(
+                after_hier, metadata, embeddings, ic_map, hier_edges)
+            all_audit.extend(emb_audit)
+
+            # topic info
+            topics_out = {}
+            for topic_id, t_cuis in topics.items():
+                if not t_cuis:
+                    continue
+                topic_types = set()
+                cui_terms = {}
+                for c in t_cuis:
+                    m = metadata.get(c)
+                    if m and m.semantic_types:
+                        topic_types.update(m.semantic_types)
+                    cui_terms[c] = m.preferred_term if m else c
+                topics_out[topic_id] = TopicInfo(
+                    topic_id=topic_id,
+                    semantic_types=topic_types or {"Unknown"},
+                    cuis=t_cuis,
+                    cui_terms=cui_terms)
+
+            # retention scoring
+            sorted_cuis, retention = self.retention_scorer.score(
+                context_string, surviving, embeddings, metadata, all_audit)
+
+            # audit accounting
+            audited = {e.removed_cui for e in all_audit}
+            survived = set(surviving)
+            unaccounted = set(cuis) - survived - audited
+            if unaccounted:
+                for cui in unaccounted:
+                    m = metadata.get(cui)
+                    all_audit.append(AuditEntry(
+                        cui, m.preferred_term if m else "",
+                        "", "", "unaccounted",
+                        "CUI not in surviving or audit trail"))
+
+            elapsed = (time.perf_counter() - t_start) * 1000
+            log(f"  [{context_string[:50]}] -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
+
+            results.append(ReductionResult(
+                context_string=context_string,
+                input_count=len(cuis),
+                after_filter_count=len(after_hier),
+                after_hierarchy_count=len(after_hier),
+                after_redundancy_count=len(surviving),
+                topics=topics_out,
+                all_reduced_cuis=sorted_cuis,
+                retention=retention,
+                audit_trail=all_audit,
+                processing_time_ms=elapsed,
+                metadata_coverage=emb_cov,
+                embedding_coverage=emb_cov))
+
+        total = (time.perf_counter() - t0) * 1000
+        log(f"[Batch] DONE: {len(inputs)} texts in {total:.0f}ms")
+
+        return results
 
     def _empty(self, ctx, t0, audit=None, meta_cov=0.0):
         return ReductionResult(
@@ -1056,18 +1076,31 @@ texts = [
     "Patient has severe pain in left knee with swelling",
 ]
 
-for text in texts:
-    log(f"\n{'=' * 60}")
-    log(f"TEXT: {text}")
+# extract CUIs for all texts in parallel
+from concurrent.futures import ThreadPoolExecutor
 
+def _extract(text):
     cuis = extractor.extract(text)
-    if not cuis:
-        log("No CUIs extracted")
-        continue
+    return (cuis, text) if cuis else None
 
-    result = system.reduce(cuis, text)
+with ThreadPoolExecutor(max_workers=min(len(texts), 8)) as pool:
+    raw = pool.map(_extract, texts)
+    inputs = [r for r in raw if r is not None]
 
-    # top CUIs by narrative retention
+log(f"Extracted {len(inputs)}/{len(texts)} texts in parallel")
+
+# single batch call: shared metadata + embedding fetch across all texts
+results = system.reduce_batch(inputs)
+
+# single batch call: shared metadata + embedding fetch across all texts
+results = system.reduce_batch(inputs)
+
+for result in results:
+    log(f"\n{'=' * 60}")
+    log(f"TEXT: {result.context_string}")
+    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
+        f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
+
     log(f"\n-- Top 20 CUIs by retention (of {len(result.retention)}) --")
     for entry in result.retention[:20]:
         stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
@@ -1076,7 +1109,6 @@ for text in texts:
             line += f" | explains {len(entry.explains_cuis)}"
         log(line)
 
-    # topic summary
     log(f"\n-- Topics: {len(result.topics)} --")
     for tid, topic in list(result.topics.items())[:5]:
         log(f"  {tid} [{', '.join(list(topic.semantic_types)[:2])}] {len(topic.cuis)} CUIs")
