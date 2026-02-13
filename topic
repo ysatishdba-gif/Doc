@@ -9,14 +9,12 @@ pip install google-cloud-bigquery networkx numpy scipy requests scann google-gen
 """
 
 # %% [1] Imports
-import re
 import time
 import logging
 import threading
-import unicodedata
 import subprocess
 import pickle
-from typing import List, Dict, Optional, Set, Tuple, FrozenSet
+from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -68,8 +66,6 @@ def timed(name):
 class CUIMetadata:
     cui: str
     preferred_term: str
-    normalized_term: str
-    all_tokens: FrozenSet[str]  # tokens from preferred terms per allowed SAB
     semantic_types: List[str]
     semantic_type_ids: List[str]
     ic_score: float
@@ -119,62 +115,56 @@ class ReductionResult:
     embedding_coverage: float
 
 
-# %% [4] Text Utilities
-def normalize_term(term):
-    t = unicodedata.normalize("NFKD", term).lower()
-    t = re.sub(r"[^a-z0-9\s]", "", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# %% [4] Graph Safety Checks
 
 
-def tokenize_term(normalized):
-    if not normalized:
-        return frozenset()
-    return frozenset(normalized.split())
+def are_siblings(graph, cui_a, cui_b):
+    """Block collapse when two CUIs share a direct parent.
 
+    Siblings are clinically distinct subtypes of the same parent:
+      "Left knee pain" and "Right knee pain" are both children of "Knee pain"
+      "Acute sinusitis" and "Chronic sinusitis" are both children of "Sinusitis"
 
-def terms_diverge(tokens_a, tokens_b):
-    """Block collapse only when terms share NO tokens at all."""
-    if not tokens_a or not tokens_b:
-        return False
-    return len(tokens_a & tokens_b) == 0
-
-
-def qualifier_conflict(tokens_a, tokens_b):
-    """Block collapse when terms are nearly identical but differ by 1-2 tokens.
-
-    If 80%+ of tokens overlap but a small set differs, those differing
-    tokens are likely clinical qualifiers (left/right, upper/lower,
-    front/back, acute/chronic, mild/severe, etc).
-
-    No hardcoded list — works for any qualifier pattern:
-      "left knee pain" vs "right knee pain" → 2/3 overlap, differ by left/right → block
-      "upper abdomen pain" vs "lower abdomen pain" → same logic
-      "acute sinusitis" vs "chronic sinusitis" → same logic
-      "knee pain" vs "elbow pain" → same logic (different body part)
+    No terms needed — pure graph structure.
     """
-    if not tokens_a or not tokens_b:
+    if graph is None or not graph.has_node(cui_a) or not graph.has_node(cui_b):
+        return False
+    parents_a = set(graph.predecessors(cui_a))
+    parents_b = set(graph.predecessors(cui_b))
+    return len(parents_a & parents_b) > 0
+
+
+def graph_distant(graph, cui_a, cui_b, max_hops=2):
+    """Block collapse when two CUIs share no common ancestor within max_hops.
+
+    If they have no nearby common ancestor, they're from different branches
+    of the ontology — shouldn't be collapsed even if embeddings are close.
+
+    No terms needed — pure graph traversal.
+    """
+    if graph is None or not graph.has_node(cui_a) or not graph.has_node(cui_b):
         return False
 
-    shared = tokens_a & tokens_b
-    only_a = tokens_a - tokens_b
-    only_b = tokens_b - tokens_a
+    def ancestors_within(cui, hops):
+        result = set()
+        frontier = {cui}
+        for _ in range(hops):
+            next_frontier = set()
+            for node in frontier:
+                if graph.has_node(node):
+                    for parent in graph.predecessors(node):
+                        if parent not in result:
+                            result.add(parent)
+                            next_frontier.add(parent)
+            frontier = next_frontier
+        return result
 
-    # no difference — identical terms, not a conflict
-    if not only_a and not only_b:
-        return False
-
-    # high overlap with small difference = qualifier distinction
-    total = len(tokens_a | tokens_b)
-    overlap_ratio = len(shared) / total if total > 0 else 0
-
-    # 50%+ overlap and BOTH sides differ by 1-2 tokens = qualifier distinction
-    # requires both sides to have unique tokens — "knee pain" vs "knee pain syndrome"
-    # has only_a=0, so it's not a qualifier swap, just extra detail
-    if overlap_ratio >= 0.5 and 1 <= len(only_a) <= 2 and 1 <= len(only_b) <= 2:
-        return True
-
-    return False
+    anc_a = ancestors_within(cui_a, max_hops)
+    anc_b = ancestors_within(cui_b, max_hops)
+    # also check if one is ancestor of the other
+    if cui_a in anc_b or cui_b in anc_a:
+        return False  # ancestor/descendant = related, not distant
+    return len(anc_a & anc_b) == 0
 
 
 # %% [5] LRU Cache (thread-safe)
@@ -249,33 +239,18 @@ class MetadataFetcher:
                 ) AS rn
               FROM `{self.pid}.{self.did}.MRCONSO`
               WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
-            ),
-            sab_pref AS (
-              SELECT CUI, SAB, STR,
-                ROW_NUMBER() OVER (
-                  PARTITION BY CUI, SAB
-                  ORDER BY
-                    CASE WHEN ISPREF='Y' THEN 0 ELSE 1 END,
-                    LENGTH(STR) DESC
-                ) AS sab_rn
-              FROM `{self.pid}.{self.did}.MRCONSO`
-              WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
-                AND SAB IN ('SNOMEDCT_US','ICD10CM','ICD10PCS','ICD9CM','LNC')
             )
             SELECT
               r.CUI AS cui,
               MAX(CASE WHEN r.rn = 1 THEN r.STR END) AS pref_term,
               ARRAY_AGG(DISTINCT s.TUI IGNORE NULLS) AS tuis,
               ARRAY_AGG(DISTINCT s.STY IGNORE NULLS) AS stys,
-              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs,
-              ARRAY_AGG(DISTINCT sp.STR IGNORE NULLS) AS sab_terms
+              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs
             FROM ranked r
             LEFT JOIN `{self.pid}.{self.did}.MRSTY` s
               ON r.CUI = s.CUI
             LEFT JOIN `{self.pid}.{self.did}.MRCONSO` c2
               ON r.CUI = c2.CUI AND c2.LAT = 'ENG'
-            LEFT JOIN sab_pref sp
-              ON r.CUI = sp.CUI AND sp.sab_rn = 1
             WHERE r.rn = 1
             GROUP BY r.CUI
             """
@@ -285,19 +260,9 @@ class MetadataFetcher:
             for row in self.bq.query(
                     query, job_config=jc, timeout=300).result():
                 term = row.pref_term or row.cui
-                norm = normalize_term(term)
-                # tokens from preferred term per allowed SAB
-                sab_tok = set()
-                for t in (row.sab_terms or []):
-                    sab_tok.update(tokenize_term(normalize_term(t)))
-                # include the preferred term tokens too
-                pref_tok = tokenize_term(norm)
-                combined = frozenset(sab_tok | pref_tok) if sab_tok else pref_tok
                 meta = CUIMetadata(
                     cui=row.cui,
                     preferred_term=term,
-                    normalized_term=norm,
-                    all_tokens=combined,
                     semantic_types=list(row.stys or []),
                     semantic_type_ids=list(row.tuis or []),
                     ic_score=0.0,
@@ -376,58 +341,6 @@ class SABFilter:
                     f"vocabs {m.source_vocabs} not in allowed"))
                 continue
             kept.append(cui)
-        return kept, audit
-
-
-class SemanticTypeFilter:
-    def __init__(self, excluded):
-        self.excluded = set(excluded) if excluded else set()
-
-    @timed("semtype_filter")
-    def run(self, cuis, metadata):
-        if not self.excluded:
-            return cuis, []
-        kept, audit = [], []
-        for cui in cuis:
-            m = metadata.get(cui)
-            if not m or not m.semantic_types:
-                kept.append(cui)
-                continue
-            if all(st in self.excluded for st in m.semantic_types):
-                audit.append(AuditEntry(
-                    cui, m.preferred_term, "", "",
-                    "semtype_excluded",
-                    f"all types {m.semantic_types} excluded"))
-                continue
-            kept.append(cui)
-        return kept, audit
-
-
-class TermDeduplicator:
-    """Collapse CUIs with identical normalized terms. Keep highest IC."""
-
-    @staticmethod
-    @timed("term_dedup")
-    def run(cuis, metadata, ic_map):
-        groups = defaultdict(list)
-        for cui in cuis:
-            m = metadata.get(cui)
-            key = m.normalized_term if m else cui
-            groups[key].append(cui)
-
-        kept, audit = [], []
-        for term, members in groups.items():
-            best = max(members, key=lambda c: ic_map.get(c, 0))
-            kept.append(best)
-            for c in members:
-                if c != best:
-                    bm = metadata.get(best)
-                    cm = metadata.get(c)
-                    audit.append(AuditEntry(
-                        c, cm.preferred_term if cm else "",
-                        best, bm.preferred_term if bm else "",
-                        "term_dedup",
-                        f"identical norm term '{term}'"))
         return kept, audit
 
 
@@ -640,7 +553,7 @@ class EmbeddingReducer:
 
     @staticmethod
     @timed("embedding_reduce")
-    def run(cuis, metadata, embeddings, ic_map, hierarchy_edges):
+    def run(cuis, metadata, embeddings, ic_map, hierarchy_edges, graph=None):
 
         type_groups = defaultdict(list)
         for cui in cuis:
@@ -684,7 +597,7 @@ class EmbeddingReducer:
                     continue
 
                 surviving, removed = _reduce_topic(
-                    t_cuis, embeddings, metadata, ic_map, hierarchy_edges)
+                    t_cuis, embeddings, metadata, ic_map, hierarchy_edges, graph)
                 all_topics[topic_id] = surviving
                 for c in surviving:
                     globally_surviving.add(c)
@@ -722,7 +635,7 @@ class EmbeddingReducer:
         return cleaned, surviving, final_audit
 
 
-def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges):
+def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges, graph=None):
     matrix = np.array([embeddings[c] for c in t_cuis])
     sim = matrix @ matrix.T
     np.clip(sim, -1, 1, out=sim)
@@ -758,14 +671,14 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges):
     all_kept, all_removed = [], []
     for r_cuis in r_groups.values():
         kept, removed = _resolve_group(
-            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx, tight_t, guardrail)
+            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx, tight_t, guardrail, graph)
         all_kept.extend(kept)
         all_removed.extend(removed)
 
     return all_kept, all_removed
 
 
-def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, tight_t, guardrail):
+def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, tight_t, guardrail, graph=None):
     if len(r_cuis) <= 1:
         return r_cuis, []
 
@@ -791,11 +704,11 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, t
             kept.append(c)
             continue
 
-        if c_meta and b_meta and terms_diverge(c_meta.all_tokens, b_meta.all_tokens):
+        if are_siblings(graph, c, best):
             kept.append(c)
             continue
 
-        if c_meta and b_meta and qualifier_conflict(c_meta.all_tokens, b_meta.all_tokens):
+        if graph_distant(graph, c, best):
             kept.append(c)
             continue
 
@@ -829,7 +742,7 @@ class CrossTopicDedup:
 
     @staticmethod
     @timed("cross_topic_dedup")
-    def run(surviving, embeddings, text_vec, metadata, ic_map):
+    def run(surviving, embeddings, text_vec, metadata, ic_map, graph=None):
         with_emb = [c for c in surviving if c in embeddings]
         without_emb = [c for c in surviving if c not in embeddings]
 
@@ -876,14 +789,10 @@ class CrossTopicDedup:
 
                 ci, cj = with_emb[i], with_emb[j]
 
-                # safety guards — don't collapse qualifier variants or divergent terms
-                ci_meta = metadata.get(ci)
-                cj_meta = metadata.get(cj)
-                ci_tok = ci_meta.all_tokens if ci_meta else frozenset()
-                cj_tok = cj_meta.all_tokens if cj_meta else frozenset()
-                if qualifier_conflict(ci_tok, cj_tok):
+                # safety guards — don't collapse siblings or graph-distant CUIs
+                if are_siblings(graph, ci, cj):
                     continue
-                if terms_diverge(ci_tok, cj_tok):
+                if graph_distant(graph, ci, cj):
                     continue
 
                 # keep higher alignment, break ties by IC
@@ -970,14 +879,12 @@ class CUIReductionSystem:
 
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
-                 excluded_semantic_types=None, ic_scores=None,
-                 genai_location="us-central1"):
+                 ic_scores=None, genai_location="us-central1"):
 
         self.bq = bigquery.Client(project=project_id)
         self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
         self.ic_computer = ICComputer(full_network, ic_scores)
         self.sab_filter = SABFilter(allowed_sabs)
-        self.semtype_filter = SemanticTypeFilter(excluded_semantic_types or set())
         self.hierarchy_reducer = HierarchyReducer(full_network)
         self.emb_fetcher = EmbeddingFetcher(
             self.bq, project_id, dataset_id, embedding_table)
@@ -1033,17 +940,11 @@ class CUIReductionSystem:
             after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
             log(f"    SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
 
-            after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
-            log(f"    Semtype Filter: {len(after_sab)} -> {len(after_sty)} (removed {len(after_sab) - len(after_sty)})")
-
-            after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
-            log(f"    Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
-
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
-                after_term, ic_map, metadata)
-            log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
+                after_sab, ic_map, metadata)
+            log(f"    Hierarchy: {len(after_sab)} -> {len(after_hier)} (removed {len(after_sab) - len(after_hier)})")
 
-            audit = sab_audit + sty_audit + term_audit + hier_audit
+            audit = sab_audit + hier_audit
             all_post_hier.update(after_hier)
             per_text.append((context_string, cuis, after_hier, hier_edges, audit))
 
@@ -1066,7 +967,8 @@ class CUIReductionSystem:
             emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
 
             topics, surviving, emb_audit = EmbeddingReducer.run(
-                after_hier, metadata, embeddings, ic_map, hier_edges)
+                after_hier, metadata, embeddings, ic_map, hier_edges,
+                graph=self.hierarchy_reducer.graph)
             all_audit.extend(emb_audit)
             log(f"\n  [{label}]")
             log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
@@ -1096,7 +998,8 @@ class CUIReductionSystem:
             # cross-topic dedup (topics stay intact, only output list trimmed)
             before_xtd = len(surviving)
             surviving, xtd_audit = CrossTopicDedup.run(
-                surviving, embeddings, text_vec, metadata, ic_map)
+                surviving, embeddings, text_vec, metadata, ic_map,
+                graph=self.hierarchy_reducer.graph)
             all_audit.extend(xtd_audit)
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
