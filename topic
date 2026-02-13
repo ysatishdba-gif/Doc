@@ -1,3 +1,183 @@
+# %% [19] Run Pipeline
+texts = [
+    "Patient has severe pain in left knee with swelling",
+]
+
+# extract CUIs in parallel
+def _extract(text):
+    cuis = extractor.extract(text)
+    return (cuis, text) if cuis else None
+
+with ThreadPoolExecutor(max_workers=min(len(texts), 8)) as pool:
+    raw = pool.map(_extract, texts)
+    inputs = [r for r in raw if r is not None]
+
+# single batch call
+results = system.reduce_batch(inputs)
+
+# display results
+for result in results:
+    log(f"\n{'=' * 60}")
+    log(f"TEXT: {result.context_string}")
+    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} (reduction) -> {result.after_relevance_count} (relevance) CUIs, "
+        f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
+    log(f"  Pre-relevance (term-free): {len(result.pre_relevance_retention)} CUIs")
+    log(f"  Post-relevance (term-dependent): {len(result.retention)} CUIs")
+
+    log(f"\n-- Top 20 CUIs by retention (of {len(result.retention)}) --")
+    for entry in result.retention[:20]:
+        stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
+        line = f"  {entry.cui} | align={entry.alignment} | [{stys}] {entry.term}"
+        if entry.explains_cuis:
+            line += f" | explains {len(entry.explains_cuis)}"
+        log(line)
+
+    log(f"\n-- Topics: {len(result.topics)} (showing first 20) --")
+    for tid, topic in list(result.topics.items())[:20]:
+        log(f"  {tid} ({len(topic.cuis)} CUIs)")
+    if len(result.topics) > 20:
+        log(f"  ... {len(result.topics) - 20} more topics")
+
+# %% [20] Inspect CUIs under a topic
+target_topic = "topic_0"  # change this to any topic ID
+for result in results:
+    topic = result.topics.get(target_topic)
+    if topic:
+        log(f"\n{target_topic} ({len(topic.cuis)} CUIs):")
+        for c, term in topic.cui_terms.items():
+            log(f"  {c}  {term}")
+        break
+    else:
+        log(f"Topic '{target_topic}' not found")
+
+# %% [21] Inspect explains for any CUI
+target = "C4081756"  # change this to any CUI
+for result in results:
+    for entry in result.retention:
+        if entry.cui == target:
+            log(f"\n{entry.cui} ({entry.term}) explains {len(entry.explains_cuis)} CUIs:")
+            for exc in entry.explains_cuis:
+                term = ""
+                for a in result.audit_trail:
+                    if a.removed_cui == exc:
+                        term = a.removed_term
+                        break
+                log(f"  {exc}  {term}")
+            break
+
+# %% [22] Validate: search for a term across audit + retention
+search_term = "knee pain"  # change this to any term fragment
+for result in results:
+    log(f"\n-- Searching '{search_term}' across pipeline --")
+
+    log(f"\n  SURVIVED (in retention):")
+    for entry in result.retention:
+        if search_term.lower() in entry.term.lower():
+            log(f"    {entry.cui} | align={entry.alignment} | {entry.term}")
+
+    log(f"\n  REMOVED (in audit trail):")
+    for a in result.audit_trail:
+        if search_term.lower() in a.removed_term.lower():
+            log(f"    {a.removed_cui} ({a.removed_term})")
+            log(f"      -> kept: {a.kept_cui} ({a.kept_term})")
+            log(f"      -> reason: {a.reason} | {a.detail}")
+
+# %% [23] Validate relevance filter — inspect cutoff and borderline CUIs
+for result in results:
+    rel_removed = [a for a in result.audit_trail if a.reason == "below_relevance_threshold"]
+    if not rel_removed:
+        log("Relevance filter removed 0 CUIs")
+        continue
+
+    cutoff_detail = rel_removed[0].detail
+    log(f"Relevance filter: kept {len(result.retention)}, removed {len(rel_removed)}")
+    log(f"Cutoff: {cutoff_detail}")
+
+    # bottom 10 survivors
+    log(f"\n-- Bottom 10 KEPT (borderline survivors) --")
+    for entry in result.retention[-10:]:
+        log(f"  {entry.cui} | align={entry.alignment} | {entry.term}")
+
+    # top 10 removed
+    log(f"\n-- Top 10 REMOVED (closest to cutoff — check these) --")
+    def _parse_boosted(detail):
+        try:
+            return float(detail.split("boosted ")[1].split(" ")[0].rstrip(","))
+        except:
+            return 0.0
+    rel_removed_sorted = sorted(rel_removed, key=lambda a: _parse_boosted(a.detail), reverse=True)
+    for a in rel_removed_sorted[:10]:
+        log(f"  {a.removed_cui} | {a.detail.split(' < ')[0]} | {a.removed_term}")
+
+    # bottom 10 removed
+    log(f"\n-- Bottom 10 REMOVED (most distant — should be noise) --")
+    for a in rel_removed_sorted[-10:]:
+        log(f"  {a.removed_cui} | {a.detail.split(' < ')[0]} | {a.removed_term}")
+
+    # distribution
+    kept_scores = [e.alignment for e in result.retention]
+    log(f"\n-- Distribution --")
+    log(f"  Kept:    count={len(kept_scores)}  min={min(kept_scores):.4f}  max={max(kept_scores):.4f}  mean={np.mean(kept_scores):.4f}")
+    log(f"  Removed: count={len(rel_removed)}")
+
+# %% [24] Boost impact analysis — how much does token overlap drive the cut?
+_meta_cache = system.fetcher._cache._d
+for result in results:
+    query_tokens = tokenize_term(normalize_term(result.context_string))
+    if not query_tokens:
+        log("No query tokens")
+        continue
+
+    zero_overlap_kept = 0
+    zero_overlap_removed = 0
+
+    # check kept CUIs
+    zero_kept_list = []
+    for entry in result.retention:
+        m = _meta_cache.get(entry.cui)
+        cui_tokens = m.all_tokens if m else frozenset()
+        overlap = len(query_tokens & cui_tokens)
+        if overlap == 0:
+            zero_overlap_kept += 1
+            zero_kept_list.append((entry.cui, entry.term, entry.alignment))
+
+    # check removed CUIs
+    rel_removed = [a for a in result.audit_trail if a.reason == "below_relevance_threshold"]
+    zero_overlap_removed = sum(
+        1 for a in rel_removed
+        if not (query_tokens & (_meta_cache.get(a.removed_cui).all_tokens
+                if _meta_cache.get(a.removed_cui) else frozenset()))
+    )
+
+    log(f"\n-- Boost Impact Analysis --")
+    log(f"  Query tokens: {query_tokens}")
+    log(f"  Kept: {len(result.retention)} ({zero_overlap_kept} with ZERO token overlap)")
+    log(f"  Removed: {len(rel_removed)} ({zero_overlap_removed} with ZERO token overlap)")
+
+    # show kept CUIs with zero overlap — these survived on alignment alone
+    log(f"\n-- KEPT with zero overlap (survived on alignment only — verify these) --")
+    for cui, term, align in zero_kept_list[:15]:
+        log(f"  {cui} | align={align} | {term}")
+    if len(zero_kept_list) > 15:
+        log(f"  ... {len(zero_kept_list) - 15} more")
+
+    # show removed CUIs with HIGH alignment but low overlap — most likely false removals
+    log(f"\n-- REMOVED with high alignment (>0.68) — potential false removals --")
+    false_removals = []
+    for a in rel_removed:
+        try:
+            align_val = float(a.detail.split("alignment ")[1].split(",")[0])
+        except:
+            continue
+        if align_val > 0.68:
+            false_removals.append((a.removed_cui, a.removed_term, a.detail))
+    for cui, term, detail in false_removals[:15]:
+        log(f"  {cui} | {detail.split(' < ')[0]} | {term}")
+    if len(false_removals) > 15:
+        log(f"  ... {len(false_removals) - 15} more")
+    if not false_removals:
+        log(f"  None — all high-alignment CUIs were kept")
+
 # %% [25] Pre-relevance vs post-relevance comparison
 # Pre-relevance = term-free stages only (ontology + embeddings)
 # Post-relevance = after token boost + Otsu (term-dependent)
