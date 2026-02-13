@@ -1054,10 +1054,12 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
 def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
                    index_map, tight_t, guardrail, sibling_threshold=8.0,
                    batch_info=None):
+    """Pick representative via IC + centrality, then keep/remove others
+    based on safety checks and rare concept protection. O(n) per group."""
     if len(r_cuis) <= 1:
         return r_cuis, []
 
-    # pick representative: IC (specificity) + centrality (cluster fit)
+    # IC (specificity) + centrality (cluster fit), normalized equally
     ic_vals = {c: ic_map.get(c, 0) for c in r_cuis}
     cent_vals = {}
     for c in r_cuis:
@@ -1104,7 +1106,7 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
             kept.append(c)
             continue
 
-        # graph safety via batch_info (uses precomputed + cached data)
+        # graph safety via batch_info (precomputed + cached)
         if batch_info is not None:
             if batch_info.are_siblings(c, best, sibling_threshold):
                 kept.append(c)
@@ -1113,19 +1115,14 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
                 kept.append(c)
                 continue
 
-        # --- Improvement #5: Rare concept protection ---
-        # Protect CUIs with high IC (very specific) AND low embedding
-        # density (few close neighbors). These are rare but clinically
-        # critical — collapsing them loses unique information.
+        # rare concept protection: high IC + isolated
         c_ic = ic_map.get(c, 0)
         ci_idx = index_map.get(c)
         if c_ic > 10.0 and ci_idx is not None:
-            # count how many CUIs in the group are within tight_t
             close_count = sum(1 for o in r_cuis if o != c and
                              index_map.get(o) is not None and
                              dist[ci_idx, index_map[o]] < tight_t)
             if close_count <= 1:
-                # isolated high-IC concept → protect
                 kept.append(c)
                 continue
 
@@ -1243,7 +1240,79 @@ class CrossTopicDedup:
         return final, audit
 
 
-# %% [14] Retention Scorer
+# %% [14] Coverage Rescue
+class CoverageRescue:
+    """Search-engine inspired coverage check — like Google ensuring
+    results span the full intent space of a query.
+
+    After all reduction, checks which semantic axes from the input
+    are missing or under-represented in the output. Rescues the
+    highest-IC CUI from each lost axis.
+
+    This prevents pathological cases where aggressive reduction
+    eliminates an entire clinical dimension (e.g. all procedure CUIs
+    collapse, leaving only findings).
+    """
+
+    @staticmethod
+    @timed("coverage_rescue")
+    def run(surviving, all_input_cuis, metadata, ic_map, embeddings):
+        # semantic types in input vs output
+        input_types = defaultdict(set)  # type → set of CUIs
+        for c in all_input_cuis:
+            m = metadata.get(c)
+            if m and m.semantic_types:
+                for t in m.semantic_types:
+                    input_types[t].add(c)
+
+        output_types = set()
+        for c in surviving:
+            m = metadata.get(c)
+            if m and m.semantic_types:
+                output_types.update(m.semantic_types)
+
+        # find lost types
+        lost_types = set(input_types.keys()) - output_types
+        if not lost_types:
+            return surviving, []
+
+        # for each lost type, rescue the CUI with highest IC that
+        # was in the input AND has an embedding (for downstream use)
+        surviving_set = set(surviving)
+        rescued = []
+        audit = []
+
+        for lost_type in sorted(lost_types):
+            candidates = input_types[lost_type] - surviving_set
+            if not candidates:
+                continue
+
+            # prefer CUIs with embeddings, then by IC
+            with_emb = [c for c in candidates if c in embeddings]
+            pool = with_emb if with_emb else list(candidates)
+            best = max(pool, key=lambda c: ic_map.get(c, 0))
+
+            rescued.append(best)
+            surviving_set.add(best)
+            m = metadata.get(best)
+            audit.append(AuditEntry(
+                removed_cui="",
+                removed_term="",
+                kept_cui=best,
+                kept_term=m.preferred_term if m else "",
+                reason="coverage_rescued",
+                detail=f"rescued for lost semantic type '{lost_type}' | "
+                       f"IC {ic_map.get(best,0):.2f}"))
+
+        if rescued:
+            surviving = list(surviving) + rescued
+            log(f"    Coverage Rescue: +{len(rescued)} CUIs for "
+                f"{len(lost_types)} lost semantic types")
+
+        return surviving, audit
+
+
+# %% [15] Retention Scorer
 class RetentionScorer:
     """Scores each CUI by narrative alignment via cosine(text_emb, cui_emb).
     Cost: 1 embedding API call (~100ms) per input text."""
@@ -1298,7 +1367,7 @@ class RetentionScorer:
 
 
 
-# %% [15] Pipeline
+# %% [16] Pipeline
 class CUIReductionSystem:
 
     def __init__(self, project_id, dataset_id, full_network,
@@ -1443,6 +1512,11 @@ class CUIReductionSystem:
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
+            # coverage rescue: restore CUIs from lost semantic axes
+            surviving, rescue_audit = CoverageRescue.run(
+                surviving, cuis, metadata, ic_map, embeddings)
+            all_audit.extend(rescue_audit)
+
             # retention scoring (alignment for downstream use)
             sorted_cuis, retention = self.retention_scorer.score(
                 text_vec, surviving, embeddings, metadata, all_audit)
@@ -1556,7 +1630,7 @@ class CUIReductionSystem:
             return out
 
 
-# %% [16] CUI Extraction API
+# %% [17] CUI Extraction API
 class CUIExtractor:
     """Calls CUI extraction endpoint. Filters by confidence."""
 
@@ -1609,7 +1683,7 @@ class CUIExtractor:
         return list(set(cuis))
 
 
-# %% [17] Load Pickles -- RUN ONCE
+# %% [18] Load Pickles -- RUN ONCE
 HIERARCHY_PATH = "umls_hierarchy.pkl"
 IC_PATH = "ic_precomputed.pkl"
 
@@ -1624,7 +1698,7 @@ with open(IC_PATH, "rb") as f:
 print(f"IC scores: {len(ic_precomputed)} entries")
 
 
-# %% [18] Init System
+# %% [19] Init System
 PROJECT_ID = "your-project-id"
 DATASET_ID = "your-dataset"
 API_URL = "https://your-api/extract"
@@ -1642,7 +1716,7 @@ extractor = CUIExtractor(API_URL)
 log("System ready.")
 
 
-# %% [19] Run Pipeline
+# %% [20] Run Pipeline
 texts = [
     "Patient has severe pain in left knee with swelling",
 ]
@@ -1683,7 +1757,7 @@ for result in results:
     if len(result.topics) > 20:
         log(f"  ... {len(result.topics) - 20} more topics")
 
-# %% [20] Inspect CUIs under a topic
+# %% [21] Inspect CUIs under a topic
 target_topic = "topic_0"  # change this to any topic ID
 for result in results:
     topic = result.topics.get(target_topic)
@@ -1695,7 +1769,7 @@ for result in results:
     else:
         log(f"Topic '{target_topic}' not found")
 
-# %% [21] Inspect explains for any CUI
+# %% [22] Inspect explains for any CUI
 target = "C4081756"  # change this to any CUI
 for result in results:
     for entry in result.retention:
@@ -1710,7 +1784,7 @@ for result in results:
                 log(f"  {exc}  {term}")
             break
 
-# %% [22] Validate: search for a term across audit + retention
+# %% [23] Validate: search for a term across audit + retention
 search_term = "knee pain"  # change this to any term fragment
 for result in results:
     log(f"\n-- Searching '{search_term}' across pipeline --")
@@ -1727,11 +1801,11 @@ for result in results:
             log(f"      -> kept: {a.kept_cui} ({a.kept_term})")
             log(f"      -> reason: {a.reason} | {a.detail}")
 
-# %% [23] Print all reduced CUIs with alignment scores
+# %% [24] Print all reduced CUIs with alignment scores
 for entry in results[0].retention:
     print(f"{entry.cui} | {entry.alignment:.4f} | {entry.term}")
 
-# %% [24] Validate sibling IC threshold (Otsu)
+# %% [25] Validate sibling IC threshold (Otsu)
 # Shows where Otsu placed the threshold and examples around it
 graph = system.hierarchy_reducer.graph
 
