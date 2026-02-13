@@ -110,11 +110,9 @@ class ReductionResult:
     after_filter_count: int
     after_hierarchy_count: int
     after_redundancy_count: int
-    after_relevance_count: int
     topics: Dict[str, TopicInfo]
     all_reduced_cuis: List[str]
     retention: List[RetentionEntry]
-    pre_relevance_retention: List[RetentionEntry]  # before term-dependent filter
     audit_trail: List[AuditEntry]
     processing_time_ms: float
     metadata_coverage: float
@@ -966,115 +964,6 @@ class RetentionScorer:
         return sorted_cuis, entries
 
 
-# %% [14B] Relevance Filter
-class RelevanceFilter:
-    """Post-retention cleanup combining embedding alignment with
-    query-term overlap.
-
-    Pure embedding alignment can't separate 'knee' from 'ankle' in
-    musculoskeletal space. Adding a simple check: do the CUI's terms
-    share any content words with the query?
-
-    Scoring:
-      boosted_score = alignment + (0.1 * overlap_ratio)
-
-    The boost widens the gap between CUIs that mention query anatomy
-    and those that don't, making Otsu's split meaningful.
-
-    No hardcoded lists, no stop words. Common tokens that appear in
-    every CUI boost everyone equally — zero discriminating effect.
-    Meaningful tokens like 'knee', 'left', 'pain' drive the separation.
-    """
-
-    @staticmethod
-    @timed("relevance_filter")
-    def run(retention, context_string, metadata):
-        if len(retention) < 10:
-            sorted_cuis = [e.cui for e in retention]
-            return sorted_cuis, retention, []
-
-        # all query tokens — no filtering
-        query_tokens = tokenize_term(normalize_term(context_string))
-
-        if not query_tokens:
-            sorted_cuis = [e.cui for e in retention]
-            return sorted_cuis, retention, []
-
-        # score each CUI: alignment + overlap boost
-        boosted = []
-        for entry in retention:
-            m = metadata.get(entry.cui)
-            cui_tokens = m.all_tokens if m else frozenset()
-
-            overlap = len(query_tokens & cui_tokens)
-            boost = 0.1 * (overlap / len(query_tokens))
-            boosted.append((entry, entry.alignment + boost))
-
-        # re-sort by boosted score
-        boosted.sort(key=lambda x: x[1], reverse=True)
-
-        # Otsu on boosted scores to find natural split
-        scores = np.array([b[1] for b in boosted])
-        otsu_cutoff = RelevanceFilter._otsu_threshold(scores)
-
-        audit = []
-        kept = []
-        for entry, score in boosted:
-            if score >= otsu_cutoff:
-                kept.append(entry)
-            else:
-                audit.append(AuditEntry(
-                    removed_cui=entry.cui,
-                    removed_term=entry.term,
-                    kept_cui="", kept_term="",
-                    reason="below_relevance_threshold",
-                    detail=f"alignment {entry.alignment:.4f}, boosted {score:.4f} "
-                           f"< otsu {otsu_cutoff:.4f}"))
-
-        # re-sort kept by original alignment for output
-        kept.sort(key=lambda e: e.alignment, reverse=True)
-        sorted_cuis = [e.cui for e in kept]
-        return sorted_cuis, kept, audit
-
-    @staticmethod
-    def _otsu_threshold(scores):
-        lo, hi = float(scores.min()), float(scores.max())
-        if hi - lo < 1e-9:
-            return lo
-
-        n_bins = 256
-        bins = np.linspace(lo, hi, n_bins + 1)
-        hist, _ = np.histogram(scores, bins=bins)
-        hist = hist.astype(np.float64)
-        total = hist.sum()
-
-        if total == 0:
-            return lo
-
-        bin_centers = (bins[:-1] + bins[1:]) / 2.0
-        best_t = lo
-        best_var = -1.0
-        sum_total = np.sum(hist * bin_centers)
-        sum_bg = 0.0
-        weight_bg = 0.0
-
-        for i in range(n_bins):
-            weight_bg += hist[i]
-            if weight_bg == 0:
-                continue
-            weight_fg = total - weight_bg
-            if weight_fg == 0:
-                break
-            sum_bg += hist[i] * bin_centers[i]
-            mean_bg = sum_bg / weight_bg
-            mean_fg = (sum_total - sum_bg) / weight_fg
-            between_var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-            if between_var > best_var:
-                best_var = between_var
-                best_t = bin_centers[i]
-
-        return float(best_t)
-
 
 # %% [15] Pipeline
 class CUIReductionSystem:
@@ -1212,22 +1101,13 @@ class CUIReductionSystem:
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
-            # retention scoring
+            # retention scoring (alignment for downstream use)
             sorted_cuis, retention = self.retention_scorer.score(
                 text_vec, surviving, embeddings, metadata, all_audit)
             if retention:
                 log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
 
-            # relevance filter (query-token boosted + Otsu)
-            pre_relevance_retention = list(retention)  # snapshot before term-dependent filter
-            before_rel = len(retention)
-            sorted_cuis, retention, rel_audit = RelevanceFilter.run(
-                retention, context_string, metadata)
-            all_audit.extend(rel_audit)
-            if before_rel != len(retention):
-                log(f"    Relevance Filter: {before_rel} -> {len(retention)} (removed {before_rel - len(retention)})")
-
-            # prune topics to only final surviving CUIs
+            # prune topics to match surviving CUIs (after cross-topic dedup)
             final_set = set(sorted_cuis)
             before_prune = len(topics_out)
             pruned_topics = {}
@@ -1242,7 +1122,8 @@ class CUIReductionSystem:
                     cuis=kept_cuis,
                     cui_terms=kept_terms)
             topics_out = pruned_topics
-            log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
+            if before_prune != len(topics_out):
+                log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
 
             audited = {e.removed_cui for e in all_audit}
             survived = set(surviving)
@@ -1256,7 +1137,7 @@ class CUIReductionSystem:
                         "CUI not in surviving or audit trail"))
 
             elapsed = (time.perf_counter() - t_start) * 1000
-            log(f"    DONE: {len(cuis)} -> {len(surviving)} -> {len(retention)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
+            log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
 
             results.append(ReductionResult(
                 context_string=context_string,
@@ -1264,11 +1145,9 @@ class CUIReductionSystem:
                 after_filter_count=len(after_hier),
                 after_hierarchy_count=len(after_hier),
                 after_redundancy_count=len(surviving),
-                after_relevance_count=len(retention),
                 topics=topics_out,
                 all_reduced_cuis=sorted_cuis,
                 retention=retention,
-                pre_relevance_retention=pre_relevance_retention,
                 audit_trail=all_audit,
                 processing_time_ms=elapsed,
                 metadata_coverage=emb_cov,
@@ -1281,7 +1160,7 @@ class CUIReductionSystem:
 
     def _empty(self, ctx, t0, audit=None, meta_cov=0.0):
         return ReductionResult(
-            ctx, 0, 0, 0, 0, 0, {}, [], [], [],
+            ctx, 0, 0, 0, 0, {}, [], [],
             audit or [], (time.perf_counter() - t0) * 1000, meta_cov, 0.0)
 
     def get_stats(self):
@@ -1405,10 +1284,8 @@ results = system.reduce_batch(inputs)
 for result in results:
     log(f"\n{'=' * 60}")
     log(f"TEXT: {result.context_string}")
-    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} (reduction) -> {result.after_relevance_count} (relevance) CUIs, "
+    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
         f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
-    log(f"  Pre-relevance (term-free): {len(result.pre_relevance_retention)} CUIs")
-    log(f"  Post-relevance (term-dependent): {len(result.retention)} CUIs")
 
     log(f"\n-- Top 20 CUIs by retention (of {len(result.retention)}) --")
     for entry in result.retention[:20]:
@@ -1468,144 +1345,6 @@ for result in results:
             log(f"      -> kept: {a.kept_cui} ({a.kept_term})")
             log(f"      -> reason: {a.reason} | {a.detail}")
 
-# %% [23] Validate relevance filter — inspect cutoff and borderline CUIs
-for result in results:
-    rel_removed = [a for a in result.audit_trail if a.reason == "below_relevance_threshold"]
-    if not rel_removed:
-        log("Relevance filter removed 0 CUIs")
-        continue
-
-    cutoff_detail = rel_removed[0].detail
-    log(f"Relevance filter: kept {len(result.retention)}, removed {len(rel_removed)}")
-    log(f"Cutoff: {cutoff_detail}")
-
-    # bottom 10 survivors
-    log(f"\n-- Bottom 10 KEPT (borderline survivors) --")
-    for entry in result.retention[-10:]:
-        log(f"  {entry.cui} | align={entry.alignment} | {entry.term}")
-
-    # top 10 removed
-    log(f"\n-- Top 10 REMOVED (closest to cutoff — check these) --")
-    def _parse_boosted(detail):
-        try:
-            return float(detail.split("boosted ")[1].split(" ")[0].rstrip(","))
-        except:
-            return 0.0
-    rel_removed_sorted = sorted(rel_removed, key=lambda a: _parse_boosted(a.detail), reverse=True)
-    for a in rel_removed_sorted[:10]:
-        log(f"  {a.removed_cui} | {a.detail.split(' < ')[0]} | {a.removed_term}")
-
-    # bottom 10 removed
-    log(f"\n-- Bottom 10 REMOVED (most distant — should be noise) --")
-    for a in rel_removed_sorted[-10:]:
-        log(f"  {a.removed_cui} | {a.detail.split(' < ')[0]} | {a.removed_term}")
-
-    # distribution
-    kept_scores = [e.alignment for e in result.retention]
-    log(f"\n-- Distribution --")
-    log(f"  Kept:    count={len(kept_scores)}  min={min(kept_scores):.4f}  max={max(kept_scores):.4f}  mean={np.mean(kept_scores):.4f}")
-    log(f"  Removed: count={len(rel_removed)}")
-
-# %% [24] Boost impact analysis — how much does token overlap drive the cut?
-_meta_cache = system.fetcher._cache._d
-for result in results:
-    query_tokens = tokenize_term(normalize_term(result.context_string))
-    if not query_tokens:
-        log("No query tokens")
-        continue
-
-    zero_overlap_kept = 0
-    zero_overlap_removed = 0
-
-    # check kept CUIs
-    zero_kept_list = []
-    for entry in result.retention:
-        m = _meta_cache.get(entry.cui)
-        cui_tokens = m.all_tokens if m else frozenset()
-        overlap = len(query_tokens & cui_tokens)
-        if overlap == 0:
-            zero_overlap_kept += 1
-            zero_kept_list.append((entry.cui, entry.term, entry.alignment))
-
-    # check removed CUIs
-    rel_removed = [a for a in result.audit_trail if a.reason == "below_relevance_threshold"]
-    zero_overlap_removed = sum(
-        1 for a in rel_removed
-        if not (query_tokens & (_meta_cache.get(a.removed_cui).all_tokens
-                if _meta_cache.get(a.removed_cui) else frozenset()))
-    )
-
-    log(f"\n-- Boost Impact Analysis --")
-    log(f"  Query tokens: {query_tokens}")
-    log(f"  Kept: {len(result.retention)} ({zero_overlap_kept} with ZERO token overlap)")
-    log(f"  Removed: {len(rel_removed)} ({zero_overlap_removed} with ZERO token overlap)")
-
-    # show kept CUIs with zero overlap — these survived on alignment alone
-    log(f"\n-- KEPT with zero overlap (survived on alignment only — verify these) --")
-    for cui, term, align in zero_kept_list[:15]:
-        log(f"  {cui} | align={align} | {term}")
-    if len(zero_kept_list) > 15:
-        log(f"  ... {len(zero_kept_list) - 15} more")
-
-    # show removed CUIs with HIGH alignment but low overlap — most likely false removals
-    log(f"\n-- REMOVED with high alignment (>0.68) — potential false removals --")
-    false_removals = []
-    for a in rel_removed:
-        try:
-            align_val = float(a.detail.split("alignment ")[1].split(",")[0])
-        except:
-            continue
-        if align_val > 0.68:
-            false_removals.append((a.removed_cui, a.removed_term, a.detail))
-    for cui, term, detail in false_removals[:15]:
-        log(f"  {cui} | {detail.split(' < ')[0]} | {term}")
-    if len(false_removals) > 15:
-        log(f"  ... {len(false_removals) - 15} more")
-    if not false_removals:
-        log(f"  None — all high-alignment CUIs were kept")
-
-# %% [25] Pre-relevance vs post-relevance comparison
-# Pre-relevance = term-free stages only (ontology + embeddings)
-# Post-relevance = after token boost + Otsu (term-dependent)
-for result in results:
-    pre = result.pre_relevance_retention
-    post = result.retention
-    removed_by_relevance = set(e.cui for e in pre) - set(e.cui for e in post)
-
-    log(f"\n{'=' * 60}")
-    log(f"PRE vs POST RELEVANCE FILTER")
-    log(f"  Pre-relevance (term-free):     {len(pre)} CUIs")
-    log(f"  Post-relevance (term-dependent): {len(post)} CUIs")
-    log(f"  Removed by relevance filter:   {len(removed_by_relevance)} CUIs")
-
-    # top 20 pre-relevance CUIs (same as post — these are the most aligned)
-    log(f"\n-- Top 20 pre-relevance CUIs --")
-    for entry in pre[:20]:
-        stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
-        marker = "✓" if entry.cui not in removed_by_relevance else "✗"
-        log(f"  {marker} {entry.cui} | align={entry.alignment} | [{stys}] {entry.term}")
-
-    # bottom 20 pre-relevance CUIs (these are the least aligned that survived stages 1-6)
-    log(f"\n-- Bottom 20 pre-relevance CUIs --")
-    for entry in pre[-20:]:
-        stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
-        marker = "✓" if entry.cui not in removed_by_relevance else "✗"
-        log(f"  {marker} {entry.cui} | align={entry.alignment} | [{stys}] {entry.term}")
-
-    # export pre-relevance to CSV for leadership review
-    import csv
-    csv_path = f"/tmp/pre_relevance_cuis_{len(pre)}.csv"
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["CUI", "Preferred_Term", "Alignment", "Semantic_Types",
-                     "Kept_By_Relevance", "Explains_Count"])
-        for entry in pre:
-            w.writerow([
-                entry.cui,
-                entry.term,
-                f"{entry.alignment:.4f}",
-                "; ".join(entry.semantic_types) if entry.semantic_types else "",
-                "YES" if entry.cui not in removed_by_relevance else "NO",
-                len(entry.explains_cuis) if entry.explains_cuis else 0
-            ])
-    log(f"\n  Exported to: {csv_path}")
+# %% [23] Print all reduced CUIs with alignment scores
+for entry in results[0].retention:
+    print(f"{entry.cui} | {entry.alignment:.4f} | {entry.term}")
