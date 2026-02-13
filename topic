@@ -155,8 +155,7 @@ def _count_desc(graph, cui):
 
 
 def _otsu(values):
-    """Otsu's method on a 1-D array. Returns threshold maximizing
-    between-class variance."""
+    """Otsu's method — threshold maximizing between-class variance."""
     lo, hi = float(values.min()), float(values.max())
     if hi - lo < 1e-9:
         return lo
@@ -195,18 +194,8 @@ def _otsu(values):
 # --- Precomputed batch graph info ---
 
 class BatchGraphInfo:
-    """Precompute parents and IC-bounded ancestors for an entire CUI batch.
-
-    Instead of fixed N-hop ancestors, walks up from each CUI collecting
-    ancestors whose IC >= sibling_threshold. Stops when ancestors become
-    too broad to be clinically meaningful.
-
-    This means:
-    - Deep specific CUI → collects many ancestors (walks far up)
-    - Shallow broad CUI → collects few ancestors (stops early)
-    - No hop parameter needed — IC threshold (already Otsu-computed) controls it
-    - O(path_length) per CUI, no sampling
-    """
+    """Precompute parents and IC-bounded ancestors for a CUI batch.
+    Walks up from each CUI collecting ancestors while IC >= threshold."""
 
     def __init__(self, graph, cuis, ic_map, sibling_threshold=8.0):
         self.graph = graph
@@ -279,16 +268,7 @@ class BatchGraphInfo:
         return distant
 
     def ontology_penalty(self, cui_a, cui_b, sibling_threshold=8.0):
-        """Improvement #3: Continuous penalty [0, 1] based on graph relationship.
-
-        0.0 = ancestor/descendant or close relatives
-        0.3 = siblings under broad parent
-        0.6 = siblings under specific parent
-        1.0 = graph distant (no common 2-hop ancestor)
-
-        Used to scale embedding distance continuously instead of
-        binary inflate/no-inflate.
-        """
+        """Continuous penalty [0,1]: 0=related, 0.3=broad sibs, 0.6=specific sibs, 1=distant."""
         anc_a = self.ancestors.get(cui_a, set())
         anc_b = self.ancestors.get(cui_b, set())
 
@@ -349,47 +329,6 @@ def compute_sibling_threshold(graph, cuis, ic_map):
         f"median {np.median(arr):.2f})")
 
     return threshold
-
-
-# Legacy standalone functions — used by CrossTopicDedup
-def are_siblings(graph, cui_a, cui_b, ic_map=None, min_parent_ic=8.0):
-    if graph is None or not graph.has_node(cui_a) or not graph.has_node(cui_b):
-        return False
-    parents_a = set(graph.predecessors(cui_a))
-    parents_b = set(graph.predecessors(cui_b))
-    shared = parents_a & parents_b
-    if not shared:
-        return False
-    if ic_map is None:
-        return True
-    for p in shared:
-        pic = _get_parent_ic(graph, p, ic_map)
-        if pic >= min_parent_ic:
-            return True
-    return False
-
-
-def graph_distant(graph, cui_a, cui_b, max_hops=2):
-    if graph is None or not graph.has_node(cui_a) or not graph.has_node(cui_b):
-        return False
-    def ancestors_within(cui, hops):
-        result = set()
-        frontier = {cui}
-        for _ in range(hops):
-            next_frontier = set()
-            for node in frontier:
-                if graph.has_node(node):
-                    for parent in graph.predecessors(node):
-                        if parent not in result:
-                            result.add(parent)
-                            next_frontier.add(parent)
-            frontier = next_frontier
-        return result
-    anc_a = ancestors_within(cui_a, max_hops)
-    anc_b = ancestors_within(cui_b, max_hops)
-    if cui_a in anc_b or cui_b in anc_a:
-        return False
-    return len(anc_a & anc_b) == 0
 
 
 # %% [5] LRU Cache (thread-safe)
@@ -572,16 +511,7 @@ class SABFilter:
 # %% [9] Hierarchy Reduction
 class HierarchyReducer:
     """Remove ancestor CUIs when a more specific descendant exists.
-
-    Uses IC-bounded ancestor walk: for each CUI, walks up the graph
-    collecting ancestors while IC >= threshold. If any ancestor is
-    also in the input set AND has lower IC, it's redundant — the
-    more specific descendant covers it.
-
-    This catches multi-hop subsumption that direct parent-child misses:
-      "Left knee pain" (IC=12) subsumes "Musculoskeletal disease" (IC=4)
-      even though they're 4 hops apart with missing intermediates.
-    """
+    Uses IC-bounded ancestor walk to catch multi-hop subsumption."""
 
     def __init__(self, graph):
         self.graph = graph
@@ -809,17 +739,13 @@ class TopicBuilder:
 
 # %% [12] Embedding Reduction
 class EmbeddingReducer:
-    """Groups by ontology branch + semantic type, runs ScaNN topics per group,
-    validates topic coherence, then dense pairwise redundancy removal."""
+    """Branch+type grouping → ScaNN topics → coherence split → pairwise reduction."""
 
     @staticmethod
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges,
             graph=None, sibling_threshold=8.0, batch_info=None):
 
-        # --- Improvement #7: Ontology branch preclustering ---
-        # Group by (ontology_branch, semantic_type) instead of just semantic_type.
-        # This prevents cross-branch CUIs from ending up in the same topic.
         branch_type_groups = defaultdict(list)
         for cui in cuis:
             meta = metadata.get(cui)
@@ -979,10 +905,6 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
 
     guardrail = float(np.median(upper))
 
-    # --- Density-adaptive threshold via Otsu ---
-    # Otsu finds the natural split between "redundant" (low distance)
-    # and "distinct" (high distance) pairs in this topic.
-    # Fully data-driven — no hardcoded percentile.
     tight_t = float(_otsu(upper))
     nonzero = upper[upper > 0]
     floor = float(np.min(nonzero)) if len(nonzero) > 0 else float(np.finfo(np.float32).eps)
@@ -1014,7 +936,7 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
     Z = linkage(condensed, method="average")
     labels = fcluster(Z, t=tight_t, criterion="distance")
 
-    # --- Silhouette score ---
+    # silhouette score
     n_clusters = len(set(labels))
     sil_score = 0.0
     if 2 <= n_clusters < n:
@@ -1054,8 +976,7 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
 def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
                    index_map, tight_t, guardrail, sibling_threshold=8.0,
                    batch_info=None):
-    """Pick representative via IC + centrality, then keep/remove others
-    based on safety checks and rare concept protection. O(n) per group."""
+    """Pick best via IC+centrality. Safety checks + rare protection. O(n)."""
     if len(r_cuis) <= 1:
         return r_cuis, []
 
@@ -1145,19 +1066,12 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
 
 # %% [13] Cross-Topic Dedup
 class CrossTopicDedup:
-    """Removes near-duplicate CUIs that survived in different topics.
-
-    Topics are NOT modified — they keep all members for grouping context.
-    Only the final output list is trimmed.
-
-    Uses text alignment as tiebreaker: keeps the CUI closer to the
-    input narrative. Threshold is adaptive from pairwise distances.
-    """
+    """Remove near-duplicate CUIs across topics. Alignment as tiebreaker."""
 
     @staticmethod
     @timed("cross_topic_dedup")
     def run(surviving, embeddings, text_vec, metadata, ic_map,
-            graph=None, sibling_threshold=8.0, batch_info=None):
+            sibling_threshold=8.0, batch_info=None):
         with_emb = [c for c in surviving if c in embeddings]
         without_emb = [c for c in surviving if c not in embeddings]
 
@@ -1204,17 +1118,11 @@ class CrossTopicDedup:
 
                 ci, cj = with_emb[i], with_emb[j]
 
-                # safety guards via batch_info (cached) or standalone fallback
-                if batch_info is not None:
-                    if batch_info.are_siblings(ci, cj, sibling_threshold):
-                        continue
-                    if batch_info.graph_distant(ci, cj):
-                        continue
-                else:
-                    if are_siblings(graph, ci, cj, ic_map, sibling_threshold):
-                        continue
-                    if graph_distant(graph, ci, cj):
-                        continue
+                # safety guards via batch_info (precomputed + cached)
+                if batch_info.are_siblings(ci, cj, sibling_threshold):
+                    continue
+                if batch_info.graph_distant(ci, cj):
+                    continue
 
                 # keep higher alignment, break ties by IC
                 if (alignments.get(ci, 0), ic_map.get(ci, 0)) >= \
@@ -1241,75 +1149,53 @@ class CrossTopicDedup:
 
 
 # %% [14] Coverage Rescue
-class CoverageRescue:
-    """Search-engine inspired coverage check — like Google ensuring
-    results span the full intent space of a query.
+@timed("coverage_rescue")
+def coverage_rescue(surviving, all_input_cuis, metadata, ic_map, embeddings):
+    """Rescue CUIs from semantic axes lost during reduction."""
+    input_types = defaultdict(set)
+    for c in all_input_cuis:
+        m = metadata.get(c)
+        if m and m.semantic_types:
+            for t in m.semantic_types:
+                input_types[t].add(c)
 
-    After all reduction, checks which semantic axes from the input
-    are missing or under-represented in the output. Rescues the
-    highest-IC CUI from each lost axis.
+    output_types = set()
+    for c in surviving:
+        m = metadata.get(c)
+        if m and m.semantic_types:
+            output_types.update(m.semantic_types)
 
-    This prevents pathological cases where aggressive reduction
-    eliminates an entire clinical dimension (e.g. all procedure CUIs
-    collapse, leaving only findings).
-    """
+    lost_types = set(input_types.keys()) - output_types
+    if not lost_types:
+        return surviving, []
 
-    @staticmethod
-    @timed("coverage_rescue")
-    def run(surviving, all_input_cuis, metadata, ic_map, embeddings):
-        # semantic types in input vs output
-        input_types = defaultdict(set)  # type → set of CUIs
-        for c in all_input_cuis:
-            m = metadata.get(c)
-            if m and m.semantic_types:
-                for t in m.semantic_types:
-                    input_types[t].add(c)
+    surviving_set = set(surviving)
+    rescued = []
+    audit = []
 
-        output_types = set()
-        for c in surviving:
-            m = metadata.get(c)
-            if m and m.semantic_types:
-                output_types.update(m.semantic_types)
+    for lost_type in sorted(lost_types):
+        candidates = input_types[lost_type] - surviving_set
+        if not candidates:
+            continue
+        with_emb = [c for c in candidates if c in embeddings]
+        pool = with_emb if with_emb else list(candidates)
+        best = max(pool, key=lambda c: ic_map.get(c, 0))
+        rescued.append(best)
+        surviving_set.add(best)
+        m = metadata.get(best)
+        audit.append(AuditEntry(
+            removed_cui="", removed_term="",
+            kept_cui=best,
+            kept_term=m.preferred_term if m else "",
+            reason="coverage_rescued",
+            detail=f"rescued for lost type '{lost_type}' | IC {ic_map.get(best,0):.2f}"))
 
-        # find lost types
-        lost_types = set(input_types.keys()) - output_types
-        if not lost_types:
-            return surviving, []
+    if rescued:
+        surviving = list(surviving) + rescued
+        log(f"    Coverage Rescue: +{len(rescued)} CUIs for "
+            f"{len(lost_types)} lost semantic types")
 
-        # for each lost type, rescue the CUI with highest IC that
-        # was in the input AND has an embedding (for downstream use)
-        surviving_set = set(surviving)
-        rescued = []
-        audit = []
-
-        for lost_type in sorted(lost_types):
-            candidates = input_types[lost_type] - surviving_set
-            if not candidates:
-                continue
-
-            # prefer CUIs with embeddings, then by IC
-            with_emb = [c for c in candidates if c in embeddings]
-            pool = with_emb if with_emb else list(candidates)
-            best = max(pool, key=lambda c: ic_map.get(c, 0))
-
-            rescued.append(best)
-            surviving_set.add(best)
-            m = metadata.get(best)
-            audit.append(AuditEntry(
-                removed_cui="",
-                removed_term="",
-                kept_cui=best,
-                kept_term=m.preferred_term if m else "",
-                reason="coverage_rescued",
-                detail=f"rescued for lost semantic type '{lost_type}' | "
-                       f"IC {ic_map.get(best,0):.2f}"))
-
-        if rescued:
-            surviving = list(surviving) + rescued
-            log(f"    Coverage Rescue: +{len(rescued)} CUIs for "
-                f"{len(lost_types)} lost semantic types")
-
-        return surviving, audit
+    return surviving, audit
 
 
 # %% [15] Retention Scorer
@@ -1505,15 +1391,13 @@ class CUIReductionSystem:
             before_xtd = len(surviving)
             surviving, xtd_audit = CrossTopicDedup.run(
                 surviving, embeddings, text_vec, metadata, ic_map,
-                graph=self.hierarchy_reducer.graph,
-                sibling_threshold=sib_threshold,
-                batch_info=batch_info)
+                sibling_threshold=sib_threshold, batch_info=batch_info)
             all_audit.extend(xtd_audit)
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
             # coverage rescue: restore CUIs from lost semantic axes
-            surviving, rescue_audit = CoverageRescue.run(
+            surviving, rescue_audit = coverage_rescue(
                 surviving, cuis, metadata, ic_map, embeddings)
             all_audit.extend(rescue_audit)
 
@@ -1756,98 +1640,3 @@ for result in results:
         log(f"  {tid} ({len(topic.cuis)} CUIs)")
     if len(result.topics) > 20:
         log(f"  ... {len(result.topics) - 20} more topics")
-
-# %% [21] Inspect CUIs under a topic
-target_topic = "topic_0"  # change this to any topic ID
-for result in results:
-    topic = result.topics.get(target_topic)
-    if topic:
-        log(f"\n{target_topic} ({len(topic.cuis)} CUIs):")
-        for c, term in topic.cui_terms.items():
-            log(f"  {c}  {term}")
-        break
-    else:
-        log(f"Topic '{target_topic}' not found")
-
-# %% [22] Inspect explains for any CUI
-target = "C4081756"  # change this to any CUI
-for result in results:
-    for entry in result.retention:
-        if entry.cui == target:
-            log(f"\n{entry.cui} ({entry.term}) explains {len(entry.explains_cuis)} CUIs:")
-            for exc in entry.explains_cuis:
-                term = ""
-                for a in result.audit_trail:
-                    if a.removed_cui == exc:
-                        term = a.removed_term
-                        break
-                log(f"  {exc}  {term}")
-            break
-
-# %% [23] Validate: search for a term across audit + retention
-search_term = "knee pain"  # change this to any term fragment
-for result in results:
-    log(f"\n-- Searching '{search_term}' across pipeline --")
-
-    log(f"\n  SURVIVED (in retention):")
-    for entry in result.retention:
-        if search_term.lower() in entry.term.lower():
-            log(f"    {entry.cui} | align={entry.alignment} | {entry.term}")
-
-    log(f"\n  REMOVED (in audit trail):")
-    for a in result.audit_trail:
-        if search_term.lower() in a.removed_term.lower():
-            log(f"    {a.removed_cui} ({a.removed_term})")
-            log(f"      -> kept: {a.kept_cui} ({a.kept_term})")
-            log(f"      -> reason: {a.reason} | {a.detail}")
-
-# %% [24] Print all reduced CUIs with alignment scores
-for entry in results[0].retention:
-    print(f"{entry.cui} | {entry.alignment:.4f} | {entry.term}")
-
-# %% [25] Validate sibling IC threshold (Otsu)
-# Shows where Otsu placed the threshold and examples around it
-graph = system.hierarchy_reducer.graph
-
-for result in results:
-    cuis = [e.cui for e in result.retention]
-
-    parent_ics = []
-    parent_examples = []
-    seen = set()
-    for cui in cuis:
-        if not graph.has_node(cui):
-            continue
-        for p in graph.predecessors(cui):
-            if p not in seen:
-                seen.add(p)
-                pic = _get_parent_ic(graph, p, {})
-                parent_ics.append(pic)
-                meta = system.fetcher._cache.get(p)
-                pterm = meta.preferred_term if meta else p
-                parent_examples.append((pic, p, pterm))
-
-    if not parent_ics:
-        print("No parent IC data found")
-        continue
-
-    arr = np.array(parent_ics)
-    threshold = _otsu(arr)
-
-    print(f"Otsu threshold: {threshold:.2f}")
-    print(f"  Parents below (broad, ALLOW collapse): {sum(arr < threshold)}")
-    print(f"  Parents above (specific, BLOCK collapse): {sum(arr >= threshold)}")
-    print(f"  Range: {arr.min():.2f} - {arr.max():.2f}, median: {np.median(arr):.2f}")
-
-    # examples around threshold
-    parent_examples.sort(key=lambda x: x[0])
-
-    print(f"\n-- Just BELOW threshold (collapse allowed) --")
-    below = [(ic, p, t) for ic, p, t in parent_examples if ic < threshold]
-    for ic, p, t in below[-10:]:
-        print(f"  IC={ic:.2f} | {t}")
-
-    print(f"\n-- Just ABOVE threshold (collapse blocked) --")
-    above = [(ic, p, t) for ic, p, t in parent_examples if ic >= threshold]
-    for ic, p, t in above[:10]:
-        print(f"  IC={ic:.2f} | {t}")
