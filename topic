@@ -26,8 +26,6 @@ import requests
 import scann
 from google.cloud import bigquery
 from google import genai
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import squareform
 
 
 # --- Configurable thresholds (override for domain-specific tuning) ---
@@ -969,7 +967,7 @@ def _validate_and_split_topics(scann_topics, metadata):
 def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
                   sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
     if len(t_cuis) > 2000:
-        log(f"    Topic too large ({len(t_cuis)} CUIs), skipping pairwise reduction", "WARNING")
+        log(f"    Topic too large ({len(t_cuis)} CUIs), skipping reduction", "WARNING")
         return t_cuis, [], 0.0
 
     matrix = np.array([embeddings[c] for c in t_cuis])
@@ -989,73 +987,33 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
     if len(upper) == 0 or np.std(upper) < 1e-9:
         return t_cuis, [], 0.0
 
-    guardrail = float(np.median(upper))
-
+    # threshold: Otsu on pairwise distances within the topic
     tight_t = float(_otsu(upper))
     nonzero = upper[upper > 0]
     floor = float(np.min(nonzero)) if len(nonzero) > 0 else float(np.finfo(np.float32).eps)
     tight_t = max(tight_t, floor)
-    tight_t = min(tight_t, guardrail)
+    median_dist = float(np.median(upper))
+    tight_t = min(tight_t, median_dist)
 
-    # Continuous ontology penalty — scales distances by graph relationship.
-    # Skip for large topics (>500) to avoid O(N²) Python loop;
-    # numpy matmul is fast but the per-pair penalty check is not.
+    # ontology penalty: push apart CUIs that are ontologically unrelated
     if batch_info is not None and n > 1 and n <= 500:
         for i in range(n):
             ci = t_cuis[i]
             for j in range(i + 1, n):
-                if dist[i, j] > guardrail:
+                if dist[i, j] > median_dist:
                     continue
                 cj = t_cuis[j]
                 penalty = batch_info.ontology_penalty(ci, cj, sibling_threshold)
                 if penalty > 0:
-                    # blend: dist → dist + penalty * (guardrail - dist)
-                    # at penalty=1.0: dist becomes guardrail
-                    # at penalty=0.6: dist moves 60% toward guardrail
-                    # at penalty=0.3: dist moves 30% toward guardrail
-                    gap = guardrail - dist[i, j]
+                    gap = median_dist - dist[i, j]
                     adjustment = penalty * gap
                     dist[i, j] += adjustment
                     dist[j, i] += adjustment
 
-    condensed = squareform(dist, checks=False)
-    Z = linkage(condensed, method="average")
-    labels = fcluster(Z, t=tight_t, criterion="distance")
+    # resolve directly on the whole topic — no secondary clustering
+    kept, removed = _resolve_group(t_cuis, metadata, ic_map, dist, idx, tight_t)
 
-    # silhouette score
-    n_clusters = len(set(labels))
-    sil_score = 0.0
-    if 2 <= n_clusters < n:
-        sil_vals = []
-        for i in range(n):
-            my_label = labels[i]
-            intra = [dist[i, j] for j in range(n)
-                     if j != i and labels[j] == my_label]
-            a_i = np.mean(intra) if intra else 0.0
-            best_other = float('inf')
-            for lbl in set(labels):
-                if lbl == my_label:
-                    continue
-                other = [dist[i, j] for j in range(n) if labels[j] == lbl]
-                if other:
-                    best_other = min(best_other, np.mean(other))
-            b_i = best_other if best_other < float('inf') else 0.0
-            s_i = (b_i - a_i) / max(a_i, b_i) if max(a_i, b_i) > 0 else 0.0
-            sil_vals.append(s_i)
-        sil_score = float(np.mean(sil_vals))
-
-    r_groups = defaultdict(list)
-    for cui, lbl in zip(t_cuis, labels):
-        r_groups[lbl].append(cui)
-
-    all_kept, all_removed = [], []
-    for r_cuis in r_groups.values():
-        kept, removed = _resolve_group(
-            r_cuis, metadata, ic_map, dist, idx, tight_t)
-        all_kept.extend(kept)
-        all_removed.extend(removed)
-
-    return all_kept, all_removed, sil_score
+    return kept, removed, 0.0
 
 
 def _resolve_group(r_cuis, metadata, ic_map, dist, index_map, tight_t):
