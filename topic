@@ -636,18 +636,43 @@ class HierarchyReducer:
         return surviving, audit, edges
 
 
-# %% [10] Embedding Fetch (parallel BQ batches)
+# %% [10] Embedding Fetch (parallel BQ batches + disk cache)
 class EmbeddingFetcher:
-    def __init__(self, bq, pid, did, embedding_table):
+    def __init__(self, bq, pid, did, embedding_table, cache_path=None):
         self.bq = bq
         self.pid = pid
         self.did = did
         self.table = embedding_table
         self._cache = Cache(50_000)
         self._pool = ThreadPoolExecutor(max_workers=4)
+        self._cache_path = cache_path
+        self._disk_cache = {}
+        self._disk_dirty = False
+
+        # load disk cache if exists
+        if cache_path:
+            import os
+            if os.path.exists(cache_path):
+                try:
+                    data = np.load(cache_path, allow_pickle=False)
+                    cuis_arr = data['cuis']
+                    vecs_arr = data['vecs']
+                    for i, cui in enumerate(cuis_arr):
+                        self._disk_cache[str(cui)] = vecs_arr[i]
+                    log(f"    Embedding disk cache: loaded {len(self._disk_cache)} from {cache_path}")
+                except Exception as e:
+                    log(f"    Embedding disk cache load failed: {e}", "WARNING")
 
     def shutdown(self):
-        """Clean up thread pool."""
+        """Save dirty cache to disk, then clean up thread pool."""
+        if self._cache_path and self._disk_dirty:
+            try:
+                cuis = list(self._disk_cache.keys())
+                vecs = np.array([self._disk_cache[c] for c in cuis], dtype=np.float32)
+                np.savez_compressed(self._cache_path, cuis=np.array(cuis), vecs=vecs)
+                log(f"    Embedding disk cache: saved {len(cuis)} to {self._cache_path}")
+            except Exception as e:
+                log(f"    Embedding disk cache save failed: {e}", "WARNING")
         self._pool.shutdown(wait=False)
 
     def _fetch_batch(self, batch):
@@ -680,15 +705,24 @@ class EmbeddingFetcher:
     def fetch(self, cuis):
         result, missing = {}, []
         for c in cuis:
+            # check in-memory cache first
             cached = self._cache.get(c)
             if cached is not None:
                 result[c] = cached
-            else:
-                missing.append(c)
+                continue
+            # then disk cache
+            if c in self._disk_cache:
+                vec = self._disk_cache[c]
+                self._cache.put(c, vec)
+                result[c] = vec
+                continue
+            missing.append(c)
 
         if not missing:
+            log(f"    Embeddings: {len(result)} from cache, 0 from BQ")
             return result
 
+        log(f"    Embeddings: {len(result)} cached, {len(missing)} fetching from BQ")
         batches = [missing[i:i + BQ_BATCH_SIZE]
                     for i in range(0, len(missing), BQ_BATCH_SIZE)]
 
@@ -696,6 +730,8 @@ class EmbeddingFetcher:
         for f in futures:
             for cui, vec in f.result():
                 self._cache.put(cui, vec)
+                self._disk_cache[cui] = vec
+                self._disk_dirty = True
                 result[cui] = vec
 
         return result
@@ -794,7 +830,7 @@ class EmbeddingReducer:
 
     @staticmethod
     @timed("embedding_reduce")
-    def run(cuis, metadata, embeddings, ic_map, hierarchy_edges,
+    def run(cuis, metadata, embeddings, ic_map,
             graph=None, sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
 
         # validate embedding dimensions
@@ -807,68 +843,53 @@ class EmbeddingReducer:
                 embeddings = {k: v for k, v in embeddings.items()
                              if hasattr(v, 'shape') and v.shape[0] == target_dim}
 
-        branch_type_groups = defaultdict(list)
-        for cui in cuis:
-            meta = metadata.get(cui)
-            branch = batch_info.ontology_branch(cui) if batch_info else "root"
-            if meta and meta.semantic_types:
-                for sty in meta.semantic_types:
-                    branch_type_groups[(branch, sty)].append(cui)
-            else:
-                branch_type_groups[(branch, "Unknown")].append(cui)
+        with_emb = [c for c in cuis if c in embeddings]
+        without_emb = [c for c in cuis if c not in embeddings]
+
+        # CUIs without embeddings survive automatically
+        globally_surviving = set(without_emb)
+
+        if len(with_emb) <= 1:
+            globally_surviving.update(with_emb)
+            topic_id = "topic_0"
+            return {topic_id: list(globally_surviving)}, globally_surviving, [], 0.0
+
+        # cluster ALL CUIs with embeddings via ScaNN
+        scann_topics = TopicBuilder.build(with_emb, embeddings)
+
+        # validate topic coherence — split mixed topics
+        validated_topics = _validate_and_split_topics(scann_topics, metadata)
 
         all_topics = {}
-        globally_surviving = set()
         removal_candidates = {}
         sil_scores = []
         tid = 0
 
-        for group_key in sorted(branch_type_groups, key=str):
-            group_cuis = sorted(set(branch_type_groups[group_key]))
-            with_emb = [c for c in group_cuis if c in embeddings]
-            without_emb = [c for c in group_cuis if c not in embeddings]
+        for t_cuis in validated_topics.values():
+            topic_id = f"topic_{tid}"
+            tid += 1
 
-            for c in without_emb:
-                globally_surviving.add(c)
-
-            if len(with_emb) <= 1:
-                all_topics[f"topic_{tid}"] = group_cuis
-                for c in group_cuis:
+            if len(t_cuis) <= 1:
+                all_topics[topic_id] = t_cuis
+                for c in t_cuis:
                     globally_surviving.add(c)
-                tid += 1
                 continue
 
-            scann_topics = TopicBuilder.build(with_emb, embeddings)
+            surviving, removed, sil = _reduce_topic(
+                t_cuis, embeddings, metadata, ic_map,
+                sibling_threshold, batch_info)
+            if sil != 0.0:
+                sil_scores.append(sil)
+            all_topics[topic_id] = surviving
+            for c in surviving:
+                globally_surviving.add(c)
+            for entry in removed:
+                removal_candidates[entry.removed_cui] = entry
 
-            # --- Improvement #6: Topic coherence validation ---
-            # Split topics that mix too many semantic types
-            validated_topics = _validate_and_split_topics(
-                scann_topics, metadata)
-
-            for t_cuis in validated_topics.values():
-                topic_id = f"topic_{tid}"
-                tid += 1
-
-                if len(t_cuis) <= 1:
-                    all_topics[topic_id] = t_cuis
-                    for c in t_cuis:
-                        globally_surviving.add(c)
-                    continue
-
-                surviving, removed, sil = _reduce_topic(
-                    t_cuis, embeddings, metadata, ic_map,
-                    hierarchy_edges, sibling_threshold, batch_info)
-                if sil != 0.0:
-                    sil_scores.append(sil)
-                all_topics[topic_id] = surviving
-                for c in surviving:
-                    globally_surviving.add(c)
-                for entry in removed:
-                    removal_candidates[entry.removed_cui] = entry
-
-            for cui in without_emb:
-                all_topics[f"topic_{tid}"] = [cui]
-                tid += 1
+        # CUIs without embeddings get individual topics
+        for cui in without_emb:
+            all_topics[f"topic_{tid}"] = [cui]
+            tid += 1
 
         final_audit = []
         for cui, entry in removal_candidates.items():
@@ -946,7 +967,7 @@ def _validate_and_split_topics(scann_topics, metadata):
 
 
 def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
-                  hierarchy_edges, sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
+                  sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
     if len(t_cuis) > 2000:
         log(f"    Topic too large ({len(t_cuis)} CUIs), skipping pairwise reduction", "WARNING")
         return t_cuis, [], 0.0
@@ -1030,22 +1051,21 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
     all_kept, all_removed = [], []
     for r_cuis in r_groups.values():
         kept, removed = _resolve_group(
-            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx,
-            tight_t, guardrail, sibling_threshold, batch_info)
+            r_cuis, metadata, ic_map, dist, idx, tight_t)
         all_kept.extend(kept)
         all_removed.extend(removed)
 
     return all_kept, all_removed, sil_score
 
 
-def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
-                   index_map, tight_t, guardrail, sibling_threshold=DEFAULT_SIBLING_IC,
-                   batch_info=None):
-    """Pick best via IC+centrality. Safety checks + rare protection. O(n)."""
+def _resolve_group(r_cuis, metadata, ic_map, dist, index_map, tight_t):
+    """Pick representative via IC+centrality. Remove CUIs that are close
+    to ANY already-kept CUI (not just best). Safety checks protect
+    rare/isolated concepts only."""
     if len(r_cuis) <= 1:
         return r_cuis, []
 
-    # IC (specificity) + centrality (cluster fit), normalized equally
+    # score all CUIs: IC (specificity) + centrality (cluster fit)
     ic_vals = {c: ic_map.get(c, 0) for c in r_cuis}
     cent_vals = {}
     for c in r_cuis:
@@ -1068,63 +1088,58 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
     ic_n = _norm(ic_vals)
     cent_n = _norm(cent_vals)
 
-    best = max(r_cuis, key=lambda c: ic_n[c] + cent_n[c])
-    b_meta = metadata.get(best)
-    b_types = set(b_meta.semantic_types) if b_meta and b_meta.semantic_types else set()
+    # sort by composite score, pick best first
+    ranked = sorted(r_cuis, key=lambda c: ic_n[c] + cent_n[c], reverse=True)
+    best = ranked[0]
 
     kept = [best]
     audit = []
 
-    for c in r_cuis:
-        if c == best:
-            continue
-
+    for c in ranked[1:]:
         c_meta = metadata.get(c)
-        c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
+        ci = index_map.get(c)
 
-        # different semantic types → keep
-        if c_types and b_types and not (c_types & b_types):
+        # check if c is close to ANY already-kept CUI
+        is_close_to_kept = False
+        closest_kept = best
+        closest_dist = float('inf')
+        if ci is not None:
+            for k in kept:
+                ki = index_map.get(k)
+                if ki is not None:
+                    d = dist[ci, ki]
+                    if d < closest_dist:
+                        closest_dist = d
+                        closest_kept = k
+                    if d < tight_t:
+                        is_close_to_kept = True
+
+        # not close to any kept CUI → keep (genuinely different)
+        if not is_close_to_kept:
             kept.append(c)
             continue
 
-        # hierarchy edges → keep
-        if (c, best) in hierarchy_edges or (best, c) in hierarchy_edges:
-            kept.append(c)
-            continue
-
-        # graph safety via batch_info (precomputed + cached)
-        if batch_info is not None:
-            if batch_info.are_siblings(c, best, sibling_threshold):
-                kept.append(c)
-                continue
-            if batch_info.graph_distant(c, best):
-                kept.append(c)
-                continue
-
-        # rare concept protection: high IC + isolated
+        # rare concept protection: high IC + isolated in the full topic
         c_ic = ic_map.get(c, 0)
-        ci_idx = index_map.get(c)
-        if c_ic > RARE_CONCEPT_IC_FLOOR and ci_idx is not None:
+        if c_ic > RARE_CONCEPT_IC_FLOOR and ci is not None:
             close_count = sum(1 for o in r_cuis if o != c and
                              index_map.get(o) is not None and
-                             dist[ci_idx, index_map[o]] < tight_t)
+                             dist[ci, index_map[o]] < tight_t)
             if close_count <= RARE_CONCEPT_MAX_NEIGHBORS:
                 kept.append(c)
                 continue
 
-        ci = index_map.get(c)
-        bi = index_map.get(best)
-        pair_dist = dist[ci, bi] if ci is not None and bi is not None else 0.0
-
+        # close to a kept CUI and not rare → remove
+        k_meta = metadata.get(closest_kept)
         audit.append(AuditEntry(
             removed_cui=c,
             removed_term=c_meta.preferred_term if c_meta else "",
-            kept_cui=best,
-            kept_term=b_meta.preferred_term if b_meta else "",
+            kept_cui=closest_kept,
+            kept_term=k_meta.preferred_term if k_meta else "",
             reason="embedding_redundant",
-            detail=f"dist {pair_dist:.3f} < tight {tight_t:.3f} | "
-                   f"IC {ic_map.get(best,0):.2f} vs {ic_map.get(c,0):.2f} | "
-                   f"centrality {cent_vals.get(best,0):.3f} vs {cent_vals.get(c,0):.3f}"))
+            detail=f"dist {closest_dist:.3f} < tight {tight_t:.3f} | "
+                   f"IC {ic_map.get(closest_kept,0):.2f} vs {ic_map.get(c,0):.2f} | "
+                   f"centrality {cent_vals.get(closest_kept,0):.3f} vs {cent_vals.get(c,0):.3f}"))
 
     return kept, audit
 
@@ -1329,7 +1344,8 @@ class CUIReductionSystem:
 
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
-                 ic_scores=None, genai_location="us-central1"):
+                 ic_scores=None, genai_location="us-central1",
+                 embedding_cache_path="embedding_cache.npz"):
 
         self.bq = bigquery.Client(project=project_id)
         self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
@@ -1337,7 +1353,8 @@ class CUIReductionSystem:
         self.sab_filter = SABFilter(allowed_sabs)
         self.hierarchy_reducer = HierarchyReducer(full_network)
         self.emb_fetcher = EmbeddingFetcher(
-            self.bq, project_id, dataset_id, embedding_table)
+            self.bq, project_id, dataset_id, embedding_table,
+            cache_path=embedding_cache_path)
         self.retention_scorer = RetentionScorer(project_id, genai_location)
 
         log(f"[Init] graph={full_network.number_of_nodes()} nodes, sabs={allowed_sabs}")
@@ -1432,7 +1449,7 @@ class CUIReductionSystem:
                     sibling_threshold=sib_threshold)
 
                 topics, surviving, emb_audit, avg_sil = EmbeddingReducer.run(
-                    after_hier, metadata, embeddings, ic_map, hier_edges,
+                    after_hier, metadata, embeddings, ic_map,
                     graph=subgraph,
                     sibling_threshold=sib_threshold,
                     batch_info=batch_info)
