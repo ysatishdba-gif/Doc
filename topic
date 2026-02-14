@@ -1,21 +1,18 @@
 """
-CUI Reduction System
-
 Reduces extracted CUIs through filtering, hierarchy pruning,
 embedding-based redundancy removal, and retention scoring.
 Groups results into topics sorted by narrative alignment.
-
-pip install google-cloud-bigquery networkx numpy requests scann google-genai
 """
 
-# %% [1] Imports
+#  [1] Imports
+import re
 import time
 import logging
 import threading
+import unicodedata
 import subprocess
 import pickle
-import functools
-from typing import List, Dict, Optional, Set, Tuple
+from typing import List, Dict, Optional, Set, Tuple, FrozenSet
 from dataclasses import dataclass, field
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -26,26 +23,17 @@ import requests
 import scann
 from google.cloud import bigquery
 from google import genai
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 
-# --- Configurable thresholds (override for domain-specific tuning) ---
-DEFAULT_SIBLING_IC = 8.0          # fallback when < 10 parents for Otsu
-RARE_CONCEPT_IC_FLOOR = 10.0      # min IC to qualify for rare-concept protection
-RARE_CONCEPT_MAX_NEIGHBORS = 1    # max close neighbors to be "isolated"
-CROSS_TOPIC_MAX_DIST = 0.05       # cosine distance ceiling for cross-topic dedup
-SUBGRAPH_MAX_NODES = 200_000      # safety cap for subgraph construction
-WALK_MAX_VISITED = 10_000         # safety cap per-CUI graph walk
-PARENT_IC_CACHE_SIZE = 100_000    # bounded cache for on-the-fly IC computation
-BQ_BATCH_SIZE = 5000              # BigQuery IN clause batch size
-
-
-# %% [2] Logging and Timing
+#  [2] Logging and Timing
 logger = logging.getLogger("cui_reduction")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+        "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(_handler)
 
 
@@ -55,32 +43,29 @@ def log(msg, level="INFO"):
 
 _timings = defaultdict(list)
 _timing_lock = threading.Lock()
-_MAX_TIMING_ENTRIES = 1000  # per function, prevents memory leak
 
 
 def timed(name):
     def dec(fn):
-        @functools.wraps(fn)
         def wrapper(*a, **kw):
             t0 = time.perf_counter()
             try:
                 return fn(*a, **kw)
             finally:
-                elapsed = (time.perf_counter() - t0) * 1000
                 with _timing_lock:
-                    entries = _timings[name]
-                    if len(entries) >= _MAX_TIMING_ENTRIES:
-                        entries.pop(0)
-                    entries.append(elapsed)
+                    _timings[name].append(
+                        (time.perf_counter() - t0) * 1000)
         return wrapper
     return dec
 
 
-# %% [3] Data Models
+#  [3] Data Models
 @dataclass
 class CUIMetadata:
     cui: str
     preferred_term: str
+    normalized_term: str
+    all_tokens: FrozenSet[str]  # tokens from preferred terms per allowed SAB
     semantic_types: List[str]
     semantic_type_ids: List[str]
     ic_score: float
@@ -121,268 +106,76 @@ class ReductionResult:
     after_filter_count: int
     after_hierarchy_count: int
     after_redundancy_count: int
+    after_relevance_count: int
     topics: Dict[str, TopicInfo]
     all_reduced_cuis: List[str]
     retention: List[RetentionEntry]
+    pre_relevance_retention: List[RetentionEntry]  # before term-dependent filter
     audit_trail: List[AuditEntry]
     processing_time_ms: float
     metadata_coverage: float
     embedding_coverage: float
-    # quality metrics
-    silhouette_score: float = 0.0        # cluster quality (-1 to 1, higher = better)
-    confidence_score: float = 0.0        # reduction confidence (0 to 1)
-    semantic_loss: float = 0.0           # estimated info loss (0 to 1, lower = better)
 
 
-# %% [4] Graph Safety Checks
+#  [4] Text Utilities
+def normalize_term(term):
+    t = unicodedata.normalize("NFKD", term).lower()
+    t = re.sub(r"[^a-z0-9\s]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 
-_parent_ic_cache = {}
-_parent_ic_cache_lock = threading.Lock()
+def tokenize_term(normalized):
+    if not normalized:
+        return frozenset()
+    return frozenset(normalized.split())
 
 
-def _get_parent_ic(graph, parent, ic_map):
-    """Get IC for a parent CUI. Checks ic_map → cache → compute."""
-    pic = ic_map.get(parent)
-    if pic is not None:
-        return pic
-    cached = _parent_ic_cache.get(parent)
-    if cached is not None:
-        return cached
-    desc = _count_desc(graph, parent)
-    total = max(graph.number_of_nodes(), 1)
-    pic = -np.log((desc + 1) / total)
-    with _parent_ic_cache_lock:
-        if len(_parent_ic_cache) >= PARENT_IC_CACHE_SIZE:
-            # evict oldest 10% to avoid repeated eviction
-            evict_n = PARENT_IC_CACHE_SIZE // 10
-            keys = list(_parent_ic_cache.keys())[:evict_n]
-            for k in keys:
-                del _parent_ic_cache[k]
-        _parent_ic_cache[parent] = pic
-    return pic
+def terms_diverge(tokens_a, tokens_b):
+    """Block collapse only when terms share NO tokens at all."""
+    if not tokens_a or not tokens_b:
+        return False
+    return len(tokens_a & tokens_b) == 0
 
 
-def _count_desc(graph, cui, max_count=5000):
-    """Count descendants via BFS, capped for performance.
-    Broad parents hit cap fast → low IC. Specific parents finish → exact IC."""
-    if not graph.has_node(cui):
-        return 0
-    visited = set()
-    frontier = deque([cui])
-    while frontier and len(visited) < max_count:
-        n = frontier.popleft()
-        for child in graph.successors(n):
-            if child not in visited:
-                visited.add(child)
-                frontier.append(child)
-    return len(visited)
+def qualifier_conflict(tokens_a, tokens_b):
+    """Block collapse when terms are nearly identical but differ by 1-2 tokens.
 
+    If 80%+ of tokens overlap but a small set differs, those differing
+    tokens are likely clinical qualifiers (left/right, upper/lower,
+    front/back, acute/chronic, mild/severe, etc).
 
-def _otsu(values):
-    """Otsu's method — threshold maximizing between-class variance."""
-    lo, hi = float(values.min()), float(values.max())
-    if hi - lo < 1e-9:
-        return lo
-
-    n_bins = 256
-    bins = np.linspace(lo, hi, n_bins + 1)
-    hist, _ = np.histogram(values, bins=bins)
-    hist = hist.astype(np.float64)
-    total = hist.sum()
-    if total == 0:
-        return lo
-
-    centers = (bins[:-1] + bins[1:]) / 2.0
-    best_t, best_var = lo, -1.0
-    sum_total = np.sum(hist * centers)
-    sum_bg, weight_bg = 0.0, 0.0
-
-    for i in range(n_bins):
-        weight_bg += hist[i]
-        if weight_bg == 0:
-            continue
-        weight_fg = total - weight_bg
-        if weight_fg == 0:
-            break
-        sum_bg += hist[i] * centers[i]
-        mean_bg = sum_bg / weight_bg
-        mean_fg = (sum_total - sum_bg) / weight_fg
-        var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
-        if var > best_var:
-            best_var = var
-            best_t = centers[i]
-
-    return float(best_t)
-
-
-# --- Precomputed batch graph info ---
-
-class BatchGraphInfo:
-    """Precompute parents and IC-bounded ancestors for a CUI batch.
-    Walks up from each CUI collecting ancestors while IC >= threshold."""
-
-    def __init__(self, graph, cuis, ic_map, sibling_threshold=DEFAULT_SIBLING_IC):
-        self.graph = graph
-        self.ic_map = ic_map
-        self.parents = {}
-        self.ancestors = {}
-        self._distant_cache = {}
-
-        for cui in cuis:
-            if graph is not None and graph.has_node(cui):
-                p = set(graph.predecessors(cui))
-                self.parents[cui] = p
-                anc = set()
-                frontier = set(p)
-                while frontier:
-                    next_frontier = set()
-                    for node in frontier:
-                        pic = _get_parent_ic(graph, node, ic_map)
-                        if pic >= sibling_threshold:
-                            anc.add(node)
-                            if graph.has_node(node):
-                                for gp in graph.predecessors(node):
-                                    if gp not in anc:
-                                        next_frontier.add(gp)
-                    frontier = next_frontier
-                    if len(anc) > WALK_MAX_VISITED:  # safety cap
-                        break
-                self.ancestors[cui] = anc
-            else:
-                self.parents[cui] = set()
-                self.ancestors[cui] = set()
-
-        log(f"    BatchGraphInfo: {len(self.ancestors)} CUIs, "
-            f"IC-bounded ancestors (threshold={sibling_threshold:.2f})")
-
-    def are_siblings(self, cui_a, cui_b, sibling_threshold=DEFAULT_SIBLING_IC):
-        """Check if two CUIs share a specific parent (IC >= threshold)."""
-        pa = self.parents.get(cui_a, set())
-        pb = self.parents.get(cui_b, set())
-        shared = pa & pb
-        if not shared:
-            return False
-        for p in shared:
-            pic = _get_parent_ic(self.graph, p, self.ic_map)
-            if pic >= sibling_threshold:
-                return True
+    No hardcoded list — works for any qualifier pattern:
+      "left knee pain" vs "right knee pain" → 2/3 overlap, differ by left/right → block
+      "upper abdomen pain" vs "lower abdomen pain" → same logic
+      "acute sinusitis" vs "chronic sinusitis" → same logic
+      "knee pain" vs "elbow pain" → same logic (different body part)
+    """
+    if not tokens_a or not tokens_b:
         return False
 
-    def graph_distant(self, cui_a, cui_b):
-        """Cached: check if two CUIs share no IC-bounded ancestors.
-        Returns False for CUIs with empty ancestor sets (unknown → don't protect)."""
-        key = (cui_a, cui_b) if cui_a < cui_b else (cui_b, cui_a)
-        if key in self._distant_cache:
-            return self._distant_cache[key]
+    shared = tokens_a & tokens_b
+    only_a = tokens_a - tokens_b
+    only_b = tokens_b - tokens_a
 
-        anc_a = self.ancestors.get(cui_a, set())
-        anc_b = self.ancestors.get(cui_b, set())
+    # no difference — identical terms, not a conflict
+    if not only_a and not only_b:
+        return False
 
-        if cui_a in anc_b or cui_b in anc_a:
-            self._distant_cache[key] = False
-            return False
+    # high overlap with small difference = qualifier distinction
+    total = len(tokens_a | tokens_b)
+    overlap_ratio = len(shared) / total if total > 0 else 0
 
-        distant = (len(anc_a & anc_b) == 0) and bool(anc_a) and bool(anc_b)
-        self._distant_cache[key] = distant
-        return distant
+    # 50%+ overlap and BOTH sides differ by 1-2 tokens = qualifier distinction
+    # requires both sides to have unique tokens — "knee pain" vs "knee pain syndrome"
+    # has only_a=0, so it's not a qualifier swap, just extra detail
+    if overlap_ratio >= 0.5 and 1 <= len(only_a) <= 2 and 1 <= len(only_b) <= 2:
+        return True
 
-    def ontology_penalty(self, cui_a, cui_b, sibling_threshold=DEFAULT_SIBLING_IC):
-        """Continuous penalty [0,1]: 0=related, 0.3=broad sibs, 0.6=specific sibs, 1=distant."""
-        anc_a = self.ancestors.get(cui_a, set())
-        anc_b = self.ancestors.get(cui_b, set())
-
-        if cui_a in anc_b or cui_b in anc_a:
-            return 0.0
-
-        if (len(anc_a & anc_b) == 0) and anc_a and anc_b:
-            return 1.0
-
-        shared_parents = self.parents.get(cui_a, set()) & self.parents.get(cui_b, set())
-        if shared_parents:
-            max_pic = max(_get_parent_ic(self.graph, p, self.ic_map)
-                         for p in shared_parents)
-            if max_pic >= sibling_threshold:
-                return 0.6
-            else:
-                return 0.3
-
-        return 0.2
-
-    def ontology_branch(self, cui, max_depth=3):
-        """Get highest ancestor within max_depth hops (branch preclustering)."""
-        if self.graph is None or not self.graph.has_node(cui):
-            return cui
-        current = cui
-        for _ in range(max_depth):
-            pars = list(self.graph.predecessors(current))
-            if not pars:
-                break
-            current = max(pars, key=lambda p: self.graph.out_degree(p))
-        return current
+    return False
 
 
-@timed("compute_sibling_threshold")
-def compute_sibling_threshold(graph, cuis, ic_map):
-    """Data-driven threshold for sibling protection using Otsu's method."""
-    parent_ics = []
-    seen_parents = set()
-    for cui in cuis:
-        if not graph.has_node(cui):
-            continue
-        for p in graph.predecessors(cui):
-            if p not in seen_parents:
-                seen_parents.add(p)
-                pic = _get_parent_ic(graph, p, ic_map)
-                parent_ics.append(pic)
-
-    if len(parent_ics) < 10:
-        return DEFAULT_SIBLING_IC
-
-    arr = np.array(parent_ics)
-    threshold = _otsu(arr)
-
-    log(f"    Sibling IC threshold (Otsu): {threshold:.2f} "
-        f"(from {len(parent_ics)} parents, "
-        f"range {arr.min():.2f}-{arr.max():.2f}, "
-        f"median {np.median(arr):.2f})")
-
-    return threshold
-
-
-@timed("build_subgraph")
-def build_subgraph(full_graph, cuis, ic_map, ic_floor):
-    """Build a small subgraph: input CUIs + IC-bounded ancestors.
-    Walks up from each CUI, collecting ancestors while IC >= ic_floor.
-    Same IC logic as the downstream walks — no arbitrary depth cap."""
-    relevant = set()
-    for cui in cuis:
-        if full_graph.has_node(cui):
-            relevant.add(cui)
-
-    frontier = set(relevant)
-    while frontier:
-        next_frontier = set()
-        for node in frontier:
-            for parent in full_graph.predecessors(node):
-                if parent not in relevant:
-                    pic = _get_parent_ic(full_graph, parent, ic_map)
-                    if pic >= ic_floor:
-                        relevant.add(parent)
-                        next_frontier.add(parent)
-        frontier = next_frontier
-        if len(relevant) > SUBGRAPH_MAX_NODES:  # safety cap
-            log(f"    Subgraph safety cap hit at {len(relevant)} nodes", "WARNING")
-            break
-
-    sub = full_graph.subgraph(relevant)
-    log(f"    Subgraph: {sub.number_of_nodes()} nodes, "
-        f"{sub.number_of_edges()} edges "
-        f"(from {full_graph.number_of_nodes()} full)")
-    return sub
-
-
-# %% [5] LRU Cache (thread-safe)
+#  [5] LRU Cache
 class Cache:
     def __init__(self, max_size):
         self._max = max_size
@@ -405,7 +198,8 @@ class Cache:
                 self._d.popitem(last=False)
 
 
-# %% [6] Metadata from BigQuery
+#  [6] Metadata from BigQuery
+_BQ_BATCH = 5000
 
 
 class MetadataFetcher:
@@ -432,8 +226,8 @@ class MetadataFetcher:
         if not missing:
             return result
 
-        for i in range(0, len(missing), BQ_BATCH_SIZE):
-            batch = missing[i:i + BQ_BATCH_SIZE]
+        for i in range(0, len(missing), _BQ_BATCH):
+            batch = missing[i:i + _BQ_BATCH]
             query = f"""
             WITH ranked AS (
               SELECT CUI, STR, SAB, ISPREF,
@@ -453,18 +247,33 @@ class MetadataFetcher:
                 ) AS rn
               FROM `{self.pid}.{self.did}.MRCONSO`
               WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+            ),
+            sab_pref AS (
+              SELECT CUI, SAB, STR,
+                ROW_NUMBER() OVER (
+                  PARTITION BY CUI, SAB
+                  ORDER BY
+                    CASE WHEN ISPREF='Y' THEN 0 ELSE 1 END,
+                    LENGTH(STR) DESC
+                ) AS sab_rn
+              FROM `{self.pid}.{self.did}.MRCONSO`
+              WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+                AND SAB IN ('SNOMEDCT_US','ICD10CM','ICD10PCS','ICD9CM','LNC')
             )
             SELECT
               r.CUI AS cui,
               MAX(CASE WHEN r.rn = 1 THEN r.STR END) AS pref_term,
               ARRAY_AGG(DISTINCT s.TUI IGNORE NULLS) AS tuis,
               ARRAY_AGG(DISTINCT s.STY IGNORE NULLS) AS stys,
-              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs
+              ARRAY_AGG(DISTINCT c2.SAB IGNORE NULLS) AS sabs,
+              ARRAY_AGG(DISTINCT sp.STR IGNORE NULLS) AS sab_terms
             FROM ranked r
             LEFT JOIN `{self.pid}.{self.did}.MRSTY` s
               ON r.CUI = s.CUI
             LEFT JOIN `{self.pid}.{self.did}.MRCONSO` c2
               ON r.CUI = c2.CUI AND c2.LAT = 'ENG'
+            LEFT JOIN sab_pref sp
+              ON r.CUI = sp.CUI AND sp.sab_rn = 1
             WHERE r.rn = 1
             GROUP BY r.CUI
             """
@@ -474,9 +283,19 @@ class MetadataFetcher:
             for row in self.bq.query(
                     query, job_config=jc, timeout=300).result():
                 term = row.pref_term or row.cui
+                norm = normalize_term(term)
+                # tokens from preferred term per allowed SAB
+                sab_tok = set()
+                for t in (row.sab_terms or []):
+                    sab_tok.update(tokenize_term(normalize_term(t)))
+                # include the preferred term tokens too
+                pref_tok = tokenize_term(norm)
+                combined = frozenset(sab_tok | pref_tok) if sab_tok else pref_tok
                 meta = CUIMetadata(
                     cui=row.cui,
                     preferred_term=term,
+                    normalized_term=norm,
+                    all_tokens=combined,
                     semantic_types=list(row.stys or []),
                     semantic_type_ids=list(row.tuis or []),
                     ic_score=0.0,
@@ -488,7 +307,7 @@ class MetadataFetcher:
         return result
 
 
-# %% [7] IC Scores
+#  [7] IC Scores
 class ICComputer:
     """IC = -log((descendants + 1) / total).
     Use precomputed dict in production to avoid BFS."""
@@ -533,7 +352,7 @@ class ICComputer:
         return len(visited)
 
 
-# %% [8] Filters
+#  [8] Filters
 class SABFilter:
     def __init__(self, allowed):
         self.allowed = set(allowed)
@@ -558,65 +377,95 @@ class SABFilter:
         return kept, audit
 
 
-# %% [9] Hierarchy Reduction
+class SemanticTypeFilter:
+    def __init__(self, excluded):
+        self.excluded = set(excluded) if excluded else set()
+
+    @timed("semtype_filter")
+    def run(self, cuis, metadata):
+        if not self.excluded:
+            return cuis, []
+        kept, audit = [], []
+        for cui in cuis:
+            m = metadata.get(cui)
+            if not m or not m.semantic_types:
+                kept.append(cui)
+                continue
+            if all(st in self.excluded for st in m.semantic_types):
+                audit.append(AuditEntry(
+                    cui, m.preferred_term, "", "",
+                    "semtype_excluded",
+                    f"all types {m.semantic_types} excluded"))
+                continue
+            kept.append(cui)
+        return kept, audit
+
+
+class TermDeduplicator:
+    """Collapse CUIs with identical normalized terms. Keep highest IC."""
+
+    @staticmethod
+    @timed("term_dedup")
+    def run(cuis, metadata, ic_map):
+        groups = defaultdict(list)
+        for cui in cuis:
+            m = metadata.get(cui)
+            key = m.normalized_term if m else cui
+            groups[key].append(cui)
+
+        kept, audit = [], []
+        for term, members in groups.items():
+            best = max(members, key=lambda c: ic_map.get(c, 0))
+            kept.append(best)
+            for c in members:
+                if c != best:
+                    bm = metadata.get(best)
+                    cm = metadata.get(c)
+                    audit.append(AuditEntry(
+                        c, cm.preferred_term if cm else "",
+                        best, bm.preferred_term if bm else "",
+                        "term_dedup",
+                        f"identical norm term '{term}'"))
+        return kept, audit
+
+
+#  [9] Hierarchy Reduction
 class HierarchyReducer:
-    """Remove ancestor CUIs when a more specific descendant exists.
-    Uses IC-bounded ancestor walk to catch multi-hop subsumption."""
+    """Remove ancestor CUIs when a more specific child exists."""
 
     def __init__(self, graph):
         self.graph = graph
 
     @timed("hierarchy_reduce")
-    def run(self, cuis, ic_map, metadata, sibling_threshold=None, graph=None):
-        g = graph if graph is not None else self.graph
+    def run(self, cuis, ic_map, metadata):
         cui_set = set(cuis)
         edges = set()
-
-        if sibling_threshold is not None:
-            ic_floor = sibling_threshold
-        else:
-            ic_vals = [ic_map.get(c, 0) for c in cuis if ic_map.get(c, 0) > 0]
-            ic_floor = float(np.median(ic_vals)) / 2 if ic_vals else 4.0
-
-        to_remove = {}
+        parent_children = defaultdict(set)
 
         for cui in cuis:
-            if not g.has_node(cui):
+            if not self.graph.has_node(cui):
                 continue
+            for parent in self.graph.predecessors(cui):
+                if parent in cui_set and parent != cui:
+                    parent_children[parent].add(cui)
+                    edges.add((parent, cui))
 
-            c_ic = ic_map.get(cui, 0)
-            c_meta = metadata.get(cui)
-            c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
+        to_remove = {}
+        for parent, children in parent_children.items():
+            p_ic = ic_map.get(parent, 0)
+            p_meta = metadata.get(parent)
+            p_types = set(p_meta.semantic_types) if p_meta and p_meta.semantic_types else set()
 
-            visited = set()
-            frontier = set(g.predecessors(cui))
-            while frontier:
-                next_frontier = set()
-                for anc in frontier:
-                    if anc in visited or anc == cui:
-                        continue
-                    visited.add(anc)
-
-                    pic = _get_parent_ic(g, anc, ic_map)
-
-                    if anc in cui_set:
-                        a_ic = ic_map.get(anc, 0)
-                        if c_ic >= a_ic:
-                            a_meta = metadata.get(anc)
-                            a_types = set(a_meta.semantic_types) if a_meta and a_meta.semantic_types else set()
-                            if not a_types or not c_types or (a_types & c_types):
-                                edges.add((anc, cui))
-                                if anc not in to_remove or c_ic > to_remove[anc][1]:
-                                    to_remove[anc] = (cui, c_ic, a_ic)
-
-                    if pic >= ic_floor and g.has_node(anc):
-                        for gp in g.predecessors(anc):
-                            if gp not in visited:
-                                next_frontier.add(gp)
-
-                frontier = next_frontier
-                if len(visited) > WALK_MAX_VISITED:
-                    break
+            for child in children:
+                c_ic = ic_map.get(child, 0)
+                if c_ic < p_ic:
+                    continue
+                c_meta = metadata.get(child)
+                c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
+                if p_types and c_types and not (p_types & c_types):
+                    continue
+                if parent not in to_remove or c_ic > to_remove[parent][1]:
+                    to_remove[parent] = (child, c_ic, p_ic)
 
         remove_set = set(to_remove.keys())
         surviving = [c for c in cuis if c not in remove_set]
@@ -629,49 +478,20 @@ class HierarchyReducer:
                 parent, pm.preferred_term if pm else "",
                 child, cm.preferred_term if cm else "",
                 "ancestor_subsumed",
-                f"child IC {c_ic:.2f} >= ancestor IC {p_ic:.2f} (multi-hop)"))
+                f"child IC {c_ic:.2f} >= parent IC {p_ic:.2f}"))
 
         return surviving, audit, edges
 
 
-# %% [10] Embedding Fetch (parallel BQ batches + disk cache)
+#  [10] Embedding Fetch -parallel BQ batches
 class EmbeddingFetcher:
-    def __init__(self, bq, pid, did, embedding_table, cache_path=None):
+    def __init__(self, bq, pid, did, embedding_table):
         self.bq = bq
         self.pid = pid
         self.did = did
         self.table = embedding_table
         self._cache = Cache(50_000)
         self._pool = ThreadPoolExecutor(max_workers=4)
-        self._cache_path = cache_path
-        self._disk_cache = {}
-        self._disk_dirty = False
-
-        # load disk cache if exists
-        if cache_path:
-            import os
-            if os.path.exists(cache_path):
-                try:
-                    data = np.load(cache_path, allow_pickle=False)
-                    cuis_arr = data['cuis']
-                    vecs_arr = data['vecs']
-                    for i, cui in enumerate(cuis_arr):
-                        self._disk_cache[str(cui)] = vecs_arr[i]
-                    log(f"    Embedding disk cache: loaded {len(self._disk_cache)} from {cache_path}")
-                except Exception as e:
-                    log(f"    Embedding disk cache load failed: {e}", "WARNING")
-
-    def shutdown(self):
-        """Save dirty cache to disk, then clean up thread pool."""
-        if self._cache_path and self._disk_dirty:
-            try:
-                cuis = list(self._disk_cache.keys())
-                vecs = np.array([self._disk_cache[c] for c in cuis], dtype=np.float32)
-                np.savez_compressed(self._cache_path, cuis=np.array(cuis), vecs=vecs)
-                log(f"    Embedding disk cache: saved {len(cuis)} to {self._cache_path}")
-            except Exception as e:
-                log(f"    Embedding disk cache save failed: {e}", "WARNING")
-        self._pool.shutdown(wait=False)
 
     def _fetch_batch(self, batch):
         """Fetch one batch from BQ. Called in parallel."""
@@ -703,371 +523,311 @@ class EmbeddingFetcher:
     def fetch(self, cuis):
         result, missing = {}, []
         for c in cuis:
-            # check in-memory cache first
             cached = self._cache.get(c)
             if cached is not None:
                 result[c] = cached
-                continue
-            # then disk cache
-            if c in self._disk_cache:
-                vec = self._disk_cache[c]
-                self._cache.put(c, vec)
-                result[c] = vec
-                continue
-            missing.append(c)
+            else:
+                missing.append(c)
 
         if not missing:
-            log(f"    Embeddings: {len(result)} from cache, 0 from BQ")
             return result
 
-        log(f"    Embeddings: {len(result)} cached, {len(missing)} fetching from BQ")
-        batches = [missing[i:i + BQ_BATCH_SIZE]
-                    for i in range(0, len(missing), BQ_BATCH_SIZE)]
+        batches = [missing[i:i + _BQ_BATCH]
+                    for i in range(0, len(missing), _BQ_BATCH)]
 
         futures = [self._pool.submit(self._fetch_batch, b) for b in batches]
         for f in futures:
             for cui, vec in f.result():
                 self._cache.put(cui, vec)
-                self._disk_cache[cui] = vec
-                self._disk_dirty = True
                 result[cui] = vec
 
         return result
 
 
-# %% [11] Greedy Embedding Reduction via ScaNN
-
-def _find_elbow(values):
-    """Find elbow point in a descending-sorted curve using max perpendicular
-    distance from the line connecting first and last points (Kneedle method).
-    Returns the index of the elbow point."""
-    n = len(values)
-    if n < 3:
-        return n - 1
-
-    # normalize to [0,1] on both axes
-    x = np.linspace(0, 1, n)
-    y_min, y_max = values[-1], values[0]
-    y_range = y_max - y_min
-    if y_range < 1e-12:
-        return n // 2
-    y = (np.array(values) - y_min) / y_range
-
-    # line from first to last point
-    dx = x[-1] - x[0]
-    dy = y[-1] - y[0]
-    line_len = np.sqrt(dx * dx + dy * dy)
-    if line_len < 1e-12:
-        return n // 2
-
-    # perpendicular distance from each point to the line
-    dist = np.abs(dy * x - dx * y + x[-1] * y[0] - y[-1] * x[0]) / line_len
-
-    return int(np.argmax(dist))
-
-
-class EmbeddingReducer:
-    """Greedy reduction: rank by IC, keep CUI if far from all already-kept.
-    Elbow detection on sorted uniqueness scores — fully data-driven cutoff.
-    ONE batch ScaNN search, then greedy from pre-computed neighbors."""
+#  [11] ScaNN Topic Builder
+class TopicBuilder:
+    """Clusters CUIs into topics via ScaNN KNN graph + connected components."""
 
     @staticmethod
-    @timed("embedding_reduce")
-    def run(cuis, metadata, embeddings, ic_map,
-            graph=None, sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
+    @timed("scann_topics")
+    def build(cuis, embeddings, k_neighbors=20):
+        # deterministic: sort input + reset numpy RNG
+        cuis = sorted(cuis)
+        np.random.seed(42)
 
-        # validate embedding dimensions
-        if embeddings:
-            dims = {v.shape[0] for v in embeddings.values() if hasattr(v, 'shape')}
-            if len(dims) > 1:
-                target_dim = max(dims, key=lambda d: sum(
-                    1 for v in embeddings.values() if hasattr(v, 'shape') and v.shape[0] == d))
-                log(f"    Mixed embedding dims {dims}, keeping dim={target_dim}", "WARNING")
-                embeddings = {k: v for k, v in embeddings.items()
-                             if hasattr(v, 'shape') and v.shape[0] == target_dim}
+        matrix = np.array([embeddings[c] for c in cuis], dtype=np.float32)
+        n = len(cuis)
+        dim = matrix.shape[1] if matrix.ndim == 2 else 0
 
-        with_emb = [c for c in cuis if c in embeddings]
-        without_emb = [c for c in cuis if c not in embeddings]
+        if n < 2 or dim == 0:
+            return {i: [c] for i, c in enumerate(cuis)}
 
-        if len(with_emb) <= 1:
-            surviving = list(cuis)
-            return {"topic_0": surviving}, surviving, [], 0.0
+        k = min(k_neighbors, n - 1)
+        k = max(k, 1)
 
-        n = len(with_emb)
-
-        # rank by IC descending (most specific first)
-        ranked = sorted(with_emb, key=lambda c: ic_map.get(c, 0), reverse=True)
-        matrix = np.array([embeddings[c] for c in ranked], dtype=np.float32)
-        dim = matrix.shape[1]
-
-        # --- ONE batch ScaNN search ---
-        k_search = min(100, n - 1)
         num_leaves = min(max(2, int(np.sqrt(n))), n)
-        builder = scann.scann_ops_pybind.builder(matrix, k_search, "dot_product")
+        builder = scann.scann_ops_pybind.builder(matrix, k, "dot_product")
+
         if n >= 16 and dim >= 2:
             dims_per_block = 2 if dim % 2 == 0 else 1
             builder = (
                 builder
-                .tree(num_leaves=num_leaves,
-                      num_leaves_to_search=max(1, num_leaves // 3),
-                      training_sample_size=min(n, 250_000))
-                .score_ah(dims_per_block, anisotropic_quantization_threshold=0.2)
-                .reorder(min(k_search * 4, n))
+                .tree(
+                    num_leaves=num_leaves,
+                    num_leaves_to_search=max(1, num_leaves // 5),
+                    training_sample_size=min(n, 250_000))
+                .score_ah(dims_per_block,
+                          anisotropic_quantization_threshold=0.2)
+                .reorder(min(k * 4, n))
             )
         else:
             builder = builder.score_brute_force()
+
         searcher = builder.build()
-        all_neighbors, all_scores = searcher.search_batched(matrix)
+        neighbors, scores = searcher.search_batched(matrix)
 
-        # --- Greedy pass: score every CUI's uniqueness ---
-        # Walk IC-ranked list, for each CUI record its min distance to
-        # any previously-seen CUI. This is its "uniqueness score":
-        #   high = adds new information, low = redundant with something better
-        kept_set = set()
-        uniqueness = np.zeros(n, dtype=np.float64)
-        closest_kept = np.full(n, -1, dtype=np.int64)
-
+        kth_dists = []
         for i in range(n):
-            if not kept_set:
-                uniqueness[i] = float('inf')
-                kept_set.add(i)
-                continue
+            valid = scores[i][scores[i] > -1e30]
+            if len(valid) > 0:
+                kth_dists.append(1.0 - float(valid[-1]))
 
-            best_dist = float('inf')
-            best_idx = -1
-            for j_pos in range(len(all_neighbors[i])):
-                j = int(all_neighbors[i][j_pos])
+        if kth_dists:
+            threshold = float(np.mean(kth_dists))
+        else:
+            all_sims = matrix @ matrix.T
+            np.fill_diagonal(all_sims, -np.inf)
+            threshold = float(1.0 - np.mean(all_sims[all_sims > -np.inf]))
+
+        adj = defaultdict(set)
+        for i in range(n):
+            for j_pos in range(len(neighbors[i])):
+                j = int(neighbors[i][j_pos])
                 if j < 0 or j >= n or j == i:
                     continue
-                if j not in kept_set:
-                    continue
-                d = 1.0 - float(all_scores[i][j_pos])
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = j
+                if (1.0 - float(scores[i][j_pos])) < threshold:
+                    adj[i].add(j)
+                    adj[j].add(i)
 
-            # if no kept neighbor found in ScaNN results, treat as unique
-            if best_idx < 0:
-                best_dist = 1.0
-
-            # ontology rescue: boost score for ontologically distinct pairs
-            if batch_info is not None and best_idx >= 0:
-                penalty = batch_info.ontology_penalty(
-                    ranked[i], ranked[best_idx], sibling_threshold)
-                if penalty > 0.5:
-                    best_dist = max(best_dist, 0.99)
-
-            uniqueness[i] = best_dist
-            closest_kept[i] = best_idx
-            kept_set.add(i)
-
-        # --- Elbow detection on sorted uniqueness scores ---
-        # Sort descending: most unique first
-        sorted_indices = np.argsort(-uniqueness)
-        sorted_scores = uniqueness[sorted_indices]
-
-        # replace inf with next highest for clean curve
-        finite_mask = np.isfinite(sorted_scores)
-        if not np.all(finite_mask):
-            max_finite = np.max(sorted_scores[finite_mask]) if np.any(finite_mask) else 1.0
-            sorted_scores[~finite_mask] = max_finite * 1.1
-
-        # find elbow: where adding more CUIs gives diminishing returns
-        elbow_idx = _find_elbow(sorted_scores.tolist())
-
-        # safety bounds: keep at least 10, at most 90% of input
-        elbow_idx = max(elbow_idx, min(10, n))
-        elbow_idx = min(elbow_idx, int(n * 0.9))
-
-        # the elbow CUIs are the ones to keep
-        final_kept = set(sorted_indices[:elbow_idx].tolist())
-        threshold = float(sorted_scores[elbow_idx - 1]) if elbow_idx > 0 else 0.0
-
-        log(f"    Elbow detection: keep {elbow_idx}/{n} "
-            f"(threshold={threshold:.4f}, "
-            f"top={float(sorted_scores[0]):.4f}, "
-            f"bottom={float(sorted_scores[-1]):.4f})")
-
-        # --- Build audit trail ---
-        audit = []
+        visited = set()
+        groups = {}
+        label = 0
         for i in range(n):
-            if i in final_kept:
+            if i in visited:
                 continue
-            cui = ranked[i]
-            k_idx = int(closest_kept[i])
-            c_meta = metadata.get(cui)
-            k_cui = ranked[k_idx] if k_idx >= 0 else ranked[0]
-            k_meta = metadata.get(k_cui)
-            audit.append(AuditEntry(
-                removed_cui=cui,
-                removed_term=c_meta.preferred_term if c_meta else "",
-                kept_cui=k_cui,
-                kept_term=k_meta.preferred_term if k_meta else "",
-                reason="embedding_redundant",
-                detail=f"uniqueness {uniqueness[i]:.3f} < elbow {threshold:.3f}"))
+            component = []
+            q = deque([i])
+            visited.add(i)
+            while q:
+                node = q.popleft()
+                component.append(cuis[node])
+                for nb in adj.get(node, set()):
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            groups[label] = component
+            label += 1
 
-        surviving = [ranked[i] for i in sorted(final_kept)] + list(without_emb)
-        log(f"    Greedy reduction: {n} -> {len(final_kept)} "
-            f"(+{len(without_emb)} no-emb) = {len(surviving)} total")
-
-        # --- Assign topics on surviving CUIs ---
-        surv_with_emb = [c for c in surviving if c in embeddings]
-        if len(surv_with_emb) < 2:
-            return {"topic_0": surviving}, surviving, audit, 0.0
-
-        topics = _assign_topics(surv_with_emb, embeddings)
-
-        tid = len(topics)
-        for c in without_emb:
-            topics[f"topic_{tid}"] = [c]
-            tid += 1
-
-        return topics, surviving, audit, 0.0
+        return groups
 
 
-def _assign_topics(cuis, embeddings, target_topic_size=15):
-    """Assign topics via ScaNN k-means partitioning (not connected components).
-    Produces balanced topics of ~target_topic_size CUIs."""
-    n = len(cuis)
-    matrix = np.array([embeddings[c] for c in cuis], dtype=np.float32)
+#  [12] Embedding Reduction
+class EmbeddingReducer:
+    """Groups by semantic type, runs ScaNN topics per group,
+    then dense pairwise redundancy removal within each topic."""
 
-    # number of topics ≈ n / target_topic_size
-    n_topics = max(2, n // target_topic_size)
-    n_topics = min(n_topics, n)
+    @staticmethod
+    @timed("embedding_reduce")
+    def run(cuis, metadata, embeddings, ic_map, hierarchy_edges):
 
-    # use ScaNN's tree partitioner as k-means
-    k = min(5, n - 1)
-    builder = scann.scann_ops_pybind.builder(matrix, k, "dot_product")
-    builder = builder.tree(
-        num_leaves=n_topics,
-        num_leaves_to_search=1,
-        training_sample_size=min(n, 250_000))
-    if matrix.shape[1] % 2 == 0:
-        builder = builder.score_ah(2, anisotropic_quantization_threshold=0.2)
-    else:
-        builder = builder.score_brute_force()
-    searcher = builder.build()
+        type_groups = defaultdict(list)
+        for cui in cuis:
+            meta = metadata.get(cui)
+            if meta and meta.semantic_types:
+                for sty in meta.semantic_types:
+                    type_groups[sty].append(cui)
+            else:
+                type_groups["Unknown"].append(cui)
 
-    # each CUI's partition = its topic
-    # search with leaves_to_search=1 returns the CUI's assigned partition
-    _, _ = searcher.search_batched(matrix)
+        all_topics = {}
+        globally_surviving = set()
+        removal_candidates = {}
+        tid = 0
 
-    # use the partitioner directly to get assignments
-    # Simpler approach: just cluster by nearest centroid via batch search
-    # Since ScaNN doesn't expose partition labels, use a quick k-means
-    np.random.seed(42)
-    # pick n_topics centroids via k-means++ style
-    centroids_idx = [0]
-    for _ in range(n_topics - 1):
-        dists = 1.0 - matrix @ matrix[centroids_idx].T  # n x len(centroids)
-        min_dists = dists.min(axis=1)
-        # pick farthest point
-        next_idx = int(np.argmax(min_dists))
-        centroids_idx.append(next_idx)
+        for sty in sorted(type_groups):
+            group_cuis = sorted(set(type_groups[sty]))
+            with_emb = [c for c in group_cuis if c in embeddings]
+            without_emb = [c for c in group_cuis if c not in embeddings]
 
-    centroids = matrix[centroids_idx]  # n_topics x dim
-    # assign each CUI to nearest centroid
-    sims = matrix @ centroids.T  # n x n_topics
-    labels = np.argmax(sims, axis=1)
+            for c in without_emb:
+                globally_surviving.add(c)
 
-    topics = defaultdict(list)
-    for i, lbl in enumerate(labels):
-        topics[f"topic_{lbl}"].append(cuis[i])
+            if len(with_emb) <= 1:
+                all_topics[f"topic_{tid}"] = group_cuis
+                for c in group_cuis:
+                    globally_surviving.add(c)
+                tid += 1
+                continue
 
-    return dict(topics)
-    """Pick representative via IC+centrality. Remove CUIs that are close
-    to ANY already-kept CUI (not just best). Safety checks protect
-    rare/isolated concepts only."""
+            scann_topics = TopicBuilder.build(with_emb, embeddings)
+
+            for t_cuis in scann_topics.values():
+                topic_id = f"topic_{tid}"
+                tid += 1
+
+                if len(t_cuis) <= 1:
+                    all_topics[topic_id] = t_cuis
+                    for c in t_cuis:
+                        globally_surviving.add(c)
+                    continue
+
+                surviving, removed = _reduce_topic(
+                    t_cuis, embeddings, metadata, ic_map, hierarchy_edges)
+                all_topics[topic_id] = surviving
+                for c in surviving:
+                    globally_surviving.add(c)
+                for entry in removed:
+                    removal_candidates[entry.removed_cui] = entry
+
+            for cui in without_emb:
+                all_topics[f"topic_{tid}"] = [cui]
+                tid += 1
+
+        final_audit = []
+        for cui, entry in removal_candidates.items():
+            if cui not in globally_surviving:
+                final_audit.append(entry)
+
+        seen = set()
+        surviving = []
+        for t_cuis in all_topics.values():
+            for c in t_cuis:
+                if c in globally_surviving and c not in seen:
+                    seen.add(c)
+                    surviving.append(c)
+
+        cleaned = {}
+        for topic_id, t_cuis in all_topics.items():
+            members = []
+            seen_t = set()
+            for c in t_cuis:
+                if c in globally_surviving and c not in seen_t:
+                    seen_t.add(c)
+                    members.append(c)
+            if members:
+                cleaned[topic_id] = members
+
+        return cleaned, surviving, final_audit
+
+
+def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges):
+    matrix = np.array([embeddings[c] for c in t_cuis])
+    sim = matrix @ matrix.T
+    np.clip(sim, -1, 1, out=sim)
+    dist = 1.0 - sim
+    np.fill_diagonal(dist, 0)
+    dist = np.maximum(dist, 0)
+
+    if np.any(~np.isfinite(dist)):
+        dist = np.nan_to_num(dist, nan=1.0, posinf=1.0, neginf=0.0)
+
+    n = len(t_cuis)
+    idx = {c: i for i, c in enumerate(t_cuis)}
+    upper = dist[np.triu_indices(n, k=1)]
+
+    if len(upper) == 0 or np.std(upper) < 1e-9:
+        return t_cuis, []
+
+    guardrail = float(np.median(upper))
+    tight_t = float(np.mean(upper) - np.std(upper))
+    nonzero = upper[upper > 0]
+    floor = float(np.min(nonzero)) if len(nonzero) > 0 else float(np.finfo(np.float32).eps)
+    tight_t = max(tight_t, floor)
+    tight_t = min(tight_t, guardrail)
+
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method="average")
+    labels = fcluster(Z, t=tight_t, criterion="distance")
+
+    r_groups = defaultdict(list)
+    for cui, lbl in zip(t_cuis, labels):
+        r_groups[lbl].append(cui)
+
+    all_kept, all_removed = [], []
+    for r_cuis in r_groups.values():
+        kept, removed = _resolve_group(
+            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx, tight_t, guardrail)
+        all_kept.extend(kept)
+        all_removed.extend(removed)
+
+    return all_kept, all_removed
+
+
+def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, tight_t, guardrail):
     if len(r_cuis) <= 1:
         return r_cuis, []
 
-    # score all CUIs: IC (specificity) + centrality (cluster fit)
-    ic_vals = {c: ic_map.get(c, 0) for c in r_cuis}
-    cent_vals = {}
-    for c in r_cuis:
-        ci = index_map.get(c)
-        if ci is not None and len(r_cuis) > 1:
-            dists = [dist[ci, index_map[o]] for o in r_cuis
-                     if o != c and index_map.get(o) is not None]
-            cent_vals[c] = 1.0 - (sum(dists) / len(dists)) if dists else 0.0
-        else:
-            cent_vals[c] = 0.0
-
-    def _norm(vals):
-        lo = min(vals.values())
-        hi = max(vals.values())
-        rng = hi - lo
-        if rng < 1e-9:
-            return {k: 0.5 for k in vals}
-        return {k: (v - lo) / rng for k, v in vals.items()}
-
-    ic_n = _norm(ic_vals)
-    cent_n = _norm(cent_vals)
-
-    # sort by composite score, pick best first
-    ranked = sorted(r_cuis, key=lambda c: ic_n[c] + cent_n[c], reverse=True)
-    best = ranked[0]
+    best = max(r_cuis, key=lambda c: ic_map.get(c, 0))
+    b_meta = metadata.get(best)
+    b_types = set(b_meta.semantic_types) if b_meta and b_meta.semantic_types else set()
 
     kept = [best]
     audit = []
 
-    for c in ranked[1:]:
+    for c in r_cuis:
+        if c == best:
+            continue
+
         c_meta = metadata.get(c)
-        ci = index_map.get(c)
+        c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
 
-        # check if c is close to ANY already-kept CUI
-        is_close_to_kept = False
-        closest_kept = best
-        closest_dist = float('inf')
-        if ci is not None:
-            for k in kept:
-                ki = index_map.get(k)
-                if ki is not None:
-                    d = dist[ci, ki]
-                    if d < closest_dist:
-                        closest_dist = d
-                        closest_kept = k
-                    if d < tight_t:
-                        is_close_to_kept = True
-
-        # not close to any kept CUI → keep (genuinely different)
-        if not is_close_to_kept:
+        if c_types and b_types and not (c_types & b_types):
             kept.append(c)
             continue
 
-        # rare concept protection: high IC + isolated in the full topic
-        c_ic = ic_map.get(c, 0)
-        if c_ic > RARE_CONCEPT_IC_FLOOR and ci is not None:
-            close_count = sum(1 for o in r_cuis if o != c and
-                             index_map.get(o) is not None and
-                             dist[ci, index_map[o]] < tight_t)
-            if close_count <= RARE_CONCEPT_MAX_NEIGHBORS:
-                kept.append(c)
-                continue
+        if (c, best) in hierarchy_edges or (best, c) in hierarchy_edges:
+            kept.append(c)
+            continue
 
-        # close to a kept CUI and not rare → remove
-        k_meta = metadata.get(closest_kept)
+        if c_meta and b_meta and terms_diverge(c_meta.all_tokens, b_meta.all_tokens):
+            kept.append(c)
+            continue
+
+        if c_meta and b_meta and qualifier_conflict(c_meta.all_tokens, b_meta.all_tokens):
+            kept.append(c)
+            continue
+
+        ci = index_map.get(c)
+        bi = index_map.get(best)
+        pair_dist = dist[ci, bi] if ci is not None and bi is not None else 0.0
+
         audit.append(AuditEntry(
             removed_cui=c,
             removed_term=c_meta.preferred_term if c_meta else "",
-            kept_cui=closest_kept,
-            kept_term=k_meta.preferred_term if k_meta else "",
+            kept_cui=best,
+            kept_term=b_meta.preferred_term if b_meta else "",
             reason="embedding_redundant",
-            detail=f"dist {closest_dist:.3f} < tight {tight_t:.3f} | "
-                   f"IC {ic_map.get(closest_kept,0):.2f} vs {ic_map.get(c,0):.2f} | "
-                   f"centrality {cent_vals.get(closest_kept,0):.3f} vs {cent_vals.get(c,0):.3f}"))
+            detail=f"dist {pair_dist:.3f} < tight {tight_t:.3f} | "
+                   f"guard {guardrail:.3f} | "
+                   f"IC {ic_map.get(best,0):.2f} vs {ic_map.get(c,0):.2f}"))
 
     return kept, audit
 
 
-# %% [13] Cross-Topic Dedup
+#  [13] Cross-Topic Dedup
 class CrossTopicDedup:
-    """Remove near-duplicate CUIs across topics. Alignment as tiebreaker."""
+    """Removes near-duplicate CUIs that survived in different topics.
+
+    Topics are NOT modified — they keep all members for grouping context.
+    Only the final output list is trimmed.
+
+    Uses text alignment as tiebreaker: keeps the CUI closer to the
+    input narrative. Threshold is adaptive from pairwise distances.
+    """
 
     @staticmethod
     @timed("cross_topic_dedup")
-    def run(surviving, embeddings, text_vec, metadata, ic_map,
-            sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
+    def run(surviving, embeddings, text_vec, metadata, ic_map):
         with_emb = [c for c in surviving if c in embeddings]
         without_emb = [c for c in surviving if c not in embeddings]
 
@@ -1097,7 +857,7 @@ class CrossTopicDedup:
         # 5th percentile of distances = tightest pairs
         threshold = float(np.percentile(upper, 5))
         # floor: don't go above 0.05 cosine distance
-        threshold = min(threshold, CROSS_TOPIC_MAX_DIST)
+        threshold = min(threshold, 0.05)
 
         # find pairs below threshold, remove the one with lower alignment
         removed = set()
@@ -1114,10 +874,14 @@ class CrossTopicDedup:
 
                 ci, cj = with_emb[i], with_emb[j]
 
-                # safety guards via batch_info (precomputed + cached)
-                if batch_info.are_siblings(ci, cj, sibling_threshold):
+                # safety guards — don't collapse qualifier variants or divergent terms
+                ci_meta = metadata.get(ci)
+                cj_meta = metadata.get(cj)
+                ci_tok = ci_meta.all_tokens if ci_meta else frozenset()
+                cj_tok = cj_meta.all_tokens if cj_meta else frozenset()
+                if qualifier_conflict(ci_tok, cj_tok):
                     continue
-                if batch_info.graph_distant(ci, cj):
+                if terms_diverge(ci_tok, cj_tok):
                     continue
 
                 # keep higher alignment, break ties by IC
@@ -1144,64 +908,7 @@ class CrossTopicDedup:
         return final, audit
 
 
-# %% [14] Coverage Rescue
-@timed("coverage_rescue")
-def coverage_rescue(surviving, all_input_cuis, metadata, ic_map, embeddings,
-                    text_vec=None):
-    """Rescue CUIs from semantic axes lost during reduction."""
-    input_types = defaultdict(set)
-    for c in all_input_cuis:
-        m = metadata.get(c)
-        if m and m.semantic_types:
-            for t in m.semantic_types:
-                input_types[t].add(c)
-
-    output_types = set()
-    for c in surviving:
-        m = metadata.get(c)
-        if m and m.semantic_types:
-            output_types.update(m.semantic_types)
-
-    lost_types = set(input_types.keys()) - output_types
-    if not lost_types:
-        return surviving, []
-
-    surviving_set = set(surviving)
-    rescued = []
-    audit = []
-
-    for lost_type in sorted(lost_types):
-        candidates = input_types[lost_type] - surviving_set
-        if not candidates:
-            continue
-        with_emb = [c for c in candidates if c in embeddings]
-        pool = with_emb if with_emb else list(candidates)
-
-        # prefer alignment to input text, fall back to IC
-        if text_vec is not None and with_emb:
-            best = max(pool, key=lambda c: float(np.dot(text_vec, embeddings[c])))
-        else:
-            best = max(pool, key=lambda c: ic_map.get(c, 0))
-
-        rescued.append(best)
-        surviving_set.add(best)
-        m = metadata.get(best)
-        audit.append(AuditEntry(
-            removed_cui="", removed_term="",
-            kept_cui=best,
-            kept_term=m.preferred_term if m else "",
-            reason="coverage_rescued",
-            detail=f"rescued for lost type '{lost_type}' | IC {ic_map.get(best,0):.2f}"))
-
-    if rescued:
-        surviving = list(surviving) + rescued
-        log(f"    Coverage Rescue: +{len(rescued)} CUIs for "
-            f"{len(lost_types)} lost semantic types")
-
-    return surviving, audit
-
-
-# %% [15] Retention Scorer
+#  [14] Retention Scorer
 class RetentionScorer:
     """Scores each CUI by narrative alignment via cosine(text_emb, cui_emb).
     Cost: 1 embedding API call (~100ms) per input text."""
@@ -1255,25 +962,134 @@ class RetentionScorer:
         return sorted_cuis, entries
 
 
-# %% [16] Pipeline
+#  [14B] Relevance Filter
+class RelevanceFilter:
+    """Post-retention cleanup combining embedding alignment with
+    query-term overlap.
+
+    Pure embedding alignment can't separate 'knee' from 'ankle' in
+    musculoskeletal space. Adding a simple check: do the CUI's terms
+    share any content words with the query?
+
+    Scoring:
+      boosted_score = alignment + (0.1 * overlap_ratio)
+
+    The boost widens the gap between CUIs that mention query anatomy
+    and those that don't, making Otsu's split meaningful.
+
+   Common tokens that appear in every CUI boost everyone equally — zero discriminating effect.
+    Meaningful tokens like 'knee', 'left', 'pain' drive the separation.
+    """
+
+    @staticmethod
+    @timed("relevance_filter")
+    def run(retention, context_string, metadata):
+        if len(retention) < 10:
+            sorted_cuis = [e.cui for e in retention]
+            return sorted_cuis, retention, []
+
+        # all query tokens — no filtering
+        query_tokens = tokenize_term(normalize_term(context_string))
+
+        if not query_tokens:
+            sorted_cuis = [e.cui for e in retention]
+            return sorted_cuis, retention, []
+
+        # score each CUI: alignment + overlap boost
+        boosted = []
+        for entry in retention:
+            m = metadata.get(entry.cui)
+            cui_tokens = m.all_tokens if m else frozenset()
+
+            overlap = len(query_tokens & cui_tokens)
+            boost = 0.1 * (overlap / len(query_tokens))
+            boosted.append((entry, entry.alignment + boost))
+
+        # re-sort by boosted score
+        boosted.sort(key=lambda x: x[1], reverse=True)
+
+        # Otsu on boosted scores to find natural split
+        scores = np.array([b[1] for b in boosted])
+        otsu_cutoff = RelevanceFilter._otsu_threshold(scores)
+
+        audit = []
+        kept = []
+        for entry, score in boosted:
+            if score >= otsu_cutoff:
+                kept.append(entry)
+            else:
+                audit.append(AuditEntry(
+                    removed_cui=entry.cui,
+                    removed_term=entry.term,
+                    kept_cui="", kept_term="",
+                    reason="below_relevance_threshold",
+                    detail=f"alignment {entry.alignment:.4f}, boosted {score:.4f} "
+                           f"< otsu {otsu_cutoff:.4f}"))
+
+        # re-sort kept by original alignment for output
+        kept.sort(key=lambda e: e.alignment, reverse=True)
+        sorted_cuis = [e.cui for e in kept]
+        return sorted_cuis, kept, audit
+
+    @staticmethod
+    def _otsu_threshold(scores):
+        lo, hi = float(scores.min()), float(scores.max())
+        if hi - lo < 1e-9:
+            return lo
+
+        n_bins = 256
+        bins = np.linspace(lo, hi, n_bins + 1)
+        hist, _ = np.histogram(scores, bins=bins)
+        hist = hist.astype(np.float64)
+        total = hist.sum()
+
+        if total == 0:
+            return lo
+
+        bin_centers = (bins[:-1] + bins[1:]) / 2.0
+        best_t = lo
+        best_var = -1.0
+        sum_total = np.sum(hist * bin_centers)
+        sum_bg = 0.0
+        weight_bg = 0.0
+
+        for i in range(n_bins):
+            weight_bg += hist[i]
+            if weight_bg == 0:
+                continue
+            weight_fg = total - weight_bg
+            if weight_fg == 0:
+                break
+            sum_bg += hist[i] * bin_centers[i]
+            mean_bg = sum_bg / weight_bg
+            mean_fg = (sum_total - sum_bg) / weight_fg
+            between_var = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+            if between_var > best_var:
+                best_var = between_var
+                best_t = bin_centers[i]
+
+        return float(best_t)
+
+
+#  [15] Pipeline
 class CUIReductionSystem:
 
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
-                 ic_scores=None, genai_location="us-central1",
-                 embedding_cache_path="embedding_cache.npz"):
+                 excluded_semantic_types=None, ic_scores=None,
+                 genai_location="us-central1"):
 
         self.bq = bigquery.Client(project=project_id)
         self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
         self.ic_computer = ICComputer(full_network, ic_scores)
         self.sab_filter = SABFilter(allowed_sabs)
+        self.semtype_filter = SemanticTypeFilter(excluded_semantic_types or set())
         self.hierarchy_reducer = HierarchyReducer(full_network)
         self.emb_fetcher = EmbeddingFetcher(
-            self.bq, project_id, dataset_id, embedding_table,
-            cache_path=embedding_cache_path)
+            self.bq, project_id, dataset_id, embedding_table)
         self.retention_scorer = RetentionScorer(project_id, genai_location)
 
-        log(f"[Init] graph={full_network.number_of_nodes()} nodes, sabs={allowed_sabs}")
+        # log(f"[Init] graph={full_network.number_of_nodes()} nodes, sabs={allowed_sabs}")
 
     @timed("full_pipeline")
     def reduce(self, cuis, context_string):
@@ -1314,7 +1130,7 @@ class CUIReductionSystem:
 
         for cuis, context_string in inputs:
             if not cuis:
-                per_text.append((context_string, [], [], set(), [], 8.0, None))
+                per_text.append((context_string, [], [], set(), []))
                 continue
 
             label = context_string[:50]
@@ -1323,22 +1139,19 @@ class CUIReductionSystem:
             after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
             log(f"    SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
 
-            # compute sibling IC threshold (1-hop parents only, fast on full graph)
-            sib_threshold = compute_sibling_threshold(
-                self.hierarchy_reducer.graph, after_sab, ic_map)
+            after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
+            log(f"    Semtype Filter: {len(after_sab)} -> {len(after_sty)} (removed {len(after_sab) - len(after_sty)})")
 
-            # build IC-bounded subgraph — same threshold controls the boundary
-            subgraph = build_subgraph(
-                self.hierarchy_reducer.graph, after_sab, ic_map, ic_floor=sib_threshold)
+            after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
+            log(f"    Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
 
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
-                after_sab, ic_map, metadata, sibling_threshold=sib_threshold,
-                graph=subgraph)
-            log(f"    Hierarchy: {len(after_sab)} -> {len(after_hier)} (removed {len(after_sab) - len(after_hier)})")
+                after_term, ic_map, metadata)
+            log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
 
-            audit = sab_audit + hier_audit
+            audit = sab_audit + sty_audit + term_audit + hier_audit
             all_post_hier.update(after_hier)
-            per_text.append((context_string, cuis, after_hier, hier_edges, audit, sib_threshold, subgraph))
+            per_text.append((context_string, cuis, after_hier, hier_edges, audit))
 
         # ONE embedding fetch for all post-hierarchy CUIs
         log(f"\n[Batch] Fetching embeddings for {len(all_post_hier)} unique post-hierarchy CUIs")
@@ -1347,7 +1160,7 @@ class CUIReductionSystem:
 
         # per-text: embedding reduction + topics + retention
         results = []
-        for context_string, cuis, after_hier, hier_edges, all_audit, sib_threshold, subgraph in per_text:
+        for context_string, cuis, after_hier, hier_edges, all_audit in per_text:
             t_start = time.perf_counter()
             label = context_string[:50]
 
@@ -1355,157 +1168,107 @@ class CUIReductionSystem:
                 results.append(self._empty(context_string, t_start, all_audit))
                 continue
 
-            try:
-                embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
-                emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
+            embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
+            emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
 
-                # precompute graph info on subgraph (not full graph)
-                batch_info = BatchGraphInfo(
-                    subgraph, after_hier, ic_map,
-                    sibling_threshold=sib_threshold)
+            topics, surviving, emb_audit = EmbeddingReducer.run(
+                after_hier, metadata, embeddings, ic_map, hier_edges)
+            all_audit.extend(emb_audit)
+            log(f"\n  [{label}]")
+            log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
 
-                topics, surviving, emb_audit, avg_sil = EmbeddingReducer.run(
-                    after_hier, metadata, embeddings, ic_map,
-                    graph=subgraph,
-                    sibling_threshold=sib_threshold,
-                    batch_info=batch_info)
-                all_audit.extend(emb_audit)
-                log(f"\n  [{label}]")
-                log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
-                if avg_sil != 0.0:
-                    log(f"    Avg Silhouette: {avg_sil:.3f}")
-
-                topics_out = {}
-                for topic_id, t_cuis in topics.items():
-                    if not t_cuis:
-                        continue
-                    topic_types = set()
-                    cui_terms = {}
-                    for c in t_cuis:
-                        m = metadata.get(c)
-                        if m and m.semantic_types:
-                            topic_types.update(m.semantic_types)
-                        cui_terms[c] = m.preferred_term if m else c
-                    topics_out[topic_id] = TopicInfo(
-                        topic_id=topic_id,
-                        semantic_types=topic_types or {"Unknown"},
-                        cuis=t_cuis,
-                        cui_terms=cui_terms)
-
-                log(f"    Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
-
-                # embed input text once — used for cross-topic dedup AND retention
-                text_vec = self.retention_scorer.embed_text(context_string)
-
-                # cross-topic dedup (topics stay intact, only output list trimmed)
-                before_xtd = len(surviving)
-                surviving, xtd_audit = CrossTopicDedup.run(
-                    surviving, embeddings, text_vec, metadata, ic_map,
-                    sibling_threshold=sib_threshold, batch_info=batch_info)
-                all_audit.extend(xtd_audit)
-                if xtd_audit:
-                    log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
-
-                # coverage rescue: restore CUIs from lost semantic axes
-                surviving, rescue_audit = coverage_rescue(
-                    surviving, cuis, metadata, ic_map, embeddings,
-                    text_vec=text_vec)
-                all_audit.extend(rescue_audit)
-
-                # retention scoring (alignment for downstream use)
-                sorted_cuis, retention = self.retention_scorer.score(
-                    text_vec, surviving, embeddings, metadata, all_audit)
-                if retention:
-                    log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
-
-                # prune topics to match surviving CUIs (after cross-topic dedup)
-                final_set = set(sorted_cuis)
-                before_prune = len(topics_out)
-                pruned_topics = {}
-                for topic_id, topic in topics_out.items():
-                    kept_cuis = [c for c in topic.cuis if c in final_set]
-                    if not kept_cuis:
-                        continue
-                    kept_terms = {c: topic.cui_terms[c] for c in kept_cuis if c in topic.cui_terms}
-                    pruned_topics[topic_id] = TopicInfo(
-                        topic_id=topic_id,
-                        semantic_types=topic.semantic_types,
-                        cuis=kept_cuis,
-                        cui_terms=kept_terms)
-                topics_out = pruned_topics
-                if before_prune != len(topics_out):
-                    log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
-
-                audited = {e.removed_cui for e in all_audit}
-                survived = set(surviving)
-                unaccounted = set(cuis) - survived - audited
-                if unaccounted:
-                    for cui in unaccounted:
-                        m = metadata.get(cui)
-                        all_audit.append(AuditEntry(
-                            cui, m.preferred_term if m else "",
-                            "", "", "unaccounted",
-                            "CUI not in surviving or audit trail"))
-
-                # --- Quality metrics ---
-                # Semantic loss: what fraction of input semantic types are NOT
-                # covered by any surviving CUI?
-                input_stys = set()
-                for cui in cuis:
-                    m = metadata.get(cui)
+            topics_out = {}
+            for topic_id, t_cuis in topics.items():
+                if not t_cuis:
+                    continue
+                topic_types = set()
+                cui_terms = {}
+                for c in t_cuis:
+                    m = metadata.get(c)
                     if m and m.semantic_types:
-                        input_stys.update(m.semantic_types)
-                output_stys = set()
-                for cui in surviving:
+                        topic_types.update(m.semantic_types)
+                    cui_terms[c] = m.preferred_term if m else c
+                topics_out[topic_id] = TopicInfo(
+                    topic_id=topic_id,
+                    semantic_types=topic_types or {"Unknown"},
+                    cuis=t_cuis,
+                    cui_terms=cui_terms)
+
+            log(f"    Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
+
+            # embed input text once — used for cross-topic dedup AND retention
+            text_vec = self.retention_scorer.embed_text(context_string)
+
+            # cross-topic dedup (topics stay intact, only output list trimmed)
+            before_xtd = len(surviving)
+            surviving, xtd_audit = CrossTopicDedup.run(
+                surviving, embeddings, text_vec, metadata, ic_map)
+            all_audit.extend(xtd_audit)
+            if xtd_audit:
+                log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
+
+            # retention scoring
+            sorted_cuis, retention = self.retention_scorer.score(
+                text_vec, surviving, embeddings, metadata, all_audit)
+            if retention:
+                log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
+
+            # relevance filter (query-token boosted + Otsu)
+            pre_relevance_retention = list(retention)  # snapshot before term-dependent filter
+            before_rel = len(retention)
+            sorted_cuis, retention, rel_audit = RelevanceFilter.run(
+                retention, context_string, metadata)
+            all_audit.extend(rel_audit)
+            if before_rel != len(retention):
+                log(f"    Relevance Filter: {before_rel} -> {len(retention)} (removed {before_rel - len(retention)})")
+
+            # prune topics to only final surviving CUIs
+            final_set = set(sorted_cuis)
+            before_prune = len(topics_out)
+            pruned_topics = {}
+            for topic_id, topic in topics_out.items():
+                kept_cuis = [c for c in topic.cuis if c in final_set]
+                if not kept_cuis:
+                    continue
+                kept_terms = {c: topic.cui_terms[c] for c in kept_cuis if c in topic.cui_terms}
+                pruned_topics[topic_id] = TopicInfo(
+                    topic_id=topic_id,
+                    semantic_types=topic.semantic_types,
+                    cuis=kept_cuis,
+                    cui_terms=kept_terms)
+            topics_out = pruned_topics
+            log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
+
+            audited = {e.removed_cui for e in all_audit}
+            survived = set(surviving)
+            unaccounted = set(cuis) - survived - audited
+            if unaccounted:
+                for cui in unaccounted:
                     m = metadata.get(cui)
-                    if m and m.semantic_types:
-                        output_stys.update(m.semantic_types)
-                sem_loss = 1.0 - (len(output_stys) / len(input_stys)) if input_stys else 0.0
+                    all_audit.append(AuditEntry(
+                        cui, m.preferred_term if m else "",
+                        "", "", "unaccounted",
+                        "CUI not in surviving or audit trail"))
 
-                # Confidence score (0-1): composite of cluster quality,
-                # reduction ratio sanity, and embedding coverage
-                # - silhouette: cluster quality (0 = random, 1 = perfect)
-                # - ratio penalty: if we removed >95% or <30%, something may be off
-                # - embedding coverage: how many CUIs had embeddings
-                ratio = len(surviving) / len(cuis) if cuis else 0
-                ratio_score = 1.0 - abs(ratio - 0.15) / 0.85  # peaks at ~15% retention
-                ratio_score = max(0.0, min(1.0, ratio_score))
-                sil_component = (avg_sil + 1.0) / 2.0  # normalize -1..1 → 0..1
-                confidence = (
-                    0.40 * sil_component +
-                    0.30 * emb_cov +
-                    0.20 * (1.0 - sem_loss) +
-                    0.10 * ratio_score
-                )
+            elapsed = (time.perf_counter() - t_start) * 1000
+            log(f"    DONE: {len(cuis)} -> {len(surviving)} -> {len(retention)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
 
-                log(f"    Quality: silhouette={avg_sil:.3f}, confidence={confidence:.3f}, "
-                    f"semantic_loss={sem_loss:.3f}")
+            results.append(ReductionResult(
+                context_string=context_string,
+                input_count=len(cuis),
+                after_filter_count=len(after_hier),
+                after_hierarchy_count=len(after_hier),
+                after_redundancy_count=len(surviving),
+                after_relevance_count=len(retention),
+                topics=topics_out,
+                all_reduced_cuis=sorted_cuis,
+                retention=retention,
+                pre_relevance_retention=pre_relevance_retention,
+                audit_trail=all_audit,
+                processing_time_ms=elapsed,
+                metadata_coverage=emb_cov,
+                embedding_coverage=emb_cov))
 
-                elapsed = (time.perf_counter() - t_start) * 1000
-                log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
-
-                results.append(ReductionResult(
-                    context_string=context_string,
-                    input_count=len(cuis),
-                    after_filter_count=len(after_hier),
-                    after_hierarchy_count=len(after_hier),
-                    after_redundancy_count=len(surviving),
-                    topics=topics_out,
-                    all_reduced_cuis=sorted_cuis,
-                    retention=retention,
-                    audit_trail=all_audit,
-                    processing_time_ms=elapsed,
-                    metadata_coverage=emb_cov,
-                    embedding_coverage=emb_cov,
-                    silhouette_score=avg_sil,
-                    confidence_score=confidence,
-                    semantic_loss=sem_loss))
-
-            except Exception as e:
-                log(f"    FAILED [{label}]: {e}", "ERROR")
-                results.append(self._empty(context_string, t_start, all_audit))
-
-        self.emb_fetcher.shutdown()
         total = (time.perf_counter() - t0) * 1000
         log(f"\n[Batch] ALL DONE: {len(inputs)} texts in {total:.0f}ms")
 
@@ -1513,7 +1276,7 @@ class CUIReductionSystem:
 
     def _empty(self, ctx, t0, audit=None, meta_cov=0.0):
         return ReductionResult(
-            ctx, 0, 0, 0, 0, {}, [], [],
+            ctx, 0, 0, 0, 0, 0, {}, [], [], [],
             audit or [], (time.perf_counter() - t0) * 1000, meta_cov, 0.0)
 
     def get_stats(self):
@@ -1530,7 +1293,7 @@ class CUIReductionSystem:
             return out
 
 
-# %% [17] CUI Extraction API
+#  [16] CUI Extraction API
 class CUIExtractor:
     """Calls CUI extraction endpoint. Filters by confidence."""
 
@@ -1583,26 +1346,26 @@ class CUIExtractor:
         return list(set(cuis))
 
 
-# %% [18] Load Pickles -- RUN ONCE
-HIERARCHY_PATH = "umls_hierarchy.pkl"
-IC_PATH = "ic_precomputed.pkl"
+#  [17] Load Pickles -- RUN ONCE
+# HIERARCHY_PATH = "umls_hierarchy.pkl"
+# IC_PATH = "ic_precomputed.pkl"
 
-log("Loading hierarchy...")
-with open(HIERARCHY_PATH, "rb") as f:
-    hierarchy = pickle.load(f)
-log(f"Hierarchy: {hierarchy.number_of_nodes()} nodes, {hierarchy.number_of_edges()} edges")
+# print("Loading hierarchy...")
+# with open(HIERARCHY_PATH, "rb") as f:
+#     hierarchy = pickle.load(f)
+# print(f"Hierarchy: {hierarchy.number_of_nodes()} nodes, {hierarchy.number_of_edges()} edges")
 
-log("Loading IC scores...")
-with open(IC_PATH, "rb") as f:
-    ic_precomputed = pickle.load(f)
-log(f"IC scores: {len(ic_precomputed)} entries")
+# print("Loading IC scores...")
+# with open(IC_PATH, "rb") as f:
+#     ic_precomputed = pickle.load(f)
+# print(f"IC scores: {len(ic_precomputed)} entries")
 
 
-# %% [19] Init System
-PROJECT_ID = "your-project-id"
-DATASET_ID = "your-dataset"
-API_URL = "https://your-api/extract"
-EMBEDDING_TABLE = "cui_embeddings"
+#  [18] Init System
+PROJECT_ID = project_id
+DATASET_ID = dataset
+API_URL = url
+EMBEDDING_TABLE = embedding_table
 ALLOWED_SABS = ["ICD10CM", "ICD10PCS", "ICD9CM", "SNOMEDCT_US", "LNC"]
 
 system = CUIReductionSystem(
@@ -1613,12 +1376,11 @@ system = CUIReductionSystem(
     ic_scores=ic_precomputed,
 )
 extractor = CUIExtractor(API_URL)
-log("System ready.")
 
 
-# %% [20] Run Pipeline
+#  [19] Run Pipeline
 texts = [
-    "Patient has severe pain in left knee with swelling",
+    "Patient has severe pain in left knee with swelling"
 ]
 
 # extract CUIs in parallel
@@ -1637,11 +1399,10 @@ results = system.reduce_batch(inputs)
 for result in results:
     log(f"\n{'=' * 60}")
     log(f"TEXT: {result.context_string}")
-    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
+    log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} (reduction) -> {result.after_relevance_count} (relevance) CUIs, "
         f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
-    log(f"  Quality: silhouette={result.silhouette_score:.3f}, "
-        f"confidence={result.confidence_score:.3f}, "
-        f"semantic_loss={result.semantic_loss:.3f}")
+    log(f"  Pre-relevance (term-free): {len(result.pre_relevance_retention)} CUIs")
+    log(f"  Post-relevance (term-dependent): {len(result.retention)} CUIs")
 
     log(f"\n-- Top 20 CUIs by retention (of {len(result.retention)}) --")
     for entry in result.retention[:20]:
@@ -1656,3 +1417,4 @@ for result in results:
         log(f"  {tid} ({len(topic.cuis)} CUIs)")
     if len(result.topics) > 20:
         log(f"  ... {len(result.topics) - 20} more topics")
+
