@@ -14,6 +14,7 @@ import logging
 import threading
 import subprocess
 import pickle
+import functools
 from typing import List, Dict, Optional, Set, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, deque, OrderedDict
@@ -29,13 +30,24 @@ from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
 
+# --- Configurable thresholds (override for domain-specific tuning) ---
+DEFAULT_SIBLING_IC = 8.0          # fallback when < 10 parents for Otsu
+RARE_CONCEPT_IC_FLOOR = 10.0      # min IC to qualify for rare-concept protection
+RARE_CONCEPT_MAX_NEIGHBORS = 1    # max close neighbors to be "isolated"
+CROSS_TOPIC_MAX_DIST = 0.05       # cosine distance ceiling for cross-topic dedup
+SUBGRAPH_MAX_NODES = 200_000      # safety cap for subgraph construction
+WALK_MAX_VISITED = 10_000         # safety cap per-CUI graph walk
+PARENT_IC_CACHE_SIZE = 100_000    # bounded cache for on-the-fly IC computation
+BQ_BATCH_SIZE = 5000              # BigQuery IN clause batch size
+
+
 # %% [2] Logging and Timing
 logger = logging.getLogger("cui_reduction")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
     logger.addHandler(_handler)
 
 
@@ -45,18 +57,23 @@ def log(msg, level="INFO"):
 
 _timings = defaultdict(list)
 _timing_lock = threading.Lock()
+_MAX_TIMING_ENTRIES = 1000  # per function, prevents memory leak
 
 
 def timed(name):
     def dec(fn):
+        @functools.wraps(fn)
         def wrapper(*a, **kw):
             t0 = time.perf_counter()
             try:
                 return fn(*a, **kw)
             finally:
+                elapsed = (time.perf_counter() - t0) * 1000
                 with _timing_lock:
-                    _timings[name].append(
-                        (time.perf_counter() - t0) * 1000)
+                    entries = _timings[name]
+                    if len(entries) >= _MAX_TIMING_ENTRIES:
+                        entries.pop(0)
+                    entries.append(elapsed)
         return wrapper
     return dec
 
@@ -122,30 +139,40 @@ class ReductionResult:
 # %% [4] Graph Safety Checks
 
 
-_parent_ic_cache = {}  # module-level cache for parent IC values
+_parent_ic_cache = {}
+_parent_ic_cache_lock = threading.Lock()
 
 
 def _get_parent_ic(graph, parent, ic_map):
-    """Get IC for a parent CUI. Checks ic_map first, then cache, then computes."""
+    """Get IC for a parent CUI. Checks ic_map → cache → compute."""
     pic = ic_map.get(parent)
     if pic is not None:
         return pic
-    if parent in _parent_ic_cache:
-        return _parent_ic_cache[parent]
+    cached = _parent_ic_cache.get(parent)
+    if cached is not None:
+        return cached
     desc = _count_desc(graph, parent)
     total = max(graph.number_of_nodes(), 1)
     pic = -np.log((desc + 1) / total)
-    _parent_ic_cache[parent] = pic
+    with _parent_ic_cache_lock:
+        if len(_parent_ic_cache) >= PARENT_IC_CACHE_SIZE:
+            # evict oldest 10% to avoid repeated eviction
+            evict_n = PARENT_IC_CACHE_SIZE // 10
+            keys = list(_parent_ic_cache.keys())[:evict_n]
+            for k in keys:
+                del _parent_ic_cache[k]
+        _parent_ic_cache[parent] = pic
     return pic
 
 
-def _count_desc(graph, cui):
-    """Count descendants via BFS. Used for on-the-fly IC of parent CUIs."""
+def _count_desc(graph, cui, max_count=5000):
+    """Count descendants via BFS, capped for performance.
+    Broad parents hit cap fast → low IC. Specific parents finish → exact IC."""
     if not graph.has_node(cui):
         return 0
     visited = set()
     frontier = deque([cui])
-    while frontier:
+    while frontier and len(visited) < max_count:
         n = frontier.popleft()
         for child in graph.successors(n):
             if child not in visited:
@@ -197,22 +224,19 @@ class BatchGraphInfo:
     """Precompute parents and IC-bounded ancestors for a CUI batch.
     Walks up from each CUI collecting ancestors while IC >= threshold."""
 
-    def __init__(self, graph, cuis, ic_map, sibling_threshold=8.0):
+    def __init__(self, graph, cuis, ic_map, sibling_threshold=DEFAULT_SIBLING_IC):
         self.graph = graph
         self.ic_map = ic_map
         self.parents = {}
         self.ancestors = {}
         self._distant_cache = {}
-        self._max_depth = 0
 
         for cui in cuis:
             if graph is not None and graph.has_node(cui):
                 p = set(graph.predecessors(cui))
                 self.parents[cui] = p
-                # IC-bounded ancestors: walk up while IC >= threshold
                 anc = set()
                 frontier = set(p)
-                depth = 0
                 while frontier:
                     next_frontier = set()
                     for node in frontier:
@@ -224,20 +248,17 @@ class BatchGraphInfo:
                                     if gp not in anc:
                                         next_frontier.add(gp)
                     frontier = next_frontier
-                    depth += 1
-                    if depth > 15:
-                        break  # safety cap for cyclic edges
+                    if len(anc) > WALK_MAX_VISITED:  # safety cap
+                        break
                 self.ancestors[cui] = anc
-                self._max_depth = max(self._max_depth, depth)
             else:
                 self.parents[cui] = set()
                 self.ancestors[cui] = set()
 
         log(f"    BatchGraphInfo: {len(self.ancestors)} CUIs, "
-            f"IC-bounded ancestors (threshold={sibling_threshold:.2f}), "
-            f"max depth walked={self._max_depth}")
+            f"IC-bounded ancestors (threshold={sibling_threshold:.2f})")
 
-    def are_siblings(self, cui_a, cui_b, sibling_threshold=8.0):
+    def are_siblings(self, cui_a, cui_b, sibling_threshold=DEFAULT_SIBLING_IC):
         """Check if two CUIs share a specific parent (IC >= threshold)."""
         pa = self.parents.get(cui_a, set())
         pb = self.parents.get(cui_b, set())
@@ -251,7 +272,8 @@ class BatchGraphInfo:
         return False
 
     def graph_distant(self, cui_a, cui_b):
-        """Cached: check if no common ancestor within 2 hops."""
+        """Cached: check if two CUIs share no IC-bounded ancestors.
+        Returns False for CUIs with empty ancestor sets (unknown → don't protect)."""
         key = (cui_a, cui_b) if cui_a < cui_b else (cui_b, cui_a)
         if key in self._distant_cache:
             return self._distant_cache[key]
@@ -267,7 +289,7 @@ class BatchGraphInfo:
         self._distant_cache[key] = distant
         return distant
 
-    def ontology_penalty(self, cui_a, cui_b, sibling_threshold=8.0):
+    def ontology_penalty(self, cui_a, cui_b, sibling_threshold=DEFAULT_SIBLING_IC):
         """Continuous penalty [0,1]: 0=related, 0.3=broad sibs, 0.6=specific sibs, 1=distant."""
         anc_a = self.ancestors.get(cui_a, set())
         anc_b = self.ancestors.get(cui_b, set())
@@ -290,8 +312,7 @@ class BatchGraphInfo:
         return 0.2
 
     def ontology_branch(self, cui, max_depth=3):
-        """Get the highest ancestor within max_depth hops (ontology branch).
-        Used for Improvement #7: branch preclustering."""
+        """Get highest ancestor within max_depth hops (branch preclustering)."""
         if self.graph is None or not self.graph.has_node(cui):
             return cui
         current = cui
@@ -299,7 +320,7 @@ class BatchGraphInfo:
             pars = list(self.graph.predecessors(current))
             if not pars:
                 break
-            current = max(pars, key=lambda p: len(list(self.graph.successors(p))))
+            current = max(pars, key=lambda p: self.graph.out_degree(p))
         return current
 
 
@@ -318,7 +339,7 @@ def compute_sibling_threshold(graph, cuis, ic_map):
                 parent_ics.append(pic)
 
     if len(parent_ics) < 10:
-        return 8.0
+        return DEFAULT_SIBLING_IC
 
     arr = np.array(parent_ics)
     threshold = _otsu(arr)
@@ -329,6 +350,38 @@ def compute_sibling_threshold(graph, cuis, ic_map):
         f"median {np.median(arr):.2f})")
 
     return threshold
+
+
+@timed("build_subgraph")
+def build_subgraph(full_graph, cuis, ic_map, ic_floor):
+    """Build a small subgraph: input CUIs + IC-bounded ancestors.
+    Walks up from each CUI, collecting ancestors while IC >= ic_floor.
+    Same IC logic as the downstream walks — no arbitrary depth cap."""
+    relevant = set()
+    for cui in cuis:
+        if full_graph.has_node(cui):
+            relevant.add(cui)
+
+    frontier = set(relevant)
+    while frontier:
+        next_frontier = set()
+        for node in frontier:
+            for parent in full_graph.predecessors(node):
+                if parent not in relevant:
+                    pic = _get_parent_ic(full_graph, parent, ic_map)
+                    if pic >= ic_floor:
+                        relevant.add(parent)
+                        next_frontier.add(parent)
+        frontier = next_frontier
+        if len(relevant) > SUBGRAPH_MAX_NODES:  # safety cap
+            log(f"    Subgraph safety cap hit at {len(relevant)} nodes", "WARNING")
+            break
+
+    sub = full_graph.subgraph(relevant)
+    log(f"    Subgraph: {sub.number_of_nodes()} nodes, "
+        f"{sub.number_of_edges()} edges "
+        f"(from {full_graph.number_of_nodes()} full)")
+    return sub
 
 
 # %% [5] LRU Cache (thread-safe)
@@ -355,7 +408,6 @@ class Cache:
 
 
 # %% [6] Metadata from BigQuery
-_BQ_BATCH = 5000
 
 
 class MetadataFetcher:
@@ -382,8 +434,8 @@ class MetadataFetcher:
         if not missing:
             return result
 
-        for i in range(0, len(missing), _BQ_BATCH):
-            batch = missing[i:i + _BQ_BATCH]
+        for i in range(0, len(missing), BQ_BATCH_SIZE):
+            batch = missing[i:i + BQ_BATCH_SIZE]
             query = f"""
             WITH ranked AS (
               SELECT CUI, STR, SAB, ISPREF,
@@ -517,33 +569,29 @@ class HierarchyReducer:
         self.graph = graph
 
     @timed("hierarchy_reduce")
-    def run(self, cuis, ic_map, metadata, sibling_threshold=None):
+    def run(self, cuis, ic_map, metadata, sibling_threshold=None, graph=None):
+        g = graph if graph is not None else self.graph
         cui_set = set(cuis)
         edges = set()
 
-        # Determine IC floor for ancestor walk.
-        # Use Otsu on parent ICs if not provided, else use a
-        # conservative floor (lowest IC in input set / 2).
         if sibling_threshold is not None:
             ic_floor = sibling_threshold
         else:
             ic_vals = [ic_map.get(c, 0) for c in cuis if ic_map.get(c, 0) > 0]
             ic_floor = float(np.median(ic_vals)) / 2 if ic_vals else 4.0
 
-        # For each CUI, find which input CUIs are its IC-bounded ancestors
-        to_remove = {}  # ancestor_cui → (best_child, child_ic, parent_ic)
+        to_remove = {}
 
         for cui in cuis:
-            if not self.graph.has_node(cui):
+            if not g.has_node(cui):
                 continue
 
             c_ic = ic_map.get(cui, 0)
             c_meta = metadata.get(cui)
             c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
 
-            # walk up collecting ancestors while IC >= floor
             visited = set()
-            frontier = set(self.graph.predecessors(cui))
+            frontier = set(g.predecessors(cui))
             while frontier:
                 next_frontier = set()
                 for anc in frontier:
@@ -551,13 +599,11 @@ class HierarchyReducer:
                         continue
                     visited.add(anc)
 
-                    pic = _get_parent_ic(self.graph, anc, ic_map)
+                    pic = _get_parent_ic(g, anc, ic_map)
 
-                    # if ancestor is in input set, check subsumption
                     if anc in cui_set:
                         a_ic = ic_map.get(anc, 0)
                         if c_ic >= a_ic:
-                            # semantic type compatibility
                             a_meta = metadata.get(anc)
                             a_types = set(a_meta.semantic_types) if a_meta and a_meta.semantic_types else set()
                             if not a_types or not c_types or (a_types & c_types):
@@ -565,13 +611,14 @@ class HierarchyReducer:
                                 if anc not in to_remove or c_ic > to_remove[anc][1]:
                                     to_remove[anc] = (cui, c_ic, a_ic)
 
-                    # keep walking up while ancestors are specific enough
-                    if pic >= ic_floor and self.graph.has_node(anc):
-                        for gp in self.graph.predecessors(anc):
+                    if pic >= ic_floor and g.has_node(anc):
+                        for gp in g.predecessors(anc):
                             if gp not in visited:
                                 next_frontier.add(gp)
 
                 frontier = next_frontier
+                if len(visited) > WALK_MAX_VISITED:
+                    break
 
         remove_set = set(to_remove.keys())
         surviving = [c for c in cuis if c not in remove_set]
@@ -598,6 +645,10 @@ class EmbeddingFetcher:
         self.table = embedding_table
         self._cache = Cache(50_000)
         self._pool = ThreadPoolExecutor(max_workers=4)
+
+    def shutdown(self):
+        """Clean up thread pool."""
+        self._pool.shutdown(wait=False)
 
     def _fetch_batch(self, batch):
         """Fetch one batch from BQ. Called in parallel."""
@@ -638,8 +689,8 @@ class EmbeddingFetcher:
         if not missing:
             return result
 
-        batches = [missing[i:i + _BQ_BATCH]
-                    for i in range(0, len(missing), _BQ_BATCH)]
+        batches = [missing[i:i + BQ_BATCH_SIZE]
+                    for i in range(0, len(missing), BQ_BATCH_SIZE)]
 
         futures = [self._pool.submit(self._fetch_batch, b) for b in batches]
         for f in futures:
@@ -744,7 +795,17 @@ class EmbeddingReducer:
     @staticmethod
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges,
-            graph=None, sibling_threshold=8.0, batch_info=None):
+            graph=None, sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
+
+        # validate embedding dimensions
+        if embeddings:
+            dims = {v.shape[0] for v in embeddings.values() if hasattr(v, 'shape')}
+            if len(dims) > 1:
+                target_dim = max(dims, key=lambda d: sum(
+                    1 for v in embeddings.values() if hasattr(v, 'shape') and v.shape[0] == d))
+                log(f"    Mixed embedding dims {dims}, keeping dim={target_dim}", "WARNING")
+                embeddings = {k: v for k, v in embeddings.items()
+                             if hasattr(v, 'shape') and v.shape[0] == target_dim}
 
         branch_type_groups = defaultdict(list)
         for cui in cuis:
@@ -885,7 +946,11 @@ def _validate_and_split_topics(scann_topics, metadata):
 
 
 def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
-                  hierarchy_edges, sibling_threshold=8.0, batch_info=None):
+                  hierarchy_edges, sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
+    if len(t_cuis) > 2000:
+        log(f"    Topic too large ({len(t_cuis)} CUIs), skipping pairwise reduction", "WARNING")
+        return t_cuis, [], 0.0
+
     matrix = np.array([embeddings[c] for c in t_cuis])
     sim = matrix @ matrix.T
     np.clip(sim, -1, 1, out=sim)
@@ -911,10 +976,10 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
     tight_t = max(tight_t, floor)
     tight_t = min(tight_t, guardrail)
 
-    # --- Improvement #3: Continuous ontology penalty ---
-    # Instead of binary inflate, scale distances by ontology relationship.
-    # penalty 0 → no change; penalty 1 → distance pushed to guardrail.
-    if batch_info is not None and n > 1:
+    # Continuous ontology penalty — scales distances by graph relationship.
+    # Skip for large topics (>500) to avoid O(N²) Python loop;
+    # numpy matmul is fast but the per-pair penalty check is not.
+    if batch_info is not None and n > 1 and n <= 500:
         for i in range(n):
             ci = t_cuis[i]
             for j in range(i + 1, n):
@@ -974,7 +1039,7 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map,
 
 
 def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
-                   index_map, tight_t, guardrail, sibling_threshold=8.0,
+                   index_map, tight_t, guardrail, sibling_threshold=DEFAULT_SIBLING_IC,
                    batch_info=None):
     """Pick best via IC+centrality. Safety checks + rare protection. O(n)."""
     if len(r_cuis) <= 1:
@@ -1039,11 +1104,11 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist,
         # rare concept protection: high IC + isolated
         c_ic = ic_map.get(c, 0)
         ci_idx = index_map.get(c)
-        if c_ic > 10.0 and ci_idx is not None:
+        if c_ic > RARE_CONCEPT_IC_FLOOR and ci_idx is not None:
             close_count = sum(1 for o in r_cuis if o != c and
                              index_map.get(o) is not None and
                              dist[ci_idx, index_map[o]] < tight_t)
-            if close_count <= 1:
+            if close_count <= RARE_CONCEPT_MAX_NEIGHBORS:
                 kept.append(c)
                 continue
 
@@ -1071,7 +1136,7 @@ class CrossTopicDedup:
     @staticmethod
     @timed("cross_topic_dedup")
     def run(surviving, embeddings, text_vec, metadata, ic_map,
-            sibling_threshold=8.0, batch_info=None):
+            sibling_threshold=DEFAULT_SIBLING_IC, batch_info=None):
         with_emb = [c for c in surviving if c in embeddings]
         without_emb = [c for c in surviving if c not in embeddings]
 
@@ -1101,7 +1166,7 @@ class CrossTopicDedup:
         # 5th percentile of distances = tightest pairs
         threshold = float(np.percentile(upper, 5))
         # floor: don't go above 0.05 cosine distance
-        threshold = min(threshold, 0.05)
+        threshold = min(threshold, CROSS_TOPIC_MAX_DIST)
 
         # find pairs below threshold, remove the one with lower alignment
         removed = set()
@@ -1150,7 +1215,8 @@ class CrossTopicDedup:
 
 # %% [14] Coverage Rescue
 @timed("coverage_rescue")
-def coverage_rescue(surviving, all_input_cuis, metadata, ic_map, embeddings):
+def coverage_rescue(surviving, all_input_cuis, metadata, ic_map, embeddings,
+                    text_vec=None):
     """Rescue CUIs from semantic axes lost during reduction."""
     input_types = defaultdict(set)
     for c in all_input_cuis:
@@ -1179,7 +1245,13 @@ def coverage_rescue(surviving, all_input_cuis, metadata, ic_map, embeddings):
             continue
         with_emb = [c for c in candidates if c in embeddings]
         pool = with_emb if with_emb else list(candidates)
-        best = max(pool, key=lambda c: ic_map.get(c, 0))
+
+        # prefer alignment to input text, fall back to IC
+        if text_vec is not None and with_emb:
+            best = max(pool, key=lambda c: float(np.dot(text_vec, embeddings[c])))
+        else:
+            best = max(pool, key=lambda c: ic_map.get(c, 0))
+
         rescued.append(best)
         surviving_set.add(best)
         m = metadata.get(best)
@@ -1252,7 +1324,6 @@ class RetentionScorer:
         return sorted_cuis, entries
 
 
-
 # %% [16] Pipeline
 class CUIReductionSystem:
 
@@ -1310,7 +1381,7 @@ class CUIReductionSystem:
 
         for cuis, context_string in inputs:
             if not cuis:
-                per_text.append((context_string, [], [], set(), []))
+                per_text.append((context_string, [], [], set(), [], 8.0, None))
                 continue
 
             label = context_string[:50]
@@ -1319,17 +1390,22 @@ class CUIReductionSystem:
             after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
             log(f"    SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
 
-            # compute sibling IC threshold early — used by both hierarchy and embedding
+            # compute sibling IC threshold (1-hop parents only, fast on full graph)
             sib_threshold = compute_sibling_threshold(
                 self.hierarchy_reducer.graph, after_sab, ic_map)
 
+            # build IC-bounded subgraph — same threshold controls the boundary
+            subgraph = build_subgraph(
+                self.hierarchy_reducer.graph, after_sab, ic_map, ic_floor=sib_threshold)
+
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(
-                after_sab, ic_map, metadata, sibling_threshold=sib_threshold)
+                after_sab, ic_map, metadata, sibling_threshold=sib_threshold,
+                graph=subgraph)
             log(f"    Hierarchy: {len(after_sab)} -> {len(after_hier)} (removed {len(after_sab) - len(after_hier)})")
 
             audit = sab_audit + hier_audit
             all_post_hier.update(after_hier)
-            per_text.append((context_string, cuis, after_hier, hier_edges, audit, sib_threshold))
+            per_text.append((context_string, cuis, after_hier, hier_edges, audit, sib_threshold, subgraph))
 
         # ONE embedding fetch for all post-hierarchy CUIs
         log(f"\n[Batch] Fetching embeddings for {len(all_post_hier)} unique post-hierarchy CUIs")
@@ -1338,7 +1414,7 @@ class CUIReductionSystem:
 
         # per-text: embedding reduction + topics + retention
         results = []
-        for context_string, cuis, after_hier, hier_edges, all_audit, sib_threshold in per_text:
+        for context_string, cuis, after_hier, hier_edges, all_audit, sib_threshold, subgraph in per_text:
             t_start = time.perf_counter()
             label = context_string[:50]
 
@@ -1346,150 +1422,157 @@ class CUIReductionSystem:
                 results.append(self._empty(context_string, t_start, all_audit))
                 continue
 
-            embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
-            emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
+            try:
+                embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
+                emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
 
-            # precompute graph info — IC-bounded ancestors (no hop parameter)
-            batch_info = BatchGraphInfo(
-                self.hierarchy_reducer.graph, after_hier, ic_map,
-                sibling_threshold=sib_threshold)
+                # precompute graph info on subgraph (not full graph)
+                batch_info = BatchGraphInfo(
+                    subgraph, after_hier, ic_map,
+                    sibling_threshold=sib_threshold)
 
-            topics, surviving, emb_audit, avg_sil = EmbeddingReducer.run(
-                after_hier, metadata, embeddings, ic_map, hier_edges,
-                graph=self.hierarchy_reducer.graph,
-                sibling_threshold=sib_threshold,
-                batch_info=batch_info)
-            all_audit.extend(emb_audit)
-            log(f"\n  [{label}]")
-            log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
-            if avg_sil != 0.0:
-                log(f"    Avg Silhouette: {avg_sil:.3f}")
+                topics, surviving, emb_audit, avg_sil = EmbeddingReducer.run(
+                    after_hier, metadata, embeddings, ic_map, hier_edges,
+                    graph=subgraph,
+                    sibling_threshold=sib_threshold,
+                    batch_info=batch_info)
+                all_audit.extend(emb_audit)
+                log(f"\n  [{label}]")
+                log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
+                if avg_sil != 0.0:
+                    log(f"    Avg Silhouette: {avg_sil:.3f}")
 
-            topics_out = {}
-            for topic_id, t_cuis in topics.items():
-                if not t_cuis:
-                    continue
-                topic_types = set()
-                cui_terms = {}
-                for c in t_cuis:
-                    m = metadata.get(c)
-                    if m and m.semantic_types:
-                        topic_types.update(m.semantic_types)
-                    cui_terms[c] = m.preferred_term if m else c
-                topics_out[topic_id] = TopicInfo(
-                    topic_id=topic_id,
-                    semantic_types=topic_types or {"Unknown"},
-                    cuis=t_cuis,
-                    cui_terms=cui_terms)
+                topics_out = {}
+                for topic_id, t_cuis in topics.items():
+                    if not t_cuis:
+                        continue
+                    topic_types = set()
+                    cui_terms = {}
+                    for c in t_cuis:
+                        m = metadata.get(c)
+                        if m and m.semantic_types:
+                            topic_types.update(m.semantic_types)
+                        cui_terms[c] = m.preferred_term if m else c
+                    topics_out[topic_id] = TopicInfo(
+                        topic_id=topic_id,
+                        semantic_types=topic_types or {"Unknown"},
+                        cuis=t_cuis,
+                        cui_terms=cui_terms)
 
-            log(f"    Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
+                log(f"    Topics: {len(surviving)} CUIs -> {len(topics_out)} topics")
 
-            # embed input text once — used for cross-topic dedup AND retention
-            text_vec = self.retention_scorer.embed_text(context_string)
+                # embed input text once — used for cross-topic dedup AND retention
+                text_vec = self.retention_scorer.embed_text(context_string)
 
-            # cross-topic dedup (topics stay intact, only output list trimmed)
-            before_xtd = len(surviving)
-            surviving, xtd_audit = CrossTopicDedup.run(
-                surviving, embeddings, text_vec, metadata, ic_map,
-                sibling_threshold=sib_threshold, batch_info=batch_info)
-            all_audit.extend(xtd_audit)
-            if xtd_audit:
-                log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
+                # cross-topic dedup (topics stay intact, only output list trimmed)
+                before_xtd = len(surviving)
+                surviving, xtd_audit = CrossTopicDedup.run(
+                    surviving, embeddings, text_vec, metadata, ic_map,
+                    sibling_threshold=sib_threshold, batch_info=batch_info)
+                all_audit.extend(xtd_audit)
+                if xtd_audit:
+                    log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
-            # coverage rescue: restore CUIs from lost semantic axes
-            surviving, rescue_audit = coverage_rescue(
-                surviving, cuis, metadata, ic_map, embeddings)
-            all_audit.extend(rescue_audit)
+                # coverage rescue: restore CUIs from lost semantic axes
+                surviving, rescue_audit = coverage_rescue(
+                    surviving, cuis, metadata, ic_map, embeddings,
+                    text_vec=text_vec)
+                all_audit.extend(rescue_audit)
 
-            # retention scoring (alignment for downstream use)
-            sorted_cuis, retention = self.retention_scorer.score(
-                text_vec, surviving, embeddings, metadata, all_audit)
-            if retention:
-                log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
+                # retention scoring (alignment for downstream use)
+                sorted_cuis, retention = self.retention_scorer.score(
+                    text_vec, surviving, embeddings, metadata, all_audit)
+                if retention:
+                    log(f"    Retention: scored {len(retention)} (top={retention[0].alignment:.3f}, bottom={retention[-1].alignment:.3f})")
 
-            # prune topics to match surviving CUIs (after cross-topic dedup)
-            final_set = set(sorted_cuis)
-            before_prune = len(topics_out)
-            pruned_topics = {}
-            for topic_id, topic in topics_out.items():
-                kept_cuis = [c for c in topic.cuis if c in final_set]
-                if not kept_cuis:
-                    continue
-                kept_terms = {c: topic.cui_terms[c] for c in kept_cuis if c in topic.cui_terms}
-                pruned_topics[topic_id] = TopicInfo(
-                    topic_id=topic_id,
-                    semantic_types=topic.semantic_types,
-                    cuis=kept_cuis,
-                    cui_terms=kept_terms)
-            topics_out = pruned_topics
-            if before_prune != len(topics_out):
-                log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
+                # prune topics to match surviving CUIs (after cross-topic dedup)
+                final_set = set(sorted_cuis)
+                before_prune = len(topics_out)
+                pruned_topics = {}
+                for topic_id, topic in topics_out.items():
+                    kept_cuis = [c for c in topic.cuis if c in final_set]
+                    if not kept_cuis:
+                        continue
+                    kept_terms = {c: topic.cui_terms[c] for c in kept_cuis if c in topic.cui_terms}
+                    pruned_topics[topic_id] = TopicInfo(
+                        topic_id=topic_id,
+                        semantic_types=topic.semantic_types,
+                        cuis=kept_cuis,
+                        cui_terms=kept_terms)
+                topics_out = pruned_topics
+                if before_prune != len(topics_out):
+                    log(f"    Topics after pruning: {len(topics_out)} (dropped {before_prune - len(topics_out)} empty)")
 
-            audited = {e.removed_cui for e in all_audit}
-            survived = set(surviving)
-            unaccounted = set(cuis) - survived - audited
-            if unaccounted:
-                for cui in unaccounted:
+                audited = {e.removed_cui for e in all_audit}
+                survived = set(surviving)
+                unaccounted = set(cuis) - survived - audited
+                if unaccounted:
+                    for cui in unaccounted:
+                        m = metadata.get(cui)
+                        all_audit.append(AuditEntry(
+                            cui, m.preferred_term if m else "",
+                            "", "", "unaccounted",
+                            "CUI not in surviving or audit trail"))
+
+                # --- Quality metrics ---
+                # Semantic loss: what fraction of input semantic types are NOT
+                # covered by any surviving CUI?
+                input_stys = set()
+                for cui in cuis:
                     m = metadata.get(cui)
-                    all_audit.append(AuditEntry(
-                        cui, m.preferred_term if m else "",
-                        "", "", "unaccounted",
-                        "CUI not in surviving or audit trail"))
+                    if m and m.semantic_types:
+                        input_stys.update(m.semantic_types)
+                output_stys = set()
+                for cui in surviving:
+                    m = metadata.get(cui)
+                    if m and m.semantic_types:
+                        output_stys.update(m.semantic_types)
+                sem_loss = 1.0 - (len(output_stys) / len(input_stys)) if input_stys else 0.0
 
-            # --- Quality metrics ---
-            # Semantic loss: what fraction of input semantic types are NOT
-            # covered by any surviving CUI?
-            input_stys = set()
-            for cui in cuis:
-                m = metadata.get(cui)
-                if m and m.semantic_types:
-                    input_stys.update(m.semantic_types)
-            output_stys = set()
-            for cui in surviving:
-                m = metadata.get(cui)
-                if m and m.semantic_types:
-                    output_stys.update(m.semantic_types)
-            sem_loss = 1.0 - (len(output_stys) / len(input_stys)) if input_stys else 0.0
+                # Confidence score (0-1): composite of cluster quality,
+                # reduction ratio sanity, and embedding coverage
+                # - silhouette: cluster quality (0 = random, 1 = perfect)
+                # - ratio penalty: if we removed >95% or <30%, something may be off
+                # - embedding coverage: how many CUIs had embeddings
+                ratio = len(surviving) / len(cuis) if cuis else 0
+                ratio_score = 1.0 - abs(ratio - 0.15) / 0.85  # peaks at ~15% retention
+                ratio_score = max(0.0, min(1.0, ratio_score))
+                sil_component = (avg_sil + 1.0) / 2.0  # normalize -1..1 → 0..1
+                confidence = (
+                    0.40 * sil_component +
+                    0.30 * emb_cov +
+                    0.20 * (1.0 - sem_loss) +
+                    0.10 * ratio_score
+                )
 
-            # Confidence score (0-1): composite of cluster quality,
-            # reduction ratio sanity, and embedding coverage
-            # - silhouette: cluster quality (0 = random, 1 = perfect)
-            # - ratio penalty: if we removed >95% or <30%, something may be off
-            # - embedding coverage: how many CUIs had embeddings
-            ratio = len(surviving) / len(cuis) if cuis else 0
-            ratio_score = 1.0 - abs(ratio - 0.15) / 0.85  # peaks at ~15% retention
-            ratio_score = max(0.0, min(1.0, ratio_score))
-            sil_component = (avg_sil + 1.0) / 2.0  # normalize -1..1 → 0..1
-            confidence = (
-                0.40 * sil_component +
-                0.30 * emb_cov +
-                0.20 * (1.0 - sem_loss) +
-                0.10 * ratio_score
-            )
+                log(f"    Quality: silhouette={avg_sil:.3f}, confidence={confidence:.3f}, "
+                    f"semantic_loss={sem_loss:.3f}")
 
-            log(f"    Quality: silhouette={avg_sil:.3f}, confidence={confidence:.3f}, "
-                f"semantic_loss={sem_loss:.3f}")
+                elapsed = (time.perf_counter() - t_start) * 1000
+                log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
 
-            elapsed = (time.perf_counter() - t_start) * 1000
-            log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
+                results.append(ReductionResult(
+                    context_string=context_string,
+                    input_count=len(cuis),
+                    after_filter_count=len(after_hier),
+                    after_hierarchy_count=len(after_hier),
+                    after_redundancy_count=len(surviving),
+                    topics=topics_out,
+                    all_reduced_cuis=sorted_cuis,
+                    retention=retention,
+                    audit_trail=all_audit,
+                    processing_time_ms=elapsed,
+                    metadata_coverage=emb_cov,
+                    embedding_coverage=emb_cov,
+                    silhouette_score=avg_sil,
+                    confidence_score=confidence,
+                    semantic_loss=sem_loss))
 
-            results.append(ReductionResult(
-                context_string=context_string,
-                input_count=len(cuis),
-                after_filter_count=len(after_hier),
-                after_hierarchy_count=len(after_hier),
-                after_redundancy_count=len(surviving),
-                topics=topics_out,
-                all_reduced_cuis=sorted_cuis,
-                retention=retention,
-                audit_trail=all_audit,
-                processing_time_ms=elapsed,
-                metadata_coverage=emb_cov,
-                embedding_coverage=emb_cov,
-                silhouette_score=avg_sil,
-                confidence_score=confidence,
-                semantic_loss=sem_loss))
+            except Exception as e:
+                log(f"    FAILED [{label}]: {e}", "ERROR")
+                results.append(self._empty(context_string, t_start, all_audit))
 
+        self.emb_fetcher.shutdown()
         total = (time.perf_counter() - t0) * 1000
         log(f"\n[Batch] ALL DONE: {len(inputs)} texts in {total:.0f}ms")
 
@@ -1571,15 +1654,15 @@ class CUIExtractor:
 HIERARCHY_PATH = "umls_hierarchy.pkl"
 IC_PATH = "ic_precomputed.pkl"
 
-print("Loading hierarchy...")
+log("Loading hierarchy...")
 with open(HIERARCHY_PATH, "rb") as f:
     hierarchy = pickle.load(f)
-print(f"Hierarchy: {hierarchy.number_of_nodes()} nodes, {hierarchy.number_of_edges()} edges")
+log(f"Hierarchy: {hierarchy.number_of_nodes()} nodes, {hierarchy.number_of_edges()} edges")
 
-print("Loading IC scores...")
+log("Loading IC scores...")
 with open(IC_PATH, "rb") as f:
     ic_precomputed = pickle.load(f)
-print(f"IC scores: {len(ic_precomputed)} entries")
+log(f"IC scores: {len(ic_precomputed)} entries")
 
 
 # %% [19] Init System
