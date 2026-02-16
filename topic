@@ -1,4 +1,5 @@
 import re
+import os
 import time
 import logging
 import threading
@@ -204,12 +205,46 @@ def qualifier_conflict(tokens_a, tokens_b):
     return False
 
 
-#  5- LRU Cache
+#  5- LRU Cache with optional disk persistence
 class Cache:
-    def __init__(self, max_size):
+    def __init__(self, max_size, persist_path=None):
         self._max = max_size
         self._d = OrderedDict()
         self._lock = threading.Lock()
+        self._persist_path = persist_path
+        self._dirty = False
+        if persist_path:
+            self._load()
+
+    def _load(self):
+        """Load cache from disk if file exists."""
+        import pickle
+        try:
+            if self._persist_path and os.path.exists(self._persist_path):
+                with open(self._persist_path, "rb") as f:
+                    data = pickle.load(f)
+                if isinstance(data, dict):
+                    # load up to max_size most recent entries
+                    items = list(data.items())[-self._max:]
+                    self._d = OrderedDict(items)
+                    log(f"    Cache loaded: {len(self._d)} entries from {self._persist_path}")
+        except Exception as e:
+            log(f"    Cache load failed ({self._persist_path}): {e}", level="WARNING")
+
+    def flush(self):
+        """Persist cache to disk."""
+        import pickle
+        if not self._persist_path or not self._dirty:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
+            with self._lock:
+                with open(self._persist_path, "wb") as f:
+                    pickle.dump(dict(self._d), f, protocol=pickle.HIGHEST_PROTOCOL)
+                self._dirty = False
+                log(f"    Cache saved: {len(self._d)} entries to {self._persist_path}")
+        except Exception as e:
+            log(f"    Cache save failed ({self._persist_path}): {e}", level="WARNING")
 
     def get(self, key):
         with self._lock:
@@ -223,19 +258,24 @@ class Cache:
             if key in self._d:
                 self._d.move_to_end(key)
             self._d[key] = val
+            self._dirty = True
             while len(self._d) > self._max:
                 self._d.popitem(last=False)
+
+    def __len__(self):
+        return len(self._d)
 
 
 #  6-BigQuery
 _BQ_BATCH = 5000
 
 class MetadataFetcher:
-    def __init__(self, bq, pid, did):
+    def __init__(self, bq, pid, did, cache_dir=None):
         self.bq = bq
         self.pid = pid
         self.did = did
-        self._cache = Cache(50_000)
+        path = os.path.join(cache_dir, "metadata_cache.pkl") if cache_dir else None
+        self._cache = Cache(50_000, persist_path=path)
 
     @timed("metadata_fetch")
     def fetch(self, cuis):
@@ -474,12 +514,13 @@ class HierarchyReducer:
 
 #  10- Embedding Fetch
 class EmbeddingFetcher:
-    def __init__(self, bq, pid, did, embedding_table):
+    def __init__(self, bq, pid, did, embedding_table, cache_dir=None):
         self.bq = bq
         self.pid = pid
         self.did = did
         self.table = embedding_table
-        self._cache = Cache(50_000)
+        path = os.path.join(cache_dir, "embedding_cache.pkl") if cache_dir else None
+        self._cache = Cache(50_000, persist_path=path)
         self._pool = ThreadPoolExecutor(max_workers=4)
 
     def _fetch_batch(self, batch):
@@ -1020,14 +1061,17 @@ class ConfidenceScorer:
 class CUIReductionSystem:
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
-                 excluded_semantic_types=None, ic_scores=None):
+                 excluded_semantic_types=None, ic_scores=None,
+                 cache_dir=None):
         self.bq = bigquery.Client(project=project_id)
-        self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
+        self.cache_dir = cache_dir
+        self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id, cache_dir=cache_dir)
         self.ic_computer = ICComputer(full_network, ic_scores)
         self.sab_filter = SABFilter(allowed_sabs)
         self.semtype_filter = SemanticTypeFilter(excluded_semantic_types or set())
         self.hierarchy_reducer = HierarchyReducer(full_network)
-        self.emb_fetcher = EmbeddingFetcher(self.bq, project_id, dataset_id, embedding_table)
+        self.emb_fetcher = EmbeddingFetcher(
+            self.bq, project_id, dataset_id, embedding_table, cache_dir=cache_dir)
 
     @timed("full_pipeline")
     def reduce(self, cuis, context_string):
@@ -1202,7 +1246,13 @@ class CUIReductionSystem:
                 processing_time_ms=elapsed,
                 embedding_coverage=emb_cov))
         total = (time.perf_counter() - t0) * 1000
+        self._flush_caches()
         return results
+
+    def _flush_caches(self):
+        """Persist all caches to disk."""
+        self.fetcher._cache.flush()
+        self.emb_fetcher._cache.flush()
 
     def _empty(self, ctx, t0, audit=None):
         return ReductionResult(
@@ -1222,10 +1272,12 @@ class CUIReductionSystem:
 
 #  16- CUI Extraction(API)
 class CUIExtractor:
-    def __init__(self, api_url, min_confidence=0.0, top_k=3):
+    def __init__(self, api_url, min_confidence=0.0, top_k=3, cache_dir=None):
         self.url = api_url
         self.min_confidence = min_confidence
         self.top_k = top_k
+        path = os.path.join(cache_dir, "extraction_cache.pkl") if cache_dir else None
+        self._cache = Cache(10_000, persist_path=path)
         self.session = requests.Session()
         try:
             token = subprocess.run(
@@ -1242,6 +1294,13 @@ class CUIExtractor:
 
     @timed("cui_extraction")
     def extract(self, text):
+        # cache key: text + top_k (different top_k = different results)
+        cache_key = f"{text}||{self.top_k}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            log(f"    Extraction: {len(cached)} unique CUIs (cached)")
+            return cached
+
         resp = self.session.post(
             self.url, headers=self.headers,
             json={"query_texts": [text], "top_k": self.top_k}, timeout=200)
@@ -1274,6 +1333,7 @@ class CUIExtractor:
                 f"mean={np.mean(score_vals):.3f}")
         else:
             log(f"    Extraction: {len(unique)} unique CUIs (no scores)")
+        self._cache.put(cache_key, unique)
         return unique
 
 
@@ -1283,11 +1343,12 @@ DATASET_ID = dataset
 API_URL = url
 EMBEDDING_TABLE = embedding_table
 ALLOWED_SABS = ["ICD10CM", "ICD10PCS", "ICD9CM", "SNOMEDCT_US", "LNC"]
+CACHE_DIR = ".cui_cache"
 
 system = CUIReductionSystem(
     PROJECT_ID, DATASET_ID, hierarchy, ALLOWED_SABS, EMBEDDING_TABLE,
-    ic_scores=ic_precomputed)
-extractor = CUIExtractor(API_URL)
+    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
+extractor = CUIExtractor(API_URL, cache_dir=CACHE_DIR)
 
 
 #  18- Pipeline
@@ -1306,6 +1367,7 @@ with ThreadPoolExecutor(max_workers=min(len(texts), 8)) as pool:
     inputs = [r for r in raw if r is not None]
 
 results = system.reduce_batch(inputs)
+extractor._cache.flush()
 
 for result in results:
     log(f"\n{'=' * 60}")
