@@ -887,38 +887,41 @@ class GraphComponentBuilder:
                 if a not in hub_ancestors and a not in cui_set:
                     ancestor_to_cuis[a].add(c)
 
-        # Step 4: build adjacency from shared non-hub ancestors
-        # Skip ancestors shared by too many CUIs — they're still generic bridges
+        # Step 4: Union-Find — O(N) per shared ancestor instead of O(N²)
         max_share = max(2, int(np.sqrt(len(cuis))))
-        adj = defaultdict(set)
+        parent_map = {c: c for c in cuis}
+        rank = {c: 0 for c in cuis}
+
+        def find(x):
+            while parent_map[x] != x:
+                parent_map[x] = parent_map[parent_map[x]]  # path compression
+                x = parent_map[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx == ry:
+                return
+            if rank[rx] < rank[ry]:
+                rx, ry = ry, rx
+            parent_map[ry] = rx
+            if rank[rx] == rank[ry]:
+                rank[rx] += 1
+
         for a, shared_cuis in ancestor_to_cuis.items():
             if len(shared_cuis) < 2 or len(shared_cuis) > max_share:
                 continue
-            cui_list = list(shared_cuis)
-            for i in range(len(cui_list)):
-                for j in range(i + 1, len(cui_list)):
-                    adj[cui_list[i]].add(cui_list[j])
-                    adj[cui_list[j]].add(cui_list[i])
+            # union all CUIs sharing this ancestor — O(K) not O(K²)
+            anchor = next(iter(shared_cuis))
+            for c in shared_cuis:
+                if c != anchor:
+                    union(anchor, c)
 
-        # Step 5: connected components via BFS
-        visited = set()
-        components = {}
-        label = 0
+        # Step 5: collect components from Union-Find
+        comp_map = defaultdict(list)
         for c in cuis:
-            if c in visited:
-                continue
-            component = []
-            queue = deque([c])
-            visited.add(c)
-            while queue:
-                node = queue.popleft()
-                component.append(node)
-                for nb in adj.get(node, set()):
-                    if nb not in visited:
-                        visited.add(nb)
-                        queue.append(nb)
-            components[label] = component
-            label += 1
+            comp_map[find(c)].append(c)
+        components = {i: members for i, members in enumerate(comp_map.values())}
 
         # log distribution
         sizes = sorted([len(v) for v in components.values()], reverse=True)
