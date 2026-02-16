@@ -639,15 +639,22 @@ class TopicBuilder:
             communities = louvain_communities(G, seed=42, weight='weight')
         else:
             communities = [{i} for i in range(n)]
-        large, singletons = [], []
-        for comm in communities:
-            if len(comm) > 1:
-                large.append(set(comm))
+        # separate large vs small communities via Otsu on sizes
+        comm_list = [set(c) for c in communities]
+        sizes = np.array([len(c) for c in comm_list])
+        if len(sizes) >= 2 and float(np.std(sizes)) > 0:
+            min_size = max(2, int(_otsu(sizes.astype(float))))
+        else:
+            min_size = 2
+        large, small_idxs = [], []
+        for comm in comm_list:
+            if len(comm) >= min_size:
+                large.append(comm)
             else:
-                singletons.append(list(comm)[0])
-        if singletons and large:
+                small_idxs.extend(comm)
+        if small_idxs and large:
             centroids = np.array([np.mean(matrix[list(c)], axis=0) for c in large], dtype=np.float32)
-            for s_idx in singletons:
+            for s_idx in small_idxs:
                 best = int(np.argmax(matrix[s_idx] @ centroids.T))
                 large[best].add(s_idx)
         elif not large:
@@ -1131,11 +1138,11 @@ class ConfidenceScorer:
     """Scores each surviving CUI by 6 structural signals.
 
     confidence = 0.25 * normalized_IC
-               + 0.20 * embedding_centrality
+               + 0.20 * centrality (per-topic normalized)
                + 0.20 * relevance (max cosine to anchor)
                + 0.15 * retention_power
-               + 0.10 * silhouette
-               + 0.10 * vocab_breadth
+               + 0.10 * silhouette ([-1,1] mapped to [0,1])
+               + 0.10 * vocab_breadth (log-scaled)
     """
 
     @staticmethod
@@ -1161,6 +1168,24 @@ class ConfidenceScorer:
 
         max_retained = max((len(v) for v in explains.values()), default=0)
 
+        # item 6: per-topic centrality min/max for normalization
+        raw_centralities = defaultdict(list)
+        for cui in surviving:
+            topic_id = topic_map.get(cui)
+            centroid = topic_centroids.get(topic_id)
+            if centroid is not None and cui in embeddings:
+                raw_centralities[topic_id].append(
+                    max(float(np.dot(embeddings[cui], centroid)), 0.0))
+        topic_cent_range = {}
+        for tid, vals in raw_centralities.items():
+            lo, hi = min(vals), max(vals)
+            topic_cent_range[tid] = (lo, hi - lo if hi > lo else 1.0)
+
+        # item 7: max vocab count for log normalization
+        all_vocab_counts = [len(metadata.get(c).source_vocabs)
+                           if metadata.get(c) else 0 for c in surviving]
+        max_vocab = max(all_vocab_counts) if all_vocab_counts else 1
+
         entries = []
         retention_map = {}
         for cui in surviving:
@@ -1171,10 +1196,13 @@ class ConfidenceScorer:
 
             norm_ic = (ic - ic_min) / ic_range
 
+            # item 6: per-topic normalized centrality
             topic_id = topic_map.get(cui)
             centroid = topic_centroids.get(topic_id)
             if centroid is not None and cui in embeddings:
-                centrality = max(float(np.dot(embeddings[cui], centroid)), 0.0)
+                raw_cent = max(float(np.dot(embeddings[cui], centroid)), 0.0)
+                lo, rng = topic_cent_range.get(topic_id, (0.0, 1.0))
+                centrality = (raw_cent - lo) / rng
             else:
                 centrality = 0.0
 
@@ -1186,10 +1214,13 @@ class ConfidenceScorer:
             else:
                 retention_power = 0.0
 
-            sil_norm = max(per_cui_sil.get(cui, 0.0), 0.0)
+            # item 12: penalize negative silhouette (map [-1,1] → [0,1])
+            sil_raw = per_cui_sil.get(cui, 0.0)
+            sil_norm = (sil_raw + 1.0) / 2.0
 
+            # item 7: log-transform vocab breadth
             n_vocabs = len(m.source_vocabs) if m else 0
-            vocab_breadth = n_vocabs / allowed_sab_count
+            vocab_breadth = np.log1p(n_vocabs) / np.log1p(max_vocab) if max_vocab > 0 else 0.0
 
             confidence = (0.25 * norm_ic
                         + 0.20 * centrality
@@ -1385,6 +1416,26 @@ class CUIReductionSystem:
                 global_sil, per_topic_sil, per_cui_sil = compute_silhouette(
                     surviving, cui_topic, embeddings)
                 log(f"    Silhouette: global={global_sil:.3f}")
+
+                # item 3: flag topics by silhouette quality
+                sil_vals = [v for v in per_topic_sil.values() if v != 0.0]
+                if len(sil_vals) >= 2:
+                    sil_threshold = _otsu(np.array(sil_vals))
+                    n_weak = sum(1 for v in sil_vals if v < sil_threshold)
+                    n_strong = sum(1 for v in sil_vals if v >= sil_threshold)
+                    log(f"    Silhouette quality: {n_strong} strong topics "
+                        f"(>={sil_threshold:.2f}), {n_weak} weak topics")
+
+                # item 13: anchor coverage metric
+                if anchors:
+                    anchors_survived = sum(1 for a in anchors if a in set(surviving))
+                    anchor_pct = anchors_survived / len(anchors) * 100
+                    anchor_rels = [relevance_scores.get(a, 0) for a in anchors
+                                   if a in relevance_scores]
+                    mean_anchor_rel = float(np.mean(anchor_rels)) if anchor_rels else 0
+                    log(f"    Anchor coverage: {anchors_survived}/{len(anchors)} "
+                        f"({anchor_pct:.0f}%) survived, "
+                        f"mean relevance={mean_anchor_rel:.3f}")
 
                 for topic_id, topic in topics_out.items():
                     topic.silhouette = per_topic_sil.get(topic_id, 0.0)
