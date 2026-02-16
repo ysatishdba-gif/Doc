@@ -4,20 +4,18 @@ import logging
 import threading
 import unicodedata
 import subprocess
-import pickle
 from typing import List, Dict, Set, FrozenSet
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import networkx as nx
+import networkx
 import requests
 import scann
 from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-
 
 
 logger = logging.getLogger("cui_reduction")
@@ -1044,23 +1042,17 @@ class CUIReductionSystem:
             all_cuis.update(cuis)
         log(f"[Batch] {len(inputs)} texts, {len(all_cuis)} unique CUIs")
 
-        # --- CONCURRENT: metadata + embeddings fire together ---
-        # Embeddings fetched for ALL CUIs upfront (slightly more data, massively less wall time)
-        # By the time filters+hierarchy finish, embeddings are already cached
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            meta_future = pool.submit(self.fetcher.fetch, list(all_cuis))
-            emb_future = pool.submit(self.emb_fetcher.fetch, list(all_cuis))
-            metadata = meta_future.result()
-            log(f"[Batch] Metadata: {len(metadata)}/{len(all_cuis)} matched")
-            all_embeddings = emb_future.result()
-            log(f"[Batch] Embeddings: {len(all_embeddings)}/{len(all_cuis)} matched (prefetched)")
-        # --- END CONCURRENT ---
+        metadata = self.fetcher.fetch(list(all_cuis))
+        log(f"[Batch] Metadata: {len(metadata)}/{len(all_cuis)} matched")
 
         ic_map = self.ic_computer.compute(list(all_cuis), metadata)
         log(f"[Batch] IC Scores: {len(ic_map)} computed")
         ancestor_depth = _compute_ancestor_depth(self.hierarchy_reducer.graph)
         log(f"[Batch] Ancestor depth: {ancestor_depth} (mean_in_degree={np.mean([d for _, d in self.hierarchy_reducer.graph.in_degree()]):.2f})")
+
+        # first pass: run filters + hierarchy (no embeddings needed)
         per_text = []
+        all_post_hier = set()
         for cuis, context_string in inputs:
             if not cuis:
                 per_text.append((context_string, [], [], set(), []))
@@ -1076,11 +1068,18 @@ class CUIReductionSystem:
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_term, ic_map, metadata)
             log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
             audit = sab_audit + sty_audit + term_audit + hier_audit
+            all_post_hier.update(after_hier)
             per_text.append((context_string, cuis, after_hier, hier_edges, audit))
+
+        # fetch embeddings only for post-hierarchy survivors
+        log(f"\n[Batch] Fetching embeddings for {len(all_post_hier)} post-hierarchy CUIs "
+            f"(skipped {len(all_cuis) - len(all_post_hier)})")
+        all_embeddings = self.emb_fetcher.fetch(list(all_post_hier))
+
+        # second pass: embedding-based stages
         results = []
         for context_string, cuis, after_hier, hier_edges, all_audit in per_text:
             t_start = time.perf_counter()
-            label = context_string[:50]
             if not after_hier:
                 results.append(self._empty(context_string, t_start, all_audit))
                 continue
@@ -1278,16 +1277,7 @@ class CUIExtractor:
         return unique
 
 
-#  17- Load Pickles
-# HIERARCHY_PATH = "umls_hierarchy.pkl"
-# IC_PATH = "ic_precomputed.pkl"
-# with open(HIERARCHY_PATH, "rb") as f:
-#     hierarchy = pickle.load(f)
-# with open(IC_PATH, "rb") as f:
-#     ic_precomputed = pickle.load(f)
-
-
-#  18- Init
+#  17- Init
 PROJECT_ID = project_id
 DATASET_ID = dataset
 API_URL = url
@@ -1300,7 +1290,7 @@ system = CUIReductionSystem(
 extractor = CUIExtractor(API_URL)
 
 
-#  19- Pipeline
+#  18- Pipeline
 texts = ["Patient has severe pain in left knee with swelling"]
 
 def _extract(text):
