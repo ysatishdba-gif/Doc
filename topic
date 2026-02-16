@@ -692,45 +692,7 @@ class TopicBuilder:
 
 
 
-#  12- Hub Filter & Graph Component Builder
-class HubFilter:
-    """Removes hub CUIs that create artificial cross-topic bridges.
-
-    Hubs are CUIs with very high out-degree in the full UMLS graph —
-    generic concepts like 'Disease', 'Disorder', 'Clinical finding'.
-    These create false connectivity when building semantic components.
-    """
-
-    @staticmethod
-    @timed("hub_filter")
-    def run(cuis, graph):
-        if graph is None:
-            return cuis, []
-        degrees = {}
-        for c in cuis:
-            if graph.has_node(c):
-                degrees[c] = graph.out_degree(c)
-            else:
-                degrees[c] = 0
-        if not degrees:
-            return cuis, []
-        vals = np.array(list(degrees.values()), dtype=np.float32)
-        # only filter if there are actual hubs (non-zero variance)
-        if np.max(vals) == np.min(vals):
-            return cuis, []
-        threshold = _otsu_threshold(vals)
-        # hubs are ABOVE threshold (high degree = generic)
-        kept, audit = [], []
-        for c in cuis:
-            if degrees.get(c, 0) <= threshold:
-                kept.append(c)
-            else:
-                audit.append(AuditEntry(
-                    c, "", "", "", "hub_removal",
-                    f"out_degree={degrees[c]} > threshold={threshold:.0f}"))
-        log(f"    Hub Filter: {len(cuis)} -> {len(kept)} "
-            f"(removed {len(cuis)-len(kept)}, degree_threshold={threshold:.0f})")
-        return kept, audit
+#  12- Graph Component Builder
 
 
 class GraphComponentBuilder:
@@ -845,10 +807,9 @@ class EmbeddingReducer:
     @staticmethod
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges, graph=None, ancestor_depth=3):
-        # Shallow depth for component separation (tight islands),
-        # full ancestor_depth for overlap guard in _resolve_group
-        component_depth = min(2, ancestor_depth)
-        components = GraphComponentBuilder.build(cuis, graph, component_depth)
+        # Same ancestor_depth for components and overlap guard (consistent criteria)
+        # Hub exclusion (degree + frequency) prevents over-merging at deeper depths
+        components = GraphComponentBuilder.build(cuis, graph, ancestor_depth)
 
         all_topics = {}
         globally_surviving = set()
@@ -930,11 +891,10 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges, graph=N
     upper = dist[np.triu_indices(n, k=1)]
     if len(upper) == 0 or np.std(upper) < 1e-9:
         return t_cuis, []
+    # Otsu finds natural split between "same cluster" and "different cluster"
+    tight_t = _otsu_threshold(upper)
+    # guardrail: never exceed median (prevents over-aggressive merging)
     guardrail = float(np.median(upper))
-    tight_t = float(np.mean(upper) - np.std(upper))
-    nonzero = upper[upper > 0]
-    floor = float(np.min(nonzero)) if len(nonzero) > 0 else float(np.finfo(np.float32).eps)
-    tight_t = max(tight_t, floor)
     tight_t = min(tight_t, guardrail)
 
     # --- FIX A: compute topic centroid, pass to _resolve_group ---
@@ -1023,6 +983,19 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
 
 #  14- Cross-Topic Dedup
 class CrossTopicDedup:
+    """Connected-component duplicate collapse (not greedy).
+
+    1. ScaNN k-NN finds close pairs
+    2. Guard checks (qualifier, terms, ancestor overlap) filter edges
+    3. Valid edges form connected components via Union-Find
+    4. Per component: keep CUI with highest centrality to global centroid
+    5. Remove all others
+
+    This is mathematically complete: if A≈B and B≈C, all three are in
+    the same component and one representative is picked — regardless of
+    iteration order.
+    """
+
     @staticmethod
     @timed("cross_topic_dedup")
     def run(surviving, embeddings, metadata, graph=None, ancestor_depth=3):
@@ -1032,13 +1005,13 @@ class CrossTopicDedup:
         n = len(with_emb)
         matrix = np.array([embeddings[c] for c in with_emb], dtype=np.float32)
 
-        # global centroid for tiebreaking
+        # global centroid for representative selection
         global_cent = np.mean(matrix, axis=0).astype(np.float32)
         g_norm = np.linalg.norm(global_cent)
         if g_norm > 0:
             global_cent = global_cent / g_norm
 
-        # use ScaNN to find k nearest neighbors instead of full N×N matrix
+        # ScaNN k-NN
         k = min(10, n - 1)
         num_leaves = min(max(2, int(np.sqrt(n))), n)
         dim = matrix.shape[1]
@@ -1057,7 +1030,7 @@ class CrossTopicDedup:
         searcher = builder.build()
         neighbors, scores = searcher.search_batched(matrix)
 
-        # compute threshold from k-NN distances
+        # threshold from k-NN distances
         nn_dists = []
         for i in range(n):
             for j_pos in range(len(neighbors[i])):
@@ -1071,16 +1044,12 @@ class CrossTopicDedup:
         threshold = _otsu_threshold(nn_dists)
         threshold = min(threshold, float(np.percentile(nn_dists, 5)))
 
-        removed = set()
-        audit = []
+        # Step 1: collect valid edges (pass all guards)
+        edges = []  # list of (i, j, dist)
         for i in range(n):
-            if with_emb[i] in removed:
-                continue
             for j_pos in range(len(neighbors[i])):
                 j = int(neighbors[i][j_pos])
-                if j < 0 or j >= n or j == i:
-                    continue
-                if with_emb[j] in removed:
+                if j < 0 or j >= n or j <= i:
                     continue
                 dist_ij = 1.0 - float(scores[i][j_pos])
                 if dist_ij > threshold:
@@ -1094,29 +1063,69 @@ class CrossTopicDedup:
                     continue
                 if terms_diverge(ci_tok, cj_tok):
                     continue
-                # ancestor overlap guard
                 if graph is not None:
                     ci_anc = _get_ancestors(graph, ci, ancestor_depth)
                     cj_anc = _get_ancestors(graph, cj, ancestor_depth)
                     if ci_anc and cj_anc and len(ci_anc & cj_anc) == 0:
                         continue
-                # tiebreak by centrality to global centroid
-                ci_cent = float(np.dot(embeddings[ci], global_cent))
-                cj_cent = float(np.dot(embeddings[cj], global_cent))
-                if ci_cent >= cj_cent:
-                    keep, drop = ci, cj
-                else:
-                    keep, drop = cj, ci
-                removed.add(drop)
-                km = metadata.get(keep)
-                dm = metadata.get(drop)
+                edges.append((i, j, dist_ij))
+
+        if not edges:
+            return surviving, []
+
+        # Step 2: Union-Find to build connected components
+        parent_uf = list(range(n))
+        rank_uf = [0] * n
+
+        def find(x):
+            while parent_uf[x] != x:
+                parent_uf[x] = parent_uf[parent_uf[x]]
+                x = parent_uf[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx == ry:
+                return
+            if rank_uf[rx] < rank_uf[ry]:
+                rx, ry = ry, rx
+            parent_uf[ry] = rx
+            if rank_uf[rx] == rank_uf[ry]:
+                rank_uf[rx] += 1
+
+        for i, j, _ in edges:
+            union(i, j)
+
+        # Step 3: collect components
+        comp_members = defaultdict(list)
+        for i in range(n):
+            comp_members[find(i)].append(i)
+
+        # Step 4: per component, keep best representative (highest centrality)
+        centralities = matrix @ global_cent  # precompute all at once
+        removed = set()
+        audit = []
+        for root, members in comp_members.items():
+            if len(members) <= 1:
+                continue
+            # pick representative with highest centrality
+            best_idx = max(members, key=lambda i: float(centralities[i]))
+            best_cui = with_emb[best_idx]
+            bm = metadata.get(best_cui)
+            for idx in members:
+                if idx == best_idx:
+                    continue
+                drop_cui = with_emb[idx]
+                removed.add(drop_cui)
+                dm = metadata.get(drop_cui)
                 audit.append(AuditEntry(
-                    removed_cui=drop,
+                    removed_cui=drop_cui,
                     removed_term=dm.preferred_term if dm else "",
-                    kept_cui=keep,
-                    kept_term=km.preferred_term if km else "",
+                    kept_cui=best_cui,
+                    kept_term=bm.preferred_term if bm else "",
                     reason="cross_topic_dedup",
-                    detail=f"dist {dist_ij:.4f} < threshold {threshold:.4f}"))
+                    detail=f"component size={len(members)}"))
+
         final = [c for c in surviving if c not in removed]
         return final, audit
 
@@ -1232,10 +1241,9 @@ class CUIReductionSystem:
             log(f"    Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_term, ic_map, metadata)
             log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
-            after_hub, hub_audit = HubFilter.run(after_hier, self.hierarchy_reducer.graph)
-            audit = sab_audit + sty_audit + term_audit + hier_audit + hub_audit
-            all_filtered.update(after_hub)
-            per_text.append((context_string, cuis, after_hub, hier_edges, audit))
+            audit = sab_audit + sty_audit + term_audit + hier_audit
+            all_filtered.update(after_hier)
+            per_text.append((context_string, cuis, after_hier, hier_edges, audit))
 
         # fetch embeddings only for post-filter survivors
         log(f"\n[Batch] Fetching embeddings for {len(all_filtered)} post-filter CUIs "
@@ -1280,14 +1288,17 @@ class CUIReductionSystem:
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
-            # compute topic centroids for confidence scorer
+            # compute topic centroids AFTER cross-topic dedup (using only surviving CUIs)
+            surviving_set = set(surviving)
             cui_topic = {}
             for topic_id, topic in topics_out.items():
                 for c in topic.cuis:
-                    cui_topic[c] = topic_id
+                    if c in surviving_set:
+                        cui_topic[c] = topic_id
             topic_centroids = {}
             for topic_id, topic in topics_out.items():
-                vecs = [embeddings[c] for c in topic.cuis if c in embeddings]
+                vecs = [embeddings[c] for c in topic.cuis
+                        if c in embeddings and c in surviving_set]
                 if vecs:
                     cent = np.mean(vecs, axis=0).astype(np.float32)
                     norm = np.linalg.norm(cent)
