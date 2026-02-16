@@ -1,12 +1,4 @@
-"""
-Reduces extracted CUIs through filtering, hierarchy pruning,
-embedding-based redundancy removal, and structural confidence scoring.
-Groups results into topics.
 
-No Gemini API dependency. Scoring is IC + retention + type uniqueness.
-"""
-
-#  [1] Imports
 import re
 import time
 import logging
@@ -26,10 +18,9 @@ import scann
 from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
-from networkx.algorithms.community import louvain_communities
 
 
-#  [2] Logging and Timing
+
 logger = logging.getLogger("cui_reduction")
 logger.setLevel(logging.DEBUG)
 if not logger.handlers:
@@ -61,7 +52,7 @@ def timed(name):
     return dec
 
 
-#  [3] Data Models
+# 3- Data Models
 @dataclass
 class CUIMetadata:
     cui: str
@@ -117,7 +108,7 @@ class ReductionResult:
     embedding_coverage: float
 
 
-#  [4] Text Utilities
+#  4- Text Utilities
 def normalize_term(term):
     t = unicodedata.normalize("NFKD", term).lower()
     t = re.sub(r"[^a-z0-9\s]", "", t)
@@ -152,7 +143,7 @@ def qualifier_conflict(tokens_a, tokens_b):
     return False
 
 
-#  [5] LRU Cache
+#  5- LRU Cache
 class Cache:
     def __init__(self, max_size):
         self._max = max_size
@@ -175,7 +166,7 @@ class Cache:
                 self._d.popitem(last=False)
 
 
-#  [6] Metadata from BigQuery
+#  6-BigQuery
 _BQ_BATCH = 5000
 
 class MetadataFetcher:
@@ -266,7 +257,7 @@ class MetadataFetcher:
         return result
 
 
-#  [7] IC Scores
+#  7- IC Scores
 class ICComputer:
     def __init__(self, graph, precomputed=None):
         self.graph = graph
@@ -308,7 +299,7 @@ class ICComputer:
         return len(visited)
 
 
-#  [8] Filters
+#  8- Filters
 class SABFilter:
     def __init__(self, allowed):
         self.allowed = set(allowed)
@@ -375,7 +366,7 @@ class TermDeduplicator:
         return kept, audit
 
 
-#  [9] Hierarchy Reduction
+#  9- Hierarchy Reduction
 class HierarchyReducer:
     def __init__(self, graph):
         self.graph = graph
@@ -420,7 +411,7 @@ class HierarchyReducer:
         return surviving, audit, edges
 
 
-#  [10] Embedding Fetch
+#  10- Embedding Fetch
 class EmbeddingFetcher:
     def __init__(self, bq, pid, did, embedding_table):
         self.bq = bq
@@ -473,7 +464,7 @@ class EmbeddingFetcher:
         return result
 
 
-#  [11] ScaNN Topic Builder (Louvain communities)
+#  11- ScaNN Topic Builder
 class TopicBuilder:
     @staticmethod
     @timed("scann_topics")
@@ -513,48 +504,37 @@ class TopicBuilder:
             all_sims = matrix @ matrix.T
             np.fill_diagonal(all_sims, -np.inf)
             threshold = float(1.0 - np.mean(all_sims[all_sims > -np.inf]))
-        # --- CHANGED: build weighted graph + Louvain (was BFS connected components) ---
-        G = nx.Graph()
-        G.add_nodes_from(range(n))
+        adj = defaultdict(set)
         for i in range(n):
             for j_pos in range(len(neighbors[i])):
                 j = int(neighbors[i][j_pos])
                 if j < 0 or j >= n or j == i:
                     continue
-                sim = float(scores[i][j_pos])
-                if sim > -1e30 and (1.0 - sim) < threshold:
-                    w = max(sim, 0.01)
-                    if G.has_edge(i, j):
-                        G[i][j]['weight'] = max(G[i][j]['weight'], w)
-                    else:
-                        G.add_edge(i, j, weight=w)
-        if G.number_of_edges() > 0:
-            communities = louvain_communities(G, seed=42, weight='weight')
-        else:
-            communities = [{i} for i in range(n)]
-        large, singletons = [], []
-        for comm in communities:
-            if len(comm) > 1:
-                large.append(set(comm))
-            else:
-                singletons.extend(comm)
-        if singletons and large:
-            centroids = np.array(
-                [np.mean(matrix[list(c)], axis=0) for c in large],
-                dtype=np.float32)
-            for s_idx in singletons:
-                best = int(np.argmax(matrix[s_idx] @ centroids.T))
-                large[best].add(s_idx)
-        elif not large:
-            large = [set(range(n))]
+                if (1.0 - float(scores[i][j_pos])) < threshold:
+                    adj[i].add(j)
+                    adj[j].add(i)
+        visited = set()
         groups = {}
-        for label, comm in enumerate(large):
-            groups[label] = [cuis[i] for i in sorted(comm)]
+        label = 0
+        for i in range(n):
+            if i in visited:
+                continue
+            component = []
+            q = deque([i])
+            visited.add(i)
+            while q:
+                node = q.popleft()
+                component.append(cuis[node])
+                for nb in adj.get(node, set()):
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            groups[label] = component
+            label += 1
         return groups
-        # --- END CHANGE ---
 
 
-#  [12] Embedding Reduction
+#  12- Embedding Reduction
 class EmbeddingReducer:
     @staticmethod
     @timed("embedding_reduce")
@@ -701,7 +681,7 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, t
     return kept, audit
 
 
-#  [13] Cross-Topic Dedup
+#  13- Cross-Topic Dedup
 class CrossTopicDedup:
     @staticmethod
     @timed("cross_topic_dedup")
@@ -760,7 +740,7 @@ class CrossTopicDedup:
         return final, audit
 
 
-#  [14] Confidence Scorer (structural)
+#  14- Confidence Scorer
 class ConfidenceScorer:
     @staticmethod
     @timed("confidence_score")
@@ -797,7 +777,7 @@ class ConfidenceScorer:
                 type_uniq = 1.0 - min(type_counts[t] / total_types for t in m.semantic_types)
             else:
                 type_uniq = 0.0
-            confidence = 0.50 * norm_ic + 0.30 * retention_power + 0.20 * type_uniq
+            confidence = 0.80 * norm_ic + 0.20 * retention_power + 0.00 * type_uniq
             entries.append(ConfidenceEntry(
                 cui=cui, term=m.preferred_term if m else cui,
                 confidence=round(confidence, 4),
@@ -808,7 +788,7 @@ class ConfidenceScorer:
         return sorted_cuis, entries, retention_map
 
 
-#  [15] Pipeline
+#  15- Pipeline
 class CUIReductionSystem:
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
@@ -871,7 +851,7 @@ class CUIReductionSystem:
             topics, surviving, emb_audit = EmbeddingReducer.run(
                 after_hier, metadata, embeddings, ic_map, hier_edges)
             all_audit.extend(emb_audit)
-            log(f"\n  [{label}]")
+            # log(f"\n  [{label}]")
             log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
             topics_out = {}
             for topic_id, t_cuis in topics.items():
@@ -895,9 +875,9 @@ class CUIReductionSystem:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
             sorted_cuis, confidence, retention_map = ConfidenceScorer.score(
                 surviving, metadata, ic_map, all_audit)
-            if confidence:
-                log(f"    Confidence: scored {len(confidence)} "
-                    f"(top={confidence[0].confidence:.3f}, bottom={confidence[-1].confidence:.3f})")
+            # if confidence:
+            #     log(f"    Confidence: scored {len(confidence)} "
+            #         f"(top={confidence[0].confidence:.3f}, bottom={confidence[-1].confidence:.3f})")
             final_set = set(sorted_cuis)
             before_prune = len(topics_out)
             pruned_topics = {}
@@ -921,7 +901,7 @@ class CUIReductionSystem:
                         cui, m.preferred_term if m else "", "", "", "unaccounted",
                         "CUI not in surviving or audit trail"))
             elapsed = (time.perf_counter() - t_start) * 1000
-            log(f"    DONE: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
+            log(f"    Final: {len(cuis)} -> {len(surviving)} CUIs, {len(topics_out)} topics ({elapsed:.0f}ms)")
             results.append(ReductionResult(
                 context_string=context_string,
                 input_count=len(cuis),
@@ -936,7 +916,7 @@ class CUIReductionSystem:
                 processing_time_ms=elapsed,
                 embedding_coverage=emb_cov))
         total = (time.perf_counter() - t0) * 1000
-        log(f"\n[Batch] ALL DONE: {len(inputs)} texts in {total:.0f}ms")
+        # log(f"\n[Batch] ALL DONE: {len(inputs)} texts in {total:.0f}ms")
         return results
 
     def _empty(self, ctx, t0, audit=None):
@@ -955,7 +935,7 @@ class CUIReductionSystem:
             return out
 
 
-#  [16] CUI Extraction API
+#  16- CUI Extraction(API)
 class CUIExtractor:
     def __init__(self, api_url, min_confidence=0.0, top_k=3):
         self.url = api_url
@@ -1000,7 +980,7 @@ class CUIExtractor:
         return list(set(cuis))
 
 
-#  [17] Load Pickles -- RUN ONCE
+#  17- Load Pickles
 # HIERARCHY_PATH = "umls_hierarchy.pkl"
 # IC_PATH = "ic_precomputed.pkl"
 # with open(HIERARCHY_PATH, "rb") as f:
@@ -1009,7 +989,7 @@ class CUIExtractor:
 #     ic_precomputed = pickle.load(f)
 
 
-#  [18] Init System
+#  18- Init
 PROJECT_ID = project_id
 DATASET_ID = dataset
 API_URL = url
@@ -1022,7 +1002,7 @@ system = CUIReductionSystem(
 extractor = CUIExtractor(API_URL)
 
 
-#  [19] Run Pipeline
+#  19- Pipeline
 texts = ["Patient has severe pain in left knee with swelling"]
 
 def _extract(text):
@@ -1037,13 +1017,12 @@ results = system.reduce_batch(inputs)
 
 for result in results:
     log(f"\n{'=' * 60}")
-    log(f"TEXT: {result.context_string}")
     log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
         f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
     log(f"\n-- Top 20 CUIs by confidence (of {len(result.confidence)}) --")
     for entry in result.confidence[:20]:
-        stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
-        line = f"  {entry.cui} | conf={entry.confidence} | [{stys}] {entry.term}"
+        # stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
+        line = f"  {entry.cui} | conf={entry.confidence} | {entry.term}"
         if entry.explains_cuis:
             line += f" | explains {len(entry.explains_cuis)}"
         log(line)
