@@ -691,7 +691,7 @@ class TopicBuilder:
         return groups
 
 
-#  12a- Relevance Filter (density-based core detection)
+#  12- Relevance Filter (density-based core detection)
 class RelevanceFilter:
     """Finds query-relevant CUIs via extraction density, no terms needed.
 
@@ -699,7 +699,7 @@ class RelevanceFilter:
     plus scattered CUIs from related but irrelevant body sites (sparse periphery).
     This filter recovers that signal structurally:
 
-    1. k-NN density: mean cosine to 10 nearest neighbors per CUI
+    1. k-NN density: mean cosine to sqrt(N) nearest neighbors per CUI
     2. Otsu on density -> core (dense) vs periphery (sparse)
     3. Anchor centroid = normalized mean of core embeddings
     4. Relevance = cosine(each CUI, anchor centroid)
@@ -788,39 +788,176 @@ class RelevanceFilter:
         return kept, audit
 
 
-#  12b- Embedding Reduction
+#  13- Hub Filter & Graph Component Builder
+class HubFilter:
+    """Removes hub CUIs that create artificial cross-topic bridges.
+
+    Hubs are CUIs with very high out-degree in the full UMLS graph —
+    generic concepts like 'Disease', 'Disorder', 'Clinical finding'.
+    These create false connectivity when building semantic components.
+    """
+
+    @staticmethod
+    @timed("hub_filter")
+    def run(cuis, graph):
+        if graph is None:
+            return cuis, []
+        degrees = {}
+        for c in cuis:
+            if graph.has_node(c):
+                degrees[c] = graph.out_degree(c)
+            else:
+                degrees[c] = 0
+        if not degrees:
+            return cuis, []
+        vals = np.array(list(degrees.values()), dtype=np.float32)
+        # only filter if there are actual hubs (non-zero variance)
+        if np.max(vals) == np.min(vals):
+            return cuis, []
+        threshold = _otsu_threshold(vals)
+        # hubs are ABOVE threshold (high degree = generic)
+        kept, audit = [], []
+        for c in cuis:
+            if degrees.get(c, 0) <= threshold:
+                kept.append(c)
+            else:
+                audit.append(AuditEntry(
+                    c, "", "", "", "hub_removal",
+                    f"out_degree={degrees[c]} > threshold={threshold:.0f}"))
+        log(f"    Hub Filter: {len(cuis)} -> {len(kept)} "
+            f"(removed {len(cuis)-len(kept)}, degree_threshold={threshold:.0f})")
+        return kept, audit
+
+
+class GraphComponentBuilder:
+    """Finds connected semantic components using UMLS hierarchy.
+
+    Instead of grouping by semantic type (which mixes body sites),
+    uses shared ancestry in the UMLS graph to find natural semantic islands.
+
+    Algorithm:
+    1. For each CUI, compute ancestors up to `depth` hops
+    2. Exclude hub ancestors (high out-degree) that bridge unrelated groups
+    3. Build inverted index: ancestor → set of CUIs that share it
+    4. CUIs sharing a non-hub ancestor get an edge
+    5. Connected components = semantic islands
+    """
+
+    @staticmethod
+    @timed("graph_components")
+    def build(cuis, graph, ancestor_depth):
+        if graph is None or len(cuis) < 2:
+            return {0: list(cuis)}
+
+        cui_set = set(cuis)
+
+        # Step 1: compute ancestors for each CUI
+        cui_ancestors = {}
+        all_ancestors = defaultdict(int)  # ancestor → how many CUIs share it
+        for c in cuis:
+            anc = _get_ancestors(graph, c, ancestor_depth)
+            cui_ancestors[c] = anc
+            for a in anc:
+                all_ancestors[a] += 1
+
+        # Step 2: exclude hub ancestors (high out-degree in full graph)
+        # These are generic concepts that bridge unrelated groups
+        ancestor_degrees = {}
+        for a in all_ancestors:
+            if graph.has_node(a):
+                ancestor_degrees[a] = graph.out_degree(a)
+        if ancestor_degrees:
+            deg_vals = np.array(list(ancestor_degrees.values()), dtype=np.float32)
+            if np.max(deg_vals) > np.min(deg_vals):
+                hub_threshold = _otsu_threshold(deg_vals)
+                hub_ancestors = {a for a, d in ancestor_degrees.items()
+                                 if d > hub_threshold}
+            else:
+                hub_ancestors = set()
+        else:
+            hub_ancestors = set()
+
+        # Step 3: inverted index — ancestor → CUIs that share it
+        # (excluding hubs and ancestors shared by only 1 CUI)
+        ancestor_to_cuis = defaultdict(set)
+        for c in cuis:
+            for a in cui_ancestors.get(c, set()):
+                if a not in hub_ancestors and a not in cui_set:
+                    ancestor_to_cuis[a].add(c)
+
+        # Step 4: build adjacency from shared non-hub ancestors
+        # Skip ancestors shared by too many CUIs — they're still generic bridges
+        max_share = max(2, int(np.sqrt(len(cuis))))
+        adj = defaultdict(set)
+        for a, shared_cuis in ancestor_to_cuis.items():
+            if len(shared_cuis) < 2 or len(shared_cuis) > max_share:
+                continue
+            cui_list = list(shared_cuis)
+            for i in range(len(cui_list)):
+                for j in range(i + 1, len(cui_list)):
+                    adj[cui_list[i]].add(cui_list[j])
+                    adj[cui_list[j]].add(cui_list[i])
+
+        # Step 5: connected components via BFS
+        visited = set()
+        components = {}
+        label = 0
+        for c in cuis:
+            if c in visited:
+                continue
+            component = []
+            queue = deque([c])
+            visited.add(c)
+            while queue:
+                node = queue.popleft()
+                component.append(node)
+                for nb in adj.get(node, set()):
+                    if nb not in visited:
+                        visited.add(nb)
+                        queue.append(nb)
+            components[label] = component
+            label += 1
+
+        # log distribution
+        sizes = sorted([len(v) for v in components.values()], reverse=True)
+        singleton_count = sum(1 for s in sizes if s == 1)
+        log(f"    Graph Components: {len(cuis)} CUIs -> {len(components)} components "
+            f"(max={sizes[0]}, singletons={singleton_count}, "
+            f"hub_ancestors_excluded={len(hub_ancestors)})")
+        return components
+
+
+#  14- Embedding Reduction
 class EmbeddingReducer:
     @staticmethod
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges, graph=None, ancestor_depth=3):
-        type_groups = defaultdict(list)
-        for cui in cuis:
-            meta = metadata.get(cui)
-            if meta and meta.semantic_types:
-                for sty in meta.semantic_types:
-                    type_groups[sty].append(cui)
-            else:
-                type_groups["Unknown"].append(cui)
+        # Step 1: find natural semantic islands via graph topology
+        components = GraphComponentBuilder.build(cuis, graph, ancestor_depth)
+
         all_topics = {}
         globally_surviving = set()
         removal_candidates = {}
         tid = 0
-        for sty in sorted(type_groups):
-            group_cuis = sorted(set(type_groups[sty]))
-            with_emb = [c for c in group_cuis if c in embeddings]
-            without_emb = [c for c in group_cuis if c not in embeddings]
+        for comp_id in sorted(components):
+            comp_cuis = components[comp_id]
+            with_emb = [c for c in comp_cuis if c in embeddings]
+            without_emb = [c for c in comp_cuis if c not in embeddings]
             for c in without_emb:
                 globally_surviving.add(c)
             if len(with_emb) <= 1:
-                all_topics[f"topic_{tid}"] = group_cuis
-                for c in group_cuis:
+                all_topics[f"topic_{tid}"] = comp_cuis
+                for c in comp_cuis:
                     globally_surviving.add(c)
                 tid += 1
                 continue
+            # Step 2: within each component, Louvain sub-clustering
             scann_topics = TopicBuilder.build(with_emb, embeddings)
             sizes = sorted([len(v) for v in scann_topics.values()], reverse=True)
-            log(f"      [{sty}] {len(with_emb)} CUIs -> {len(scann_topics)} topics "
-                f"(max={sizes[0]}, top5={sizes[:5]})")
+            if len(with_emb) > 10:
+                log(f"      [comp_{comp_id}] {len(with_emb)} CUIs -> {len(scann_topics)} topics "
+                    f"(max={sizes[0]}, top5={sizes[:5]})")
+            # Step 3: within each topic, reduce redundancy
             for t_cuis in scann_topics.values():
                 topic_id = f"topic_{tid}"
                 tid += 1
@@ -968,7 +1105,7 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
     return kept, audit
 
 
-#  13- Cross-Topic Dedup
+#  15- Cross-Topic Dedup
 class CrossTopicDedup:
     @staticmethod
     @timed("cross_topic_dedup")
@@ -1042,7 +1179,7 @@ class CrossTopicDedup:
         return final, audit
 
 
-#  14- Confidence Scorer
+#  16- Confidence Scorer
 class ConfidenceScorer:
     """Scores each surviving CUI by 3 structural signals.
 
@@ -1110,7 +1247,7 @@ class ConfidenceScorer:
         return sorted_cuis, entries, retention_map
 
 
-#  15- Pipeline
+#  17- Pipeline
 class CUIReductionSystem:
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
@@ -1149,7 +1286,7 @@ class CUIReductionSystem:
 
         # first pass: run filters + hierarchy (no embeddings needed)
         per_text = []
-        all_post_hier = set()
+        all_filtered = set()
         for cuis, context_string in inputs:
             if not cuis:
                 per_text.append((context_string, [], [], set(), []))
@@ -1164,14 +1301,15 @@ class CUIReductionSystem:
             log(f"    Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
             after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_term, ic_map, metadata)
             log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
-            audit = sab_audit + sty_audit + term_audit + hier_audit
-            all_post_hier.update(after_hier)
-            per_text.append((context_string, cuis, after_hier, hier_edges, audit))
+            after_hub, hub_audit = HubFilter.run(after_hier, self.hierarchy_reducer.graph)
+            audit = sab_audit + sty_audit + term_audit + hier_audit + hub_audit
+            all_filtered.update(after_hub)
+            per_text.append((context_string, cuis, after_hub, hier_edges, audit))
 
-        # fetch embeddings only for post-hierarchy survivors
-        log(f"\n[Batch] Fetching embeddings for {len(all_post_hier)} post-hierarchy CUIs "
-            f"(skipped {len(all_cuis) - len(all_post_hier)})")
-        all_embeddings = self.emb_fetcher.fetch(list(all_post_hier))
+        # fetch embeddings only for post-filter survivors
+        log(f"\n[Batch] Fetching embeddings for {len(all_filtered)} post-filter CUIs "
+            f"(skipped {len(all_cuis) - len(all_filtered)})")
+        all_embeddings = self.emb_fetcher.fetch(list(all_filtered))
 
         # second pass: embedding-based stages
         results = []
@@ -1323,7 +1461,7 @@ class CUIReductionSystem:
             return out
 
 
-#  16- CUI Extraction(API)
+#  18- CUI Extraction(API)
 class CUIExtractor:
     def __init__(self, api_url, min_confidence=0.0, top_k=3, cache_dir=None):
         self.url = api_url
@@ -1390,7 +1528,7 @@ class CUIExtractor:
         return unique
 
 
-#  17- Init
+#  19- Init
 PROJECT_ID = project_id
 DATASET_ID = dataset
 API_URL = url
@@ -1404,7 +1542,7 @@ system = CUIReductionSystem(
 extractor = CUIExtractor(API_URL, cache_dir=CACHE_DIR)
 
 
-#  18- Pipeline
+#  20- Run
 texts = ["Patient has severe pain in left knee with swelling"]
 
 def _extract(text):
