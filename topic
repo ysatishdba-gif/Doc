@@ -51,6 +51,29 @@ def timed(name):
     return dec
 
 
+# --- Otsu threshold helper ---
+def _otsu_threshold(values):
+    """Find threshold that maximizes between-class variance (Otsu's method)."""
+    arr = np.sort(values)
+    n = len(arr)
+    if n < 2:
+        return float(arr[0]) if n == 1 else 0.0
+    best_t, best_var = float(arr[0]), -1.0
+    total_mean = np.mean(arr)
+    for i in range(1, n):
+        if arr[i] == arr[i - 1]:
+            continue
+        w0 = i / n
+        w1 = 1.0 - w0
+        m0 = np.mean(arr[:i])
+        m1 = np.mean(arr[i:])
+        var = w0 * w1 * (m0 - m1) ** 2
+        if var > best_var:
+            best_var = var
+            best_t = float(arr[i])
+    return best_t
+
+
 # 3- Data Models
 @dataclass
 class CUIMetadata:
@@ -82,7 +105,6 @@ class AuditEntry:
     detail: str
 
 
-# --- CHANGE 1: added ic_norm, centrality, retention_power for diagnostics ---
 @dataclass
 class ConfidenceEntry:
     cui: str
@@ -629,6 +651,15 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges):
     floor = float(np.min(nonzero)) if len(nonzero) > 0 else float(np.finfo(np.float32).eps)
     tight_t = max(tight_t, floor)
     tight_t = min(tight_t, guardrail)
+
+    # --- FIX A: compute topic centroid, pass to _resolve_group ---
+    centroid = np.mean(matrix, axis=0).astype(np.float32)
+    c_norm = np.linalg.norm(centroid)
+    if c_norm > 0:
+        centroid = centroid / c_norm
+    else:
+        centroid = None
+
     condensed = squareform(dist, checks=False)
     Z = linkage(condensed, method="average")
     labels = fcluster(Z, t=tight_t, criterion="distance")
@@ -638,16 +669,34 @@ def _reduce_topic(t_cuis, embeddings, metadata, ic_map, hierarchy_edges):
     all_kept, all_removed = [], []
     for r_cuis in r_groups.values():
         kept, removed = _resolve_group(
-            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx, tight_t, guardrail)
+            r_cuis, metadata, ic_map, hierarchy_edges, dist, idx,
+            tight_t, guardrail, embeddings, centroid)
         all_kept.extend(kept)
         all_removed.extend(removed)
     return all_kept, all_removed
 
 
-def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map, tight_t, guardrail):
+# --- FIX A: pick winner by IC + centrality, not just IC ---
+def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
+                   tight_t, guardrail, embeddings, centroid):
     if len(r_cuis) <= 1:
         return r_cuis, []
-    best = max(r_cuis, key=lambda c: ic_map.get(c, 0))
+
+    # composite score: normalized IC within group + centrality to topic centroid
+    group_ics = [ic_map.get(c, 0) for c in r_cuis]
+    ic_min = min(group_ics)
+    ic_max = max(group_ics)
+    ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
+
+    def _composite(c):
+        norm_ic = (ic_map.get(c, 0) - ic_min) / ic_range
+        if centroid is not None and c in embeddings:
+            cent = max(float(np.dot(embeddings[c], centroid)), 0.0)
+        else:
+            cent = 0.0
+        return 0.70 * norm_ic + 0.30 * cent
+
+    best = max(r_cuis, key=_composite)
     b_meta = metadata.get(best)
     b_types = set(b_meta.semantic_types) if b_meta and b_meta.semantic_types else set()
     kept = [best]
@@ -743,7 +792,6 @@ class CrossTopicDedup:
         return final, audit
 
 
-# --- CHANGE 2: ConfidenceScorer with IC + centrality + retention ---
 #  14- Confidence Scorer
 class ConfidenceScorer:
     """Scores each surviving CUI by 3 structural signals.
@@ -757,13 +805,11 @@ class ConfidenceScorer:
     @timed("confidence_score")
     def score(surviving, metadata, ic_map, audit_trail,
               embeddings, cui_topic, topic_centroids):
-        # build explains map from audit trail
         explains = defaultdict(list)
         for entry in audit_trail:
             if entry.kept_cui and entry.removed_cui:
                 explains[entry.kept_cui].append(entry.removed_cui)
 
-        # IC normalization range
         ics = [ic_map.get(c, 0) for c in surviving]
         ic_min = min(ics) if ics else 0
         ic_max = max(ics) if ics else 1
@@ -779,12 +825,8 @@ class ConfidenceScorer:
             retained = explains.get(cui, [])
             retention_map[cui] = retained
 
-            # 1. Normalized IC (ontological specificity)
-            #    "Left knee osteoarthritis" scores higher than "Joint disorder"
             norm_ic = (ic - ic_min) / ic_range
 
-            # 2. Embedding centrality (cosine to topic centroid)
-            #    Central CUIs represent their cluster better than outliers
             topic_id = cui_topic.get(cui)
             centroid = topic_centroids.get(topic_id) if topic_id else None
             if centroid is not None and cui in embeddings:
@@ -792,8 +834,6 @@ class ConfidenceScorer:
             else:
                 centrality = 0.0
 
-            # 3. Retention power (how many redundant CUIs absorbed)
-            #    Representatives that explain more are more important
             if max_retained > 0:
                 retention_power = np.log1p(len(retained)) / np.log1p(max_retained)
             else:
@@ -902,7 +942,7 @@ class CUIReductionSystem:
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
 
-            # --- CHANGE 3: compute topic centroids, pass to scorer ---
+            # compute topic centroids for confidence scorer
             cui_topic = {}
             for topic_id, topic in topics_out.items():
                 for c in topic.cuis:
@@ -920,7 +960,29 @@ class CUIReductionSystem:
             sorted_cuis, confidence, retention_map = ConfidenceScorer.score(
                 surviving, metadata, ic_map, all_audit,
                 embeddings, cui_topic, topic_centroids)
-            # --- END CHANGE 3 ---
+
+            # --- FIX B: Otsu filter on confidence — actually drop low-confidence CUIs ---
+            before_conf = len(sorted_cuis)
+            if len(confidence) > 2:
+                conf_vals = np.array([e.confidence for e in confidence])
+                if np.std(conf_vals) > 1e-6:
+                    conf_threshold = _otsu_threshold(conf_vals)
+                    kept_entries = [e for e in confidence if e.confidence >= conf_threshold]
+                    if kept_entries:
+                        confidence = kept_entries
+                        sorted_cuis = [e.cui for e in confidence]
+                        surviving = sorted_cuis
+                        # audit dropped CUIs
+                        dropped = set(retention_map.keys()) - set(sorted_cuis)
+                        for cui in dropped:
+                            m = metadata.get(cui)
+                            all_audit.append(AuditEntry(
+                                cui, m.preferred_term if m else "",
+                                "", "", "low_confidence",
+                                f"conf below Otsu threshold {conf_threshold:.3f}"))
+                        log(f"    Confidence filter: {before_conf} -> {len(sorted_cuis)} "
+                            f"(Otsu threshold={conf_threshold:.3f})")
+            # --- END FIX B ---
 
             final_set = set(sorted_cuis)
             before_prune = len(topics_out)
