@@ -486,6 +486,11 @@ class EmbeddingFetcher:
             for cui, vec in f.result():
                 self._cache.put(cui, vec)
                 result[cui] = vec
+        fetched = len(result) - (len(cuis) - len(missing))  # newly fetched count
+        coverage = len(result) / len(cuis) * 100 if cuis else 0
+        dim = next(iter(result.values())).shape[0] if result else 0
+        log(f"    Embeddings: {len(result)}/{len(cuis)} ({coverage:.1f}%) | "
+            f"dim={dim} | cache_hits={len(cuis)-len(missing)} | fetched={fetched}")
         return result
 
 
@@ -1185,6 +1190,7 @@ class CUIExtractor:
         retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
+    @timed("cui_extraction")
     def extract(self, text):
         resp = self.session.post(
             self.url, headers=self.headers,
@@ -1192,6 +1198,7 @@ class CUIExtractor:
         resp.raise_for_status()
         data = resp.json()
         cuis = []
+        scores_map = {}
         if isinstance(data, dict):
             for val in data.values():
                 if not isinstance(val, list):
@@ -1204,10 +1211,20 @@ class CUIExtractor:
                         except (ValueError, TypeError):
                             score = 0.0
                         if score >= self.min_confidence:
-                            cuis.append(str(item["cui"]))
+                            c = str(item["cui"])
+                            cuis.append(c)
+                            scores_map[c] = score
                     elif isinstance(item, str) and item.strip():
                         cuis.append(item.strip())
-        return list(set(cuis))
+        unique = list(set(cuis))
+        if scores_map:
+            score_vals = list(scores_map.values())
+            log(f"    Extraction: {len(unique)} unique CUIs | "
+                f"score range [{min(score_vals):.3f}, {max(score_vals):.3f}] | "
+                f"mean={np.mean(score_vals):.3f}")
+        else:
+            log(f"    Extraction: {len(unique)} unique CUIs (no scores)")
+        return unique
 
 
 #  17- Load Pickles
@@ -1236,7 +1253,11 @@ extractor = CUIExtractor(API_URL)
 texts = ["Patient has severe pain in left knee with swelling"]
 
 def _extract(text):
+    log(f"\n[Extract] '{text[:80]}'")
+    t0 = time.perf_counter()
     cuis = extractor.extract(text)
+    elapsed = (time.perf_counter() - t0) * 1000
+    log(f"    Extraction time: {elapsed:.0f}ms")
     return (cuis, text) if cuis else None
 
 with ThreadPoolExecutor(max_workers=min(len(texts), 8)) as pool:
