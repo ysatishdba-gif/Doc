@@ -1426,16 +1426,19 @@ class CUIExtractor:
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     @timed("cui_extraction")
-    def extract(self, text, context=None):
-        """Extract CUIs from text.
+    def extract(self, text_list, context):
+        """Extract CUIs from clinical phrases within a context.
 
         Args:
-            text: The clinical text to extract CUIs from
-            context: Optional broader context (e.g. full sentence when text is a phrase).
-                     If None, text is used as both text_list and context_list.
+            text_list: List of clinical phrases to look up
+                       e.g. ["left knee", "swelling", "severe pain"]
+            context:   The full user query for disambiguation
+                       e.g. "Patient has severe pain in left knee with swelling"
+
+        Returns:
+            List of unique CUI strings (combined across all phrases)
         """
-        ctx = context or text
-        cache_key = f"{text}||{ctx}||{self.top_k}||{self.top_p}"
+        cache_key = f"{'||'.join(sorted(text_list))}||{context}||{self.top_k}||{self.top_p}"
         cached = self._cache.get(cache_key)
         if cached is not None:
             log(f"    Extraction: {len(cached)} unique CUIs (cached)")
@@ -1443,8 +1446,8 @@ class CUIExtractor:
 
         payload = {
             "cluster_set": self.cluster_set,
-            "text_list": [text],
-            "context_list": [ctx],
+            "text_list": text_list,
+            "context_list": [context],
             "top_k": self.top_k,
             "top_p": self.top_p,
             "combined": self.combined
@@ -1475,11 +1478,11 @@ class CUIExtractor:
         unique = list(set(cuis))
         if scores_map:
             score_vals = list(scores_map.values())
-            log(f"    Extraction: {len(unique)} unique CUIs | "
+            log(f"    Extraction: {len(unique)} unique CUIs from {len(text_list)} phrases | "
                 f"score range [{min(score_vals):.3f}, {max(score_vals):.3f}] | "
                 f"mean={np.mean(score_vals):.3f}")
         else:
-            log(f"    Extraction: {len(unique)} unique CUIs (no scores)")
+            log(f"    Extraction: {len(unique)} unique CUIs from {len(text_list)} phrases (no scores)")
         self._cache.put(cache_key, unique)
         return unique
 
@@ -1523,18 +1526,28 @@ extractor = CUIExtractor(
 
 #  19- Run
 if __name__ == "__main__":
-    texts = ["Patient has severe pain in left knee with swelling"]
+    # context = the full user query
+    # text_list = clinical phrases extracted from the context for CUI lookup
+    queries = [
+        {
+            "context": "Patient has severe pain in left knee with swelling",
+            "text_list": ["left knee", "swelling", "severe pain"],
+        },
+    ]
 
-    def _extract(text):
-        log(f"\n[Extract] '{text[:80]}'")
+    def _extract(query):
+        context = query["context"]
+        text_list = query["text_list"]
+        log(f"\n[Extract] context='{context}'")
+        log(f"          phrases={text_list}")
         t0 = time.perf_counter()
-        cuis = extractor.extract(text)
+        cuis = extractor.extract(text_list, context)
         elapsed = (time.perf_counter() - t0) * 1000
         log(f"    Extraction time: {elapsed:.0f}ms")
-        return (cuis, text) if cuis else None
+        return (cuis, context) if cuis else None
 
-    with ThreadPoolExecutor(max_workers=min(len(texts), 8)) as pool:
-        raw = pool.map(_extract, texts)
+    with ThreadPoolExecutor(max_workers=min(len(queries), 8)) as pool:
+        raw = pool.map(_extract, queries)
         inputs = [r for r in raw if r is not None]
 
     results = system.reduce_batch(inputs)
