@@ -1,4 +1,3 @@
-
 import re
 import time
 import logging
@@ -83,11 +82,15 @@ class AuditEntry:
     detail: str
 
 
+# --- CHANGE 1: added ic_norm, centrality, retention_power for diagnostics ---
 @dataclass
 class ConfidenceEntry:
     cui: str
     term: str
     confidence: float
+    ic_norm: float
+    centrality: float
+    retention_power: float
     semantic_types: List[str]
     explains_cuis: List[str]
 
@@ -740,27 +743,34 @@ class CrossTopicDedup:
         return final, audit
 
 
+# --- CHANGE 2: ConfidenceScorer with IC + centrality + retention ---
 #  14- Confidence Scorer
 class ConfidenceScorer:
+    """Scores each surviving CUI by 3 structural signals.
+
+    confidence = 0.50 * normalized_IC          (ontological specificity)
+               + 0.30 * embedding_centrality   (cosine to own topic centroid)
+               + 0.20 * retention_power        (log-scaled absorbed CUI count)
+    """
+
     @staticmethod
     @timed("confidence_score")
-    def score(surviving, metadata, ic_map, audit_trail):
+    def score(surviving, metadata, ic_map, audit_trail,
+              embeddings, cui_topic, topic_centroids):
+        # build explains map from audit trail
         explains = defaultdict(list)
         for entry in audit_trail:
             if entry.kept_cui and entry.removed_cui:
                 explains[entry.kept_cui].append(entry.removed_cui)
+
+        # IC normalization range
         ics = [ic_map.get(c, 0) for c in surviving]
         ic_min = min(ics) if ics else 0
         ic_max = max(ics) if ics else 1
         ic_range = ic_max - ic_min if ic_max > ic_min else 1.0
-        type_counts = defaultdict(int)
-        for c in surviving:
-            m = metadata.get(c)
-            if m and m.semantic_types:
-                for t in m.semantic_types:
-                    type_counts[t] += 1
-        total_types = sum(type_counts.values()) or 1
+
         max_retained = max((len(v) for v in explains.values()), default=0)
+
         entries = []
         retention_map = {}
         for cui in surviving:
@@ -768,21 +778,40 @@ class ConfidenceScorer:
             ic = ic_map.get(cui, 0)
             retained = explains.get(cui, [])
             retention_map[cui] = retained
+
+            # 1. Normalized IC (ontological specificity)
+            #    "Left knee osteoarthritis" scores higher than "Joint disorder"
             norm_ic = (ic - ic_min) / ic_range
+
+            # 2. Embedding centrality (cosine to topic centroid)
+            #    Central CUIs represent their cluster better than outliers
+            topic_id = cui_topic.get(cui)
+            centroid = topic_centroids.get(topic_id) if topic_id else None
+            if centroid is not None and cui in embeddings:
+                centrality = max(float(np.dot(embeddings[cui], centroid)), 0.0)
+            else:
+                centrality = 0.0
+
+            # 3. Retention power (how many redundant CUIs absorbed)
+            #    Representatives that explain more are more important
             if max_retained > 0:
                 retention_power = np.log1p(len(retained)) / np.log1p(max_retained)
             else:
                 retention_power = 0.0
-            if m and m.semantic_types:
-                type_uniq = 1.0 - min(type_counts[t] / total_types for t in m.semantic_types)
-            else:
-                type_uniq = 0.0
-            confidence = 0.80 * norm_ic + 0.20 * retention_power + 0.00 * type_uniq
+
+            confidence = (0.50 * norm_ic
+                        + 0.30 * centrality
+                        + 0.20 * retention_power)
+
             entries.append(ConfidenceEntry(
                 cui=cui, term=m.preferred_term if m else cui,
                 confidence=round(confidence, 4),
+                ic_norm=round(norm_ic, 3),
+                centrality=round(centrality, 3),
+                retention_power=round(retention_power, 3),
                 semantic_types=list(m.semantic_types) if m else [],
                 explains_cuis=retained))
+
         entries.sort(key=lambda e: e.confidence, reverse=True)
         sorted_cuis = [e.cui for e in entries]
         return sorted_cuis, entries, retention_map
@@ -851,7 +880,6 @@ class CUIReductionSystem:
             topics, surviving, emb_audit = EmbeddingReducer.run(
                 after_hier, metadata, embeddings, ic_map, hier_edges)
             all_audit.extend(emb_audit)
-            # log(f"\n  [{label}]")
             log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)} (removed {len(after_hier) - len(surviving)})")
             topics_out = {}
             for topic_id, t_cuis in topics.items():
@@ -873,11 +901,27 @@ class CUIReductionSystem:
             all_audit.extend(xtd_audit)
             if xtd_audit:
                 log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)} (removed {before_xtd - len(surviving)})")
+
+            # --- CHANGE 3: compute topic centroids, pass to scorer ---
+            cui_topic = {}
+            for topic_id, topic in topics_out.items():
+                for c in topic.cuis:
+                    cui_topic[c] = topic_id
+            topic_centroids = {}
+            for topic_id, topic in topics_out.items():
+                vecs = [embeddings[c] for c in topic.cuis if c in embeddings]
+                if vecs:
+                    cent = np.mean(vecs, axis=0).astype(np.float32)
+                    norm = np.linalg.norm(cent)
+                    if norm > 0:
+                        cent = cent / norm
+                    topic_centroids[topic_id] = cent
+
             sorted_cuis, confidence, retention_map = ConfidenceScorer.score(
-                surviving, metadata, ic_map, all_audit)
-            # if confidence:
-            #     log(f"    Confidence: scored {len(confidence)} "
-            #         f"(top={confidence[0].confidence:.3f}, bottom={confidence[-1].confidence:.3f})")
+                surviving, metadata, ic_map, all_audit,
+                embeddings, cui_topic, topic_centroids)
+            # --- END CHANGE 3 ---
+
             final_set = set(sorted_cuis)
             before_prune = len(topics_out)
             pruned_topics = {}
@@ -916,7 +960,6 @@ class CUIReductionSystem:
                 processing_time_ms=elapsed,
                 embedding_coverage=emb_cov))
         total = (time.perf_counter() - t0) * 1000
-        # log(f"\n[Batch] ALL DONE: {len(inputs)} texts in {total:.0f}ms")
         return results
 
     def _empty(self, ctx, t0, audit=None):
@@ -1021,10 +1064,9 @@ for result in results:
         f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
     log(f"\n-- Top 20 CUIs by confidence (of {len(result.confidence)}) --")
     for entry in result.confidence[:20]:
-        # stys = ", ".join(entry.semantic_types[:2]) if entry.semantic_types else "?"
-        line = f"  {entry.cui} | conf={entry.confidence} | {entry.term}"
-        if entry.explains_cuis:
-            line += f" | explains {len(entry.explains_cuis)}"
+        line = (f"  {entry.cui} | conf={entry.confidence} "
+                f"IC={entry.ic_norm} cent={entry.centrality} "
+                f"ret={entry.retention_power} | {entry.term}")
         log(line)
     log(f"\n-- Topics: {len(result.topics)} (showing first 20) --")
     for tid, topic in list(result.topics.items())[:20]:
