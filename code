@@ -268,6 +268,14 @@ class ContextualEnvironmentOutput(BaseModel):
 
 # ── Output formats ──
 
+class RetrievalContext(BaseModel):
+    document_types: List[str] = Field(default_factory=list)
+    author_roles: List[str] = Field(default_factory=list)
+    temporal_scope: List[str] = Field(default_factory=list)
+    content_signals: List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
+
+
 class IntentSummaryItem(BaseModel):
     intent_title: str
     description: str
@@ -286,11 +294,14 @@ class IntentWithContext(BaseModel):
     nature: str
     sub_natures: List[SubNature]
     final_queries: List[str]
-    document_types: List[str] = Field(default_factory=list)
-    author_roles: List[str] = Field(default_factory=list)
-    temporal_scope: List[str] = Field(default_factory=list)
-    content_signals: List[str] = Field(default_factory=list)
-    clinical_setting: List[str] = Field(default_factory=list)
+    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
+
+
+class FinalQueryIntent(BaseModel):
+    intent_title: str
+    nature: str
+    final_queries: List[str]
+    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
 
 
 class Format_IntentExtraction(BaseModel):
@@ -303,10 +314,10 @@ class Format_IntentExtraction(BaseModel):
 
 class Format_FinalQueries(BaseModel):
     user_query: str
-    final_queries: List[str]
-    total_queries: int
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    total_queries: int
+    intents: List[FinalQueryIntent]
     timestamp: str
 
 
@@ -356,14 +367,36 @@ class ExtractionResult:
             timestamp=self.timestamp
         ).model_dump()
 
+    def _build_ctx(self, intent_title: str) -> RetrievalContext:
+        """Build RetrievalContext for an intent from Step 3 output."""
+        if self.context:
+            for ic in self.context.intents_with_context:
+                if ic.intent_title == intent_title:
+                    return RetrievalContext(
+                        document_types=ic.document_types,
+                        author_roles=ic.author_roles,
+                        temporal_scope=ic.temporal_scope,
+                        content_signals=ic.content_signals,
+                        clinical_setting=ic.clinical_setting,
+                    )
+        return RetrievalContext()
+
     def to_final_queries(self) -> Dict[str, Any]:
-        queries = [q for i in self.intents.intents for q in i.final_queries]
+        intents = []
+        for i in self.intents.intents:
+            intents.append(FinalQueryIntent(
+                intent_title=i.intent_title,
+                nature=i.nature,
+                final_queries=i.final_queries,
+                retrieval_context=self._build_ctx(i.intent_title),
+            ))
+        total = sum(len(i.final_queries) for i in intents)
         return Format_FinalQueries(
             user_query=self.original_query,
-            final_queries=queries,
-            total_queries=len(queries),
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            total_queries=total,
+            intents=intents,
             timestamp=self.timestamp
         ).model_dump()
 
@@ -381,23 +414,13 @@ class ExtractionResult:
         ).model_dump()
 
     def to_full_pipeline(self) -> Dict[str, Any]:
-        ctx_map = {}
-        if self.context:
-            for ic in self.context.intents_with_context:
-                ctx_map[ic.intent_title] = ic
-
         enriched = []
         for i in self.intents.intents:
-            ctx = ctx_map.get(i.intent_title)
             enriched.append(IntentWithContext(
                 intent_title=i.intent_title, description=i.description,
                 nature=i.nature, sub_natures=i.sub_natures,
                 final_queries=i.final_queries,
-                document_types=ctx.document_types if ctx else [],
-                author_roles=ctx.author_roles if ctx else [],
-                temporal_scope=ctx.temporal_scope if ctx else [],
-                content_signals=ctx.content_signals if ctx else [],
-                clinical_setting=ctx.clinical_setting if ctx else [],
+                retrieval_context=self._build_ctx(i.intent_title),
             ))
 
         return Format_FullPipeline(
