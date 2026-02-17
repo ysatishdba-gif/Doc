@@ -1,13 +1,90 @@
+"""
+================================================================================
+Contextual Intent Pipeline — Consolidated
+================================================================================
+
+Pipeline:   Query Expansion → Intent Extraction → Contextual Environment
+Downstream: CUI Reduction, Document Retrieval, Routing
+
+────────────────────────────────────────────────────────────────────────────────
+ARCHITECTURE
+────────────────────────────────────────────────────────────────────────────────
+
+STEP 1: Query Expansion
+  - Expands abbreviations, clarifies vague terms
+  - Input:  raw user query
+  - Output: expanded clinical description
+
+STEP 2: Intent Extraction
+  - Identifies distinct clinical intents with sub_natures and atomic_concepts
+  - Input:  original query + expanded query
+  - Output: structured intents with final_queries
+
+STEP 3: Contextual Environment Generation
+  - Identifies WHERE, WHO, WHEN, WHAT, IN WHAT for each intent
+  - Input:  atomic_concepts extracted from intents (focused signal)
+  - Output: annotated facets with {term - description} strings
+  - No hardcoded vocabulary — values derived from clinical domain
+
+────────────────────────────────────────────────────────────────────────────────
+CONTEXTUAL ENVIRONMENT — DESIGN DECISIONS
+────────────────────────────────────────────────────────────────────────────────
+
+1. INPUT: Atomic concepts (not full intent structure) — maximum signal, 
+   minimum noise and tokens.
+
+2. OUTPUT FORMAT: Annotated keys with flat described strings:
+     "document_types(Where)":     ["medication_order - Formal physician order specifying...", ...]
+     "author_roles(Who)":         ["pharmacist - Medication specialist responsible for...", ...]
+     "temporal_scope(when)":      ["active_treatment - Time period during which...", ...]
+     "content_signals(What)":     ["medication_names - Presence of documented drug names...", ...]
+     "clinical_setting(In what)": ["outpatient - Ambulatory care setting where...", ...]
+
+3. CONTENT SIGNALS: Markers that confirm findability — satisfies AC
+   "Method outputs information types that indicate/confirm finding of info."
+
+4. NO HARDCODED LISTS: Expandable to any clinical service without prompt changes.
+
+5. FUZZY KEY MATCHING: Validation recovers if LLM drops annotations 
+   (e.g., "document_types" → "document_types(Where)").
+
+================================================================================
+"""
+
 import json
 import re
 from datetime import datetime
-from typing import Dict, Any, List, Optional, Literal, Tuple
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field, field_validator, model_validator
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
+from typing import Dict, Any, List
+try:
+    from google.cloud import aiplatform
+    from vertexai.generative_models import GenerativeModel
+    _GCP_AVAILABLE = True
+except ImportError:
+    _GCP_AVAILABLE = False
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                         FACET KEY CONSTANTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+FACET_DOCUMENT_TYPES   = "document_types(Where)"
+FACET_AUTHOR_ROLES     = "author_roles(Who)"
+FACET_TEMPORAL_SCOPE   = "temporal_scope(when)"
+FACET_CONTENT_SIGNALS  = "content_signals(What)"
+FACET_CLINICAL_SETTING = "clinical_setting(In what)"
+
+REQUIRED_FACETS = [
+    FACET_DOCUMENT_TYPES,
+    FACET_AUTHOR_ROLES,
+    FACET_TEMPORAL_SCOPE,
+    FACET_CONTENT_SIGNALS,
+    FACET_CLINICAL_SETTING,
+]
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                         STEP 1: QUERY EXPANSION PROMPT
+# ═════════════════════════════════════════════════════════════════════════════
 
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
@@ -40,7 +117,12 @@ Return ONLY valid JSON (no markdown, no explanation):
 User Input: {query}
 """
 
-INTENT_EXTRACTION_PROMPT ="""
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                     STEP 2: INTENT EXTRACTION PROMPT
+# ═════════════════════════════════════════════════════════════════════════════
+
+INTENT_EXTRACTION_PROMPT = """
 You are a clinical intent extraction engine for medical document retrieval.
 
 ====================================================
@@ -210,434 +292,884 @@ On Utility:
 - Are the queries realistic for clinical documentation?
 - Do the queries cover all the important atomic_concepts?
 
+====================================================
+OUTPUT FORMAT
+====================================================
+
+{{
+  "is_clinical": true,
+  "reason": "",
+  "original_query": "{original_query}",
+  "expanded_query": "{expanded_query}",
+  "total_intents_detected": <number>,
+  "intents": [
+    {{
+      "intent_title": "<string>",
+      "description": "<string>",
+      "nature": "<string>",
+      "sub_natures": [
+        {{
+          "category_path": "<Broad >> Specific >> Detail>",
+          "atomic_concepts": ["<concept1>", "<concept2>"]
+        }}
+      ],
+      "final_queries": ["<query1>", "<query2>", "<query3>", "..."]
+    }}
+  ]
+}}
+
 User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
 
-# SCHEMA
+# ═════════════════════════════════════════════════════════════════════════════
+#                 STEP 3: CONTEXTUAL ENVIRONMENT PROMPT
+# ═════════════════════════════════════════════════════════════════════════════
 
-class PipelineInput(BaseModel):
-    query: str
+CONTEXTUAL_ENVIRONMENT_PROMPT = """
+You are a clinical documentation specialist. Your job is to determine WHERE 
+clinical information would be found in a medical record system.
+
+====================================================
+CRITICAL DISTINCTION
+====================================================
+
+You are NOT describing the medical concept itself.
+You ARE describing the documentation environment — the types of documents,
+the authors, the time windows, the care settings, and the content markers
+where answers to this clinical concept would be recorded.
+
+====================================================
+TASK
+====================================================
+
+For each intent below, you are given:
+- **intent_title**: The clinical concept being sought
+- **nature**: The informational purpose (what kind of question this is)
+- **atomic_concepts**: The specific, granular clinical terms that need to be
+  found in documents. These are the actual data points to locate.
+
+Using the atomic_concepts as your primary signal, determine FIVE contextual 
+facets. Each facet answers a different question about the documentation 
+environment:
+
+1. **document_types(Where)** — "What kind of document would contain these atomic concepts?"
+   Derive the document type from the clinical domain of the atomic concepts.
+   Think: If a clinician needed to locate this data, what document would they open?
+   Generate 3-5 values.
+
+2. **author_roles(Who)** — "Who would have authored a document containing these atomic concepts?"
+   Derive the role from the clinical specialty implied by the atomic concepts.
+   Think: What professional's scope of practice includes documenting this data?
+   Generate 2-4 values.
+
+3. **temporal_scope(when)** — "When in the patient's care journey would this be documented?"
+   Derive the time window from the clinical context of the atomic concepts.
+   Think: Is this initial workup, ongoing management, acute event, follow-up, etc.?
+   Generate 1-3 values.
+
+4. **content_signals(What)** — "What specific data markers in a document confirm it contains these atomic concepts?"
+   Derive content signals from the nature of the atomic concepts themselves.
+   Think: What observable data elements (names, codes, values, measurements, 
+   findings) would be present in a document that answers this intent?
+   These are the markers that CONFIRM the right information has been found.
+   Generate 2-4 values.
+
+5. **clinical_setting(In what)** — "In what care environment would this be documented?"
+   Derive the setting from where the clinical activity behind the atomic concepts occurs.
+   Think: Hospital ward, clinic, ED, lab, OR, home, virtual, etc.?
+   Generate 1-3 values.
+
+====================================================
+REASONING APPROACH
+====================================================
+
+For each intent, reason from the atomic_concepts outward:
+
+1. Read the atomic_concepts — these are the exact terms to locate
+2. For each atomic concept, ask:
+   - "What document would I open to find this?"             → document_types(Where)
+   - "Who would have written that document?"                → author_roles(Who)
+   - "When in the care journey is this documented?"         → temporal_scope(when)
+   - "What data markers confirm I found the right content?" → content_signals(What)
+   - "Where in the healthcare system does this happen?"     → clinical_setting(In what)
+3. Aggregate across atomic concepts — the facets should cover ALL of them,
+   not just the first one
+
+DO NOT rely on a fixed vocabulary. Generate values that are accurate for the
+specific clinical domain of the atomic concepts. If the domain involves 
+specialties, document types, settings, or content markers that are uncommon, 
+generate the appropriate values — do not force-fit into generic terms.
+
+====================================================
+VALUE FORMAT
+====================================================
+
+Each facet is a list of flat strings: "<snake_case_term> - <description>"
+
+**Rules:**
+- Term uses snake_case
+- Description states what this IS — direct, no hedging
+
+BAD: "medication_order - Physicians will often document this type of..."
+GOOD: "medication_order - Formal order specifying medication, dose, route, and frequency."
+
+Start with WHAT it is. Not who does it, how often, or why we think so.
+
+====================================================
+INPUT
+====================================================
+
+Original Query: {original_query}
+Expanded Query: {expanded_query}
+
+Intents to contextualize:
+{intents_input_json}
+
+====================================================
+OUTPUT FORMAT
+====================================================
+
+Return ONLY valid JSON (no markdown, no explanation, no preamble):
+{{
+  "intents_with_context": [
+    {{
+      "intent_title": "<exact title from input>",
+      "context": {{
+        "document_types(Where)": [
+          "<snake_case_type> - <direct definition>",
+          ...
+        ],
+        "author_roles(Who)": [
+          "<snake_case_role> - <direct definition>",
+          ...
+        ],
+        "temporal_scope(when)": [
+          "<snake_case_scope> - <direct definition>",
+          ...
+        ],
+        "content_signals(What)": [
+          "<snake_case_signal> - <direct definition>",
+          ...
+        ],
+        "clinical_setting(In what)": [
+          "<snake_case_setting> - <direct definition>",
+          ...
+        ]
+      }}
+    }}
+  ]
+}}
+"""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                         UTILITY FUNCTIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _safe_json(text: str) -> Dict[str, Any]:
+    """Parse JSON from LLM response, handling markdown fences and embedded JSON."""
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text)
+    text = text.strip()
+    
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+        
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                pass
+        
+        print(f"Failed to parse JSON from response: {text[:200]}")
+        return {}
+
+
+def _validate_json_structure(data: Dict, required_keys: List[str]) -> bool:
+    """Check that all required keys exist in a dict."""
+    return all(key in data for key in required_keys)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#          STEP 3 HELPERS: ATOMIC CONCEPT EXTRACTION & VALIDATION
+# ═════════════════════════════════════════════════════════════════════════════
+
+def extract_atomic_concepts_from_intent(intent: Dict[str, Any]) -> List[str]:
+    """
+    Flattens all atomic_concepts from an intent's sub_natures into a 
+    deduplicated list. This is the primary input signal for contextual
+    environment generation.
+    
+    Args:
+        intent: A single intent dict with sub_natures containing atomic_concepts.
+    
+    Returns:
+        Deduplicated list of atomic concept strings.
+    """
+    concepts = []
+    seen = set()
+    
+    for sub_nature in intent.get("sub_natures", []):
+        for concept in sub_nature.get("atomic_concepts", []):
+            normalized = concept.strip().lower()
+            if normalized and normalized not in seen:
+                concepts.append(concept.strip())
+                seen.add(normalized)
+    
+    return concepts
+
+
+def prepare_intents_input(intents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Transforms intents into focused input for the contextual environment prompt.
+    Extracts only intent_title, nature, and flattened atomic_concepts — 
+    eliminates noise from descriptions, category_paths, and final_queries.
+    
+    Args:
+        intents: List of intent dicts from extraction step.
+    
+    Returns:
+        List of focused intent dicts for the prompt.
+    """
+    focused = []
+    for intent in intents:
+        atomic_concepts = extract_atomic_concepts_from_intent(intent)
+        focused.append({
+            "intent_title": intent.get("intent_title", ""),
+            "nature": intent.get("nature", ""),
+            "atomic_concepts": atomic_concepts
+        })
+    return focused
+
+
+def _validate_contextual_output(
+    data: Dict[str, Any], 
+    original_intents: List[Dict[str, Any]],
     verbose: bool = False
-
-    @field_validator('query', mode='before')
-    @classmethod
-    def ensure_string(cls, v):
-        return str(v).strip()
-
-
-
-class QueryExpansionOutput(BaseModel):
-    expanded_query: str
-    abbreviations_expanded: List[str] = Field(default_factory=list)
-
-
-class SubNature(BaseModel):
-    category_path: str
-    atomic_concepts: List[str]
+) -> Dict[str, Any]:
+    """
+    Validates LLM contextual environment output.
     
-    @field_validator('category_path')
-    @classmethod
-    def normalize_separator(cls, v: str) -> str:
-        if '>>' not in v:
-            raise ValueError("category_path must use '>>' as separator")
-        return re.sub(r'\s*>>\s*', ' >> ', v).strip()
-
-class Intent(BaseModel):
-    intent_title: str
-    description: str
-    nature: str
-    sub_natures: List[SubNature]
-    final_queries: List[str]
-
-
-class IntentWithoutQueries(BaseModel):    
-    intent_title: str
-    description: str
-    nature: str
-    sub_natures: List[SubNature]
-
-
-class IntentExtractionOutput(BaseModel):
-    is_clinical: bool
-    reason: Optional[str] = None
-    original_query: str
-    expanded_query: str
-    total_intents_detected: int
-    intents: List[Intent] = Field(default_factory=list)
+    Expected: each facet is a list of strings ("term - description").
+    Repairs: dicts flattened to strings, un-annotated keys matched via prefix.
+    """
+    validated_intents = []
+    input_titles = {i.get("intent_title", "") for i in original_intents}
     
-    @model_validator(mode='after')
-    def fix_intent_count(self) -> 'IntentExtractionOutput':
-        actual = len(self.intents)
-        if self.total_intents_detected != actual:
-            self.total_intents_detected = actual
-        return self
-
-
-# Output schemas
-class IntentSummaryItem(BaseModel):
-    intent_title: str
-    description: str
-
-
-class Format_IntentExtraction(BaseModel):
-    
-    user_query: str
-    intents: List[IntentSummaryItem]
-    is_clinical: bool
-    rejected_reason: Optional[str] = None
-    timestamp: str
-
-
-class Format_FinalQueries(BaseModel):    
-    user_query: str
-    final_queries: List[str]
-    total_queries: int
-    is_clinical: bool
-    rejected_reason: Optional[str] = None
-    timestamp: str
-
-
-class Format_NatureBreakdown(BaseModel):    
-    is_clinical: bool
-    reason: Optional[str] = None
-    original_query: str
-    # expanded_query: str
-    total_intents_detected: int
-    intents: List[IntentWithoutQueries]
-    timestamp: str
-
-
-
-# EXTRACTION
-
-class ExtractionResult:    
-    def __init__(self, 
-                 original_query: str,
-                 expansion: QueryExpansionOutput,
-                 intents: IntentExtractionOutput,
-                 processing_time: float):
-        self.original_query = original_query
-        self.expansion = expansion
-        self.intents = intents
-        self.processing_time = processing_time
-        self.timestamp = datetime.utcnow().isoformat()
-    
-    def to_intent_extraction(self) -> Dict[str, Any]:
+    for item in data.get("intents_with_context", []):
+        title = item.get("intent_title", "")
         
-        items = [
-            IntentSummaryItem(
-                intent_title=i.intent_title,
-                description=i.description
-            ) for i in self.intents.intents
-        ]
+        if title not in input_titles and verbose:
+            print(f"  [Validation] Warning: '{title}' not in input intents")
         
-        result = Format_IntentExtraction(
-            user_query=self.original_query,
-            intents=items,
-            is_clinical=self.intents.is_clinical,
-            rejected_reason=self.intents.reason,
-            timestamp=self.timestamp
-        )
-        return result.model_dump()
-    
-    def to_final_queries(self) -> Dict[str, Any]:        
-        queries = [q for intent in self.intents.intents for q in intent.final_queries]
+        context = item.get("context", {})
+        validated_context = {}
         
-        result = Format_FinalQueries(
-            user_query=self.original_query,
-            final_queries=queries,
-            total_queries=len(queries),
-            is_clinical=self.intents.is_clinical,
-            rejected_reason=self.intents.reason,
-            timestamp=self.timestamp
-        )
-        return result.model_dump()
-    
-    def to_nature_breakdown(self) -> Dict[str, Any]:        
-        intents_no_queries = [
-            IntentWithoutQueries(
-                intent_title=i.intent_title,
-                description=i.description,
-                nature=i.nature,
-                sub_natures=i.sub_natures
-            ) for i in self.intents.intents
-        ]
+        for facet_key in REQUIRED_FACETS:
+            facet_items = context.get(facet_key, None)
+            
+            # Fuzzy key match if LLM dropped the annotation
+            if facet_items is None:
+                prefix = facet_key.split("(")[0]
+                for ctx_key in context:
+                    if ctx_key.startswith(prefix):
+                        facet_items = context[ctx_key]
+                        if verbose:
+                            print(f"  [Validation] Fuzzy: '{ctx_key}' → '{facet_key}'")
+                        break
+            
+            if facet_items is None:
+                facet_items = []
+            
+            validated_items = []
+            for fi in facet_items:
+                if isinstance(fi, str) and fi.strip():
+                    validated_items.append(fi.strip())
+                elif isinstance(fi, dict):
+                    # Convert {"value":v, "description":d} or {"k": "v"} → "k - v"
+                    if "value" in fi:
+                        k, v = fi["value"], fi.get("description", "")
+                    else:
+                        k, v = next(iter(fi.items()), ("", ""))
+                    if k:
+                        validated_items.append(f"{k} - {v}" if v else k)
+            
+            validated_context[facet_key] = validated_items
         
-        result = Format_NatureBreakdown(
-            is_clinical=self.intents.is_clinical,
-            reason=self.intents.reason,
-            original_query=self.intents.original_query,
-            expanded_query=self.intents.expanded_query,
-            total_intents_detected=self.intents.total_intents_detected,
-            intents=intents_no_queries,
-            timestamp=self.timestamp
-        )
-        return result.model_dump()
+        validated_intents.append({
+            "intent_title": title,
+            "context": validated_context
+        })
     
-    def to_all_formats(self) -> Dict[str, Dict[str, Any]]:        
-        return {
-            "intent_extraction": self.to_intent_extraction(),
-            "final_queries": self.to_final_queries(),
-            "nature_breakdown": self.to_nature_breakdown()
+    return {"intents_with_context": validated_intents}
+
+
+def merge_context_into_intents(
+    intents: List[Dict[str, Any]], 
+    context_result: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Merges contextual environment data back into the intent structure.
+    Produces final output format compatible with downstream consumers.
+    """
+    context_map = {}
+    for ic in context_result.get("intents_with_context", []):
+        context_map[ic["intent_title"]] = ic.get("context", {})
+    
+    merged = []
+    for intent in intents:
+        merged_intent = {
+            "intent_title": intent.get("intent_title", ""),
+            "description": intent.get("description", ""),
+            "nature": intent.get("nature", ""),
+            "sub_natures": intent.get("sub_natures", []),
+            "final_queries": intent.get("final_queries", [])
         }
+        
+        title = intent.get("intent_title", "")
+        if title in context_map:
+            merged_intent["contextual_environment"] = context_map[title]
+        
+        merged.append(merged_intent)
+    
+    return merged
 
 
-
-# PIPELINE CLASS
-
+# ═════════════════════════════════════════════════════════════════════════════
+#                            PIPELINE CLASS
+# ═════════════════════════════════════════════════════════════════════════════
 
 class ContextualIntentPipeline:
+    """
+    Three-step pipeline: Query Expansion → Intent Extraction → Contextual Environment.
     
-    def __init__(self, project: str, location: str = LOCATION, model: str = MODEL_VERSION):       
-        self.client = genai.Client(
-            vertexai=True,
-            project=project,
-            location=location
-        )
-        
+    Contextual environment uses atomic_concepts as input, produces annotated 
+    facet keys with {term - description} strings, no hardcoded vocabulary.
+    """
+    
+    def __init__(self, project: str, location: str = "us-central1", 
+                 model: str = "gemini-2.5-flash"):
+        if not _GCP_AVAILABLE:
+            raise ImportError(
+                "google-cloud-aiplatform is required. "
+                "Install with: pip install google-cloud-aiplatform"
+            )
+        aiplatform.init(project=project, location=location)
+        self.model = GenerativeModel(model)
         self.project = project
         self.location = location
         self.model_name = model
-        
-     
-        
-    def _extract_json(self, response) -> Dict[str, Any]:
-       
-        if hasattr(response, 'text'):
-            text = response.text
-        elif hasattr(response, 'candidates') and response.candidates:
-            text = response.candidates[0].content.parts[0].text
-        else:
-            text = str(response)
-        
-        text = re.sub(r'```json\s*', '', text)
-        text = re.sub(r'```\s*', '', text)
-        text = text.strip()
-        
-        try:
-            return json.loads(text)
-        except:
-            pass
-        
-        json_patterns = [
-            (r'\{.*?\}', re.DOTALL),
-            (r'\[.*?\]', re.DOTALL),
-        ]
-        
-        for pattern, flags in json_patterns:
-            matches = list(re.finditer(pattern, text, flags))
-            matches.sort(key=lambda m: len(m.group(0)), reverse=True)
-            
-            for match in matches:
-                try:
-                    return json.loads(match.group(0))
-                except:
-                    continue
-        
-        raise ValueError(f"Could not parse JSON from response: {text[:500]}...")
     
-    def _call_model(self, prompt: str, response_schema: type[BaseModel],
-                    context_query: str = "") -> BaseModel:        
+    # ─────────────────────────────────────────────────────────────────────────
+    # GENERATION CONFIGS — Per-Step
+    # ─────────────────────────────────────────────────────────────────────────
+    #
+    # Each step has different output characteristics:
+    #
+    # ┌──────────────────┬───────────────┬───────────────┬────────────────────┐
+    # │ Step             │ Output Size   │ Complexity    │ Risk               │
+    # ├──────────────────┼───────────────┼───────────────┼────────────────────┤
+    # │ 1. Expansion     │ ~200-500 tok  │ Low           │ Hallucinated terms │
+    # │ 2. Intents       │ ~1000-6000    │ High          │ Token loops, miss  │
+    # │ 3. Context Env   │ ~500-4000     │ Medium        │ Generic desc loops │
+    # └──────────────────┴───────────────┴───────────────┴────────────────────┘
+    #
+    # Parameter reasoning:
+    #
+    # temperature:
+    #   0.0 = pure greedy (single most likely token). Best for factual
+    #         extraction where there's one correct answer.
+    #   0.1 = near-deterministic with escape valve. Prevents degenerate
+    #         token repetition loops in long outputs. Critical for Step 2
+    #         and Step 3 where output can be 2000-6000 tokens.
+    #   Rule: short output → 0.0, long structured output → 0.1
+    #
+    # top_p (nucleus sampling):
+    #   0.95 = considers tokens covering 95% of probability mass.
+    #          Filters out very unlikely tokens that cause JSON breaks.
+    #   1.0  = no filtering. Fine when temperature is already 0.0.
+    #   Rule: if temperature > 0, use top_p < 1.0 to guard output quality.
+    #
+    # Note: top_k is intentionally omitted. top_p is the superior filter
+    # for structured output — it adapts to the actual probability distribution
+    # rather than applying a fixed cutoff. Stacking both adds complexity
+    # without benefit.
+    #
+    # max_output_tokens:
+    #   Sized to the step's realistic output + 30% headroom.
+    #   Undersizing causes truncated JSON (silent failures).
+    #   Oversizing wastes quota/budget on unused allocation.
+    #
+    # seed:
+    #   Fixed integer for reproducibility across runs. Same seed + same
+    #   input + temperature=0 → identical output. At temperature>0, seed
+    #   gives best-effort reproducibility (model-dependent).
+    #
+    # response_mime_type:
+    #   "application/json" tells Gemini to constrain output to valid JSON.
+    #   This is the single most impactful setting for structured output —
+    #   eliminates markdown fences, preamble, and explanation text that 
+    #   otherwise require regex cleanup. Available on Gemini 1.5+/2.x.
+    #
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    # Step 1: Query Expansion
+    # Short factual transformation. One correct answer per abbreviation.
+    # Pure greedy is ideal — no creativity needed, output is small.
+    EXPANSION_CONFIG = {
+        "temperature": 0.0,         # Greedy: deterministic expansion
+        "top_p": 1.0,               # No filtering needed at temp=0
+        "max_output_tokens": 1024,  # Expansion output: ~200-500 tokens
+        "seed": 42,                 # Reproducibility
+        "response_mime_type": "application/json",
+    }
+    
+    # Step 2: Intent Extraction
+    # Complex multi-intent decomposition. Long structured output.
+    # Slight temperature prevents repetition loops in long sequences.
+    INTENT_CONFIG = {
+        "temperature": 0.1,         # Near-greedy: prevents token loops in long output
+        "top_p": 0.95,              # Filters unlikely tokens that break JSON structure
+        "max_output_tokens": 8192,  # Multi-intent output can reach 4000-6000 tokens
+        "seed": 42,                 # Best-effort reproducibility at temp > 0
+        "response_mime_type": "application/json",
+    }
+    
+    # Step 3: Contextual Environment
+    # Medium complexity. Generates descriptions per facet value.
+    # Slight temperature avoids repetitive description phrasing.
+    CONTEXT_ENV_CONFIG = {
+        "temperature": 0.1,         # Near-greedy: avoids repetitive descriptions
+        "top_p": 0.95,              # Filters unlikely tokens
+        "max_output_tokens": 4096,  # Context output: ~500-3000 tokens
+        "seed": 42,                 # Best-effort reproducibility
+        "response_mime_type": "application/json",
+    }
+    
+    def _call_model(self, prompt: str, config: Dict[str, Any]) -> str:
+        """
+        Call Vertex AI model with step-specific generation config.
+        
+        Args:
+            prompt: The formatted prompt string
+            config: Generation config dict (use class-level step configs)
+        
+        Returns:
+            Raw model response text, or "{}" on failure.
+        """
         try:
-            config = types.GenerateContentConfig(
-                temperature=0.0,
-                top_p=0.2,
-                seed=34,
-                max_output_tokens=8096,
-                response_mime_type="application/json",
-                response_schema=response_schema
+            if hasattr(self.model, "session") and self.model.session is not None:
+                self.model.session.reset()
+            
+            response = self.model.generate_content(
+                prompt,
+                generation_config=config
             )
-            
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config
-            )
-            
-            data = self._extract_json(response)
-            return response_schema.model_validate(data)
-            
+            return response.text.strip()
         except Exception as e:
-            print(f"Model error: {e}")
-            
-            if response_schema == QueryExpansionOutput:
-                return QueryExpansionOutput(
-                    expanded_query=context_query if context_query else "",
-                    abbreviations_expanded=[]
-                )
-            else:
-                return IntentExtractionOutput(
-                    is_clinical=False,
-                    reason=f"Processing error: {str(e)}",
-                    original_query=context_query if context_query else "",
-                    expanded_query=context_query if context_query else "",
-                    total_intents_detected=0,
-                    intents=[]
-                )
+            print(f"Error calling model: {str(e)}")
+            return "{}"
     
-    def expand_query(self, query: str) -> QueryExpansionOutput:
-        """Step 1: Expand abbreviations and add clinical context"""
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 1: Query Expansion
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def expand_query(self, query: str) -> Dict[str, Any]:
+        """Expand abbreviations and clarify clinical terms."""
         prompt = QUERY_EXPANSION_PROMPT.format(query=query)
-        return self._call_model(prompt, QueryExpansionOutput, query)
+        raw_response = self._call_model(prompt, self.EXPANSION_CONFIG)
+        data = _safe_json(raw_response)
+        
+        if not _validate_json_structure(data, ["expanded_query"]):
+            return {
+                "expanded_query": query,
+                "abbreviations_expanded": []
+            }
+        
+        return {
+            "expanded_query": data.get("expanded_query", query),
+            "abbreviations_expanded": data.get("abbreviations_expanded", [])
+        }
     
-    def extract_intents(self, original_query: str, expanded_query: str) -> IntentExtractionOutput:
-        """Step 2: Extract clinical intents with sub-natures"""
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 2: Intent Extraction
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def extract_intents(self, original_query: str, 
+                       expanded_query: str) -> Dict[str, Any]:
+        """Extract structured clinical intents with sub_natures and final_queries."""
         prompt = INTENT_EXTRACTION_PROMPT.format(
             original_query=original_query,
             expanded_query=expanded_query,
             timestamp=datetime.utcnow().isoformat()
         )
-        return self._call_model(prompt, IntentExtractionOutput, original_query)
+        
+        raw_response = self._call_model(prompt, self.INTENT_CONFIG)
+        data = _safe_json(raw_response)
+        
+        # Non-clinical rejection
+        if not data.get("is_clinical", True):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "is_clinical": False,
+                "rejected_reason": data.get("reason", "Query is not clinical"),
+                "original_query": original_query,
+                "expanded_query": expanded_query
+            }
+        
+        if not _validate_json_structure(data, ["intents"]):
+            return {
+                "intents": [],
+                "total_intents_detected": 0,
+                "error": "Failed to extract intents"
+            }
+        
+        # Validate that all intents have final_queries
+        intents = data.get("intents", [])
+        validated_intents = []
+        
+        for idx, intent in enumerate(intents):
+            if "final_queries" not in intent or not intent["final_queries"]:
+                print(f"  Warning: Intent {idx + 1} "
+                      f"'{intent.get('intent_title', 'Unknown')}' "
+                      f"has no final_queries. Skipping.")
+                continue
+            validated_intents.append(intent)
+        
+        return {
+            "intents": validated_intents,
+            "total_intents_detected": data.get("total_intents_detected", 
+                                               len(validated_intents)),
+            "is_clinical": True,
+            "original_query": data.get("original_query", original_query),
+            "expanded_query": data.get("expanded_query", expanded_query)
+        }
     
-    def extract(self, query: str, verbose: bool = False) -> ExtractionResult:       
-        if not query or not query.strip():
-            raise ValueError("Empty query provided")
+    # ─────────────────────────────────────────────────────────────────────────
+    # STEP 3: Contextual Environment Generation
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def generate_contextual_environment(
+        self,
+        original_query: str,
+        expanded_query: str,
+        intents: List[Dict[str, Any]],
+        verbose: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Generate contextual environment metadata for each clinical intent.
         
+        Uses atomic_concepts as primary input signal. Produces annotated
+        facet keys with {term - description} strings. No hardcoded vocabulary.
+        
+        Args:
+            original_query: Raw user query
+            expanded_query: Expanded clinical description
+            intents: Intent dicts with sub_natures containing atomic_concepts
+            verbose: Print debug info
+        
+        Returns:
+            Dict with intents_with_context, each containing annotated context facets.
+        """
+        if not intents:
+            if verbose:
+                print("  [Contextual Env] No intents provided — skipping")
+            return {"intents_with_context": []}
+        
+        # Extract focused input: atomic_concepts per intent
+        focused_input = prepare_intents_input(intents)
+        
+        if verbose:
+            for fi in focused_input:
+                print(f"  [Contextual Env] Intent: {fi['intent_title']}")
+                print(f"    Nature: {fi['nature']}")
+                print(f"    Atomic Concepts ({len(fi['atomic_concepts'])}): "
+                      f"{fi['atomic_concepts']}")
+        
+        intents_input_json = json.dumps(focused_input, indent=2)
+        
+        prompt = CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+            original_query=original_query,
+            expanded_query=expanded_query,
+            intents_input_json=intents_input_json
+        )
+        
+        raw_response = self._call_model(prompt, self.CONTEXT_ENV_CONFIG)
+        data = _safe_json(raw_response)
+        
+        if not data or "intents_with_context" not in data:
+            print("  [Contextual Env] Warning: Failed to parse output")
+            return {"intents_with_context": []}
+        
+        validated = _validate_contextual_output(data, intents, verbose)
+        return validated
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # PIPELINE EXECUTION
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
+        """
+        Execute the full pipeline: Expand → Extract → Contextualize.
+        
+        Args:
+            query: Raw user input
+            verbose: Print step-by-step debug output
+        
+        Returns:
+            Complete result with intents and contextual environments.
+        """
         start_time = datetime.utcnow()
-        
-        # Step 1: Expand query
-        expansion = self.expand_query(query)
-        
-        # Step 2: Extract intents
-        intents = self.extract_intents(query, expansion.expanded_query)
-        
-        processing_time = (datetime.utcnow() - start_time).total_seconds()
         
         if verbose:
             print(f"Original Query: {query}")
-            print(f"Expanded Query: {expansion.expanded_query}")
-            
-            if intents.is_clinical:
-                total_queries = sum(len(i.final_queries) for i in intents.intents)
-                total_sub_natures = sum(len(i.sub_natures) for i in intents.intents)
-                print(f"Status: Clinical")
-                print(f"Intents: {intents.total_intents_detected} | Sub-natures: {total_sub_natures} | Queries: {total_queries}")
-            else:
-                print(f"Status: Non-clinical")
-                print(f"Reason: {intents.reason}")
-            
-            print(f"Processing Time: {processing_time:.2f}s")
-            print()
         
-        return ExtractionResult(query, expansion, intents, processing_time)
-    
-    def run(self, query: str,
-            output_format: Literal["intent_extraction", "final_queries", "nature_breakdown"] = "nature_breakdown",
-            verbose: bool = False) -> Dict[str, Any]:
+        # ── STEP 1: Query Expansion ──
+        expansion_result = self.expand_query(query)
+        expanded_query = expansion_result["expanded_query"]
         
-        try:
-            result = self.extract(query, verbose)
+        if verbose:
+            print(f"Expanded Query: {expanded_query}")
+        
+        # ── STEP 2: Intent Extraction ──
+        intent_result = self.extract_intents(query, expanded_query)
+        
+        # Handle non-clinical queries
+        if not intent_result.get("is_clinical", True):
+            processing_time = (datetime.utcnow() - start_time).total_seconds()
             
-            if output_format == "intent_extraction":
-                return result.to_intent_extraction()
-            elif output_format == "final_queries":
-                return result.to_final_queries()
-            else:
-                return result.to_nature_breakdown()
-                
-        except ValueError as e:
-            return {
-                "error": str(e),
-                "query": query,
-                "timestamp": datetime.utcnow().isoformat()
-            }
-        except Exception as e:
             if verbose:
-                print(f"Error: {e}\n")
+                print(f"Status: NON-CLINICAL (rejected)")
+                print(f"Processing Time: {processing_time:.2f}s\n")
+            
             return {
-                "error": str(e),
-                "query": query,
-                "timestamp": datetime.utcnow().isoformat()
+                "original_query": query,
+                "expanded_query": expanded_query,
+                "is_clinical": False,
+                "rejected_reason": intent_result.get("rejected_reason", 
+                                                     "Query is not clinical"),
+                "intents": [],
+                "timestamp": datetime.utcnow().isoformat(),
+                "processing_time_seconds": processing_time
             }
-
-
-
-# UTILITY
-
-
-def save_json(data: Dict, filename: str):   
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"{filename}")
-
-
-def print_results(result: Dict):    
-    print(json.dumps(result, indent=2))
-
-
-def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:    
-    try:
-        if format_type == "intent_extraction":
-            Format_IntentExtraction.model_validate(result)
-        elif format_type == "final_queries":
-            Format_FinalQueries.model_validate(result)
-        elif format_type == "nature_breakdown":
-            Format_NatureBreakdown.model_validate(result)
-        else:
-            return False, f"Unknown format type: {format_type}"
         
-        return True, None
+        intents = intent_result.get("intents", [])
         
-    except Exception as e:
-        return False, str(e)
-
-
-def test_pipeline_consistency(pipeline, query: str):
-    """Run the pipeline for a query and save all output formats."""
-    result = pipeline.extract(query, verbose=True)
-    all_formats = result.to_all_formats()
-    
-    for fmt, data in all_formats.items():
-        filename = f"{fmt}.json"
-        save_json(data, filename)
-        # Ignore unused return values
-        _, _ = validate_schema(data, fmt)      
-
-
-def run_single_query(pipeline, query: str, idx: int):
-    """Run the pipeline for a single query, save outputs, and return summary."""
-    result = pipeline.extract(query, verbose=True)
-    all_formats = result.to_all_formats()
-    
-    prefix = f"query{idx}"
-
-    save_json(all_formats["intent_extraction"], f"{prefix}_intent_extraction.json")
-    save_json(all_formats["final_queries"], f"{prefix}_final_queries.json")
-    save_json(all_formats["nature_breakdown"], f"{prefix}_nature_breakdown.json")
-    print("-" * 60)
-
-    return {
-        "query": query,
-        "status": "completed",
-        "files": [
-            f"{prefix}_intent_extraction.json",
-            f"{prefix}_final_queries.json",
-            f"{prefix}_nature_breakdown.json",
-        ]
-    }
-
-
-if __name__ == "__main__":
-    pipeline = ContextualIntentPipeline(
-        project=PROJECT_ID,
-        location=LOCATION,
-        model=MODEL_VERSION
-    )
-
-    test_queries = [
-        "HAVE YOU RECEIVED ANY TREATMENT FOR YOUR CANCER?"
-    ]
-
-    results = []
-
-    # Parallel execution
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(run_single_query, pipeline, query, idx): query
-            for idx, query in enumerate(test_queries, 1)
+        # ── STEP 3: Contextual Environment ──
+        context_result = self.generate_contextual_environment(
+            query, expanded_query, intents, verbose
+        )
+        
+        # Merge contexts back into intents
+        final_intents = merge_context_into_intents(intents, context_result)
+        
+        # ── Stats ──
+        total_queries = sum(len(i.get('final_queries', [])) for i in intents)
+        total_sub_natures = sum(len(i.get('sub_natures', [])) for i in intents)
+        contexts_generated = len([i for i in final_intents 
+                                  if "contextual_environment" in i])
+        processing_time = (datetime.utcnow() - start_time).total_seconds()
+        
+        if verbose:
+            print(f"Status: Clinical")
+            print(f"Intents: {len(intents)} | Sub-natures: {total_sub_natures} "
+                  f"| Queries: {total_queries}")
+            print(f"Contextual Environments: {contexts_generated}")
+            print(f"Processing Time: {processing_time:.2f}s\n")
+        
+        return {
+            "original_query": query,
+            "expanded_query": expanded_query,
+            "is_clinical": True,
+            "total_intents_detected": len(intents),
+            "intents": final_intents,
         }
 
-        for future in as_completed(futures):
-            results.append(future.result())
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                              UNIT TESTS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_unit_tests():
+    """Unit tests for structural logic. No LLM required."""
+    print("=" * 60)
+    print("UNIT TESTS")
+    print("=" * 60)
+    
+    passed = 0
+    failed = 0
+    
+    def ok(name, condition, detail=""):
+        nonlocal passed, failed
+        if condition:
+            print(f"  ✓ {name}")
+            passed += 1
+        else:
+            print(f"  ✗ {name} — {detail}")
+            failed += 1
+    
+    # ── Shared fixtures ──
+    INTENTS = [
+        {
+            "intent_title": "A", "description": "da", "nature": "na",
+            "sub_natures": [
+                {"category_path": "x >> y", "atomic_concepts": ["c1", "c2"]},
+                {"category_path": "x >> z", "atomic_concepts": ["c3"]}
+            ],
+            "final_queries": ["q1", "q2"]
+        },
+        {
+            "intent_title": "B", "description": "db", "nature": "nb",
+            "sub_natures": [{"category_path": "m", "atomic_concepts": ["c4"]}],
+            "final_queries": ["q3"]
+        }
+    ]
+    
+    def _ctx(title):
+        s = "t1 - d1"
+        return {"intent_title": title, "context": {f: [s] for f in REQUIRED_FACETS}}
+    
+    # ── 1. extract_atomic_concepts ──
+    print("\n[1] extract_atomic_concepts")
+    ok("Flattens", extract_atomic_concepts_from_intent(INTENTS[0]) == ["c1", "c2", "c3"])
+    ok("Dedup", len(extract_atomic_concepts_from_intent(
+        {"sub_natures": [{"atomic_concepts": ["X", "x", "Y"]}]})) == 2)
+    ok("Empty", extract_atomic_concepts_from_intent({"sub_natures": []}) == [])
+    ok("Missing", extract_atomic_concepts_from_intent({}) == [])
+    
+    # ── 2. prepare_intents_input ──
+    print("\n[2] prepare_intents_input")
+    focused = prepare_intents_input(INTENTS)
+    ok("Count", len(focused) == 2)
+    ok("Keeps title", focused[0]["intent_title"] == "A")
+    ok("Keeps nature", focused[0]["nature"] == "na")
+    ok("Keeps concepts", focused[0]["atomic_concepts"] == ["c1", "c2", "c3"])
+    ok("Drops description", "description" not in focused[0])
+    ok("Drops final_queries", "final_queries" not in focused[0])
+    ok("Empty", prepare_intents_input([]) == [])
+    
+    # ── 3. validate — valid flat strings ──
+    print("\n[3] validate — valid")
+    v = _validate_contextual_output({"intents_with_context": [_ctx("A")]}, INTENTS)
+    ctx = v["intents_with_context"][0]["context"]
+    ok("5 facets", all(f in ctx for f in REQUIRED_FACETS))
+    ok("Items are strings", isinstance(ctx[FACET_DOCUMENT_TYPES][0], str))
+    ok("Content preserved", ctx[FACET_DOCUMENT_TYPES][0] == "t1 - d1")
+    
+    # ── 4. validate — dict fallback (LLM returns objects) ──
+    print("\n[4] validate — dict→string")
+    obj = {"intents_with_context": [{"intent_title": "A", "context": {
+        f: [{"value": "v1", "description": "d1"}] for f in REQUIRED_FACETS
+    }}]}
+    dt = _validate_contextual_output(obj, INTENTS
+        )["intents_with_context"][0]["context"][FACET_DOCUMENT_TYPES]
+    ok("Dict flattened to string", dt[0] == "v1 - d1")
+    
+    # ── 5. validate — single-key dict fallback ──
+    print("\n[5] validate — {k:v} dict→string")
+    kv = {"intents_with_context": [{"intent_title": "A", "context": {
+        f: [{"term1": "desc1"}] for f in REQUIRED_FACETS
+    }}]}
+    dt2 = _validate_contextual_output(kv, INTENTS
+        )["intents_with_context"][0]["context"][FACET_DOCUMENT_TYPES]
+    ok("Key:value dict flattened", dt2[0] == "term1 - desc1")
+    
+    # ── 6. validate — fuzzy key match ──
+    print("\n[6] validate — fuzzy keys")
+    fuzzy = {"intents_with_context": [{"intent_title": "A", "context": {
+        "document_types": ["a - b"], "author_roles": ["c - d"],
+        "temporal_scope": ["e - f"], "content_signals": ["g - h"],
+        "clinical_setting": ["i - j"]
+    }}]}
+    cf = _validate_contextual_output(fuzzy, INTENTS)["intents_with_context"][0]["context"]
+    ok("All recovered", all(len(cf[f]) > 0 for f in REQUIRED_FACETS))
+    ok("Values preserved", cf[FACET_CONTENT_SIGNALS][0] == "g - h")
+    
+    # ── 7. merge ──
+    print("\n[7] merge")
+    merged = merge_context_into_intents(INTENTS, {"intents_with_context": [_ctx("A")]})
+    ok("Count", len(merged) == 2)
+    ok("Matched", "contextual_environment" in merged[0])
+    ok("Unmatched", "contextual_environment" not in merged[1])
+    ok("Fields kept", merged[0]["final_queries"] == ["q1", "q2"])
+    ok("Annotated keys", FACET_DOCUMENT_TYPES in merged[0]["contextual_environment"])
+    ok("Empty", merge_context_into_intents([], {"intents_with_context": []}) == [])
+    
+    # ── 8. _safe_json ──
+    print("\n[8] _safe_json")
+    ok("Clean", _safe_json('{"k": 1}') == {"k": 1})
+    ok("Fenced", _safe_json('```json\n{"k": 1}\n```') == {"k": 1})
+    ok("Embedded", _safe_json('txt {"k": 1} txt') == {"k": 1})
+    ok("Garbage", _safe_json('nope') == {})
+    
+    # ── 9. Constants ──
+    print("\n[9] Constants")
+    ok("5 facets", len(REQUIRED_FACETS) == 5)
+    ok("Annotated", all("(" in f for f in REQUIRED_FACETS))
+    ok("Has content_signals", any("content_signals" in f for f in REQUIRED_FACETS))
+    
+    print(f"\n{'=' * 60}")
+    print(f"{passed} passed, {failed} failed")
+    print(f"{'=' * 60}")
+    return failed == 0
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#                                MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import sys
+    
+    # If --test flag, run unit tests only
+    if "--test" in sys.argv:
+        success = run_unit_tests()
+        sys.exit(0 if success else 1)
+    
+    # Otherwise run the pipeline
+    if not _GCP_AVAILABLE:
+        print("ERROR: google-cloud-aiplatform not installed.")
+        print("Install with: pip install google-cloud-aiplatform")
+        print("Run unit tests with: python contextual_intent_pipeline.py --test")
+        sys.exit(1)
+    
+    PROJECT_ID = "your-project-id"       # ← Replace
+    MODEL_VERSION = "gemini-2.5-flash"   # ← Replace if needed
+    
+    pipeline = ContextualIntentPipeline(
+        project=PROJECT_ID,
+        location="us-central1",
+        model=MODEL_VERSION
+    )
+    
+    # Accept queries from command line or prompt interactively
+    queries = sys.argv[1:] if len(sys.argv) > 1 else []
+    if not queries:
+        print("Usage: python contextual_intent_pipeline.py <query1> [query2] ...")
+        print("       python contextual_intent_pipeline.py --test")
+        sys.exit(0)
+    
+    for idx, query in enumerate(queries, 1):
+        print(f"\n{'='*80}")
+        print(f"Query {idx}/{len(queries)}")
+        print(f"{'='*80}")
+        
+        result = pipeline.run(query, verbose=True)
+        
+        output_filename = f"query_result_{idx}_with_context.json"
+        with open(output_filename, 'w') as f:
+            json.dump(result, f, indent=2)
+        
+        print(f"Saved to: {output_filename}")
