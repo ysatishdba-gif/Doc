@@ -13,7 +13,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import networkx
 import requests
-import scann
 from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
@@ -161,7 +160,7 @@ class ConfidenceEntry:
     cui: str
     term: str
     confidence: float
-    ic_norm: float
+    extraction_proximity: float
     centrality: float
     retention_power: float
     semantic_types: List[str]
@@ -414,7 +413,7 @@ class ICComputer:
         return len(visited)
 
 
-#  8- Filters
+#  8- SAB Filter
 class SABFilter:
     def __init__(self, allowed):
         self.allowed = set(allowed)
@@ -432,52 +431,6 @@ class SABFilter:
                     f"vocabs {m.source_vocabs} not in allowed"))
                 continue
             kept.append(cui)
-        return kept, audit
-
-
-class SemanticTypeFilter:
-    def __init__(self, excluded):
-        self.excluded = set(excluded) if excluded else set()
-
-    @timed("semtype_filter")
-    def run(self, cuis, metadata):
-        if not self.excluded:
-            return cuis, []
-        kept, audit = [], []
-        for cui in cuis:
-            m = metadata.get(cui)
-            if not m or not m.semantic_types:
-                kept.append(cui)
-                continue
-            if all(st in self.excluded for st in m.semantic_types):
-                audit.append(AuditEntry(cui, m.preferred_term, "", "", "semtype_excluded",
-                    f"all types {m.semantic_types} excluded"))
-                continue
-            kept.append(cui)
-        return kept, audit
-
-
-class TermDeduplicator:
-    @staticmethod
-    @timed("term_dedup")
-    def run(cuis, metadata, ic_map):
-        groups = defaultdict(list)
-        for cui in cuis:
-            m = metadata.get(cui)
-            key = m.normalized_term if m else cui
-            groups[key].append(cui)
-        kept, audit = [], []
-        for term, members in groups.items():
-            best = max(members, key=lambda c: ic_map.get(c, 0))
-            kept.append(best)
-            for c in members:
-                if c != best:
-                    bm = metadata.get(best)
-                    cm = metadata.get(c)
-                    audit.append(AuditEntry(
-                        c, cm.preferred_term if cm else "",
-                        best, bm.preferred_term if bm else "",
-                        "term_dedup", f"identical norm term '{term}'"))
         return kept, audit
 
 
@@ -585,10 +538,48 @@ class EmbeddingFetcher:
         return result
 
 
-#  11- ScaNN Topic Builder
+def _cosine_knn(matrix, k):
+    """Compute k nearest neighbors using cosine similarity via numpy.
+
+    Args:
+        matrix: (N, D) float32 array, assumed L2-normalized
+        k: number of neighbors per point
+
+    Returns:
+        neighbors: (N, k) int array of neighbor indices
+        sim_scores: (N, k) float array of cosine similarities (descending)
+    """
+    n = matrix.shape[0]
+    k = min(k, n - 1)
+    if k < 1:
+        return np.zeros((n, 0), dtype=int), np.zeros((n, 0), dtype=np.float32)
+
+    # cosine similarity = dot product for L2-normalized vectors
+    # chunk to limit memory: 2000 rows at a time (~30MB per chunk for dim=768)
+    chunk_size = 2000
+    neighbors = np.zeros((n, k), dtype=int)
+    sim_scores = np.zeros((n, k), dtype=np.float32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        sims = matrix[start:end] @ matrix.T  # (chunk, N)
+        # zero out self-similarity
+        for i in range(start, end):
+            sims[i - start, i] = -np.inf
+        # top-k per row
+        top_k_idx = np.argpartition(-sims, k, axis=1)[:, :k]
+        for i in range(end - start):
+            row_idx = top_k_idx[i]
+            row_sims = sims[i, row_idx]
+            order = np.argsort(-row_sims)
+            neighbors[start + i] = row_idx[order]
+            sim_scores[start + i] = row_sims[order]
+    return neighbors, sim_scores
+
+
+#  11- Topic Builder (cosine k-NN + Louvain)
 class TopicBuilder:
     @staticmethod
-    @timed("scann_topics")
+    @timed("cosine_topics")
     def build(cuis, embeddings, k_neighbors=20):
         cuis = sorted(cuis)
         np.random.seed(42)
@@ -599,24 +590,13 @@ class TopicBuilder:
             return {i: [c] for i, c in enumerate(cuis)}
         k = min(k_neighbors, n - 1)
         k = max(k, 1)
-        num_leaves = min(max(2, int(np.sqrt(n))), n)
-        builder = scann.scann_ops_pybind.builder(matrix, k, "dot_product")
-        if n >= 16 and dim >= 2:
-            dims_per_block = 2 if dim % 2 == 0 else 1
-            builder = (
-                builder
-                .tree(num_leaves=num_leaves,
-                      num_leaves_to_search=max(1, num_leaves // 5),
-                      training_sample_size=min(n, 250_000))
-                .score_ah(dims_per_block, anisotropic_quantization_threshold=0.2)
-                .reorder(min(k * 4, n)))
-        else:
-            builder = builder.score_brute_force()
-        searcher = builder.build()
-        neighbors, scores = searcher.search_batched(matrix)
+
+        # cosine k-NN
+        neighbors, sim_scores = _cosine_knn(matrix, k)
+
         kth_dists = []
         for i in range(n):
-            valid = scores[i][scores[i] > -1e30]
+            valid = sim_scores[i][sim_scores[i] > -1e30]
             if len(valid) > 0:
                 kth_dists.append(1.0 - float(valid[-1]))
         if kth_dists:
@@ -634,7 +614,7 @@ class TopicBuilder:
                 j = int(neighbors[i][j_pos])
                 if j < 0 or j >= n or j == i:
                     continue
-                dist = 1.0 - float(scores[i][j_pos])
+                dist = 1.0 - float(sim_scores[i][j_pos])
                 if dist < threshold:
                     weight = 1.0 - dist  # higher similarity = higher weight
                     if G.has_edge(i, j):
@@ -849,13 +829,13 @@ class EmbeddingReducer:
                 continue
 
             # within each component, Louvain sub-clustering
-            scann_topics = TopicBuilder.build(with_emb, embeddings)
-            sizes = sorted([len(v) for v in scann_topics.values()], reverse=True)
+            louvain_topics = TopicBuilder.build(with_emb, embeddings)
+            sizes = sorted([len(v) for v in louvain_topics.values()], reverse=True)
             if len(with_emb) > 10:
-                log(f"      [comp_{comp_id}] {len(with_emb)} CUIs -> {len(scann_topics)} topics "
+                log(f"      [comp_{comp_id}] {len(with_emb)} CUIs -> {len(louvain_topics)} topics "
                     f"(max={sizes[0]}, top5={sizes[:5]})")
             # Step 3: within each topic, reduce redundancy
-            for t_cuis in scann_topics.values():
+            for t_cuis in louvain_topics.values():
                 topic_id = f"topic_{tid}"
                 tid += 1
                 if len(t_cuis) <= 1:
@@ -1009,7 +989,7 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
 class CrossTopicDedup:
     """Connected-component duplicate collapse (not greedy).
 
-    1. ScaNN k-NN finds close pairs
+    1. Cosine k-NN finds close pairs
     2. Guard checks (qualifier, terms, ancestor overlap) filter edges
     3. Valid edges form connected components via Union-Find
     4. Per component: keep CUI with highest centrality to global centroid
@@ -1035,24 +1015,9 @@ class CrossTopicDedup:
         if g_norm > 0:
             global_cent = global_cent / g_norm
 
-        # ScaNN k-NN
+        # cosine k-NN
         k = min(10, n - 1)
-        num_leaves = min(max(2, int(np.sqrt(n))), n)
-        dim = matrix.shape[1]
-        builder = scann.scann_ops_pybind.builder(matrix, k, "dot_product")
-        if n >= 16 and dim >= 2:
-            dims_per_block = 2 if dim % 2 == 0 else 1
-            builder = (
-                builder
-                .tree(num_leaves=num_leaves,
-                      num_leaves_to_search=max(1, num_leaves // 5),
-                      training_sample_size=min(n, 250_000))
-                .score_ah(dims_per_block, anisotropic_quantization_threshold=0.2)
-                .reorder(min(k * 4, n)))
-        else:
-            builder = builder.score_brute_force()
-        searcher = builder.build()
-        neighbors, scores = searcher.search_batched(matrix)
+        neighbors, sim_scores = _cosine_knn(matrix, k)
 
         # threshold from k-NN distances
         nn_dists = []
@@ -1061,7 +1026,7 @@ class CrossTopicDedup:
                 j = int(neighbors[i][j_pos])
                 if j < 0 or j >= n or j == i:
                     continue
-                nn_dists.append(1.0 - float(scores[i][j_pos]))
+                nn_dists.append(1.0 - float(sim_scores[i][j_pos]))
         if not nn_dists:
             return surviving, []
         nn_dists = np.array(nn_dists, dtype=np.float32)
@@ -1074,7 +1039,7 @@ class CrossTopicDedup:
                 j = int(neighbors[i][j_pos])
                 if j < 0 or j >= n or j <= i:
                     continue
-                dist_ij = 1.0 - float(scores[i][j_pos])
+                dist_ij = 1.0 - float(sim_scores[i][j_pos])
                 if dist_ij > threshold:
                     continue
                 ci, cj = with_emb[i], with_emb[j]
@@ -1155,25 +1120,47 @@ class CrossTopicDedup:
 
 #  15- Confidence Scorer
 class ConfidenceScorer:
-    """Scores each surviving CUI by 2 structural signals.
+    """Scores each surviving CUI by up to 3 signals.
 
-    IC is flat across 97% of UMLS leaf nodes (all = 14.8), providing zero
-    discriminative signal. Removed entirely.
+    When extraction distances available (per-phrase scoring):
+        confidence = 0.50 * extraction_proximity  (1 - normalized distance)
+                   + 0.30 * embedding_centrality   (cosine to topic centroid)
+                   + 0.20 * retention_power         (log-scaled absorbed count)
 
-    confidence = 0.60 * embedding_centrality   (cosine to own topic centroid)
-               + 0.40 * retention_power        (log-scaled absorbed CUI count)
+    When no extraction distances (e.g. patient documents):
+        confidence = 0.60 * embedding_centrality
+                   + 0.40 * retention_power
     """
 
     @staticmethod
     @timed("confidence_score")
     def score(surviving, metadata, audit_trail,
-              embeddings, cui_topic, topic_centroids):
+              embeddings, cui_topic, topic_centroids,
+              extraction_distances=None):
+        """Score surviving CUIs.
+
+        Args:
+            extraction_distances: optional dict CUI -> distance from API.
+                                  Lower distance = more relevant to query phrase.
+        """
         explains = defaultdict(list)
         for entry in audit_trail:
             if entry.kept_cui and entry.removed_cui:
                 explains[entry.kept_cui].append(entry.removed_cui)
 
         max_retained = max((len(v) for v in explains.values()), default=0)
+
+        # normalize extraction distances to [0, 1] proximity
+        ext_prox = {}
+        if extraction_distances:
+            dists = [d for d in extraction_distances.values() if d is not None]
+            if dists:
+                max_dist = max(dists) if max(dists) > 0 else 1.0
+                for cui, d in extraction_distances.items():
+                    if d is not None:
+                        ext_prox[cui] = 1.0 - (d / max_dist)
+
+        has_ext = len(ext_prox) > 0
 
         entries = []
         retention_map = {}
@@ -1182,6 +1169,10 @@ class ConfidenceScorer:
             retained = explains.get(cui, [])
             retention_map[cui] = retained
 
+            # signal 1: extraction proximity
+            proximity = ext_prox.get(cui, 0.0)
+
+            # signal 2: embedding centrality to topic centroid
             topic_id = cui_topic.get(cui)
             centroid = topic_centroids.get(topic_id) if topic_id else None
             if centroid is not None and cui in embeddings:
@@ -1189,17 +1180,25 @@ class ConfidenceScorer:
             else:
                 centrality = 0.0
 
+            # signal 3: retention power
             if max_retained > 0:
                 retention_power = np.log1p(len(retained)) / np.log1p(max_retained)
             else:
                 retention_power = 0.0
 
-            confidence = 0.60 * centrality + 0.40 * retention_power
+            # weighted combination
+            if has_ext:
+                confidence = (0.50 * proximity +
+                              0.30 * centrality +
+                              0.20 * retention_power)
+            else:
+                confidence = (0.60 * centrality +
+                              0.40 * retention_power)
 
             entries.append(ConfidenceEntry(
                 cui=cui, term=m.preferred_term if m else cui,
                 confidence=round(confidence, 4),
-                ic_norm=0.0,
+                extraction_proximity=round(proximity, 3),
                 centrality=round(centrality, 3),
                 retention_power=round(retention_power, 3),
                 semantic_types=list(m.semantic_types) if m else [],
@@ -1214,29 +1213,45 @@ class ConfidenceScorer:
 class CUIReductionSystem:
     def __init__(self, project_id, dataset_id, full_network,
                  allowed_sabs, embedding_table,
-                 excluded_semantic_types=None, ic_scores=None,
+                 ic_scores=None,
                  cache_dir=None):
         self.bq = bigquery.Client(project=project_id)
         self.cache_dir = cache_dir
         self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id, cache_dir=cache_dir)
         self.ic_computer = ICComputer(full_network, ic_scores)
         self.sab_filter = SABFilter(allowed_sabs)
-        self.semtype_filter = SemanticTypeFilter(excluded_semantic_types or set())
         self.hierarchy_reducer = HierarchyReducer(full_network)
         self.emb_fetcher = EmbeddingFetcher(
             self.bq, project_id, dataset_id, embedding_table, cache_dir=cache_dir)
 
     @timed("full_pipeline")
-    def reduce(self, cuis, context_string):
-        results = self.reduce_batch([(cuis, context_string)])
+    def reduce(self, cuis, context_string, extraction_distances=None):
+        results = self.reduce_batch([(cuis, context_string, extraction_distances)])
         return results[0]
 
     @timed("batch_pipeline")
     def reduce_batch(self, inputs):
+        """Run reduction pipeline on multiple inputs.
+
+        Args:
+            inputs: list of tuples, each either:
+                (cuis, context_string) — no extraction distances
+                (cuis, context_string, extraction_distances) — with distances
+                where extraction_distances = dict CUI -> float distance
+        """
         t0 = time.perf_counter()
         _clear_ancestor_cache()
+
+        # normalize inputs to 3-tuples
+        normalized = []
+        for item in inputs:
+            if len(item) == 2:
+                normalized.append((item[0], item[1], None))
+            else:
+                normalized.append((item[0], item[1], item[2]))
+
         all_cuis = set()
-        for cuis, _ in inputs:
+        for cuis, _, _ in normalized:
             all_cuis.update(cuis)
         log(f"[Batch] {len(inputs)} texts, {len(all_cuis)} unique CUIs")
 
@@ -1251,23 +1266,19 @@ class CUIReductionSystem:
         # first pass: run filters + hierarchy (no embeddings needed)
         per_text = []
         all_filtered = set()
-        for cuis, context_string in inputs:
+        for cuis, context_string, ext_dists in normalized:
             if not cuis:
-                per_text.append((context_string, [], [], [], set(), []))
+                per_text.append((context_string, [], [], [], set(), [], None))
                 continue
             label = context_string[:50]
             log(f"\n  [{label}]")
             after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
             log(f"    SAB Filter: {len(cuis)} -> {len(after_sab)} (removed {len(cuis) - len(after_sab)})")
-            after_sty, sty_audit = self.semtype_filter.run(after_sab, metadata)
-            log(f"    Semtype Filter: {len(after_sab)} -> {len(after_sty)} (removed {len(after_sab) - len(after_sty)})")
-            after_term, term_audit = TermDeduplicator.run(after_sty, metadata, ic_map)
-            log(f"    Term Dedup: {len(after_sty)} -> {len(after_term)} (removed {len(after_sty) - len(after_term)})")
-            after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_term, ic_map, metadata)
-            log(f"    Hierarchy: {len(after_term)} -> {len(after_hier)} (removed {len(after_term) - len(after_hier)})")
-            audit = sab_audit + sty_audit + term_audit + hier_audit
+            after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_sab, ic_map, metadata)
+            log(f"    Hierarchy: {len(after_sab)} -> {len(after_hier)} (removed {len(after_sab) - len(after_hier)})")
+            audit = sab_audit + hier_audit
             all_filtered.update(after_hier)
-            per_text.append((context_string, cuis, after_term, after_hier, hier_edges, audit))
+            per_text.append((context_string, cuis, after_sab, after_hier, hier_edges, audit, ext_dists))
 
         # fetch embeddings only for post-filter survivors
         log(f"\n[Batch] Fetching embeddings for {len(all_filtered)} post-filter CUIs "
@@ -1276,7 +1287,7 @@ class CUIReductionSystem:
 
         # second pass: embedding-based stages
         results = []
-        for context_string, cuis, after_filter, after_hier, hier_edges, all_audit in per_text:
+        for context_string, cuis, after_filter, after_hier, hier_edges, all_audit, ext_dists in per_text:
             t_start = time.perf_counter()
             if not after_hier:
                 results.append(self._empty(context_string, t_start, all_audit))
@@ -1332,7 +1343,8 @@ class CUIReductionSystem:
 
             sorted_cuis, confidence, retention_map = ConfidenceScorer.score(
                 surviving, metadata, all_audit,
-                embeddings, cui_topic, topic_centroids)
+                embeddings, cui_topic, topic_centroids,
+                extraction_distances=ext_dists)
 
             # confidence scores rank output only — no Otsu cutoff
             # (confidence distributions in multi-topic documents are often unimodal;
@@ -1427,22 +1439,23 @@ class CUIExtractor:
 
     @timed("cui_extraction")
     def extract(self, text_list, context_list):
-        """Extract CUIs for clinical terms within contexts.
+        """Extract CUIs per phrase with distances.
 
         Args:
             text_list:    List of clinical phrases to look up.
                           e.g. ["left knee pain", "swelling"]
             context_list: Parallel list — one context per text (same length).
-                          e.g. ["Patient has left knee pain with swelling",
-                                "Patient has left knee pain with swelling"]
+                          e.g. ["Patient has left knee pain...",
+                                "Patient has left knee pain..."]
 
         Returns:
-            List of unique CUI strings from member_code fields
+            dict: {phrase: {cui: distance}} — per-phrase CUIs with distances
         """
         cache_key = f"{'||'.join(sorted(text_list))}||{self.top_k}||{self.top_p}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            log(f"    Extraction: {len(cached)} unique CUIs (cached)")
+            total = sum(len(v) for v in cached.values())
+            log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
             return cached
 
         payload = {
@@ -1460,32 +1473,36 @@ class CUIExtractor:
         data = resp.json()
 
         # Response: { "output": { phrase: [ { cluster_code, members } ] } }
-        # member_code = the actual CUIs (deduplicated across clusters, sorted by distance)
-        cuis = []
-        scores_map = {}
+        # Return per-phrase: { phrase: { cui: distance } }
+        per_phrase = {}
         output = data.get("output", {})
         for phrase, clusters in output.items():
             if not isinstance(clusters, list):
                 continue
+            cui_dists = {}
             for cluster in clusters:
                 for member in cluster.get("members", []):
                     c = str(member.get("member_code", ""))
                     if c:
-                        cuis.append(c)
                         dist = member.get("member_code_distance")
-                        if dist is not None:
-                            scores_map[c] = float(dist)
+                        d = float(dist) if dist is not None else None
+                        # keep closest distance if CUI appears in multiple clusters
+                        if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
+                            cui_dists[c] = d
+            if cui_dists:
+                per_phrase[phrase] = cui_dists
 
-        unique = list(set(cuis))
-        if scores_map:
-            score_vals = list(scores_map.values())
-            log(f"    Extraction: {len(unique)} unique CUIs | "
-                f"distance range [{min(score_vals):.3f}, {max(score_vals):.3f}] | "
-                f"mean={np.mean(score_vals):.3f}")
-        else:
-            log(f"    Extraction: {len(unique)} unique CUIs")
-        self._cache.put(cache_key, unique)
-        return unique
+        total = sum(len(v) for v in per_phrase.values())
+        log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases")
+        for phrase, cuis in per_phrase.items():
+            dists = [d for d in cuis.values() if d is not None]
+            if dists:
+                log(f"      '{phrase}': {len(cuis)} CUIs | "
+                    f"dist [{min(dists):.3f}, {max(dists):.3f}]")
+            else:
+                log(f"      '{phrase}': {len(cuis)} CUIs")
+        self._cache.put(cache_key, per_phrase)
+        return per_phrase
 
 
 #  18- Init
@@ -1540,7 +1557,7 @@ if __name__ == "__main__":
         "climbing stairs difficulty",
         "knee effusion",
     ]
-    context_list = [context] * len(text_list)  # 5 texts → 5 copies of same context
+    context_list = [context] * len(text_list)
 
     log(f"\n[Extract] {len(text_list)} phrases, context='{context[:60]}...'")
     for t in text_list:
@@ -1548,28 +1565,30 @@ if __name__ == "__main__":
     assert len(text_list) == len(context_list), \
         f"text_list ({len(text_list)}) and context_list ({len(context_list)}) must be same length"
 
-    t0 = time.perf_counter()
-    cuis = extractor.extract(text_list, context_list)
-    elapsed = (time.perf_counter() - t0) * 1000
-    log(f"    Extraction time: {elapsed:.0f}ms")
+    # one API call returns per-phrase CUIs: { phrase: { cui: distance } }
+    per_phrase = extractor.extract(text_list, context_list)
 
-    if cuis:
-        inputs = [(cuis, context)]
-        results = system.reduce_batch(inputs)
-        extractor._cache.flush()
+    # each phrase runs through the pipeline separately with its own distances
+    inputs = []
+    for phrase, cui_dists in per_phrase.items():
+        cuis = list(cui_dists.keys())
+        inputs.append((cuis, phrase, cui_dists))
 
-        for result in results:
-            log(f"\n{'=' * 60}")
-            log(f"SUMMARY: {result.input_count} -> {result.after_redundancy_count} CUIs, "
-                f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
-            log(f"\n-- Top 20 CUIs by confidence (of {len(result.confidence)}) --")
-            for entry in result.confidence[:20]:
-                line = (f"  {entry.cui} | conf={entry.confidence} "
-                        f"cent={entry.centrality} ret={entry.retention_power} | "
-                        f"{entry.term} | explains {len(entry.explains_cuis)}")
-                log(line)
-            log(f"\n-- Topics: {len(result.topics)} (showing first 20) --")
-            for tid, topic in list(result.topics.items())[:20]:
-                log(f"  {tid} ({len(topic.cuis)} CUIs)")
-            if len(result.topics) > 20:
-                log(f"  ... {len(result.topics) - 20} more topics")
+    results = system.reduce_batch(inputs)
+    extractor._cache.flush()
+
+    # per-phrase output
+    for result in results:
+        log(f"\n{'=' * 70}")
+        log(f"PHRASE: '{result.context_string}'")
+        log(f"  {result.input_count} -> {result.after_redundancy_count} CUIs, "
+            f"{len(result.topics)} topics ({result.processing_time_ms:.0f}ms)")
+        log(f"\n  -- CUIs ranked by confidence --")
+        for entry in result.confidence[:20]:
+            line = (f"    {entry.cui} | conf={entry.confidence} "
+                    f"prox={entry.extraction_proximity} "
+                    f"cent={entry.centrality} ret={entry.retention_power} | "
+                    f"{entry.term}")
+            log(line)
+        if len(result.confidence) > 20:
+            log(f"    ... {len(result.confidence) - 20} more")
