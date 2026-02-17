@@ -1221,38 +1221,61 @@ class CrossTopicDedup:
 
 #  15- Confidence Scorer
 class ConfidenceScorer:
-    """Scores each surviving CUI by up to 3 signals.
+    """Statistical confidence scoring — no hardcoded weights.
 
-    When extraction distances available (per-phrase scoring):
-        confidence = 0.55 * extraction_proximity  (1/(1+d) — monotonic, high spread)
-                   + 0.30 * global_centrality      (cosine to proximity-weighted centroid)
-                   + 0.15 * retention_power         (log-scaled absorbed count)
+    Method: Per-phrase z-score normalization + margin-adjusted sigmoid.
 
-    When no extraction distances (e.g. patient documents):
-        confidence = 0.60 * global_centrality
-                   + 0.40 * retention_power
+    Step 1 — Raw signals (same as before):
+        prox = 1/(1+d)           extraction proximity
+        cent = cos(emb, G)       cosine to proximity-weighted global centroid
+        ret  = log(1+n)/log(1+N) retention power (absorbed CUI count)
 
-    Key design choices:
-    - Global centroid (not topic centroid): with 70+ topics for ~120 CUIs,
-      topic centroids = each CUI's own centroid → centrality=1.0 everywhere.
-    - Proximity-weighted centroid: CUIs close to the query phrase pull the
-      centroid toward "true meaning" of the phrase. Helps filter wrong
-      laterality (right vs left) and wrong body parts (hand vs knee).
-    - 1/(1+d) proximity: maps API distance to [0,1] with natural spread.
-      d=0→1.0, d=0.1→0.91, d=0.5→0.67, d=1.0→0.5, d=2.0→0.33
+    Step 2 — Per-phrase z-score normalization:
+        z_prox = (prox - μ_prox) / σ_prox    (within THIS phrase's survivors)
+        z_cent = (cent - μ_cent) / σ_cent
+        z_ret  = (ret  - μ_ret)  / σ_ret
+
+        Why: Removes scale dependence. Each signal contributes equally in
+        standardized space without arbitrary weight tuning. A 1σ outlier
+        in proximity has the same influence as a 1σ outlier in centrality.
+
+    Step 3 — Raw composite:
+        raw = z_prox + z_cent + z_ret
+
+        With extraction distances: all 3 signals.
+        Without (patient documents): raw = z_cent + z_ret.
+
+    Step 4 — Margin adjustment:
+        margin_i = raw_i - median(raw)
+
+        Measures how distinctive each CUI is relative to the phrase's
+        typical candidate. Based on signal detection theory: CUIs far
+        above the median have higher "discriminability" (d').
+
+    Step 5 — Sigmoid squash:
+        confidence = σ(raw + α · margin)     where α = 0.3
+
+        Maps to [0,1] with probabilistic interpretation. The margin
+        term spreads the top CUIs further from the pack, improving
+        discrimination among leaders without changing rank order.
+
+    Properties:
+        - No hardcoded signal weights (z-scores self-calibrate)
+        - Per-phrase adaptive (each phrase has own μ, σ)
+        - Margin captures ranking stability (signal detection theory)
+        - Sigmoid gives [0,1] probability interpretation
+        - Fully unsupervised (no labels needed)
+        - O(n) per phrase — no iteration or resampling
     """
+
+    MARGIN_WEIGHT = 0.3   # α: margin boost factor
 
     @staticmethod
     @timed("confidence_score")
     def score(surviving, metadata, audit_trail,
               embeddings, cui_topic, topic_centroids,
               extraction_distances=None):
-        """Score surviving CUIs.
 
-        Args:
-            extraction_distances: optional dict CUI -> distance from API.
-                                  Lower distance = more relevant to query phrase.
-        """
         explains = defaultdict(list)
         for entry in audit_trail:
             if entry.kept_cui and entry.removed_cui:
@@ -1260,29 +1283,20 @@ class ConfidenceScorer:
 
         max_retained = max((len(v) for v in explains.values()), default=0)
 
-        # extraction proximity: 1/(1+d) — maps distance to [0,1]
-        # d=0 → 1.0, d=0.1 → 0.91, d=0.5 → 0.67, d=1.0 → 0.5
+        # ── Raw signal 1: extraction proximity  1/(1+d) ──
         ext_prox = {}
         if extraction_distances:
             for cui, d in extraction_distances.items():
                 if d is not None:
                     ext_prox[cui] = 1.0 / (1.0 + d)
-
         has_ext = len(ext_prox) > 0
 
-        # global centroid: weighted center of ALL surviving CUI embeddings.
-        # Proximity-weighted: CUIs closer to the query phrase pull the centroid
-        # toward the "true meaning". This helps because:
-        #   - For "left knee pain": most close CUIs are about left knee
-        #     → centroid biased toward left knee → "right knee" CUIs score lower
-        #   - For "swelling" in knee context: close CUIs are knee swelling
-        #     → centroid biased toward knee → "left hand" CUIs score lower
+        # ── Raw signal 2: proximity-weighted global centroid ──
         emb_cuis = [c for c in surviving if c in embeddings]
         global_centroid = None
         if emb_cuis:
             global_matrix = np.array([embeddings[c] for c in emb_cuis], dtype=np.float32)
             if has_ext:
-                # weight by proximity: closer CUIs contribute more to centroid
                 weights = np.array([ext_prox.get(c, 0.01) for c in emb_cuis],
                                    dtype=np.float32)
                 weights = weights / weights.sum()
@@ -1293,45 +1307,72 @@ class ConfidenceScorer:
             if gc_norm > 0:
                 global_centroid = gc / gc_norm
 
-        entries = []
+        # ── Collect raw signals for all survivors ──
+        raw_signals = []   # parallel to surviving
         retention_map = {}
         for cui in surviving:
-            m = metadata.get(cui)
             retained = explains.get(cui, [])
             retention_map[cui] = retained
 
-            # signal 1: extraction proximity
-            proximity = ext_prox.get(cui, 0.0)
+            prox = ext_prox.get(cui, 0.0)
 
-            # signal 2: cosine to global centroid
             if global_centroid is not None and cui in embeddings:
-                centrality = max(float(np.dot(embeddings[cui], global_centroid)), 0.0)
+                cent = max(float(np.dot(embeddings[cui], global_centroid)), 0.0)
             else:
-                centrality = 0.0
+                cent = 0.0
 
-            # signal 3: retention power
             if max_retained > 0:
-                retention_power = np.log1p(len(retained)) / np.log1p(max_retained)
+                ret = np.log1p(len(retained)) / np.log1p(max_retained)
             else:
-                retention_power = 0.0
+                ret = 0.0
 
-            # weighted combination
-            if has_ext:
-                confidence = (0.55 * proximity +
-                              0.30 * centrality +
-                              0.15 * retention_power)
-            else:
-                confidence = (0.60 * centrality +
-                              0.40 * retention_power)
+            raw_signals.append((cui, prox, cent, ret))
 
+        if not raw_signals:
+            return [], [], {}
+
+        n = len(raw_signals)
+
+        # ── Z-score normalization (per-phrase) ──
+        prox_arr = np.array([s[1] for s in raw_signals], dtype=np.float64)
+        cent_arr = np.array([s[2] for s in raw_signals], dtype=np.float64)
+        ret_arr  = np.array([s[3] for s in raw_signals], dtype=np.float64)
+
+        def _z(vals):
+            """Z-score with dead-signal guard."""
+            mu, sigma = vals.mean(), vals.std()
+            if sigma > 1e-8:
+                return (vals - mu) / sigma
+            return np.zeros_like(vals)  # signal has no variance → contributes nothing
+
+        z_prox = _z(prox_arr) if has_ext else np.zeros(n)
+        z_cent = _z(cent_arr)
+        z_ret  = _z(ret_arr)
+
+        # ── Raw composite (equal weight in z-space) ──
+        raw_composite = z_prox + z_cent + z_ret
+
+        # ── Margin: distance from phrase median ──
+        median_raw = float(np.median(raw_composite))
+        margins = raw_composite - median_raw
+
+        # ── Sigmoid with margin boost ──
+        alpha = ConfidenceScorer.MARGIN_WEIGHT
+        logits = raw_composite + alpha * margins
+        confidences = 1.0 / (1.0 + np.exp(-logits))
+
+        # ── Build entries ──
+        entries = []
+        for i, (cui, prox, cent, ret) in enumerate(raw_signals):
+            m = metadata.get(cui)
             entries.append(ConfidenceEntry(
                 cui=cui, term=m.preferred_term if m else cui,
-                confidence=round(confidence, 4),
-                extraction_proximity=round(proximity, 3),
-                centrality=round(centrality, 3),
-                retention_power=round(retention_power, 3),
+                confidence=round(float(confidences[i]), 4),
+                extraction_proximity=round(prox, 3),
+                centrality=round(cent, 3),
+                retention_power=round(ret, 3),
                 semantic_types=list(m.semantic_types) if m else [],
-                explains_cuis=retained))
+                explains_cuis=retention_map[cui]))
 
         entries.sort(key=lambda e: e.confidence, reverse=True)
         sorted_cuis = [e.cui for e in entries]
@@ -1566,9 +1607,13 @@ class CUIExtractor:
         cache_key = f"{'||'.join(sorted(text_list))}||{self.top_k}||{self.top_p}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            total = sum(len(v) for v in cached.values())
-            log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
-            return cached
+            # handle old cache format (flat list from previous code version)
+            if isinstance(cached, list):
+                log("    Cache format outdated (flat list), re-extracting...", level="DEBUG")
+            elif isinstance(cached, dict):
+                total = sum(len(v) for v in cached.values())
+                log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
+                return cached
 
         payload = {
             "cluster_set": self.cluster_set,
