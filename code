@@ -239,16 +239,27 @@ class Intent(BaseModel):
 
 class IntentExtractionOutput(BaseModel):
     is_clinical: bool
+class IntentExtractionResponse(BaseModel):
+    """What Gemini returns — no pipeline metadata."""
+    is_clinical: bool
+    reason: Optional[str] = None
+    total_intents_detected: int
+    intents: List[Intent] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def fix_intent_count(self) -> 'IntentExtractionResponse':
+        self.total_intents_detected = len(self.intents)
+        return self
+
+
+class IntentExtractionOutput(BaseModel):
+    """Full pipeline output — response + metadata we attach."""
+    is_clinical: bool
     reason: Optional[str] = None
     original_query: str
     expanded_query: str
     total_intents_detected: int
     intents: List[Intent] = Field(default_factory=list)
-
-    @model_validator(mode='after')
-    def fix_intent_count(self) -> 'IntentExtractionOutput':
-        self.total_intents_detected = len(self.intents)
-        return self
 
 
 # ── Step 3 ──
@@ -503,10 +514,9 @@ class ContextualIntentPipeline:
             print(f"Model error: {e}")
             if schema == QueryExpansionOutput:
                 return QueryExpansionOutput(expanded_query=fallback_query)
-            elif schema == IntentExtractionOutput:
-                return IntentExtractionOutput(
+            elif schema == IntentExtractionResponse:
+                return IntentExtractionResponse(
                     is_clinical=False, reason=f"Error: {e}",
-                    original_query=fallback_query, expanded_query=fallback_query,
                     total_intents_detected=0)
             elif schema == ContextualEnvironmentOutput:
                 return ContextualEnvironmentOutput(intents_with_context=[])
@@ -523,12 +533,21 @@ class ContextualIntentPipeline:
 
     def extract_intents(self, original_query: str,
                         expanded_query: str) -> IntentExtractionOutput:
-        return self._call_model(
+        response = self._call_model(
             INTENT_EXTRACTION_PROMPT.format(
                 original_query=original_query,
                 expanded_query=expanded_query,
                 timestamp=datetime.utcnow().isoformat()),
-            IntentExtractionOutput, original_query)
+            IntentExtractionResponse, original_query)
+
+        return IntentExtractionOutput(
+            is_clinical=response.is_clinical,
+            reason=response.reason,
+            original_query=original_query,
+            expanded_query=expanded_query,
+            total_intents_detected=response.total_intents_detected,
+            intents=response.intents,
+        )
 
     # ── Step 3 ──
 
