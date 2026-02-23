@@ -3,6 +3,7 @@ CUI Reduction Runner — Dev Testing
 Loads pickle files from GCS, runs CUI reduction per entity,
 builds topics across ALL entities in each case.
 Each pickle file processed independently (no overlap).
+Saves structured output per case.
 """
 
 # ── cell 1: config ──────────────────────────────────────────────────────────
@@ -14,6 +15,7 @@ CACHE_DIR      = None               # None = no disk cache, fresh BQ each run
 
 GCS_BUCKET     = "your-bucket-name"
 PICKLE_PREFIX  = "path/to/pickle/files/"
+OUTPUT_DIR     = "output/"           # local dir to save results
 
 ALLOWED_SABS   = {"ICD10CM", "ICD10PCS", "ICD9CM", "SNOMEDCT_US", "LNC"}
 
@@ -23,6 +25,8 @@ ALLOWED_SABS   = {"ICD10CM", "ICD10PCS", "ICD9CM", "SNOMEDCT_US", "LNC"}
 
 # ── cell 2: imports + helpers ────────────────────────────────────────────────
 
+import os
+import json
 import pickle
 import networkx
 import numpy as np
@@ -36,7 +40,7 @@ from cui_reduction_system import (
 
 
 def load_pickles_from_gcs(bucket_name, prefix):
-    """Load all pickle files from a GCS folder. Returns list of (filename, data)."""
+    """Load all pickle files from a GCS folder."""
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blobs = list(bucket.list_blobs(prefix=prefix))
@@ -45,35 +49,19 @@ def load_pickles_from_gcs(bucket_name, prefix):
     for blob in blobs:
         if blob.name.endswith("/"):
             continue
-        # accept .pk, .pkl, .pickle
         if blob.name.endswith((".pk", ".pkl", ".pickle")):
             data = pickle.loads(blob.download_as_bytes())
             fname = blob.name.split("/")[-1]
             results.append((fname, data))
             print(f"  Loaded: {fname}")
         else:
-            print(f"  Skipped (not pickle): {blob.name.split('/')[-1]}")
+            print(f"  Skipped: {blob.name.split('/')[-1]}")
     print(f"Total pickle files: {len(results)}")
     return results
 
 
 def parse_pickle(data):
-    """Parse pickle format into list of (entity_text, sentence, [cuis], {cui: distance}).
-
-    Expected format:
-    {
-      "text": "...",
-      "extracted": {
-        "1": {
-          "intent": {...},
-          "matching_items": [
-            ["entity_text", "sentence", [[CUI, distance, ...], ...]],
-            ...
-          ]
-        }
-      }
-    }
-    """
+    """Parse pickle into list of (entity_text, sentence, [cuis], {cui: distance})."""
     text = data.get("text", "")
     entities = []
     extracted = data.get("extracted", {})
@@ -82,20 +70,17 @@ def parse_pickle(data):
             entity_text = item[0]
             sentence = item[1]
             cui_list = item[2] if len(item) > 2 else []
-            cuis = []
-            distances = {}
+            cuis, distances = [], {}
             for entry in cui_list:
-                cui = entry[0]
-                dist = entry[1]
-                cuis.append(cui)
-                distances[cui] = dist
+                cuis.append(entry[0])
+                distances[entry[0]] = entry[1]
             if cuis:
                 entities.append((entity_text, sentence, cuis, distances))
     return text, entities
 
 
 def fetch_preferred_terms(bq, project_id, dataset_id, cuis):
-    """Fetch preferred terms from BQ for display only. Not used in reduction."""
+    """Fetch preferred terms from BQ for display only."""
     if not cuis:
         return {}
     terms = {}
@@ -121,42 +106,40 @@ def fetch_preferred_terms(bq, project_id, dataset_id, cuis):
 # ── cell 3: run ─────────────────────────────────────────────────────────────
 
 def process_one_pickle(fname, data, system, bq):
-    """Process one pickle file: reduce per entity via batch, build topics across all."""
+    """Process one pickle file. Returns structured output dict."""
     text, entities = parse_pickle(data)
     if not entities:
-        print(f"\n{'='*60}")
-        print(f"FILE: {fname} — no entities found")
-        return
+        print(f"\n  FILE: {fname} — no entities found")
+        return None
 
     print(f"\n{'='*80}")
-    print(f"FILE: {fname}")
-    print(f"TEXT: {text[:120]}...")
+    print(f"CASE: {fname}")
+    print(f"TEXT: {text[:150]}...")
     print(f"ENTITIES: {len(entities)}")
     total_cuis = sum(len(c) for _, _, c, _ in entities)
     print(f"TOTAL INPUT CUIs: {total_cuis}")
     print(f"{'='*80}")
 
-    # ── step 1: CUI reduction — ONE batch call for all entities ──
-    batch_inputs = []
-    for entity_text, sentence, cuis, distances in entities:
-        batch_inputs.append((cuis, entity_text, distances))
-
+    # ── step 1: batch reduction ──
+    batch_inputs = [(cuis, entity_text, distances)
+                    for entity_text, sentence, cuis, distances in entities]
     results = system.reduce_batch(batch_inputs)
-    per_entity_results = list(zip([e[0] for e in entities], results))
+    per_entity_results = list(zip(
+        [(e[0], e[1]) for e in entities],  # (entity_text, sentence)
+        results))
 
-    # collect all surviving CUIs
     all_surviving_cuis = set()
     for _, result in per_entity_results:
         all_surviving_cuis.update(result.all_reduced_cuis)
 
-    # ── step 2: fetch preferred terms once for ALL cuis (display only) ──
+    # ── step 2: preferred terms for ALL cuis ──
     all_cuis_for_terms = set()
     for _, _, cuis, _ in entities:
         all_cuis_for_terms.update(cuis)
     all_cuis_for_terms.update(all_surviving_cuis)
     terms = fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, all_cuis_for_terms)
 
-    # ── step 3: build topics across ALL surviving cuis in this case ──
+    # ── step 3: case-level topics ──
     surviving_list = list(all_surviving_cuis)
     embeddings = system.emb_fetcher.fetch(surviving_list)
     with_emb = [c for c in surviving_list if c in embeddings]
@@ -167,39 +150,84 @@ def process_one_pickle(fname, data, system, bq):
     elif with_emb:
         case_topics = {0: with_emb}
 
-    metadata = system.fetcher.fetch(with_emb)
+    # ── step 4: build output + print ──
+    case_output = {
+        "file": fname,
+        "text": text,
+        "entity_count": len(entities),
+        "total_input_cuis": total_cuis,
+        "total_surviving_cuis": len(all_surviving_cuis),
+        "entities": [],
+        "topics": []
+    }
 
-    # ── step 4: print per-entity results ──
-    for entity_text, result in per_entity_results:
+    for (entity_text, sentence), result in per_entity_results:
+        entity_out = {
+            "entity": entity_text,
+            "sentence": sentence,
+            "input_count": result.input_count,
+            "after_sab": result.after_filter_count,
+            "after_hierarchy": result.after_hierarchy_count,
+            "final_count": result.after_redundancy_count,
+            "cuis": []
+        }
+
         print(f"\n  ENTITY: \"{entity_text}\"")
         print(f"  {result.input_count} → SAB:{result.after_filter_count} "
               f"→ Hier:{result.after_hierarchy_count} → Final:{result.after_redundancy_count}")
+
+        for e in result.confidence:
+            explains_count = len(e.explains_cuis)
+            cui_entry = {
+                "cui": e.cui,
+                "preferred_term": terms.get(e.cui, e.cui),
+                "confidence": e.confidence,
+                "extraction_proximity": e.extraction_proximity,
+                "centrality": e.centrality,
+                "retention_power": e.retention_power,
+                "explains_count": explains_count,
+                "explains_cuis": [
+                    {"cui": ec, "preferred_term": terms.get(ec, ec)}
+                    for ec in e.explains_cuis
+                ]
+            }
+            entity_out["cuis"].append(cui_entry)
+
+        # print top 5
         if result.confidence:
-            print(f"  Top CUIs:")
             for e in result.confidence[:5]:
+                exp = len(e.explains_cuis)
+                exp_str = f"  explains {exp}" if exp > 0 else ""
                 print(f"    {e.cui}  conf={e.confidence:.3f}  "
                       f"prox={e.extraction_proximity:.3f} cent={e.centrality:.3f} "
-                      f"ret={e.retention_power:.3f}  |  {terms.get(e.cui, e.cui)}")
+                      f"ret={e.retention_power:.3f}{exp_str}  |  {terms.get(e.cui, e.cui)}")
 
-    # ── step 5: print case-level topics ──
+        case_output["entities"].append(entity_out)
+
+    # topics
     print(f"\n  {'─'*60}")
-    print(f"  CASE-LEVEL TOPICS ({len(case_topics)} topics from {len(with_emb)} surviving CUIs)")
+    print(f"  CASE-LEVEL TOPICS: {len(case_topics)} topics, {len(with_emb)} CUIs")
     print(f"  {'─'*60}")
 
     for tid, members in sorted(case_topics.items()):
-        stypes = set()
-        for c in members:
-            m = metadata.get(c)
-            if m and m.semantic_types:
-                stypes.update(m.semantic_types)
+        topic_out = {
+            "topic_id": tid,
+            "cui_count": len(members),
+            "cuis": [{"cui": c, "preferred_term": terms.get(c, c)} for c in members]
+        }
+        case_output["topics"].append(topic_out)
 
-        print(f"\n  Topic {tid} ({len(members)} CUIs) — {', '.join(sorted(stypes)) or 'Unknown'}")
+        print(f"\n  Topic {tid} ({len(members)} CUIs)")
         for c in members[:5]:
             print(f"    {c}  |  {terms.get(c, c)}")
         if len(members) > 5:
             print(f"    ... and {len(members) - 5} more")
 
-    print(f"\n  TOTAL: {len(all_surviving_cuis)} unique CUIs across {len(entities)} entities")
+    print(f"\n  SUMMARY: {len(entities)} entities → "
+          f"{total_cuis} input CUIs → {len(all_surviving_cuis)} surviving → "
+          f"{len(case_topics)} topics")
+
+    return case_output
 
 
 # ── cell 4: main loop ───────────────────────────────────────────────────────
@@ -219,12 +247,28 @@ system = CUIReductionSystem(
 
 bq = bigquery.Client(project=PROJECT_ID)
 
-# load all pickles
 pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
 
-# process each independently
-for fname, data in pickles:
-    process_one_pickle(fname, data, system, bq)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+all_cases = []
 
-print("\n" + "="*80)
-print("DONE — all pickle files processed independently")
+for fname, data in pickles:
+    case_output = process_one_pickle(fname, data, system, bq)
+    if case_output:
+        all_cases.append(case_output)
+        # save per-case JSON
+        out_name = fname.rsplit(".", 1)[0] + "_output.json"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
+        with open(out_path, "w") as f:
+            json.dump(case_output, f, indent=2)
+        print(f"  Saved: {out_path}")
+
+# save combined
+combined_path = os.path.join(OUTPUT_DIR, "all_cases_output.json")
+with open(combined_path, "w") as f:
+    json.dump(all_cases, f, indent=2)
+
+print(f"\n{'='*80}")
+print(f"DONE — {len(all_cases)} cases processed")
+print(f"Combined output: {combined_path}")
+print(f"Per-case outputs: {OUTPUT_DIR}")
