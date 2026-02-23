@@ -3,7 +3,7 @@ CUI Reduction Runner — Dev Testing
 Loads pickle files from GCS, runs CUI reduction per entity,
 builds topics across ALL entities in each case.
 Each pickle file processed independently (no overlap).
-Saves structured output per case.
+Saves flat CSV output per case — no nesting.
 """
 
 # ── cell 1: config ──────────────────────────────────────────────────────────
@@ -11,22 +11,21 @@ Saves structured output per case.
 PROJECT_ID     = "your-project-id"
 DATASET_ID     = "your-dataset-id"
 EMBEDDING_TABLE = "cui_embeddings"
-CACHE_DIR      = None               # None = no disk cache, fresh BQ each run
+CACHE_DIR      = None
 
 GCS_BUCKET     = "your-bucket-name"
 PICKLE_PREFIX  = "path/to/pickle/files/"
-OUTPUT_DIR     = "output/"           # local dir to save results
+OUTPUT_DIR     = "output/"
 
 ALLOWED_SABS   = {"ICD10CM", "ICD10PCS", "ICD9CM", "SNOMEDCT_US", "LNC"}
 
-# hierarchy graph — load however you normally do
 # hierarchy = networkx.read_gpickle("umls_hierarchy.gpickle")
-# ic_precomputed = {}  # optional
+# ic_precomputed = {}
 
 # ── cell 2: imports + helpers ────────────────────────────────────────────────
 
 import os
-import json
+import csv
 import pickle
 import networkx
 import numpy as np
@@ -40,7 +39,6 @@ from cui_reduction_system import (
 
 
 def load_pickles_from_gcs(bucket_name, prefix):
-    """Load all pickle files from a GCS folder."""
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blobs = list(bucket.list_blobs(prefix=prefix))
@@ -54,14 +52,11 @@ def load_pickles_from_gcs(bucket_name, prefix):
             fname = blob.name.split("/")[-1]
             results.append((fname, data))
             print(f"  Loaded: {fname}")
-        else:
-            print(f"  Skipped: {blob.name.split('/')[-1]}")
     print(f"Total pickle files: {len(results)}")
     return results
 
 
 def parse_pickle(data):
-    """Parse pickle into list of (entity_text, sentence, [cuis], {cui: distance})."""
     text = data.get("text", "")
     entities = []
     extracted = data.get("extracted", {})
@@ -80,7 +75,6 @@ def parse_pickle(data):
 
 
 def fetch_preferred_terms(bq, project_id, dataset_id, cuis):
-    """Fetch preferred terms from BQ for display only."""
     if not cuis:
         return {}
     terms = {}
@@ -103,41 +97,48 @@ def fetch_preferred_terms(bq, project_id, dataset_id, cuis):
     return terms
 
 
+def save_csv(path, headers, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
+
+
 # ── cell 3: run ─────────────────────────────────────────────────────────────
 
 def process_one_pickle(fname, data, system, bq):
-    """Process one pickle file. Returns structured output dict."""
     text, entities = parse_pickle(data)
     if not entities:
-        print(f"\n  FILE: {fname} — no entities found")
-        return None
+        print(f"  {fname} — no entities found")
+        return
 
+    case_name = fname.rsplit(".", 1)[0]
     print(f"\n{'='*80}")
     print(f"CASE: {fname}")
     print(f"TEXT: {text[:150]}...")
-    print(f"ENTITIES: {len(entities)}")
-    total_cuis = sum(len(c) for _, _, c, _ in entities)
-    print(f"TOTAL INPUT CUIs: {total_cuis}")
+    print(f"ENTITIES: {len(entities)}, TOTAL INPUT CUIs: {sum(len(c) for _, _, c, _ in entities)}")
     print(f"{'='*80}")
 
     # ── step 1: batch reduction ──
     batch_inputs = [(cuis, entity_text, distances)
                     for entity_text, sentence, cuis, distances in entities]
     results = system.reduce_batch(batch_inputs)
-    per_entity_results = list(zip(
-        [(e[0], e[1]) for e in entities],  # (entity_text, sentence)
-        results))
+    per_entity_results = list(zip(entities, results))
 
     all_surviving_cuis = set()
     for _, result in per_entity_results:
         all_surviving_cuis.update(result.all_reduced_cuis)
 
     # ── step 2: preferred terms for ALL cuis ──
-    all_cuis_for_terms = set()
+    all_cuis = set()
     for _, _, cuis, _ in entities:
-        all_cuis_for_terms.update(cuis)
-    all_cuis_for_terms.update(all_surviving_cuis)
-    terms = fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, all_cuis_for_terms)
+        all_cuis.update(cuis)
+    all_cuis.update(all_surviving_cuis)
+    # also collect explains cuis
+    for _, result in per_entity_results:
+        for e in result.confidence:
+            all_cuis.update(e.explains_cuis)
+    terms = fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, all_cuis)
 
     # ── step 3: case-level topics ──
     surviving_list = list(all_surviving_cuis)
@@ -150,89 +151,58 @@ def process_one_pickle(fname, data, system, bq):
     elif with_emb:
         case_topics = {0: with_emb}
 
-    # ── step 4: build output + print ──
-    case_output = {
-        "file": fname,
-        "text": text,
-        "entity_count": len(entities),
-        "total_input_cuis": total_cuis,
-        "total_surviving_cuis": len(all_surviving_cuis),
-        "entities": [],
-        "topics": []
-    }
-
-    for (entity_text, sentence), result in per_entity_results:
-        entity_out = {
-            "entity": entity_text,
-            "sentence": sentence,
-            "input_count": result.input_count,
-            "after_sab": result.after_filter_count,
-            "after_hierarchy": result.after_hierarchy_count,
-            "final_count": result.after_redundancy_count,
-            "cuis": []
-        }
-
-        print(f"\n  ENTITY: \"{entity_text}\"")
-        print(f"  {result.input_count} → SAB:{result.after_filter_count} "
-              f"→ Hier:{result.after_hierarchy_count} → Final:{result.after_redundancy_count}")
-
+    # ── step 4: flat entity CSV ──
+    # columns: entity | cui | preferred_term | confidence | prox | cent | ret | explains_count | explains
+    # explains = pipe-separated "CUI:Term" pairs in one cell
+    entity_rows = []
+    for (entity_text, sentence, cuis, distances), result in per_entity_results:
+        print(f"\n  ENTITY: \"{entity_text}\"  "
+              f"({result.input_count} → {result.after_redundancy_count})")
         for e in result.confidence:
-            explains_count = len(e.explains_cuis)
-            cui_entry = {
-                "cui": e.cui,
-                "preferred_term": terms.get(e.cui, e.cui),
-                "confidence": e.confidence,
-                "extraction_proximity": e.extraction_proximity,
-                "centrality": e.centrality,
-                "retention_power": e.retention_power,
-                "explains_count": explains_count,
-                "explains_cuis": [
-                    {"cui": ec, "preferred_term": terms.get(ec, ec)}
-                    for ec in e.explains_cuis
-                ]
-            }
-            entity_out["cuis"].append(cui_entry)
-
-        # print top 5
-        if result.confidence:
-            for e in result.confidence[:5]:
+            explains_str = " | ".join(
+                f"{ec}:{terms.get(ec, ec)}" for ec in e.explains_cuis
+            ) if e.explains_cuis else ""
+            entity_rows.append([
+                entity_text,
+                e.cui,
+                terms.get(e.cui, e.cui),
+                round(e.confidence, 4),
+                round(e.extraction_proximity, 3),
+                round(e.centrality, 3),
+                round(e.retention_power, 3),
+                len(e.explains_cuis),
+                explains_str
+            ])
+            # print top 5 per entity
+            if len(entity_rows) <= 5 or entity_rows[-1][0] != entity_rows[-6][0]:
                 exp = len(e.explains_cuis)
-                exp_str = f"  explains {exp}" if exp > 0 else ""
-                print(f"    {e.cui}  conf={e.confidence:.3f}  "
-                      f"prox={e.extraction_proximity:.3f} cent={e.centrality:.3f} "
-                      f"ret={e.retention_power:.3f}{exp_str}  |  {terms.get(e.cui, e.cui)}")
+                exp_s = f"  explains {exp}" if exp else ""
+                print(f"    {e.cui}  conf={e.confidence:.3f}{exp_s}  |  {terms.get(e.cui, e.cui)}")
 
-        case_output["entities"].append(entity_out)
+    entity_csv = os.path.join(OUTPUT_DIR, f"{case_name}_entities.csv")
+    save_csv(entity_csv,
+             ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
+              "explains_count", "explains"],
+             entity_rows)
 
-    # topics
-    print(f"\n  {'─'*60}")
-    print(f"  CASE-LEVEL TOPICS: {len(case_topics)} topics, {len(with_emb)} CUIs")
-    print(f"  {'─'*60}")
-
+    # ── step 5: flat topic CSV ──
+    # columns: topic_id | cui | preferred_term
+    topic_rows = []
+    print(f"\n  TOPICS: {len(case_topics)} topics, {len(with_emb)} CUIs")
     for tid, members in sorted(case_topics.items()):
-        topic_out = {
-            "topic_id": tid,
-            "cui_count": len(members),
-            "cuis": [{"cui": c, "preferred_term": terms.get(c, c)} for c in members]
-        }
-        case_output["topics"].append(topic_out)
+        print(f"    Topic {tid}: {len(members)} CUIs")
+        for c in members:
+            topic_rows.append([tid, c, terms.get(c, c)])
 
-        print(f"\n  Topic {tid} ({len(members)} CUIs)")
-        for c in members[:5]:
-            print(f"    {c}  |  {terms.get(c, c)}")
-        if len(members) > 5:
-            print(f"    ... and {len(members) - 5} more")
+    topic_csv = os.path.join(OUTPUT_DIR, f"{case_name}_topics.csv")
+    save_csv(topic_csv, ["topic_id", "cui", "preferred_term"], topic_rows)
 
-    print(f"\n  SUMMARY: {len(entities)} entities → "
-          f"{total_cuis} input CUIs → {len(all_surviving_cuis)} surviving → "
-          f"{len(case_topics)} topics")
-
-    return case_output
+    print(f"\n  Saved: {entity_csv}")
+    print(f"  Saved: {topic_csv}")
 
 
 # ── cell 4: main loop ───────────────────────────────────────────────────────
 
-# load hierarchy (adjust to your method)
 # hierarchy = networkx.read_gpickle("path/to/hierarchy.gpickle")
 # ic_precomputed = {}
 
@@ -250,25 +220,9 @@ bq = bigquery.Client(project=PROJECT_ID)
 pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-all_cases = []
 
 for fname, data in pickles:
-    case_output = process_one_pickle(fname, data, system, bq)
-    if case_output:
-        all_cases.append(case_output)
-        # save per-case JSON
-        out_name = fname.rsplit(".", 1)[0] + "_output.json"
-        out_path = os.path.join(OUTPUT_DIR, out_name)
-        with open(out_path, "w") as f:
-            json.dump(case_output, f, indent=2)
-        print(f"  Saved: {out_path}")
-
-# save combined
-combined_path = os.path.join(OUTPUT_DIR, "all_cases_output.json")
-with open(combined_path, "w") as f:
-    json.dump(all_cases, f, indent=2)
+    process_one_pickle(fname, data, system, bq)
 
 print(f"\n{'='*80}")
-print(f"DONE — {len(all_cases)} cases processed")
-print(f"Combined output: {combined_path}")
-print(f"Per-case outputs: {OUTPUT_DIR}")
+print(f"DONE — {len(pickles)} cases processed, outputs in {OUTPUT_DIR}")
