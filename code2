@@ -1,187 +1,126 @@
-# %% Cell 1: Read all pickle files from GCS folder
-
-import pickle
-from google.cloud import storage, bigquery
-from collections import defaultdict
-
-bucket_name = "<YOUR_BUCKET>"
-folder_path = "<YOUR_FOLDER>/"  # e.g. "concept_coding_output/"
-
-gcs_client = storage.Client()
-bucket = gcs_client.bucket(bucket_name)
-
-# Read all .pk files
-cases = {}
-for blob in bucket.list_blobs(prefix=folder_path):
-    if blob.name.endswith(".pk"):
-        case_name = blob.name.split("/")[-1].replace(".pk", "")
-        with blob.open("rb") as f:
-            cases[case_name] = pickle.load(f)
-        print(f"Loaded: {case_name}")
-
-print(f"\nTotal cases loaded: {len(cases)}")
-
-
-# %% Cell 2: Extract CUIs + distances from each case
-
-DISTANCE_THRESHOLD = 0.30
-
-def extract_cuis(case_data, threshold=DISTANCE_THRESHOLD):
-    """Extract CUIs from concept coding pickle. Keep best distance per CUI."""
-    extracted = case_data.get("extracted", {})
-    cui_best = {}
-
-    for entity_key, entity_data in extracted.items():
-        if not isinstance(entity_data, dict):
-            continue
-        for item in entity_data.get("matching_items", []):
-            if len(item) < 3:
-                continue
-            for match in item[2]:
-                cui, distance = match[0], match[1]
-                if distance <= threshold:
-                    if cui not in cui_best or distance < cui_best[cui]:
-                        cui_best[cui] = distance
-
-    return cui_best
-
-
-cuis_per_case = {}
-for case_name, case_data in cases.items():
-    cuis_per_case[case_name] = extract_cuis(case_data)
-    print(f"{case_name}: {len(cuis_per_case[case_name])} CUIs")
-
-all_cuis = set()
-for v in cuis_per_case.values():
-    all_cuis.update(v.keys())
-print(f"\nTotal unique CUIs across all cases: {len(all_cuis)}")
-
-
-# %% Cell 3: Fetch preferred terms for all CUIs
-
-bq_client = bigquery.Client(project="<YOUR_PROJECT>")
-
-def get_preferred_terms(cuis: set, project_id: str, dataset_id: str, desc_table: str) -> dict:
-    """Fetch preferred term for each CUI from BigQuery."""
-    if not cuis:
-        return {}
-    cui_list = list(cuis)
-    terms = {}
-    # Batch in chunks of 2000
-    for i in range(0, len(cui_list), 2000):
-        batch = cui_list[i:i+2000]
-        query = f"""
-            SELECT CUI as cui, STR as preferred_term
-            FROM `{project_id}.{dataset_id}.{desc_table}`
-            WHERE CUI IN UNNEST(@cuis)
-            AND LAT = 'ENG'
-            AND ISPREF = 'Y'
-            AND TS = 'P'
-            AND STT = 'PF'
-            QUALIFY ROW_NUMBER() OVER (PARTITION BY CUI ORDER BY LENGTH(STR)) = 1
-        """
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ArrayQueryParameter("cuis", "STRING", batch)]
-        )
-        rows = bq_client.query(query, job_config=job_config).result()
-        for row in rows:
-            terms[row.cui] = row.preferred_term
-
-    return terms
-
-
-project_id = "<YOUR_PROJECT>"
-dataset_id = "<YOUR_DATASET>"
-desc_table = "<YOUR_MRCONSO_TABLE>"  # or your CUI description table
-
-preferred_terms = get_preferred_terms(all_cuis, project_id, dataset_id, desc_table)
-print(f"Preferred terms fetched: {len(preferred_terms)} / {len(all_cuis)}")
-
-
-# %% Cell 4: CUI Reduction per case
-
-# --- Uses your existing EnhancedCUIReducer ---
-
-reducer = EnhancedCUIReducer(
-    project_id,
-    dataset_id,
-    subnet_api_url="<YOUR_SUBNET_API_URL>",
-    cui_description_table=desc_table,
-    cui_embeddings_table="<YOUR_EMBEDDING_TABLE>",
-    cui_narrower_table="<YOUR_DESCENDANTS_TABLE>"
-)
-
-reduced_per_case = {}
-
-for case_name, cui_dict in cuis_per_case.items():
-    cui_list = list(cui_dict.keys())
-    if not cui_list:
-        reduced_per_case[case_name] = []
-        continue
-
-    final_cuis, stats = reducer.reduce(
-        cui_list,
-        ic_percentile=75,
-        similarity_threshold=0.88,
-        distance_from_centroid_threshold=0.3
-    )
-    reduced_per_case[case_name] = final_cuis
-    print(f"{case_name}: {len(cui_list)} → {len(final_cuis)} "
-          f"({stats.total_reduction_pct:.1f}% reduced)")
-
-# Show reduced CUIs with preferred terms
-print("\n" + "=" * 60)
-for case_name, cuis in reduced_per_case.items():
-    print(f"\n{case_name} — Reduced CUIs:")
-    for cui in cuis:
-        term = preferred_terms.get(cui, "N/A")
-        print(f"  {cui}: {term}")
-
-
-# %% Cell 5: Topic Discovery with preferred terms
-
-# Fetch preferred terms for reduced CUIs (in case new ones appeared)
-reduced_all_cuis = set()
-for cuis in reduced_per_case.values():
-    reduced_all_cuis.update(cuis)
-
-missing = reduced_all_cuis - set(preferred_terms.keys())
-if missing:
-    extra_terms = get_preferred_terms(missing, project_id, dataset_id, desc_table)
-    preferred_terms.update(extra_terms)
-
-# Build documents
-documents = [
-    Document(doc_id=case_name, text=case_name, cuis=cuis)
-    for case_name, cuis in reduced_per_case.items() if cuis
-]
-
-result = run_topic_discovery(
-    documents=documents,
-    project_id=project_id,
-    dataset_id=dataset_id,
-    embedding_table="<YOUR_EMBEDDING_TABLE>",
-)
-
-# Print topics with top 5 CUIs + preferred terms
-print("=" * 60)
-print("DISCOVERED TOPICS")
-print("=" * 60)
-for topic in result.topics:
-    print(f"\nTopic {topic.topic_id}: {topic.label}")
-    print(f"  Documents ({topic.doc_count}): ", end="")
-    assigned_docs = [d.doc_id for d in documents if result.doc_to_topic.get(d.doc_id) == topic.topic_id]
-    print(", ".join(assigned_docs))
-    print(f"  Top 5 CUIs:")
-    for cui in topic.representative_cuis[:5]:
-        term = preferred_terms.get(cui, "N/A")
-        print(f"    {cui}: {term}")
-
-# Summary table
-print("\n" + "=" * 60)
-print("CASE → TOPIC ASSIGNMENTS")
-print("=" * 60)
-for doc in documents:
-    tid = result.doc_to_topic.get(doc.doc_id)
-    label = result.topics[tid].label if tid is not None else "None"
-    print(f"  {doc.doc_id} → Topic {tid}: {label}")
+"text": "A 58-year-old female with a history of severe persistent asthma and allergic rhinitis presents for a follow-up. She reports a worsening cough and shortness of breath over the past two weeks, especially at night. Her forced expiratory volume in 1 second (FEV1) is down 15% from her baseline. Vital signs show a respiratory rate of 22 breaths/minute. We will classify this as a moderate exacerbation. She is currently on albuterol as needed, fluticasone/salmeterol 250/50 mcg twice daily, and was recently started on oral prednisone 40 mg daily with a taper. Due to the severity and frequency of her symptoms, we will consider adding montelukast 10 mg once daily.",
+        "extracted": {
+                "1": {
+                        "intent": {
+                                "metadata": "Entity Extraction",
+                                "definition": "The text contains entities. An entity, defined by Unified Medical Language System (UMLS) Metathesaurus, is generally used to refer to a recognizable, distinct object or concept in the real world or in a medical context. For example, entity can be a disease, medication, symptom of a disease or any other concept. Identify and return ALL entities available in the provided text and exactly as they appear in the text. Entities include anything about 'Acquired Abnormality', 'Activity', 'Age Group', 'Amino Acid Sequence', 'Amino Acid, Peptide, or Protein', 'Amphibian', 'Anatomical Abnormality', 'Anatomical Structure', 'Animal', 'Antibiotic', 'Archaeon', 'Bacterium', 'Behavior', 'Biologic Function', 'Biologically Active Substance', 'Biomedical Occupation or Discipline', 'Biomedical or Dental Material', 'Bird', 'Body Location or Region', 'Body Part, Organ, or Organ Component', 'Body Space or Junction', 'Body Substance', 'Body System', 'Carbohydrate Sequence', 'Cell', 'Cell Component', 'Cell Function', 'Cell or Molecular Dysfunction', 'Chemical', 'Chemical Viewed Functionally', 'Chemical Viewed Structurally', 'Classification', 'Clinical Attribute', 'Clinical Drug', 'Conceptual Entity', 'Congenital Abnormality', 'Daily or Recreational Activity', 'Diagnostic Procedure', 'Disease or Syndrome', 'Drug Delivery Device', 'Educational Activity', 'Element, Ion, or Isotope', 'Embryonic Structure', 'Entity', 'Environmental Effect of Humans', 'Enzyme', 'Eukaryote', 'Event', 'Experimental Model of Disease', 'Family Group', 'Finding', 'Fish', 'Food', 'Fully Formed Anatomical Structure', 'Functional Concept', 'Fungus', 'Gene or Genome', 'Genetic Function', 'Geographic Area', 'Governmental or Regulatory Activity', 'Group', 'Group Attribute', 'Hazardous or Poisonous Substance', 'Health Care Activity', 'Health Care Related Organization', 'Hormone', 'Human', 'Human-caused Phenomenon or Process', 'Idea or Concept', 'Immunologic Factor', 'Indicator, Reagent, or Diagnostic Aid', 'Individual Behavior', 'Injury or Poisoning', 'Inorganic Chemical', 'Intellectual Product', 'Laboratory or Test Result', 'Laboratory Procedure', 'Language', 'Machine Activity', 'Mammal', 'Manufactured Object', 'Medical Device', 'Mental or Behavioral Dysfunction', 'Mental Process', 'Molecular Biology Research Technique', 'Molecular Function', 'Molecular Sequence', 'Natural Phenomenon or Process', 'Neoplastic Process', 'Nucleic Acid, Nucleoside, or Nucleotide', 'Nucleotide Sequence', 'Occupation or Discipline', 'Occupational Activity', 'Organ or Tissue Function', 'Organic Chemical', 'Organism', 'Organism Attribute', 'Organism Function', 'Organization', 'Pathologic Function', 'Patient or Disabled Group', 'Pharmacologic Substance', 'Phenomenon or Process', 'Physical Object', 'Physiologic Function', 'Plant', 'Population Group', 'Professional or Occupational Group', 'Professional Society', 'Qualitative Concept', 'Quantitative Concept', 'Receptor', 'Regulation or Law', 'Reptile', 'Research Activity', 'Research Device', 'Self-help or Relief Organization', 'Sign or Symptom', 'Social Behavior', 'Spatial Concept', 'Substance', 'Temporal Concept', 'Therapeutic or Preventive Procedure', 'Tissue', 'Vertebrate', 'Virus', 'Vitamin'. "
+                        },
+                        "matching_items": [
+                                [
+                                        "female",
+                                        "A 58-year-old female with a history of severe persistent asthma and allergic rhinitis presents for a follow-up.",
+                                        [
+                                                [
+                                                        "C4039481",
+                                                        0.25355328949232214
+                                                ],
+                                                [
+                                                        "C0559971",
+                                                        0.27249797836759804
+                                                ],
+                                                [
+                                                        "C4698907",
+                                                        0.27865511083192984
+                                                ],
+                                                [
+                                                        "C4039651",
+                                                        0.285508120442867
+                                                ],
+                                                [
+                                                        "C1387164",
+                                                        0.29011804336801583
+                                                ],
+                                                [
+                                                        "C3862823",
+                                                        0.29105389004436655
+                                                ],
+                                                [
+                                                        "C3697426",
+                                                        0.2911261014122287
+                                                ],
+                                                [
+                                                        "C1611771",
+                                                        0.293500928983617
+                                                ],
+                                                [
+                                                        "C0581126",
+                                                        0.29365490859392784
+                                                ],
+                                                [
+                                                        "C2887456",
+                                                        0.29778639229975656
+                                                ],
+                                                [
+                                                        "C0586109",
+                                                        0.29838399141362537
+                                                ],
+                                                [
+                                                        "C0422555",
+                                                        0.29845489838472683
+                                                ],
+                                                [
+                                                        "C4298503",
+                                                        0.2989113599163279
+                                                ],
+                                                [
+                                                        "C5885007",
+                                                        0.2998978831778808
+                                                ],
+                                                [
+                                                        "C1997922",
+                                                        0.3020049620541253
+                                                ],
+                                                [
+                                                        "C0260522",
+                                                        0.30339547811888334
+                                                ],
+                                                [
+                                                        "C0729800",
+                                                        0.3079502350177893
+                                                ],
+                                                [
+                                                        "C3262566",
+                                                        0.3099958186655487
+                                                ],
+                                                [
+                                                        "C1261327",
+                                                        0.3136967735718875
+                                                ],
+                                                [
+                                                        "C0264405",
+                                                        0.31469303742506693
+                                                ],
+                                                [
+                                                        "C3173471",
+                                                        0.3152962771729648
+                                                ]
+                                        ]
+                                ],
+                                [
+                                        "severe persistent asthma",
+                                        "A 58-year-old female with a history of severe persistent asthma and allergic rhinitis presents for a follow-up.",
+                                        [
+                                                [
+                                                        "C4039791",
+                                                        0.18384624027032181,
+                                                        1,
+                                                        "The Entity_text 'severe persistent asthma' is directly described by the Definition 'Severe persistent asthma co-occurrent with allergic rhinitis [(Disease or Syndrome)]'. The Sentence and Full_text explicitly mention 'severe persistent asthma and allergic rhinitis', making this a direct descriptor of the Entity_text."
+                                                ],
+                                                [
+                                                        "C4041088",
+                                                        0.18486096605588653
+                                                ],
+                                                [
+                                                        "C4039218",
+                                                        0.18736209040470198
+                                                ],
+                                                [
+                                                        "C4040869",
+                                                        0.19770373529222107
+                                                ],
+                                                [
+                                                        "C3508930",
+                                                        0.2080001554359877,
+                                                        1,
+                                                        "The Entity_text 'severe persistent asthma' is a component of the Definition 'Exacerbation of severe persistent asthma [(Disease or Syndrome)]'. The Sentence and Full_text explicitly mention 'severe persistent asthma' and describe a 'moderate exacerbation', which is a direct worsening of the condition. This makes the Definition a direct descriptor of the situation described in relation to the Entity_text."
+                                                ],
