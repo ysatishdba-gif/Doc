@@ -1,1 +1,286 @@
-test
+CUI Reduction System — Technical Reference
+=============================================
+
+
+Overview
+--------
+Takes a large set of extracted CUIs per clinical entity and reduces them
+to a concise, non-redundant set with confidence scores and topic clusters.
+No text or preferred terms used in any decision — all logic is purely structural
+(embeddings, hierarchy graph, semantic types, IC scores).
+
+
+End-to-End Pipeline
+--------------------
+
+### Stage 1: CUI Extraction (input)
+
+Source A — Extraction API:
+  - Input: entity text + context sentence
+  - API returns candidate CUIs with cosine distances (lower = better match)
+  - Distances represent how close the entity text is to each CUI in embedding space
+  - Typical: 20-50 candidate CUIs per entity, most are noisy/redundant
+
+Source B — Pre-extracted (pickle files):
+  - Same format: list of CUIs with cosine distances per entity
+  - Loaded from GCS pickle files for batch testing
+
+
+### Stage 2: SAB Filter
+
+What: Remove CUIs from non-allowed source vocabularies.
+Why: UMLS contains 200+ vocabularies. Many are non-clinical (billing, admin, foreign).
+
+How:
+  - Each CUI has source vocabularies (SABs) from MRCONSO table
+  - If none of a CUI's SABs overlap with allowed set → removed
+  - Allowed: ICD10CM, ICD10PCS, ICD9CM, SNOMEDCT_US, LNC
+
+Typical reduction: 10-30% of CUIs removed.
+
+
+### Stage 3: Hierarchy Reduction (IC-based)
+
+What: When both a general and specific concept exist, remove the general one.
+Why: "Knee osteoarthritis" is more informative than "Joint disease".
+
+How — Information Content (IC):
+  - IC measures how specific a concept is in the UMLS hierarchy
+  - Formula: IC(cui) = -log((descendants + 1) / total_nodes)
+  - More descendants = more general = lower IC
+  - Leaf nodes (no children) = most specific = highest IC
+
+  IC computation:
+  - If precomputed dict provided → instant lookup
+  - Otherwise → BFS from each CUI, count all descendants in hierarchy graph
+  - Results cached in-memory across entities (computed once per CUI per run)
+
+Process:
+  - For every pair where one is ancestor of the other in the hierarchy graph
+  - Compare IC scores: child IC >= parent IC (almost always true)
+  - Remove the parent (lower IC = more general)
+  - Keep the child (higher IC = more specific)
+
+Typical reduction: 20-40% of remaining CUIs removed.
+
+
+### Stage 4: Embedding Duplicate Detection
+
+What: Remove semantically redundant CUIs that aren't in a parent-child relationship.
+Why: Multiple CUIs can represent the same concept (e.g., "Asthma NOS" vs "Bronchial asthma").
+
+#### Step 4a: Otsu Thresholding (automatic distance cutoff)
+
+Problem: What cosine distance counts as "too close"?
+Solution: Otsu's method — originally for image binarization, adapted for distance distributions.
+
+How Otsu works:
+  1. Compute cosine k-NN distances for all CUI pairs
+  2. Sort all k-th neighbor distances into an array
+  3. For every possible threshold t:
+     - Split distances into two groups: below t (similar) and above t (different)
+     - Compute between-class variance: w0 * w1 * (mean0 - mean1)²
+     - w0, w1 = proportion of values in each group
+     - mean0, mean1 = mean of each group
+  4. Pick t that maximizes between-class variance
+  5. Guardrail: threshold capped at median distance (prevents too-aggressive merging)
+
+Result: A single distance threshold per entity, automatically adapted to the data.
+Dense clusters → lower threshold. Sparse CUIs → higher threshold.
+
+#### Step 4b: Five Structural Checks
+
+ALL five must pass to merge two CUIs (any failure → both kept):
+
+1. **Close embedding distance** — cosine distance below Otsu threshold
+   - Uses pre-computed UMLS CUI embeddings (L2-normalized vectors)
+   - Distance = 1 - dot_product(vec_a, vec_b)
+
+2. **Overlapping semantic types** — at least one shared UMLS semantic type
+   - From MRSTY table (e.g., T047=Disease, T121=Pharmaceutical)
+   - "Aspirin" (T121) won't merge with "Headache" (T184) even if embeddings are close
+
+3. **Not parent-child** — if one is ancestor of the other, skip
+   - Already handled in Stage 3; this is a safety check
+
+4. **Overlapping ancestors** — shared ancestors within N hops
+   - Ancestor depth auto-computed from graph density: target ~20 ancestors
+   - Formula: depth = round(log(20) / log(mean_in_degree)), clamped [1, 5]
+   - If no shared ancestors → different branches of UMLS → don't merge
+
+5. **Sibling guard** — if both CUIs are leaf nodes sharing the same immediate parent, keep both
+   - UMLS deliberately created both (e.g., "Left knee OA" vs "Right knee OA")
+   - Embeddings may be nearly identical, but they are clinically distinct
+   - Check: predecessors(A) ∩ predecessors(B) is non-empty AND both have no children
+
+#### Step 4c: Keeper Selection
+
+When merging, which CUI survives?
+  - Highest IC score (most specific)
+  - Tie-break: closest to group centroid in embedding space (most representative)
+  - The removed CUI is recorded in the keeper's "explains" list
+
+#### Fast Path vs Full Path
+
+≤200 CUIs after hierarchy: Direct pairwise comparison (fast path)
+>200 CUIs: Graph components first, then pairwise within each component
+  - Components built from shared UMLS ancestors (Union-Find)
+  - Component depth = ~40% of ancestor depth, bounded by graph density
+  - Prevents comparing CUIs from completely different medical domains
+
+
+### Stage 5: Cross-Topic Dedup
+
+What: Second-pass dedup across different topic clusters.
+When: Only runs when >200 CUIs (full path).
+Why: Stage 4 works within components. Duplicates spanning components get caught here.
+
+Same 5 structural checks as Stage 4, applied to CUIs from different topics.
+
+
+### Stage 6: Confidence Scoring
+
+Three signals, all normalized to [0, 1]:
+
+1. **Extraction Proximity** = 1 - cosine_distance
+   - From API/pickle extraction distances
+   - Lower distance → higher proximity → CUI is a better match for the entity text
+   - If no distances available (e.g., document-level processing), this signal is zeroed out
+
+2. **Semantic Centrality** = cosine(cui_embedding, topic_centroid)
+   - Topic centroid = mean of all CUI embeddings in the same topic cluster
+   - Per-topic centroids, not global centroid
+   - CUIs central to their topic score higher (more representative)
+   - Clamped to [0, 1]
+
+3. **Retention Power** = log(1 + absorbed_count) / log(1 + max_absorbed)
+   - How many duplicate CUIs this keeper absorbed
+   - Logarithmic scale prevents one mega-absorber from dominating
+   - max_absorbed = highest absorption count in this entity
+   - If a CUI absorbed 0 duplicates → retention = 0
+
+#### Variance-Based Automatic Weighting
+
+Problem: Different entities need different signal emphasis. Some have tight extraction
+distances (proximity unhelpful), others have uniform retention (retention unhelpful).
+
+Solution: Weight each signal by its standard deviation across the entity's CUIs.
+
+How:
+  1. Compute std of each signal array across all surviving CUIs in the entity
+  2. weight_i = std_i / sum(all_stds)
+  3. Signal with highest spread = best discriminator = highest weight
+  4. Flat signal (std ≈ 0) = not discriminating = near-zero weight automatically
+
+Edge cases:
+  - No extraction distances → proximity weight forced to 0, others split the load
+  - All signals flat → equal weight fallback (1/3 each, or 0.5/0.5 without extraction)
+  - Single CUI → confidence = weighted sum of its three signals
+
+Final score: confidence = w[0] × proximity + w[1] × centrality + w[2] × retention
+
+CUIs ranked by confidence score (descending).
+
+
+### Stage 7: Topic Generation
+
+What: Cluster surviving CUIs into medical themes across all entities in a case.
+Method: Cosine k-NN + Louvain community detection (no ScaNN dependency).
+
+Process:
+  1. Build L2-normalized embedding matrix for all surviving CUIs
+  2. Cosine k-NN (k=20): for each CUI, find 20 nearest neighbors via dot product
+     - Batched in chunks of 2000 for memory efficiency
+  3. Compute edge threshold via mean k-th neighbor distance
+  4. Build weighted graph: edge between CUIs if distance < threshold, weight = similarity
+  5. Louvain community detection: finds communities maximizing modularity
+     - Each community = one topic
+  6. Large topic guard: topics larger than sqrt(N) get re-split at 4× Louvain resolution
+  7. Singleton merge: CUIs in no community join nearest topic by centroid similarity
+
+For >200 CUIs:
+  - Graph components (Union-Find on shared UMLS ancestors) split CUIs first
+  - Louvain runs within each component
+  - Prevents unrelated domains from being forced into the same topic
+
+
+Evaluation (No Ground Truth)
+-----------------------------
+
+### Intrinsic Metrics (eval_metrics.csv)
+
+1. **Reduction Ratio** per entity
+   - Formula: 1 - (final_count / input_count)
+   - Healthy range: 0.40 - 0.80 (40-80% removed)
+   - WARNING >0.95: too aggressive, likely losing real concepts
+   - WARNING <0.10: barely reducing, pipeline not effective for this entity
+
+2. **Confidence Spread** per entity
+   - Formula: max(scores) - min(scores)
+   - Good: >0.2 (scorer discriminates well)
+   - WARNING <0.1: all scores compressed, not discriminating
+
+3. **Topic Coherence** per case
+   - Intra-topic similarity: avg pairwise cosine within each topic
+   - Inter-topic similarity: avg cosine between topic centroids
+   - Separation = intra - inter
+   - Good: >0.1 (topics are internally cohesive and externally distinct)
+   - WARNING <0.05: topics not well separated
+   - Negative: topics are worse than random (embeddings don't cluster well at case level)
+
+4. **Removal Breakdown** per case
+   - Count per reason: sab_filtered, ancestor_subsumed, true_duplicate, cross_topic_dedup
+   - Shows where most reduction happens
+
+
+### Reconstruction Check (eval_reconstruction.csv)
+
+For every merge (true_duplicate, cross_topic_dedup, ancestor_subsumed), verify
+whether the removed CUI and its keeper are genuinely related:
+
+Checks:
+  - **Cosine distance**: 1 - dot(removed_emb, kept_emb). Lower = more similar.
+  - **Same parent**: Do both share an immediate parent in UMLS hierarchy? YES/NO
+  - **Shared ancestors**: Count of common ancestors at depth 3
+  - **Shared semantic types**: Count of overlapping UMLS semantic types
+
+Verdict:
+  - **OK**: No issues detected
+  - **SUSPECT**: One or more flags triggered:
+    - Distant embedding (cosine distance > 0.3)
+    - No shared ancestors at depth 3
+    - No shared semantic types (with both having known types)
+
+Benchmarks from 5-case test run:
+  - 1056 OK, 13 SUSPECT (98.8% clean)
+  - All SUSPECT in 0.30-0.33 range (borderline, terms are reasonable synonyms)
+  - Reduction ratios: mostly 40-80% per entity
+  - Topic separation: needs improvement (negative for all 5 cases)
+
+
+File Structure
+--------------
+config.py (~40 lines) — all settings, hierarchy/IC loading. Edit once.
+cui_reduction_system.py (~1445 lines) — pure library, no config, no main block
+run_cui_reduction.py (~218 lines) — pickle runner: GCS → batch reduce → eval
+run_cui_reduction_api.py (~189 lines) — API runner: context + text_list → reduce → eval
+
+Key classes:
+  CUIReductionSystem — pipeline orchestrator, holds all reducers and caches
+  TopicBuilder — Louvain-based topic clustering
+  ConfidenceScorer — variance-weighted three-signal scoring
+  Evaluator — intrinsic metrics + reconstruction check
+  CUIExtractor — extraction API client
+  MetadataFetcher / EmbeddingFetcher — BigQuery fetch + LRU cache
+  HierarchyReducer / SABFilter — structural reduction stages
+  EmbeddingReducer / CrossTopicDedup — duplicate detection + removal
+  ICComputer — information content from hierarchy BFS
+
+
+Performance Notes
+-----------------
+- Hierarchy graph and IC dict loaded once, shared across all entities/cases
+- IC scores cached in-memory (BFS computed once per CUI per run)
+- Metadata and embedding caches persist across entities within a batch
+- Batch processing: one BQ call per pickle (not per entity)
+- For 5 cases with 25 entities each and ~700 CUIs per case: runs in minutes
