@@ -1,17 +1,11 @@
 import json
 import re
-import copy
-import logging
-import uuid
-import time
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional, Literal, Tuple
+from typing import Dict, Any, List, Optional, Literal
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, field_validator, model_validator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-logger = logging.getLogger(__name__)
 
 
 # =====================================================================
@@ -201,11 +195,6 @@ class IntentExtractionOutput(BaseModel):
     expanded_query: str
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
-
-    @model_validator(mode='after')
-    def fix_intent_count(self):
-        self.total_intents_detected = len(self.intents)
-        return self
 
 
 class ConceptContext(BaseModel):
@@ -466,28 +455,7 @@ class ContextualIntentPipeline:
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text).strip()
 
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # Balanced-brace extraction
-        depth, start = 0, -1
-        for i, ch in enumerate(text):
-            if ch == '{':
-                if depth == 0:
-                    start = i
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    try:
-                        return json.loads(text[start:i + 1])
-                    except json.JSONDecodeError:
-                        pass
-                    break
-
-        raise ValueError(f"Could not parse JSON from response: {text[:500]}")
+        return json.loads(text)
 
     def _call_model(self, prompt: str, response_schema: type[BaseModel],
                     context_query: str = "") -> BaseModel:
@@ -637,24 +605,6 @@ def save_json(data: Dict, filename: str):
     print(f"{filename}")
 
 
-def print_results(result: Dict):
-    print(json.dumps(result, indent=2))
-
-
-def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:
-    try:
-        schemas = {
-            "intent_extraction": Format_IntentExtraction,
-            "final_queries": Format_FinalQueries,
-            "nature_breakdown": Format_NatureBreakdown,
-            "full_pipeline": Format_FullPipeline,
-        }
-        schemas[format_type].model_validate(result)
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
 def run_single_query(pipeline, query: str, idx: int):
     result = pipeline.extract(query, verbose=True)
     all_fmts = result.to_all_formats()
@@ -671,8 +621,6 @@ def run_single_query(pipeline, query: str, idx: int):
 # =====================================================================
 
 if __name__ == "__main__":
-    import sys
-
     PROJECT_ID = "your-project-id"
     LOCATION = "us-central1"
     MODEL_VERSION = "gemini-2.5-flash"
@@ -681,10 +629,7 @@ if __name__ == "__main__":
         project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
     )
 
-    # Filter out IDE/Jupyter flags like -f /path/kernel.json
-    cli_queries = [a for a in sys.argv[1:]
-                   if not a.startswith("-") and not a.endswith(".json")]
-    test_queries = cli_queries if cli_queries else [
+    test_queries = [
         "HAVE YOU RECEIVED ANY TREATMENT FOR YOUR CANCER?"
     ]
 
