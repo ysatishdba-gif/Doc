@@ -1,43 +1,171 @@
-CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. Your task is to determine where each clinical concept most realistically lives within a medical record ecosystem. You are NOT explaining the medical concept itself. You ARE mapping its full documentation footprint across real-world clinical workflow. Each concept must be evaluated independently. Even closely related concepts may reside in different documentation environments.
+import json
+import re
+from datetime import datetime, timezone
+from typing import Dict, Any, List, Optional
+from google import genai
+from google.genai import types
+from pydantic import BaseModel, Field, field_validator, model_validator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# =====================================================================
+#  PROMPTS
+# =====================================================================
+
+QUERY_EXPANSION_PROMPT = """
+You are an expert medical AI assistant specializing in clinical query expansion.
+
+TASK: Expand the user's query into a comprehensive, detailed clinical description.
+
+INSTRUCTIONS:
+1. Expand ALL medical abbreviations to full terms (e.g., HTN -> Hypertension, DM -> Diabetes Mellitus, SOB -> Shortness of Breath)
+2. Clarify vague medical terms with specific clinical language
+3. Add relevant medical context based on standard clinical practice
+4. Identify implicit clinical concepts that should be explicit
+5. DO NOT add assumptions beyond reasonable clinical interpretation
+6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
+7. DO NOT hallucinate information not implied by the query
+8. Maintain the original query's intent and scope
+9. Make sure the Temporal aspect is relevant to the Query context
+
+User Input: {query}
+"""
+
+
+INTENT_EXTRACTION_PROMPT = """
+You are a clinical intent extraction engine for medical document retrieval.
+
+====================================================
+CLINICAL VALIDATION
+====================================================
+
+**Default: is_clinical = true**
+
+Assume the query IS clinical unless it has absolutely NO connection to medicine,
+healthcare, clinical practice, or biomedical science.
+
+The following are ALL clinical -- do not reject them:
+- Direct patient data (medications, diagnoses, vitals, labs, procedures)
+- General medical knowledge (disease mechanisms, drug classes, anatomy)
+- Clinical workflow (entity extraction, classification, summarization)
+- Meta-analytical requests (trends, patterns, comparisons)
+- Document analysis of clinical content
+- Healthcare operations (care pathways, protocols, quality measures)
+- Questions phrased as patient-facing (survey questions, intake forms)
+
+Set is_clinical=false ONLY for queries with zero medical relevance.
+When is_clinical=false, set reason and return empty intents.
+
+====================================================
+FIELD DEFINITIONS
+====================================================
+
+intent_title: What is this about?
+description: What does this represent and why does it matter?
+nature: Primary informational purpose (Format: [Context] / [Purpose])
+
+sub_natures: Distinct dimensions of this clinical concept.
+  - category_path: Hierarchical navigation from general to specific. Use " >> " separator.
+    Think: "How would I navigate to this information?" (the folders)
+  - atomic_concepts: Terminal data points at the end of the path. (the files)
+    Include all specific details: exact values, names, measurements, descriptors.
+
+  Grouping: If multiple pieces answer the same type of question, group them
+  in one sub_nature. Build depth in category_path rather than many shallow entries.
+
+final_queries: Atomic search queries derived from atomic_concepts.
+  - 2-4 words maximum per query, ONE clinical concept per query
+  - Every atomic_concept MUST appear in at least one final_query
+  - Multiple short queries > one long query
+  - Shorter = fewer CUIs = more precise matching
+
+User Input: {expanded_query}
+Timestamp: {timestamp}
+"""
+
+
+CONTEXTUAL_ENVIRONMENT_PROMPT = """
+You are a clinical documentation intelligence specialist. Your task is to
+determine where each clinical concept most realistically lives within a
+medical record ecosystem.
+
+You are NOT explaining the medical concept itself.
+You ARE mapping its full documentation footprint across real-world clinical workflow.
+
+Each concept must be evaluated independently. Even closely related concepts
+may reside in different documentation environments.
+
 ====================================================
 CORE OBJECTIVE
 ====================================================
-For each concept, identify how it propagates through care delivery. Consider where it is first recorded, where it is evaluated, where it may be escalated, where it is monitored over time, and where related downstream effects may appear. Think in terms of documentation flow, not disease description.
+
+For each concept, identify how it propagates through care delivery. Consider
+where it is first recorded, where it is evaluated, where it may be escalated,
+where it is monitored over time, and where related downstream effects may appear.
+Think in terms of documentation flow, not disease description.
+
 ====================================================
 EXPANSIVE CLINICAL REASONING
 ====================================================
+
 Treat the concept as an atomic clinical signal and reason outward dynamically. Ask:
-• Who would reasonably encounter this first?
-• Who would evaluate it further?
-• Who might be consulted if severity increases or diagnosis is unclear?
-• What other body systems could plausibly be involved?
-• What other conditions could produce or resemble it?
-• Could it appear as a complication, side effect, or secondary manifestation?
-• Could it transition across care settings depending on severity?
-Expand across clinically plausible pathways without restricting yourself to a predefined set of systems or specialties. Avoid artificial narrowing, but also avoid speculative extremes that lack realistic documentation presence. Depth should emerge from clinical logic, not from fixed taxonomies.
+- Who would reasonably encounter this first?
+- Who would evaluate it further?
+- Who might be consulted if severity increases or diagnosis is unclear?
+- What other body systems could plausibly be involved?
+- What other conditions could produce or resemble it?
+- Could it appear as a complication, side effect, or secondary manifestation?
+- Could it transition across care settings depending on severity?
+
+Expand across clinically plausible pathways without restricting yourself to a
+predefined set of systems or specialties. Avoid artificial narrowing, but also
+avoid speculative extremes that lack realistic documentation presence. Depth
+should emerge from clinical logic, not from fixed taxonomies.
+
 ====================================================
 DOCUMENTATION FOOTPRINT FIELDS
 ====================================================
+
 For each concept generate:
-document_types: multiple realistic documentation sources reflecting how this concept would appear across evaluation, escalation, and longitudinal care.
-author_roles: clinician types who would reasonably document, assess, manage, consult, or follow this concept.
-temporal_scope: realistic timing windows reflecting how this concept evolves across encounters.
-content_signals: documentation markers that indicate its presence, including cross-references, diagnostic language, management language, referral patterns, monitoring language, or escalation cues.
-clinical_setting: care environments where this concept would realistically be addressed depending on severity and context.
+
+document_types: Multiple realistic documentation sources reflecting how this
+concept would appear across evaluation, escalation, and longitudinal care.
+
+author_roles: Clinician types who would reasonably document, assess, manage,
+consult, or follow this concept.
+
+temporal_scope: Realistic timing windows reflecting how this concept evolves
+across encounters.
+
+content_signals: Documentation markers that indicate its presence, including
+cross-references, diagnostic language, management language, referral patterns,
+monitoring language, or escalation cues.
+
+clinical_setting: Care environments where this concept would realistically be
+addressed depending on severity and context.
+
 ====================================================
 FORMAT REQUIREMENTS
 ====================================================
-Each value must follow: "snake_case_term - direct documentation-focused definition". Definitions must describe record location, workflow context, or documentation behavior — not pathophysiology. atomic_concept and intent_title must exactly match the provided input values. Do not rely on rigid templates or fixed specialty lists. Use adaptive clinical reasoning grounded in real-world documentation patterns.
+
+Each value must follow: "snake_case_term - direct documentation-focused definition".
+Definitions must describe record location, workflow context, or documentation behavior
+-- not pathophysiology.
+
+atomic_concept and intent_title must exactly match the provided input values.
+
+Do not rely on rigid templates or fixed specialty lists. Use adaptive clinical
+reasoning grounded in real-world documentation patterns.
 
 ====================================================
 STRUCTURED CONTEXT STORY GENERATION
 ====================================================
 
-For each atomic_concept generate 5–10 structured context stories.
-
+For each atomic_concept generate 5-10 structured context stories.
 Each story MUST follow EXACT format:
 
-"The [document_type] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
+"The [document_type] is documented by the [author_role] during [temporal_scope]
+using [content_signal] in the [clinical_setting]."
 
 Rules:
 - Use ONLY snake_case terms already generated above.
@@ -46,12 +174,492 @@ Rules:
 - No narration.
 - Must end with period.
 
-Return stories under:
-context_stories: ["sentence1","sentence2"]
+Return stories under: context_stories: ["sentence1", "sentence2"]
 
+====================================================
+CONCEPTS TO PROCESS
 ====================================================
 
 Original query: {original_query}
 Expanded query: {expanded_query}
 Concepts: {concepts_json}
 """
+
+
+# =====================================================================
+#  LLM SCHEMAS -- what Gemini returns (raw extraction only)
+# =====================================================================
+
+class QueryExpansionOutput(BaseModel):
+    expanded_query: str
+    abbreviations_expanded: List[str] = Field(default_factory=list)
+
+
+class SubNature(BaseModel):
+    category_path: str
+    atomic_concepts: List[str] = Field(default_factory=list)
+
+    @field_validator('category_path')
+    @classmethod
+    def normalize_separator(cls, v):
+        if not isinstance(v, str):
+            v = str(v)
+        v = v.replace("/", " >> ")
+        v = re.sub(r'\s*>{1,2}\s*', ' >> ', v).strip()
+        if '>>' not in v:
+            v = f"{v} >> General"
+        return v
+
+
+class Intent(BaseModel):
+    intent_title: str
+    description: str = ""
+    nature: str = ""
+    sub_natures: List[SubNature] = Field(default_factory=list)
+    final_queries: List[str] = Field(default_factory=list)
+
+
+class IntentExtractionResponse(BaseModel):
+    """Raw LLM response for Step 2."""
+    is_clinical: bool
+    reason: Optional[str] = None
+    total_intents_detected: int = 0
+    intents: List[Intent] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def fix_intent_count(self):
+        self.total_intents_detected = len(self.intents)
+        return self
+
+
+class IntentExtractionOutput(BaseModel):
+    """Step 2 output with pipeline metadata attached."""
+    is_clinical: bool
+    reason: Optional[str] = None
+    original_query: str
+    expanded_query: str
+    total_intents_detected: int = 0
+    intents: List[Intent] = Field(default_factory=list)
+
+
+class ConceptContext(BaseModel):
+    atomic_concept: str
+    intent_title: str = ""
+    document_types: List[str] = Field(default_factory=list)
+    author_roles: List[str] = Field(default_factory=list)
+    temporal_scope: List[str] = Field(default_factory=list)
+    content_signals: List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
+    context_stories: List[str] = Field(default_factory=list)
+
+
+class ContextualEnvironmentOutput(BaseModel):
+    concepts_with_context: List[ConceptContext] = Field(default_factory=list)
+
+
+# =====================================================================
+#  OUTPUT SCHEMAS -- single normalized output, 2 entities
+# =====================================================================
+
+class OutputContext(BaseModel):
+    """Where a concept lives in the clinical record system."""
+    document_types: List[str] = Field(default_factory=list)
+    author_roles: List[str] = Field(default_factory=list)
+    temporal_scope: List[str] = Field(default_factory=list)
+    content_signals: List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
+    context_stories: List[str] = Field(default_factory=list)
+
+
+class OutputSubNature(BaseModel):
+    id: str
+    category_path: str
+
+
+class OutputIntent(BaseModel):
+    id: str
+    title: str
+    description: str
+    nature: str
+    sub_natures: List[OutputSubNature]
+    concept_ids: List[str]
+
+
+class OutputConcept(BaseModel):
+    id: str
+    term: str
+    search_terms: List[str]
+    intent_id: str
+    sub_nature_id: str
+    context: OutputContext = Field(default_factory=OutputContext)
+
+
+class OutputSummary(BaseModel):
+    total_intents: int = 0
+    total_concepts: int = 0
+    concepts_with_context: int = 0
+    concepts_without_context: int = 0
+
+
+class OutputPipelineMeta(BaseModel):
+    query: str
+    expanded_query: str
+    abbreviations_expanded: List[str] = Field(default_factory=list)
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    model: str
+    processing_time_ms: int
+    timestamp: str
+
+
+class PipelineOutput(BaseModel):
+    schema_version: str = "2.0"
+    pipeline: OutputPipelineMeta
+    summary: OutputSummary
+    intents: List[OutputIntent] = Field(default_factory=list)
+    concepts: List[OutputConcept] = Field(default_factory=list)
+
+
+# =====================================================================
+#  EXTRACTION RESULT -- builds normalized output
+# =====================================================================
+
+class ExtractionResult:
+
+    def __init__(self, original_query: str, expansion: QueryExpansionOutput,
+                 intents: IntentExtractionOutput,
+                 context: Optional[ContextualEnvironmentOutput],
+                 processing_time: float, model_name: str):
+        self.original_query = original_query
+        self.expansion = expansion
+        self.intents = intents
+        self.context = context
+        self.processing_time = processing_time
+        self.model_name = model_name
+        self.timestamp = datetime.now(timezone.utc).isoformat()
+
+    # -- helpers --
+
+    def _find_context(self, term: str) -> OutputContext:
+        """Look up Step 3 context for an atomic concept."""
+        if not self.context:
+            return OutputContext()
+        key = term.strip().lower()
+        for cc in self.context.concepts_with_context:
+            if cc.atomic_concept.strip().lower() == key:
+                return OutputContext(
+                    document_types=cc.document_types,
+                    author_roles=cc.author_roles,
+                    temporal_scope=cc.temporal_scope,
+                    content_signals=cc.content_signals,
+                    clinical_setting=cc.clinical_setting,
+                    context_stories=cc.context_stories,
+                )
+        return OutputContext()
+
+    def _build_search_terms(self, term: str, final_queries: List[str]) -> List[str]:
+        """Build search_terms for a concept: term itself + matched LLM queries."""
+        terms = [term]
+        tl = term.strip().lower()
+        for q in final_queries:
+            ql = q.strip().lower()
+            if ql == tl:
+                continue  # already included
+            if ql in tl or tl in ql:
+                terms.append(q)
+        return terms
+
+    # -- output builder --
+
+    def to_output(self) -> Dict[str, Any]:
+        """Build single normalized output."""
+        int_n, sn_n, con_n = 0, 0, 0
+        out_intents = []
+        out_concepts = []
+        with_ctx, without_ctx = 0, 0
+
+        for intent in self.intents.intents:
+            int_n += 1
+            int_id = f"int_{int_n:03d}"
+            intent_concept_ids = []
+
+            out_sub_natures = []
+            for sn in intent.sub_natures:
+                sn_n += 1
+                sn_id = f"sn_{sn_n:03d}"
+                out_sub_natures.append(OutputSubNature(
+                    id=sn_id, category_path=sn.category_path))
+
+                for term in sn.atomic_concepts:
+                    con_n += 1
+                    con_id = f"con_{con_n:03d}"
+                    intent_concept_ids.append(con_id)
+
+                    ctx = self._find_context(term)
+                    if ctx.document_types:
+                        with_ctx += 1
+                    else:
+                        without_ctx += 1
+
+                    out_concepts.append(OutputConcept(
+                        id=con_id,
+                        term=term,
+                        search_terms=self._build_search_terms(
+                            term, intent.final_queries),
+                        intent_id=int_id,
+                        sub_nature_id=sn_id,
+                        context=ctx,
+                    ))
+
+            out_intents.append(OutputIntent(
+                id=int_id, title=intent.intent_title,
+                description=intent.description, nature=intent.nature,
+                sub_natures=out_sub_natures,
+                concept_ids=intent_concept_ids))
+
+        return PipelineOutput(
+            pipeline=OutputPipelineMeta(
+                query=self.original_query,
+                expanded_query=self.expansion.expanded_query,
+                abbreviations_expanded=self.expansion.abbreviations_expanded,
+                is_clinical=self.intents.is_clinical,
+                rejected_reason=self.intents.reason,
+                model=self.model_name,
+                processing_time_ms=int(self.processing_time * 1000),
+                timestamp=self.timestamp,
+            ),
+            summary=OutputSummary(
+                total_intents=int_n,
+                total_concepts=con_n,
+                concepts_with_context=with_ctx,
+                concepts_without_context=without_ctx,
+            ),
+            intents=out_intents,
+            concepts=out_concepts,
+        ).model_dump()
+
+
+# =====================================================================
+#  PIPELINE
+# =====================================================================
+
+class ContextualIntentPipeline:
+
+    def __init__(self, project: str, location: str = "us-central1",
+                 model: str = "gemini-2.5-flash"):
+        self.client = genai.Client(vertexai=True, project=project, location=location)
+        self.project = project
+        self.location = location
+        self.model_name = model
+
+    def _extract_json(self, response) -> Dict[str, Any]:
+        if hasattr(response, 'text'):
+            text = response.text
+        elif hasattr(response, 'candidates') and response.candidates:
+            text = response.candidates[0].content.parts[0].text
+        else:
+            text = str(response)
+
+        text = re.sub(r'```json\s*', '', text)
+        text = re.sub(r'```\s*', '', text).strip()
+
+        return json.loads(text)
+
+    def _call_model(self, prompt: str, response_schema: type[BaseModel],
+                    context_query: str = "") -> BaseModel:
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.1,
+                top_p=1,
+                seed=34,
+                max_output_tokens=8096,
+                response_mime_type="application/json",
+                response_schema=response_schema,
+            )
+            response = self.client.models.generate_content(
+                model=self.model_name, contents=prompt, config=config
+            )
+            data = self._extract_json(response)
+            return response_schema.model_validate(data)
+
+        except Exception as e:
+            print(f"Model error: {e}")
+            if response_schema == QueryExpansionOutput:
+                return QueryExpansionOutput(expanded_query=context_query or "")
+            elif response_schema == IntentExtractionResponse:
+                return IntentExtractionResponse(
+                    is_clinical=False,
+                    reason=f"Processing error: {str(e)}",
+                    total_intents_detected=0, intents=[],
+                )
+            elif response_schema == ContextualEnvironmentOutput:
+                return ContextualEnvironmentOutput(concepts_with_context=[])
+            raise
+
+    # -- Step 1 --
+
+    def expand_query(self, query: str) -> QueryExpansionOutput:
+        return self._call_model(
+            QUERY_EXPANSION_PROMPT.format(query=query),
+            QueryExpansionOutput, query)
+
+    # -- Step 2 --
+
+    def extract_intents(self, original_query: str,
+                        expanded_query: str) -> IntentExtractionOutput:
+        response = self._call_model(
+            INTENT_EXTRACTION_PROMPT.format(
+                expanded_query=expanded_query,
+                timestamp=datetime.now(timezone.utc).isoformat()),
+            IntentExtractionResponse, original_query)
+
+        return IntentExtractionOutput(
+            is_clinical=response.is_clinical,
+            reason=response.reason,
+            original_query=original_query,
+            expanded_query=expanded_query,
+            total_intents_detected=len(response.intents),
+            intents=response.intents,
+        )
+
+    # -- Step 3 --
+
+    @staticmethod
+    def _prepare_context_input(intents: List[Intent]) -> List[Dict]:
+        out, seen = [], set()
+        for i in intents:
+            for sn in i.sub_natures:
+                for c in sn.atomic_concepts:
+                    key = c.strip().lower()
+                    if key and key not in seen:
+                        out.append({"atomic_concept": c.strip(),
+                                    "intent_title": i.intent_title})
+                        seen.add(key)
+        return out
+
+    def generate_context(self, original_query: str, expanded_query: str,
+                         intents: List[Intent]) -> ContextualEnvironmentOutput:
+        if not intents:
+            return ContextualEnvironmentOutput(concepts_with_context=[])
+
+        concepts = self._prepare_context_input(intents)
+        if not concepts:
+            return ContextualEnvironmentOutput(concepts_with_context=[])
+
+        result = self._call_model(
+            CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+                original_query=original_query,
+                expanded_query=expanded_query,
+                concepts_json=json.dumps(concepts, indent=2)),
+            ContextualEnvironmentOutput)
+
+        # Validate: did Step 3 cover every concept?
+        returned = {cc.atomic_concept.strip().lower()
+                    for cc in result.concepts_with_context}
+        missing = [c for c in concepts
+                   if c["atomic_concept"].strip().lower() not in returned]
+
+        if missing:
+            print(f"Step 3 missed {len(missing)}/{len(concepts)} concepts, retrying...")
+            retry = self._call_model(
+                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+                    original_query=original_query,
+                    expanded_query=expanded_query,
+                    concepts_json=json.dumps(missing, indent=2)),
+                ContextualEnvironmentOutput)
+            result.concepts_with_context.extend(retry.concepts_with_context)
+
+        return result
+
+    # -- Orchestrator --
+
+    def extract(self, query: str, verbose: bool = False) -> ExtractionResult:
+        if not query or not query.strip():
+            raise ValueError("Empty query provided")
+
+        start_time = datetime.now(timezone.utc)
+
+        # Step 1
+        expansion = self.expand_query(query)
+
+        # Step 2
+        intents = self.extract_intents(query, expansion.expanded_query)
+
+        # Step 3
+        context = None
+        if intents.is_clinical and intents.intents:
+            context = self.generate_context(
+                query, expansion.expanded_query, intents.intents)
+
+        processing_time = (datetime.now(timezone.utc) - start_time).total_seconds()
+
+        if verbose:
+            print(f"Query: {query}")
+            print(f"Expanded: {expansion.expanded_query}")
+            if intents.is_clinical:
+                nq = sum(len(i.final_queries) for i in intents.intents)
+                nc = len(context.concepts_with_context) if context else 0
+                print(f"Clinical | Intents: {intents.total_intents_detected} | "
+                      f"Queries: {nq} | Contexts: {nc}")
+            else:
+                print(f"Non-clinical | Reason: {intents.reason}")
+            print(f"Time: {processing_time:.2f}s")
+
+        return ExtractionResult(query, expansion, intents, context,
+                                processing_time, self.model_name)
+
+    def run(self, query: str, verbose: bool = False) -> Dict[str, Any]:
+        try:
+            result = self.extract(query, verbose)
+            return result.to_output()
+        except Exception as e:
+            if verbose:
+                print(f"Error: {e}\n")
+            return {"error": str(e), "query": query,
+                    "timestamp": datetime.now(timezone.utc).isoformat()}
+
+
+# =====================================================================
+#  UTILITIES
+# =====================================================================
+
+def save_json(data: Dict, filename: str):
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"{filename}")
+
+
+def run_single_query(pipeline, query: str, idx: int):
+    result = pipeline.extract(query, verbose=True)
+    output = result.to_output()
+    save_json(output, f"query{idx}_output.json")
+    print("-" * 60)
+    return {"query": query, "status": "completed",
+            "file": f"query{idx}_output.json"}
+
+
+# =====================================================================
+#  MAIN
+# =====================================================================
+
+if __name__ == "__main__":
+    PROJECT_ID = "your-project-id"
+    LOCATION = "us-central1"
+    MODEL_VERSION = "gemini-2.5-flash"
+
+    pipeline = ContextualIntentPipeline(
+        project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
+    )
+
+    test_queries = [
+        "HAVE YOU RECEIVED ANY TREATMENT FOR YOUR CANCER?"
+    ]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(run_single_query, pipeline, q, idx): q
+            for idx, q in enumerate(test_queries, 1)
+        }
+        for future in as_completed(futures):
+            results.append(future.result())
