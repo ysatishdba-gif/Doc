@@ -554,10 +554,11 @@ class ExtractionResult:
 
     @staticmethod
     def _word_overlap(a: str, b: str) -> float:
-        """Word-level Jaccard similarity, ignoring stop words."""
-        stop = {"a", "an", "the", "of", "for", "with", "in", "on", "to", "and", "or", "related"}
-        wa = {w for w in a.lower().split() if w not in stop}
-        wb = {w for w in b.lower().split() if w not in stop}
+        """Word-level Jaccard similarity — no hardcoded values."""
+        wa = set(re.split(r'[\s\-]+', a.lower()))
+        wb = set(re.split(r'[\s\-]+', b.lower()))
+        wa.discard('')
+        wb.discard('')
         if not wa or not wb:
             return 0.0
         return len(wa & wb) / len(wa | wb)
@@ -757,15 +758,9 @@ class ContextualIntentPipeline:
                         seen.add(key)
         return out
 
-    def generate_context(self, original_query: str, expanded_query: str,
-                         intents: List[Intent]) -> ContextualEnvironmentOutput:
-        if not intents:
-            return ContextualEnvironmentOutput(concepts_with_context=[])
-
-        concepts = self._prepare_context_input(intents)
-        if not concepts:
-            return ContextualEnvironmentOutput(concepts_with_context=[])
-
+    def _generate_context_batch(self, original_query: str, expanded_query: str,
+                                concepts: List[Dict]) -> List[ConceptContext]:
+        """Call Step 3 for a single batch of concepts."""
         result = self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=original_query,
@@ -774,48 +769,61 @@ class ContextualIntentPipeline:
                 concept_count=len(concepts)),
             ContextualEnvironmentOutput,
             max_tokens=16384)
+        return result.concepts_with_context
 
-        # Validate: check both PRESENCE and QUALITY (non-empty fields)
-        def _has_content(cc: ConceptContext) -> bool:
-            return bool(cc.document_types and cc.author_roles and cc.content_signals)
+    @staticmethod
+    def _has_content(cc: ConceptContext) -> bool:
+        """Check if a concept context has actual populated fields."""
+        return bool(cc.document_types and cc.author_roles and cc.content_signals)
 
+    def generate_context(self, original_query: str, expanded_query: str,
+                         intents: List[Intent],
+                         batch_size: int = 5) -> ContextualEnvironmentOutput:
+        if not intents:
+            return ContextualEnvironmentOutput(concepts_with_context=[])
+
+        concepts = self._prepare_context_input(intents)
+        if not concepts:
+            return ContextualEnvironmentOutput(concepts_with_context=[])
+
+        # Batch concepts so each LLM call has full token budget for stories
+        all_contexts = []
+        for i in range(0, len(concepts), batch_size):
+            batch = concepts[i:i + batch_size]
+            batch_results = self._generate_context_batch(
+                original_query, expanded_query, batch)
+            all_contexts.extend(batch_results)
+
+        # Validate: find concepts that came back blank or missing
         covered = {}
-        for cc in result.concepts_with_context:
-            k = cc.atomic_concept.strip().lower()
-            if _has_content(cc):
-                covered[k] = True
+        for cc in all_contexts:
+            if self._has_content(cc):
+                covered[cc.atomic_concept.strip().lower()] = True
 
         missing = [c for c in concepts
                    if c["atomic_concept"].strip().lower() not in covered]
 
-        # Remove empty stubs so retry results replace them
         if missing:
+            # Remove empty stubs so retry results replace them
             missing_keys = {c["atomic_concept"].strip().lower() for c in missing}
-            result.concepts_with_context = [
-                cc for cc in result.concepts_with_context
-                if cc.atomic_concept.strip().lower() not in missing_keys
-            ]
+            all_contexts = [cc for cc in all_contexts
+                            if cc.atomic_concept.strip().lower() not in missing_keys]
 
             print(f"Step 3: {len(covered)}/{len(concepts)} have content, "
                   f"retrying {len(missing)} blank/missing...")
-            retry = self._call_model(
-                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                    original_query=original_query,
-                    expanded_query=expanded_query,
-                    concepts_json=json.dumps(missing, indent=2),
-                    concept_count=len(missing)),
-                ContextualEnvironmentOutput,
-                max_tokens=16384)
-            result.concepts_with_context.extend(retry.concepts_with_context)
+            # Retry missing in a single batch (small enough now)
+            retry_results = self._generate_context_batch(
+                original_query, expanded_query, missing)
+            all_contexts.extend(retry_results)
 
-            # Report any still blank after retry
             still_blank = [c["atomic_concept"] for c in missing
-                           if not any(_has_content(cc) and cc.atomic_concept.strip().lower() == c["atomic_concept"].strip().lower()
-                                      for cc in retry.concepts_with_context)]
+                           if not any(self._has_content(cc)
+                                      and cc.atomic_concept.strip().lower() == c["atomic_concept"].strip().lower()
+                                      for cc in retry_results)]
             if still_blank:
                 print(f"Still blank after retry: {still_blank}")
 
-        return result
+        return ContextualEnvironmentOutput(concepts_with_context=all_contexts)
 
     # -- Orchestrator --
 
