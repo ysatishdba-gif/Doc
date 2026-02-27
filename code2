@@ -284,11 +284,8 @@ clinical_setting (REQUIRED, 2-4 values): care environments where this concept wo
 ====================================================
 WHAT A FAILED RESPONSE LOOKS LIKE (DO NOT DO THIS)
 ====================================================
-WRONG — empty fields:
-{{"atomic_concept": "cough pattern", "document_types": [], "author_roles": [], "temporal_scope": [], "content_signals": [], "clinical_setting": [], "context_stories": []}}
-
-CORRECT — every field populated:
-{{"atomic_concept": "cough pattern", "document_types": ["history_of_present_illness - HPI section documenting cough characteristics and temporal pattern", "nursing_intake_assessment - initial triage documentation of cough frequency and triggers", "pulmonology_consultation - specialist evaluation of persistent cough patterns", "telephone_encounter - patient-reported cough pattern during nurse triage call"], "author_roles": ["primary_care_physician - initial documentation of cough pattern during clinical encounter", "pulmonologist - specialist assessment of refractory cough characteristics", "triage_nurse - intake screening of cough frequency and severity"], "temporal_scope": ["acute_presentation - initial documentation of cough onset and pattern", "follow_up_visit - reassessment of cough pattern evolution over time"], "content_signals": ["cough_frequency - documentation of how often cough occurs per day or hour", "diurnal_variation - notation of daytime versus nocturnal cough predominance", "trigger_association - documentation of cough triggers such as exertion cold air or supine position", "pattern_change - language indicating worsening improving or stable cough pattern"], "clinical_setting": ["outpatient_clinic - primary care evaluation of new or changing cough", "urgent_care - acute visit for sudden cough pattern change"], "context_stories": ["The history_of_present_illness is documented by the primary_care_physician during acute_presentation using cough_frequency in the outpatient_clinic.", "The nursing_intake_assessment is documented by the triage_nurse during acute_presentation using trigger_association in the urgent_care.", "The pulmonology_consultation is documented by the pulmonologist during follow_up_visit using diurnal_variation in the outpatient_clinic.", "The telephone_encounter is documented by the triage_nurse during follow_up_visit using pattern_change in the outpatient_clinic.", "The history_of_present_illness is documented by the pulmonologist during follow_up_visit using cough_frequency in the outpatient_clinic."]}}
+WRONG: {{"atomic_concept": "cough pattern", "document_types": [], "author_roles": [], "content_signals": [], "context_stories": []}}
+CORRECT: Every field has values populated. No empty arrays anywhere. If you return even ONE empty array, the entire response is invalid.
 ====================================================
 FORMAT REQUIREMENTS
 ====================================================
@@ -299,7 +296,7 @@ STRUCTURED CONTEXT STORY GENERATION (REQUIRED)
 For each atomic_concept you MUST generate 5-10 structured context stories.
 This field MUST NOT be empty. Every concept gets stories.
 Each story MUST follow this EXACT template:
-"The [document_type] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
+"The [document_type] for [atomic_concept] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
 Rules:
 - Use ONLY the snake_case_term prefix (the part before " - ") from the fields generated above.
 - Do NOT introduce any new terminology not present in the generated fields.
@@ -420,11 +417,11 @@ class IntentWithContext(BaseModel):
     retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
 
 
-class FinalQueryItem(BaseModel):
-    query_id: str
+class FinalCandidateItem(BaseModel):
+    candidate_id: str
     intent_title: str
     atomic_concept: str
-    query: str
+    candidate: str
     retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
 
 
@@ -440,8 +437,8 @@ class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    total_queries: int
-    final_queries: List[FinalQueryItem]
+    total_candidates: int
+    final_candidates: List[FinalCandidateItem]
     timestamp: str
 
 
@@ -483,6 +480,26 @@ class ExtractionResult:
 
     # -- context helpers --
 
+    @staticmethod
+    def _clean_text(val: str) -> str:
+        """Remove underscores between words in context values and stories."""
+        if " - " in val:
+            key, desc = val.split(" - ", 1)
+            return key.replace("_", " ") + " - " + desc
+        return val.replace("_", " ")
+
+    @staticmethod
+    def _clean_list(vals: List[str]) -> List[str]:
+        """Remove underscores from all values in a list."""
+        cleaned = []
+        for v in vals:
+            if " - " in v:
+                key, desc = v.split(" - ", 1)
+                cleaned.append(key.replace("_", " ") + " - " + desc)
+            else:
+                cleaned.append(v.replace("_", " "))
+        return cleaned
+
     def _build_ctx(self, atomic_concept: str) -> RetrievalContext:
         """Look up context for one atomic concept."""
         if not self.context:
@@ -492,24 +509,24 @@ class ExtractionResult:
         for cc in self.context.concepts_with_context:
             if cc.atomic_concept.strip().lower() == key:
                 return RetrievalContext(
-                    document_types=cc.document_types,
-                    author_roles=cc.author_roles,
-                    temporal_scope=cc.temporal_scope,
-                    content_signals=cc.content_signals,
-                    clinical_setting=cc.clinical_setting,
-                    context_stories=cc.context_stories,
+                    document_types=self._clean_list(cc.document_types),
+                    author_roles=self._clean_list(cc.author_roles),
+                    temporal_scope=self._clean_list(cc.temporal_scope),
+                    content_signals=self._clean_list(cc.content_signals),
+                    clinical_setting=self._clean_list(cc.clinical_setting),
+                    context_stories=self._clean_list(cc.context_stories),
                 )
         # Pass 2: substring match
         for cc in self.context.concepts_with_context:
             cl = cc.atomic_concept.strip().lower()
             if cl in key or key in cl:
                 return RetrievalContext(
-                    document_types=cc.document_types,
-                    author_roles=cc.author_roles,
-                    temporal_scope=cc.temporal_scope,
-                    content_signals=cc.content_signals,
-                    clinical_setting=cc.clinical_setting,
-                    context_stories=cc.context_stories,
+                    document_types=self._clean_list(cc.document_types),
+                    author_roles=self._clean_list(cc.author_roles),
+                    temporal_scope=self._clean_list(cc.temporal_scope),
+                    content_signals=self._clean_list(cc.content_signals),
+                    clinical_setting=self._clean_list(cc.clinical_setting),
+                    context_stories=self._clean_list(cc.context_stories),
                 )
         # Pass 3: word overlap (catches "CBC differential" → "CBC with differential")
         best_score, best_cc = 0.0, None
@@ -520,12 +537,12 @@ class ExtractionResult:
                 best_cc = cc
         if best_cc and best_score >= 0.5:
             return RetrievalContext(
-                document_types=best_cc.document_types,
-                author_roles=best_cc.author_roles,
-                temporal_scope=best_cc.temporal_scope,
-                content_signals=best_cc.content_signals,
-                clinical_setting=best_cc.clinical_setting,
-                context_stories=best_cc.context_stories,
+                document_types=self._clean_list(best_cc.document_types),
+                author_roles=self._clean_list(best_cc.author_roles),
+                temporal_scope=self._clean_list(best_cc.temporal_scope),
+                content_signals=self._clean_list(best_cc.content_signals),
+                clinical_setting=self._clean_list(best_cc.clinical_setting),
+                context_stories=self._clean_list(best_cc.context_stories),
             )
         return RetrievalContext()
 
@@ -546,10 +563,12 @@ class ExtractionResult:
         if not any([doc, auth, temp, sig, sett]):
             return RetrievalContext()
         return RetrievalContext(
-            document_types=sorted(doc), author_roles=sorted(auth),
-            temporal_scope=sorted(temp), content_signals=sorted(sig),
-            clinical_setting=sorted(sett),
-            context_stories=stories,
+            document_types=self._clean_list(sorted(doc)),
+            author_roles=self._clean_list(sorted(auth)),
+            temporal_scope=self._clean_list(sorted(temp)),
+            content_signals=self._clean_list(sorted(sig)),
+            clinical_setting=self._clean_list(sorted(sett)),
+            context_stories=self._clean_list(stories),
         )
 
     @staticmethod
@@ -599,26 +618,26 @@ class ExtractionResult:
         ).model_dump()
 
     def to_final_queries(self) -> Dict[str, Any]:
-        queries = []
+        candidates = []
         idx = 0
         for i in self.intents.intents:
             concepts = [c for sn in i.sub_natures for c in sn.atomic_concepts]
             for q in i.final_queries:
                 idx += 1
                 matched = self._match_concept(q, concepts)
-                queries.append(FinalQueryItem(
-                    query_id=f"fq_{idx:03d}",
+                candidates.append(FinalCandidateItem(
+                    candidate_id=f"fc_{idx:03d}",
                     intent_title=i.intent_title,
                     atomic_concept=matched,
-                    query=q,
+                    candidate=q,
                     retrieval_context=self._build_ctx(matched),
                 ))
         return Format_FinalQueries(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            total_queries=len(queries),
-            final_queries=queries,
+            total_candidates=len(candidates),
+            final_candidates=candidates,
             timestamp=self.timestamp,
         ).model_dump()
 
@@ -786,13 +805,22 @@ class ContextualIntentPipeline:
         if not concepts:
             return ContextualEnvironmentOutput(concepts_with_context=[])
 
-        # Batch concepts so each LLM call has full token budget for stories
+        # Batch concepts and run in PARALLEL
+        batches = [concepts[i:i + batch_size]
+                   for i in range(0, len(concepts), batch_size)]
+
         all_contexts = []
-        for i in range(0, len(concepts), batch_size):
-            batch = concepts[i:i + batch_size]
-            batch_results = self._generate_context_batch(
-                original_query, expanded_query, batch)
-            all_contexts.extend(batch_results)
+        with ThreadPoolExecutor(max_workers=len(batches)) as executor:
+            futures = {
+                executor.submit(self._generate_context_batch,
+                                original_query, expanded_query, batch): batch
+                for batch in batches
+            }
+            for future in as_completed(futures):
+                try:
+                    all_contexts.extend(future.result())
+                except Exception as e:
+                    print(f"Batch error: {e}")
 
         # Validate: find concepts that came back blank or missing
         covered = {}
@@ -804,14 +832,12 @@ class ContextualIntentPipeline:
                    if c["atomic_concept"].strip().lower() not in covered]
 
         if missing:
-            # Remove empty stubs so retry results replace them
             missing_keys = {c["atomic_concept"].strip().lower() for c in missing}
             all_contexts = [cc for cc in all_contexts
                             if cc.atomic_concept.strip().lower() not in missing_keys]
 
             print(f"Step 3: {len(covered)}/{len(concepts)} have content, "
                   f"retrying {len(missing)} blank/missing...")
-            # Retry missing in a single batch (small enough now)
             retry_results = self._generate_context_batch(
                 original_query, expanded_query, missing)
             all_contexts.extend(retry_results)
