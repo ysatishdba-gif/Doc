@@ -230,9 +230,32 @@ CRITICAL CONTRACT
 ====================================================
 You will receive exactly {concept_count} concepts.
 You MUST return exactly {concept_count} entries in concepts_with_context.
-Every single concept MUST be processed. Do not skip, merge, or omit any.
+
+COMPLETENESS IS MANDATORY:
+Every single entry MUST have ALL fields populated. No empty arrays. No exceptions.
+- document_types: MINIMUM 4 values, maximum 7
+- author_roles: MINIMUM 3 values, maximum 5
+- temporal_scope: MINIMUM 2 values, maximum 4
+- content_signals: MINIMUM 4 values, maximum 6
+- clinical_setting: MINIMUM 2 values, maximum 4
+- context_stories: MINIMUM 5 values, maximum 10
+
+An entry with any empty array is a FAILED entry. Do not return it.
+
 Return each atomic_concept and intent_title EXACTLY as provided in the input.
 Do not rephrase, expand, abbreviate, or modify them in any way.
+
+HANDLING GENERIC CONCEPTS:
+Every clinical concept — no matter how broad — appears somewhere in documentation.
+If a concept seems generic (e.g., "cough pattern", "dyspnea", "bronchitis"), ask:
+- Where would a clinician FIRST write this down? → That is your document_type.
+- Who would write it? → That is your author_role.
+- When in the care timeline? → That is your temporal_scope.
+Reason from clinical workflow, not from concept complexity.
+A simple concept like "dyspnea" has a rich documentation footprint:
+progress notes, ED triage, nursing assessments, pulmonary function reports, etc.
+
+DO NOT leave any field empty because you are uncertain. Reason through it.
 ====================================================
 CORE OBJECTIVE
 ====================================================
@@ -252,20 +275,29 @@ Expand across clinically plausible pathways without restricting yourself to a pr
 ====================================================
 DOCUMENTATION FOOTPRINT FIELDS
 ====================================================
-For each concept generate:
-document_types (4-7 values): realistic documentation sources reflecting how this concept would appear across evaluation, escalation, and longitudinal care.
-author_roles (3-5 values): clinician types who would reasonably document, assess, manage, consult, or follow this concept.
-temporal_scope (2-4 values): realistic timing windows reflecting how this concept evolves across encounters.
-content_signals (4-6 values): documentation markers that indicate its presence, including cross-references, diagnostic language, management language, referral patterns, monitoring language, or escalation cues.
-clinical_setting (2-4 values): care environments where this concept would realistically be addressed depending on severity and context.
+For each concept you MUST generate ALL of the following (no empty arrays):
+document_types (REQUIRED, 4-7 values): realistic documentation sources reflecting how this concept would appear across evaluation, escalation, and longitudinal care.
+author_roles (REQUIRED, 3-5 values): clinician types who would reasonably document, assess, manage, consult, or follow this concept.
+temporal_scope (REQUIRED, 2-4 values): realistic timing windows reflecting how this concept evolves across encounters.
+content_signals (REQUIRED, 4-6 values): documentation markers that indicate its presence, including cross-references, diagnostic language, management language, referral patterns, monitoring language, or escalation cues.
+clinical_setting (REQUIRED, 2-4 values): care environments where this concept would realistically be addressed depending on severity and context.
+====================================================
+WHAT A FAILED RESPONSE LOOKS LIKE (DO NOT DO THIS)
+====================================================
+WRONG — empty fields:
+{{"atomic_concept": "cough pattern", "document_types": [], "author_roles": [], "temporal_scope": [], "content_signals": [], "clinical_setting": [], "context_stories": []}}
+
+CORRECT — every field populated:
+{{"atomic_concept": "cough pattern", "document_types": ["history_of_present_illness - HPI section documenting cough characteristics and temporal pattern", "nursing_intake_assessment - initial triage documentation of cough frequency and triggers", "pulmonology_consultation - specialist evaluation of persistent cough patterns", "telephone_encounter - patient-reported cough pattern during nurse triage call"], "author_roles": ["primary_care_physician - initial documentation of cough pattern during clinical encounter", "pulmonologist - specialist assessment of refractory cough characteristics", "triage_nurse - intake screening of cough frequency and severity"], "temporal_scope": ["acute_presentation - initial documentation of cough onset and pattern", "follow_up_visit - reassessment of cough pattern evolution over time"], "content_signals": ["cough_frequency - documentation of how often cough occurs per day or hour", "diurnal_variation - notation of daytime versus nocturnal cough predominance", "trigger_association - documentation of cough triggers such as exertion cold air or supine position", "pattern_change - language indicating worsening improving or stable cough pattern"], "clinical_setting": ["outpatient_clinic - primary care evaluation of new or changing cough", "urgent_care - acute visit for sudden cough pattern change"], "context_stories": ["The history_of_present_illness is documented by the primary_care_physician during acute_presentation using cough_frequency in the outpatient_clinic.", "The nursing_intake_assessment is documented by the triage_nurse during acute_presentation using trigger_association in the urgent_care.", "The pulmonology_consultation is documented by the pulmonologist during follow_up_visit using diurnal_variation in the outpatient_clinic.", "The telephone_encounter is documented by the triage_nurse during follow_up_visit using pattern_change in the outpatient_clinic.", "The history_of_present_illness is documented by the pulmonologist during follow_up_visit using cough_frequency in the outpatient_clinic."]}}
 ====================================================
 FORMAT REQUIREMENTS
 ====================================================
 Each value must follow: "snake_case_term - direct documentation-focused definition". Definitions must describe record location, workflow context, or documentation behavior — not pathophysiology. atomic_concept and intent_title must exactly match the provided input values. Do not rely on rigid templates or fixed specialty lists. Use adaptive clinical reasoning grounded in real-world documentation patterns.
 ====================================================
-STRUCTURED CONTEXT STORY GENERATION
+STRUCTURED CONTEXT STORY GENERATION (REQUIRED)
 ====================================================
-For each atomic_concept generate 5-10 structured context stories.
+For each atomic_concept you MUST generate 5-10 structured context stories.
+This field MUST NOT be empty. Every concept gets stories.
 Each story MUST follow this EXACT template:
 "The [document_type] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
 Rules:
@@ -456,6 +488,7 @@ class ExtractionResult:
         if not self.context:
             return RetrievalContext()
         key = atomic_concept.strip().lower()
+        # Pass 1: exact match
         for cc in self.context.concepts_with_context:
             if cc.atomic_concept.strip().lower() == key:
                 return RetrievalContext(
@@ -466,6 +499,34 @@ class ExtractionResult:
                     clinical_setting=cc.clinical_setting,
                     context_stories=cc.context_stories,
                 )
+        # Pass 2: substring match
+        for cc in self.context.concepts_with_context:
+            cl = cc.atomic_concept.strip().lower()
+            if cl in key or key in cl:
+                return RetrievalContext(
+                    document_types=cc.document_types,
+                    author_roles=cc.author_roles,
+                    temporal_scope=cc.temporal_scope,
+                    content_signals=cc.content_signals,
+                    clinical_setting=cc.clinical_setting,
+                    context_stories=cc.context_stories,
+                )
+        # Pass 3: word overlap (catches "CBC differential" → "CBC with differential")
+        best_score, best_cc = 0.0, None
+        for cc in self.context.concepts_with_context:
+            score = self._word_overlap(atomic_concept, cc.atomic_concept)
+            if score > best_score:
+                best_score = score
+                best_cc = cc
+        if best_cc and best_score >= 0.5:
+            return RetrievalContext(
+                document_types=best_cc.document_types,
+                author_roles=best_cc.author_roles,
+                temporal_scope=best_cc.temporal_scope,
+                content_signals=best_cc.content_signals,
+                clinical_setting=best_cc.clinical_setting,
+                context_stories=best_cc.context_stories,
+            )
         return RetrievalContext()
 
     def _build_intent_ctx(self, intent_title: str) -> RetrievalContext:
@@ -491,6 +552,16 @@ class ExtractionResult:
             context_stories=stories,
         )
 
+    @staticmethod
+    def _word_overlap(a: str, b: str) -> float:
+        """Word-level Jaccard similarity, ignoring stop words."""
+        stop = {"a", "an", "the", "of", "for", "with", "in", "on", "to", "and", "or", "related"}
+        wa = {w for w in a.lower().split() if w not in stop}
+        wb = {w for w in b.lower().split() if w not in stop}
+        if not wa or not wb:
+            return 0.0
+        return len(wa & wb) / len(wa | wb)
+
     def _match_concept(self, query: str, concepts: List[str]) -> str:
         """Match a final_query string to its source atomic_concept."""
         ql = query.lower().strip()
@@ -498,11 +569,20 @@ class ExtractionResult:
         for c in concepts:
             if c.lower().strip() == ql:
                 return c
-        # Pass 2: contains
+        # Pass 2: substring
         for c in concepts:
             cl = c.lower().strip()
             if cl in ql or ql in cl:
                 return c
+        # Pass 3: word overlap (handles "CBC differential" ↔ "CBC with differential")
+        best_score, best_match = 0.0, None
+        for c in concepts:
+            score = self._word_overlap(query, c)
+            if score > best_score:
+                best_score = score
+                best_match = c
+        if best_match and best_score >= 0.5:
+            return best_match
         return query
 
     # -- output builders --
@@ -695,14 +775,29 @@ class ContextualIntentPipeline:
             ContextualEnvironmentOutput,
             max_tokens=16384)
 
-        # Validate: did Step 3 cover every concept?
-        returned = {cc.atomic_concept.strip().lower()
-                    for cc in result.concepts_with_context}
-        missing = [c for c in concepts
-                   if c["atomic_concept"].strip().lower() not in returned]
+        # Validate: check both PRESENCE and QUALITY (non-empty fields)
+        def _has_content(cc: ConceptContext) -> bool:
+            return bool(cc.document_types and cc.author_roles and cc.content_signals)
 
+        covered = {}
+        for cc in result.concepts_with_context:
+            k = cc.atomic_concept.strip().lower()
+            if _has_content(cc):
+                covered[k] = True
+
+        missing = [c for c in concepts
+                   if c["atomic_concept"].strip().lower() not in covered]
+
+        # Remove empty stubs so retry results replace them
         if missing:
-            print(f"Step 3 missed {len(missing)}/{len(concepts)} concepts, retrying...")
+            missing_keys = {c["atomic_concept"].strip().lower() for c in missing}
+            result.concepts_with_context = [
+                cc for cc in result.concepts_with_context
+                if cc.atomic_concept.strip().lower() not in missing_keys
+            ]
+
+            print(f"Step 3: {len(covered)}/{len(concepts)} have content, "
+                  f"retrying {len(missing)} blank/missing...")
             retry = self._call_model(
                 CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                     original_query=original_query,
@@ -713,13 +808,12 @@ class ContextualIntentPipeline:
                 max_tokens=16384)
             result.concepts_with_context.extend(retry.concepts_with_context)
 
-            # Check if retry covered everything
-            still_returned = {cc.atomic_concept.strip().lower()
-                              for cc in result.concepts_with_context}
-            still_missing = [c for c in concepts
-                             if c["atomic_concept"].strip().lower() not in still_returned]
-            if still_missing:
-                print(f"Still missing after retry: {[c['atomic_concept'] for c in still_missing]}")
+            # Report any still blank after retry
+            still_blank = [c["atomic_concept"] for c in missing
+                           if not any(_has_content(cc) and cc.atomic_concept.strip().lower() == c["atomic_concept"].strip().lower()
+                                      for cc in retry.concepts_with_context)]
+            if still_blank:
+                print(f"Still blank after retry: {still_blank}")
 
         return result
 
