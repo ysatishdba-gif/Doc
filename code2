@@ -226,6 +226,14 @@ Timestamp: {timestamp}
 
 CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. Your task is to determine where each clinical concept most realistically lives within a medical record ecosystem. You are NOT explaining the medical concept itself. You ARE mapping its full documentation footprint across real-world clinical workflow. Each concept must be evaluated independently. Even closely related concepts may reside in different documentation environments.
 ====================================================
+CRITICAL CONTRACT
+====================================================
+You will receive exactly {concept_count} concepts.
+You MUST return exactly {concept_count} entries in concepts_with_context.
+Every single concept MUST be processed. Do not skip, merge, or omit any.
+Return each atomic_concept and intent_title EXACTLY as provided in the input.
+Do not rephrase, expand, abbreviate, or modify them in any way.
+====================================================
 CORE OBJECTIVE
 ====================================================
 For each concept, identify how it propagates through care delivery. Consider where it is first recorded, where it is evaluated, where it may be escalated, where it is monitored over time, and where related downstream effects may appear. Think in terms of documentation flow, not disease description.
@@ -245,17 +253,30 @@ Expand across clinically plausible pathways without restricting yourself to a pr
 DOCUMENTATION FOOTPRINT FIELDS
 ====================================================
 For each concept generate:
-document_types: multiple realistic documentation sources reflecting how this concept would appear across evaluation, escalation, and longitudinal care.
-author_roles: clinician types who would reasonably document, assess, manage, consult, or follow this concept.
-temporal_scope: realistic timing windows reflecting how this concept evolves across encounters.
-content_signals: documentation markers that indicate its presence, including cross-references, diagnostic language, management language, referral patterns, monitoring language, or escalation cues.
-clinical_setting: care environments where this concept would realistically be addressed depending on severity and context.
+document_types (4-7 values): realistic documentation sources reflecting how this concept would appear across evaluation, escalation, and longitudinal care.
+author_roles (3-5 values): clinician types who would reasonably document, assess, manage, consult, or follow this concept.
+temporal_scope (2-4 values): realistic timing windows reflecting how this concept evolves across encounters.
+content_signals (4-6 values): documentation markers that indicate its presence, including cross-references, diagnostic language, management language, referral patterns, monitoring language, or escalation cues.
+clinical_setting (2-4 values): care environments where this concept would realistically be addressed depending on severity and context.
 ====================================================
 FORMAT REQUIREMENTS
 ====================================================
 Each value must follow: "snake_case_term - direct documentation-focused definition". Definitions must describe record location, workflow context, or documentation behavior — not pathophysiology. atomic_concept and intent_title must exactly match the provided input values. Do not rely on rigid templates or fixed specialty lists. Use adaptive clinical reasoning grounded in real-world documentation patterns.
 ====================================================
-CONCEPTS TO PROCESS
+STRUCTURED CONTEXT STORY GENERATION
+====================================================
+For each atomic_concept generate 5-10 structured context stories.
+Each story MUST follow this EXACT template:
+"The [document_type] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
+Rules:
+- Use ONLY the snake_case_term prefix (the part before " - ") from the fields generated above.
+- Do NOT introduce any new terminology not present in the generated fields.
+- Each story must use a DIFFERENT combination of fields.
+- Collectively, stories must cover ALL document_types and ALL author_roles at least once.
+- One sentence per story. Must end with period.
+Return stories under: context_stories: ["sentence1", "sentence2"]
+====================================================
+CONCEPTS TO PROCESS ({concept_count} total — return all {concept_count})
 ====================================================
 Original query: {original_query}
 Expanded query: {expanded_query}
@@ -326,6 +347,7 @@ class ConceptContext(BaseModel):
     temporal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
+    context_stories: List[str] = Field(default_factory=list)
 
 
 class ContextualEnvironmentOutput(BaseModel):
@@ -342,6 +364,7 @@ class RetrievalContext(BaseModel):
     temporal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
+    context_stories: List[str] = Field(default_factory=list)
 
 
 class IntentSummaryItem(BaseModel):
@@ -441,6 +464,7 @@ class ExtractionResult:
                     temporal_scope=cc.temporal_scope,
                     content_signals=cc.content_signals,
                     clinical_setting=cc.clinical_setting,
+                    context_stories=cc.context_stories,
                 )
         return RetrievalContext()
 
@@ -449,6 +473,7 @@ class ExtractionResult:
         if not self.context:
             return RetrievalContext()
         doc, auth, temp, sig, sett = set(), set(), set(), set(), set()
+        stories = []
         for cc in self.context.concepts_with_context:
             if cc.intent_title == intent_title:
                 doc.update(cc.document_types)
@@ -456,12 +481,14 @@ class ExtractionResult:
                 temp.update(cc.temporal_scope)
                 sig.update(cc.content_signals)
                 sett.update(cc.clinical_setting)
+                stories.extend(cc.context_stories)
         if not any([doc, auth, temp, sig, sett]):
             return RetrievalContext()
         return RetrievalContext(
             document_types=sorted(doc), author_roles=sorted(auth),
             temporal_scope=sorted(temp), content_signals=sorted(sig),
             clinical_setting=sorted(sett),
+            context_stories=stories,
         )
 
     def _match_concept(self, query: str, concepts: List[str]) -> str:
@@ -579,13 +606,13 @@ class ContextualIntentPipeline:
         return json.loads(text)
 
     def _call_model(self, prompt: str, response_schema: type[BaseModel],
-                    context_query: str = "") -> BaseModel:
+                    context_query: str = "", max_tokens: int = 8096) -> BaseModel:
         try:
             config = types.GenerateContentConfig(
                 temperature=0,
                 top_p=0.2,
                 seed=34,
-                max_output_tokens=8096,
+                max_output_tokens=max_tokens,
                 response_mime_type="application/json",
                 response_schema=response_schema,
             )
@@ -659,12 +686,42 @@ class ContextualIntentPipeline:
         if not concepts:
             return ContextualEnvironmentOutput(concepts_with_context=[])
 
-        return self._call_model(
+        result = self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=original_query,
                 expanded_query=expanded_query,
-                concepts_json=json.dumps(concepts, indent=2)),
-            ContextualEnvironmentOutput)
+                concepts_json=json.dumps(concepts, indent=2),
+                concept_count=len(concepts)),
+            ContextualEnvironmentOutput,
+            max_tokens=16384)
+
+        # Validate: did Step 3 cover every concept?
+        returned = {cc.atomic_concept.strip().lower()
+                    for cc in result.concepts_with_context}
+        missing = [c for c in concepts
+                   if c["atomic_concept"].strip().lower() not in returned]
+
+        if missing:
+            print(f"Step 3 missed {len(missing)}/{len(concepts)} concepts, retrying...")
+            retry = self._call_model(
+                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+                    original_query=original_query,
+                    expanded_query=expanded_query,
+                    concepts_json=json.dumps(missing, indent=2),
+                    concept_count=len(missing)),
+                ContextualEnvironmentOutput,
+                max_tokens=16384)
+            result.concepts_with_context.extend(retry.concepts_with_context)
+
+            # Check if retry covered everything
+            still_returned = {cc.atomic_concept.strip().lower()
+                              for cc in result.concepts_with_context}
+            still_missing = [c for c in concepts
+                             if c["atomic_concept"].strip().lower() not in still_returned]
+            if still_missing:
+                print(f"Still missing after retry: {[c['atomic_concept'] for c in still_missing]}")
+
+        return result
 
     # -- Orchestrator --
 
