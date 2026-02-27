@@ -1,4 +1,4 @@
-_VERSION = "2026-02-26-v7"  # verify with: from cui_reduction_system import _VERSION; print(_VERSION)
+_VERSION = "2026-02-27-v7.2"  # verify with: from cui_reduction_system import _VERSION; print(_VERSION)
 import os
 import time
 import logging
@@ -16,6 +16,51 @@ from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
+# ── Tunable constants (override via config or env) ───────────────────────────
+_BQ_BATCH = 5000                     # BigQuery batch size for inserts/reads
+_BQ_TIMEOUT = 300                    # BQ query timeout seconds
+_API_TIMEOUT = 200                   # CUI extraction API timeout seconds
+_GCLOUD_TIMEOUT = 30                 # gcloud auth subprocess timeout seconds
+_EMB_FETCH_WORKERS = 4               # parallel embedding fetch threads
+_KNN_BLOCK_SIZE = 2000               # cosine kNN block size for memory control
+_RANDOM_SEED = 42                    # reproducible community detection
+
+_CACHE_METADATA = 50_000             # LRU size for metadata cache
+_CACHE_IC = 100_000                  # LRU size for IC cache
+_CACHE_EMBEDDING = 50_000            # LRU size for embedding cache
+_CACHE_EXTRACTION = 10_000           # LRU size for extraction API cache
+_ANCESTOR_CACHE_MAX = 200_000        # max _ancestor_cache entries before evict
+_TIMING_MAX_PER_KEY = 10_000         # max timing samples per operation name
+
+_FAST_PATH_THRESHOLD = 200           # EmbeddingReducer: below this, skip components/louvain
+_CROSS_TOPIC_DEDUP_MIN = 200         # only run cross-topic dedup above this CUI count
+_ANCESTOR_TARGET = 20                # target ancestor count for depth derivation
+_ANCESTOR_DEPTH_CLAMP = (1, 5)       # min/max for computed ancestor depth
+_COMPONENT_DEPTH_RATIO = 0.4         # component depth as fraction of ancestor depth
+_HT_MAX_COVERAGE = 0.6              # HierarchicalTopicBuilder: exclude ancestors covering >60%
+
+_TYPEAHEAD_IC_CENTER = 7.0           # preferred IC for navigable typeahead results
+_TYPEAHEAD_WEIGHTS = (3.0, 2.0, 1.0) # (starts_with, ic_nav, descendant_nav) scoring weights
+_TYPEAHEAD_DESC_NORM = 50.0          # descendant count normalization divisor
+
+_EVAL_AGGRESSIVE_RATIO = 0.95        # reduction ratio above this = WARNING
+_EVAL_MINIMAL_RATIO = 0.10           # reduction ratio below this = WARNING
+_EVAL_COMPRESSED_SPREAD = 0.1        # confidence spread below this = WARNING
+_EVAL_SEPARATION_MIN = 0.05          # topic separation below this = WARNING
+_EVAL_SUSPECT_DIST = 0.3             # embedding distance above this in recon = SUSPECT
+_MATCH_ANCESTOR_IC_MIN = 4.0         # min IC for shared ancestor to count in match_topics
+_XTD_KNN_K = 10                      # k-NN neighbors for cross-topic dedup
+_LOUVAIN_SPLIT_RESOLUTION = 2.0      # Louvain resolution for oversized community sub-splits
+_COSINE_FALLBACK_THRESHOLD = 0.5     # TopicBuilder: fallback if no valid kNN distances
+_EVAL_RECON_DEPTH = 3                # ancestor depth for reconstruction checks
+_RETRY_TOTAL = 3                     # HTTP retry attempts
+_RETRY_BACKOFF = 1                   # HTTP retry backoff factor (seconds)
+_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)  # HTTP status codes to retry
+_COMP_DEPTH_MEAN_THRESHOLD = 1.5     # min mean in-degree for component depth > 1
+_DEFAULT_ANCESTOR_DEPTH = 3          # fallback ancestor depth when graph too sparse
+_TYPEAHEAD_OVERSAMPLE = 3            # oversample factor before final sort in typeahead
+_CANONICAL_MAX_DEPTH = 8             # default max depth for canonical topic mapping
+
 logger = logging.getLogger("cui_reduction")
 logger.setLevel(logging.DEBUG)
 if not logger.handlers:
@@ -27,7 +72,7 @@ if not logger.handlers:
 def log(msg, level="INFO"):
     getattr(logger, level.lower(), logger.info)(msg)
 
-_timings = defaultdict(list)
+_timings = defaultdict(lambda: deque(maxlen=_TIMING_MAX_PER_KEY))
 _timing_lock = threading.Lock()
 
 def timed(name):
@@ -38,40 +83,39 @@ def timed(name):
                 return fn(*a, **kw)
             finally:
                 with _timing_lock:
-                    _timings[name].append(
-                        (time.perf_counter() - t0) * 1000)
+                    _timings[name].append((time.perf_counter() - t0) * 1000)
         return wrapper
     return dec
 
-# --- Otsu threshold helper ---
 def _otsu_threshold(values):
-    """Find threshold that maximizes between-class variance (Otsu's method)."""
+    """Find threshold that maximizes between-class variance (Otsu's method). O(N)."""
     arr = np.sort(values)
     n = len(arr)
     if n < 2:
         return float(arr[0]) if n == 1 else 0.0
+    cumsum = np.cumsum(arr)
+    total_sum = cumsum[-1]
     best_t, best_var = float(arr[0]), -1.0
-    total_mean = np.mean(arr)
     for i in range(1, n):
         if arr[i] == arr[i - 1]:
             continue
         w0 = i / n
         w1 = 1.0 - w0
-        m0 = np.mean(arr[:i])
-        m1 = np.mean(arr[i:])
+        m0 = cumsum[i - 1] / i
+        m1 = (total_sum - cumsum[i - 1]) / (n - i)
         var = w0 * w1 * (m0 - m1) ** 2
         if var > best_var:
             best_var = var
             best_t = float(arr[i])
     return best_t
 
-# ancestor cache — cleared per pipeline run to avoid stale data
-_ancestor_cache = {}
+_ancestor_cache = OrderedDict()
 
 def _get_ancestors(graph, cui, depth):
-    """Collect all ancestors up to `depth` hops. Cached per (cui, depth)."""
+    """Collect all ancestors up to `depth` hops. LRU cached."""
     key = (cui, depth)
     if key in _ancestor_cache:
+        _ancestor_cache.move_to_end(key)
         return _ancestor_cache[key]
     if graph is None or not graph.has_node(cui):
         _ancestor_cache[key] = frozenset()
@@ -90,52 +134,88 @@ def _get_ancestors(graph, cui, depth):
             break
     result = frozenset(ancestors)
     _ancestor_cache[key] = result
+    while len(_ancestor_cache) > _ANCESTOR_CACHE_MAX:
+        _ancestor_cache.popitem(last=False)
     return result
 
 def _clear_ancestor_cache():
     """Call at start of each pipeline run."""
     _ancestor_cache.clear()
 
-def _compute_component_depth(graph, ancestor_depth):
-    """Derive component separation depth: ~40% of ancestor_depth, bounded by graph density."""
+def _graph_mean_in(graph):
+    """Return (mean_in_degree, log_mean_in, n_nodes) or None if graph too small."""
     try:
         if graph is None or graph.number_of_nodes() == 0:
-            return 1
-        in_degrees = [d for _, d in graph.in_degree()]
-        if not in_degrees:
-            return 1
-        mean_in = float(np.mean(in_degrees))
-        if not np.isfinite(mean_in) or mean_in <= 1.5:
-            return 1
-        derived = max(1, int(round(ancestor_depth * 0.4)))
+            return None
+        degs = [d for _, d in graph.in_degree()]
+        if not degs:
+            return None
+        mean_in = float(np.mean(degs))
+        if not np.isfinite(mean_in) or mean_in <= 1.0:
+            return None
         log_mean = float(np.log(mean_in))
         if not np.isfinite(log_mean) or log_mean < 1e-9:
-            return derived
-        n_nodes = graph.number_of_nodes()
-        max_depth_for_nodes = max(1, int(np.log(max(np.sqrt(n_nodes), 1)) / log_mean))
-        derived = min(derived, max_depth_for_nodes)
-        return max(1, min(derived, ancestor_depth))
+            return None
+        return mean_in, log_mean, graph.number_of_nodes()
     except Exception:
-        return 1
+        return None
 
 def _compute_ancestor_depth(graph):
     """Derive ancestor lookup depth from graph density. Target ~20 ancestors, clamped [1,5]."""
-    try:
-        if graph is None or graph.number_of_nodes() == 0:
-            return 3
-        in_degrees = [d for _, d in graph.in_degree()]
-        if not in_degrees:
-            return 3
-        mean_in = float(np.mean(in_degrees))
-        if not np.isfinite(mean_in) or mean_in <= 1.0:
-            return 3
-        log_mean = float(np.log(mean_in))
-        if not np.isfinite(log_mean) or log_mean < 1e-9:
-            return 3
-        depth = int(round(np.log(20) / log_mean))
-        return max(1, min(depth, 5))
-    except Exception:
-        return 3
+    stats = _graph_mean_in(graph)
+    if stats is None:
+        return _DEFAULT_ANCESTOR_DEPTH
+    _, log_mean, _ = stats
+    return max(_ANCESTOR_DEPTH_CLAMP[0],
+               min(int(round(np.log(_ANCESTOR_TARGET) / log_mean)), _ANCESTOR_DEPTH_CLAMP[1]))
+
+def _compute_component_depth(graph, ancestor_depth):
+    """Derive component separation depth: ~40% of ancestor_depth, bounded by graph density."""
+    stats = _graph_mean_in(graph)
+    if stats is None or stats[0] <= _COMP_DEPTH_MEAN_THRESHOLD:
+        return 1
+    _, log_mean, n_nodes = stats
+    derived = max(1, int(round(ancestor_depth * _COMPONENT_DEPTH_RATIO)))
+    max_for_nodes = max(1, int(np.log(max(np.sqrt(n_nodes), 1)) / log_mean))
+    return max(1, min(derived, max_for_nodes, ancestor_depth))
+
+def _are_cuis_different(ci, cj, metadata, hierarchy_edges, graph, ancestor_depth):
+    """Return True if two CUIs are meaningfully different (ALL 5 structural guards)."""
+    ci_m, cj_m = metadata.get(ci), metadata.get(cj)
+    ci_types = set(ci_m.semantic_types) if ci_m and ci_m.semantic_types else set()
+    cj_types = set(cj_m.semantic_types) if cj_m and cj_m.semantic_types else set()
+    if ci_types and cj_types and not (ci_types & cj_types):
+        return True
+    if hierarchy_edges and ((ci, cj) in hierarchy_edges or (cj, ci) in hierarchy_edges):
+        return True
+    if graph is not None:
+        ci_anc = _get_ancestors(graph, ci, ancestor_depth)
+        cj_anc = _get_ancestors(graph, cj, ancestor_depth)
+        if ci_anc and cj_anc and len(ci_anc & cj_anc) == 0:
+            return True
+        ci_par = set(graph.predecessors(ci)) if graph.has_node(ci) else set()
+        cj_par = set(graph.predecessors(cj)) if graph.has_node(cj) else set()
+        if ci_par and cj_par and (ci_par & cj_par):
+            ci_leaf = graph.out_degree(ci) == 0 if graph.has_node(ci) else False
+            cj_leaf = graph.out_degree(cj) == 0 if graph.has_node(cj) else False
+            if ci_leaf and cj_leaf:
+                return True
+    return False
+
+def _union_find(n):
+    """Return (find, union) closures over n elements."""
+    parent, rank = list(range(n)), [0] * n
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx == ry: return
+        if rank[rx] < rank[ry]: rx, ry = ry, rx
+        parent[ry] = rx
+        if rank[rx] == rank[ry]: rank[rx] += 1
+    return find, union
 
 # 3- Data Models
 @dataclass
@@ -242,7 +322,6 @@ class Cache:
         return len(self._d)
 
 #  6-BigQuery
-_BQ_BATCH = 5000
 
 class MetadataFetcher:
     def __init__(self, bq, pid, did, cache_dir=None):
@@ -250,7 +329,7 @@ class MetadataFetcher:
         self.pid = pid
         self.did = did
         path = os.path.join(cache_dir, "metadata_cache.pkl") if cache_dir else None
-        self._cache = Cache(50_000, persist_path=path)
+        self._cache = Cache(_CACHE_METADATA, persist_path=path)
 
     @timed("metadata_fetch")
     def fetch(self, cuis):
@@ -279,7 +358,7 @@ class MetadataFetcher:
             """
             jc = bigquery.QueryJobConfig(query_parameters=[
                 bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-            for row in self.bq.query(query, job_config=jc, timeout=300).result():
+            for row in self.bq.query(query, job_config=jc, timeout=_BQ_TIMEOUT).result():
                 meta = CUIMetadata(
                     cui=row.cui,
                     semantic_types=list(row.stys or []),
@@ -293,7 +372,7 @@ class ICComputer:
     def __init__(self, graph, precomputed=None):
         self.graph = graph
         self.precomputed = precomputed or {}
-        self._cache = Cache(100_000)
+        self._cache = Cache(_CACHE_IC)
         self._total = max(graph.number_of_nodes(), 1)
 
     @timed("ic_compute")
@@ -395,8 +474,8 @@ class EmbeddingFetcher:
         self.did = did
         self.table = embedding_table
         path = os.path.join(cache_dir, "embedding_cache.pkl") if cache_dir else None
-        self._cache = Cache(50_000, persist_path=path)
-        self._pool = ThreadPoolExecutor(max_workers=4)
+        self._cache = Cache(_CACHE_EMBEDDING, persist_path=path)
+        self._pool = ThreadPoolExecutor(max_workers=_EMB_FETCH_WORKERS)
 
     def _fetch_batch(self, batch):
         rows = []
@@ -407,7 +486,7 @@ class EmbeddingFetcher:
         """
         jc = bigquery.QueryJobConfig(query_parameters=[
             bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-        for row in self.bq.query(query, job_config=jc, timeout=300).result():
+        for row in self.bq.query(query, job_config=jc, timeout=_BQ_TIMEOUT).result():
             raw = row.embedding
             if raw is None or len(raw) == 0:
                 continue
@@ -451,16 +530,20 @@ def _cosine_knn(matrix, k):
     if k < 1:
         return np.zeros((n, 0), dtype=int), np.zeros((n, 0), dtype=np.float32)
     neighbors, sim_scores = np.zeros((n, k), dtype=int), np.zeros((n, k), dtype=np.float32)
-    for start in range(0, n, 2000):
-        end = min(start + 2000, n)
+    for start in range(0, n, _KNN_BLOCK_SIZE):
+        end = min(start + _KNN_BLOCK_SIZE, n)
         sims = matrix[start:end] @ matrix.T
         for i in range(start, end):
             sims[i - start, i] = -np.inf
         top_k_idx = np.argpartition(-sims, k, axis=1)[:, :k]
-        for i in range(end - start):
-            order = np.argsort(-sims[i, top_k_idx[i]])
-            neighbors[start + i] = top_k_idx[i][order]
-            sim_scores[start + i] = sims[i, top_k_idx[i][order]]
+        # vectorized gather + sort within each row's top-k
+        block_size = end - start
+        row_idx = np.arange(block_size)[:, None]
+        top_k_sims = sims[row_idx, top_k_idx]
+        order = np.argsort(-top_k_sims, axis=1)
+        row_idx_flat = np.arange(block_size)[:, None]
+        neighbors[start:end] = top_k_idx[row_idx_flat, order]
+        sim_scores[start:end] = top_k_sims[row_idx_flat, order]
     return neighbors, sim_scores
 
 class TopicBuilder:
@@ -468,7 +551,7 @@ class TopicBuilder:
     @timed("cosine_topics")
     def build(cuis, embeddings, k_neighbors=20):
         cuis = sorted(cuis)
-        np.random.seed(42)
+        np.random.seed(_RANDOM_SEED)
         matrix = np.array([embeddings[c] for c in cuis], dtype=np.float32)
         n = len(cuis)
         dim = matrix.shape[1] if matrix.ndim == 2 else 0
@@ -477,7 +560,6 @@ class TopicBuilder:
         k = min(k_neighbors, n - 1)
         k = max(k, 1)
 
-        # cosine k-NN
         neighbors, sim_scores = _cosine_knn(matrix, k)
 
         kth_dists = []
@@ -494,9 +576,8 @@ class TopicBuilder:
             if len(valid_sims) > 0:
                 threshold = float(1.0 - np.mean(valid_sims))
             else:
-                threshold = 0.5
+                threshold = _COSINE_FALLBACK_THRESHOLD
 
-        # build weighted graph for Louvain
         G = networkx.Graph()
         G.add_nodes_from(range(n))
         for i in range(n):
@@ -512,9 +593,8 @@ class TopicBuilder:
                     else:
                         G.add_edge(i, j, weight=weight)
 
-        communities = networkx.community.louvain_communities(G, weight="weight", seed=42)
+        communities = networkx.community.louvain_communities(G, weight="weight", seed=_RANDOM_SEED)
 
-        # recursive split if community > sqrt(N)
         max_size = max(2, int(np.sqrt(n)))
         final_communities = []
         queue = list(communities)
@@ -529,13 +609,12 @@ class TopicBuilder:
                 final_communities.append(comm)
                 continue
             sub_comms = networkx.community.louvain_communities(
-                subG, weight="weight", seed=42, resolution=2.0)
+                subG, weight="weight", seed=_RANDOM_SEED, resolution=_LOUVAIN_SPLIT_RESOLUTION)
             if len(sub_comms) <= 1:
                 final_communities.append(comm)
             else:
                 queue.extend(sub_comms)
 
-        # merge singletons into nearest community
         idx_map = {c: i for i, c in enumerate(cuis)}
         groups = {}
         label = 0
@@ -582,7 +661,6 @@ class GraphComponentBuilder:
         cui_set = set(cuis)
         n = len(cuis)
 
-        # ancestors per CUI
         cui_ancestors = {}
         all_ancestors = defaultdict(int)
         for c in cuis:
@@ -591,7 +669,6 @@ class GraphComponentBuilder:
             for a in anc:
                 all_ancestors[a] += 1
 
-        # exclude hub ancestors: high out-degree OR shared by >sqrt(N) CUIs
         ancestor_degrees = {}
         for a in all_ancestors:
             if graph.has_node(a):
@@ -612,14 +689,12 @@ class GraphComponentBuilder:
             f"(degree={len(hub_ancestors - freq_hubs)}, "
             f"freq={len(freq_hubs)}, freq_threshold={freq_threshold})", level="DEBUG")
 
-        # inverted index: ancestor → CUIs (excluding hubs and singletons)
         ancestor_to_cuis = defaultdict(set)
         for c in cuis:
             for a in cui_ancestors.get(c, set()):
                 if a not in hub_ancestors and a not in cui_set:
                     ancestor_to_cuis[a].add(c)
 
-        # Union-Find
         max_share = max(2, int(np.sqrt(len(cuis))))
         parent_map = {c: c for c in cuis}
         rank = {c: 0 for c in cuis}
@@ -648,7 +723,6 @@ class GraphComponentBuilder:
                 if c != anchor:
                     union(anchor, c)
 
-        # collect components
         comp_map = defaultdict(list)
         for c in cuis:
             comp_map[find(c)].append(c)
@@ -663,15 +737,7 @@ class GraphComponentBuilder:
 
 class HierarchicalTopicBuilder:
     """Build 2-level topic hierarchy from UMLS ancestor convergence.
-
-    Walk up from each surviving CUI, find where paths merge.
-    Those merge points are natural topics/subtopics.
-
-    Output per topic:
-      topic_cui     — the ancestor CUI that groups this topic
-      members       — all surviving CUIs under this ancestor
-      subtopics     — dict of more specific sub-groupings within the topic
-      ungrouped     — members not in any subtopic
+    Output: {tid: {topic_cui, members, subtopics: {stid: {subtopic_cui, members}}, ungrouped}}.
     """
 
     @staticmethod
@@ -684,25 +750,24 @@ class HierarchicalTopicBuilder:
                             "subtopics": {}, "ungrouped": sorted(surviving)}}
             return {}
 
-        # Step 1: for each CUI, collect ancestors with depth
-        cui_ancestors = {}  # cui -> set of ancestors
-        for cui in surviving:
-            if not graph.has_node(cui):
-                cui_ancestors[cui] = set()
-                continue
-            ancestors = set()
-            frontier = {cui}
+        def _bfs_up(node):
+            """BFS ancestors up to max_depth from node."""
+            if not graph.has_node(node):
+                return set()
+            ancestors, frontier = set(), {node}
             for _ in range(max_depth):
                 nxt = set()
-                for node in frontier:
-                    for parent in graph.predecessors(node):
+                for n in frontier:
+                    for parent in graph.predecessors(n):
                         if parent not in ancestors:
                             ancestors.add(parent)
                             nxt.add(parent)
                 frontier = nxt
                 if not frontier:
                     break
-            cui_ancestors[cui] = ancestors
+            return ancestors
+
+        cui_ancestors = {cui: _bfs_up(cui) for cui in surviving}
 
         # Step 2: ancestor coverage — which surviving CUIs each ancestor covers
         ancestor_coverage = defaultdict(set)
@@ -710,26 +775,16 @@ class HierarchicalTopicBuilder:
             for anc in cui_ancestors.get(cui, set()):
                 ancestor_coverage[anc].add(cui)
 
-        # Step 3: convergence points — ancestors covering 2+ CUIs
-        # Filter out super-broad (covers >60% of all CUIs) — too general to be useful
-        max_cover = max(2, int(len(surviving) * 0.6))
+        # convergence points: ancestors covering 2+ CUIs (not super-broad)
+        max_cover = max(2, int(len(surviving) * _HT_MAX_COVERAGE))
         convergence = {anc: members for anc, members in ancestor_coverage.items()
                        if 2 <= len(members) <= max_cover and anc not in surviving}
 
         if not convergence:
-            # no convergence found — single flat topic
             return {0: {"topic_cui": None, "members": sorted(surviving),
                         "subtopics": {}, "ungrouped": sorted(surviving)}}
 
-        # Step 4: build 2-level hierarchy
-        # Subtopics: most SPECIFIC convergence points (highest IC, smallest groups)
-        # Topics: less specific convergence points that group subtopics together
-        #
-        # Strategy: greedy bottom-up
-        #   a) pick most specific (highest IC) convergence points as subtopics
-        #   b) group subtopics under broader convergence points as topics
-
-        # 4a: subtopic selection — most specific first
+        # Subtopics: most specific convergence points (highest IC). Topics: broader groupers.
         by_specificity = sorted(convergence.items(),
                                 key=lambda x: (-ic_scores.get(x[0], 0), len(x[1])))
 
@@ -742,26 +797,10 @@ class HierarchicalTopicBuilder:
                 subtopic_map[anc] = unassigned
                 assigned |= unassigned
 
-        # 4b: group subtopics under broader topics
-        # for each subtopic ancestor, find a less-specific ancestor that covers
-        # multiple subtopics = that's the topic
-        topic_coverage = defaultdict(set)  # broad_anc -> set of subtopic_cuis
+        topic_coverage = defaultdict(set)
         for sub_cui in subtopic_map:
-            if graph.has_node(sub_cui):
-                sub_ancestors = set()
-                frontier = {sub_cui}
-                for _ in range(max_depth):
-                    nxt = set()
-                    for node in frontier:
-                        for parent in graph.predecessors(node):
-                            if parent not in sub_ancestors:
-                                sub_ancestors.add(parent)
-                                nxt.add(parent)
-                    frontier = nxt
-                    if not frontier:
-                        break
-                for anc in sub_ancestors:
-                    topic_coverage[anc].add(sub_cui)
+            for anc in _bfs_up(sub_cui):
+                topic_coverage[anc].add(sub_cui)
 
         # pick topic ancestors that group 2+ subtopics, most specific first
         topic_candidates = {anc: subs for anc, subs in topic_coverage.items()
@@ -797,7 +836,6 @@ class HierarchicalTopicBuilder:
             used_subtopics |= available
             tid += 1
 
-        # standalone subtopics (not grouped into a broader topic)
         for sc in subtopic_map:
             if sc not in used_subtopics:
                 members = subtopic_map[sc]
@@ -809,7 +847,6 @@ class HierarchicalTopicBuilder:
                 }
                 tid += 1
 
-        # singletons — CUIs not in any subtopic
         remaining = surviving - assigned
         if remaining:
             for cui in remaining:
@@ -843,19 +880,17 @@ class HierarchicalTopicBuilder:
 
         return topics
 
-
 class EmbeddingReducer:
     @staticmethod
     @timed("embedding_reduce")
     def run(cuis, metadata, embeddings, ic_map, hierarchy_edges, graph=None, ancestor_depth=3):
+        """Full path: components → louvain → per-topic reduction. Fast path for ≤200."""
         n_input = len(cuis)
 
-        # SMALL INPUT FAST PATH (<=200 CUIs): skip component/louvain
-        if n_input <= 200:
+        if n_input <= _FAST_PATH_THRESHOLD:
             return EmbeddingReducer._fast_path(
                 cuis, metadata, embeddings, ic_map, hierarchy_edges, graph, ancestor_depth)
 
-        # FULL PATH: components -> louvain -> per-topic reduction
         component_depth = _compute_component_depth(graph, ancestor_depth) if graph else 1
         log(f"    Component depth: {component_depth} (ancestor_depth={ancestor_depth})", level="DEBUG")
         components = GraphComponentBuilder.build(cuis, graph, component_depth)
@@ -923,9 +958,10 @@ class EmbeddingReducer:
         surviving, audit = _reduce_topic(
             with_emb, embeddings, metadata, ic_map, hierarchy_edges, graph, ancestor_depth)
         surviving.extend(without_emb)
-        if len([c for c in surviving if c in embeddings]) >= 2:
+        emb_surviving = [c for c in surviving if c in embeddings]
+        if len(emb_surviving) >= 2:
             topics = {f"topic_{i}": t for i, t in enumerate(
-                TopicBuilder.build([c for c in surviving if c in embeddings], embeddings).values())}
+                TopicBuilder.build(emb_surviving, embeddings).values())}
             tid = len(topics)
             for c in without_emb:
                 if c in surviving:
@@ -984,30 +1020,6 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
     if len(r_cuis) <= 1:
         return r_cuis, []
 
-    def _is_different(ci, cj):
-        """Return True if ci and cj are meaningfully different."""
-        ci_meta, cj_meta = metadata.get(ci), metadata.get(cj)
-        ci_types = set(ci_meta.semantic_types) if ci_meta and ci_meta.semantic_types else set()
-        cj_types = set(cj_meta.semantic_types) if cj_meta and cj_meta.semantic_types else set()
-        if ci_types and cj_types and not (ci_types & cj_types):
-            return True
-        if (ci, cj) in hierarchy_edges or (cj, ci) in hierarchy_edges:
-            return True
-        if graph is not None:
-            ci_anc = _get_ancestors(graph, ci, ancestor_depth)
-            cj_anc = _get_ancestors(graph, cj, ancestor_depth)
-            if ci_anc and cj_anc and len(ci_anc & cj_anc) == 0:
-                return True
-            # sibling guard: same immediate parent + both leaves = UMLS distinguished them
-            ci_parents = set(graph.predecessors(ci)) if graph.has_node(ci) else set()
-            cj_parents = set(graph.predecessors(cj)) if graph.has_node(cj) else set()
-            if ci_parents and cj_parents and (ci_parents & cj_parents):
-                ci_leaf = graph.out_degree(ci) == 0 if graph.has_node(ci) else False
-                cj_leaf = graph.out_degree(cj) == 0 if graph.has_node(cj) else False
-                if ci_leaf and cj_leaf:
-                    return True
-        return False
-
     def _score(c):
         if centroid is not None and c in embeddings:
             return max(float(np.dot(embeddings[c], centroid)), 0.0)
@@ -1024,7 +1036,7 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
             pair_dist = dist[ci, ki] if ci is not None and ki is not None else 1.0
             if pair_dist > tight_t:
                 continue
-            if _is_different(c, k):
+            if _are_cuis_different(c, k, metadata, hierarchy_edges, graph, ancestor_depth):
                 continue
             is_duplicate_of = k
             break
@@ -1054,27 +1066,25 @@ class CrossTopicDedup:
         n = len(with_emb)
         matrix = np.array([embeddings[c] for c in with_emb], dtype=np.float32)
 
-        # global centroid for representative selection
         global_cent = np.mean(matrix, axis=0).astype(np.float32)
         g_norm = np.linalg.norm(global_cent)
         if g_norm > 0:
             global_cent = global_cent / g_norm
 
-        k = min(10, n - 1)
+        k = min(_XTD_KNN_K, n - 1)
         neighbors, sim_scores = _cosine_knn(matrix, k)
 
-        # single pass: collect distances and valid edges
-        nn_dists, edges = [], []
+        nn_dists = []
         for i in range(n):
             for j_pos in range(len(neighbors[i])):
                 j = int(neighbors[i][j_pos])
-                if j < 0 or j >= n or j == i:
-                    continue
-                d = 1.0 - float(sim_scores[i][j_pos])
-                nn_dists.append(d)
+                if 0 <= j < n and j != i:
+                    nn_dists.append(1.0 - float(sim_scores[i][j_pos]))
         if not nn_dists:
             return surviving, []
         threshold = _otsu_threshold(np.array(nn_dists, dtype=np.float32))
+
+        edges = []
         for i in range(n):
             for j_pos in range(len(neighbors[i])):
                 j = int(neighbors[i][j_pos])
@@ -1083,41 +1093,13 @@ class CrossTopicDedup:
                 d = 1.0 - float(sim_scores[i][j_pos])
                 if d > threshold:
                     continue
-                ci, cj = with_emb[i], with_emb[j]
-                # structural guards
-                ci_m, cj_m = metadata.get(ci), metadata.get(cj)
-                ci_types = set(ci_m.semantic_types) if ci_m and ci_m.semantic_types else set()
-                cj_types = set(cj_m.semantic_types) if cj_m and cj_m.semantic_types else set()
-                if ci_types and cj_types and not (ci_types & cj_types):
+                if _are_cuis_different(with_emb[i], with_emb[j], metadata, None, graph, ancestor_depth):
                     continue
-                if graph is not None:
-                    ci_anc, cj_anc = _get_ancestors(graph, ci, ancestor_depth), _get_ancestors(graph, cj, ancestor_depth)
-                    if ci_anc and cj_anc and not (ci_anc & cj_anc):
-                        continue
-                    # sibling guard
-                    ci_par = set(graph.predecessors(ci)) if graph.has_node(ci) else set()
-                    cj_par = set(graph.predecessors(cj)) if graph.has_node(cj) else set()
-                    if ci_par and cj_par and (ci_par & cj_par):
-                        if (graph.out_degree(ci) == 0 if graph.has_node(ci) else False) and \
-                           (graph.out_degree(cj) == 0 if graph.has_node(cj) else False):
-                            continue
                 edges.append((i, j, d))
         if not edges:
             return surviving, []
 
-        # Union-Find → components
-        parent_uf, rank_uf = list(range(n)), [0] * n
-        def find(x):
-            while parent_uf[x] != x:
-                parent_uf[x] = parent_uf[parent_uf[x]]; x = parent_uf[x]
-            return x
-        def union(x, y):
-            rx, ry = find(x), find(y)
-            if rx == ry: return
-            if rank_uf[rx] < rank_uf[ry]: rx, ry = ry, rx
-            parent_uf[ry] = rx
-            if rank_uf[rx] == rank_uf[ry]: rank_uf[rx] += 1
-
+        find, union = _union_find(n)
         for i, j, _ in edges:
             union(i, j)
 
@@ -1146,15 +1128,8 @@ class CrossTopicDedup:
         return [c for c in surviving if c not in removed], audit
 
 class ConfidenceScorer:
-    """Variance-weighted confidence: signals that discriminate more get more weight.
-
-    Signals (all [0,1]):
-      prox = 1 - d                      extraction proximity (cosine similarity)
-      cent = cos(emb, topic_centroid)   centrality within own topic
-      ret  = log(1+n)/log(1+N)         retention power
-
-    Weights = std of each signal across the phrase's CUIs, normalized to sum=1.
-    A flat signal (all CUIs score ~same) gets near-zero weight automatically.
+    """Variance-weighted confidence: prox(extraction), cent(topic centroid), ret(retention power).
+    Weights = std of each signal, normalized. Flat signals get near-zero weight.
     """
 
     @staticmethod
@@ -1169,7 +1144,6 @@ class ConfidenceScorer:
                 explains[entry.kept_cui].append(entry.removed_cui)
         max_retained = max((len(v) for v in explains.values()), default=0)
 
-        # extraction proximity: 1 - cosine_distance = cosine_similarity
         ext_prox = {}
         if extraction_distances:
             for cui, d in extraction_distances.items():
@@ -1177,7 +1151,6 @@ class ConfidenceScorer:
                     ext_prox[cui] = max(1.0 - d, 0.0)
         has_ext = len(ext_prox) > 0
 
-        # per-topic centroids
         t_centroids = {}
         topic_members = defaultdict(list)
         for cui, tid in cui_topic.items():
@@ -1189,22 +1162,29 @@ class ConfidenceScorer:
             if tc_norm > 0:
                 t_centroids[tid] = tc / tc_norm
 
-        # collect raw signals for all CUIs
         signals, retention_map = [], {}
+        raw_cents = []
         for cui in surviving:
             retained = explains.get(cui, [])
             retention_map[cui] = retained
             prox = ext_prox.get(cui, 0.0)
             tid = cui_topic.get(cui)
             tc = t_centroids.get(tid) if tid is not None else None
-            cent = max(float(np.dot(embeddings[cui], tc)), 0.0) \
-                if tc is not None and cui in embeddings else 0.0
+            if tc is not None and cui in embeddings:
+                cent = max(float(np.dot(embeddings[cui], tc)), 0.0)
+            else:
+                cent = None  # placeholder — filled after median computed
             ret = np.log1p(len(retained)) / np.log1p(max_retained) if max_retained > 0 else 0.0
             signals.append((cui, prox, cent, ret))
+            if cent is not None:
+                raw_cents.append(cent)
         if not signals:
             return [], [], {}
+        # CUIs without embeddings get median centrality (neutral, not penalized)
+        median_cent = float(np.median(raw_cents)) if raw_cents else 0.0
+        signals = [(cui, prox, cent if cent is not None else median_cent, ret)
+                   for cui, prox, cent, ret in signals]
 
-        # variance-based weights: std per signal, normalized
         prox_arr = np.array([s[1] for s in signals])
         cent_arr = np.array([s[2] for s in signals])
         ret_arr  = np.array([s[3] for s in signals])
@@ -1219,7 +1199,6 @@ class ConfidenceScorer:
             # all signals flat — equal weight fallback
             w = np.array([1/3, 1/3, 1/3]) if has_ext else np.array([0.0, 0.5, 0.5])
 
-        # score each CUI
         entries = []
         for cui, prox, cent, ret in signals:
             conf = w[0] * prox + w[1] * cent + w[2] * ret
@@ -1309,7 +1288,7 @@ class CUIReductionSystem:
 
             topics_out = self._build_topics(topics, metadata)
 
-            if len(after_hier) > 200:  # cross-topic dedup for large inputs only
+            if len(after_hier) > _CROSS_TOPIC_DEDUP_MIN:  # cross-topic dedup for large inputs only
                 before_xtd = len(surviving)
                 surviving, xtd_audit = CrossTopicDedup.run(
                     surviving, embeddings, metadata,
@@ -1397,28 +1376,8 @@ class CUIReductionSystem:
             return out
 
 class CanonicalTopicMapper:
-    """Map any CUI to standardized canonical topic CUIs at 3 granularity levels.
-
-    Production architecture:
-      OFFLINE (one-time or periodic):
-        mapper = CanonicalTopicMapper(graph, ic_computer)
-        mapper.build_full_mapping()          # walks entire hierarchy
-        mapper.save_mapping("mapping.pkl")   # local pickle
-        mapper.save_to_bq(bq, proj, ds)     # or BigQuery table
-
-      RUNTIME — document ingestion (no graph needed):
-        mapper = CanonicalTopicMapper.load_mapping("mapping.pkl")  # or load_from_bq()
-        doc_topics = mapper.map_cuis(doc_cuis, level="standard")
-        # store doc_topics with the document in your index
-
-      RUNTIME — query matching (no graph needed):
-        query_topics = mapper.map_cuis(query_cuis, level="standard")
-        shared = set(doc_topics) & set(query_topics)  # matched topics
-
-    Three levels:
-      broad    (IC ~4): organ system level     ~50-100 unique topics
-      standard (IC ~6): disease category level  ~500-1000 unique topics
-      specific (IC ~8): specific disease level  ~5000+ unique topics
+    """Map any CUI to standardized canonical topic CUIs at 3 IC-based granularity levels.
+    Offline: build_full_mapping() → save. Runtime: load → map_cuis/map_single (no graph needed).
     """
 
     LEVELS = {
@@ -1430,28 +1389,32 @@ class CanonicalTopicMapper:
     def __init__(self, graph=None, ic_computer=None):
         self.graph = graph
         self.ic_computer = ic_computer
-        self._mapping = {}           # {cui: {"broad": anc, "standard": anc, "specific": anc}}
-        self._canonical_cuis = {l: {} for l in self.LEVELS}  # {level: {canon_cui: ic}}
+        self._mapping = {}
+        self._canonical_cuis = {l: {} for l in self.LEVELS}
 
-    # ── offline: build full mapping ──────────────────────────────────────
+    def _ensure_mapping(self, cui):
+        """Lazily compute mapping for a single CUI if not already cached."""
+        if cui in self._mapping:
+            return self._mapping[cui]
+        if self.graph and self.ic_computer:
+            ic_map = self.ic_computer.compute([cui], {})
+            m = self._find_canonical(cui, ic_map, _CANONICAL_MAX_DEPTH)
+            self._mapping[cui] = m
+            return m
+        return None
 
     @timed("build_topic_mapping")
-    def build_full_mapping(self, cuis=None, max_depth=8):
+    def build_full_mapping(self, cuis=None, max_depth=_CANONICAL_MAX_DEPTH):
         """Build canonical mapping for all CUIs (or subset). Call once offline."""
         if cuis is None:
             cuis = list(self.graph.nodes()) if self.graph else []
         if not cuis:
             return
-
         all_nodes = list(self.graph.nodes()) if self.graph else []
         ic_map = self.ic_computer.compute(all_nodes, {})
-        log(f"[CanonicalTopicMapper] Building mapping for {len(cuis)} CUIs, "
-            f"{len(all_nodes)} nodes in graph")
-
+        log(f"[CanonicalTopicMapper] Building mapping for {len(cuis)} CUIs")
         for cui in cuis:
             self._mapping[cui] = self._find_canonical(cui, ic_map, max_depth)
-
-        # reverse index
         for level in self.LEVELS:
             seen = {}
             for cui, lvls in self._mapping.items():
@@ -1459,16 +1422,12 @@ class CanonicalTopicMapper:
                 if canon and canon not in seen:
                     seen[canon] = ic_map.get(canon, 0.0)
             self._canonical_cuis[level] = seen
-
-        for level in self.LEVELS:
-            log(f"  {level}: {len(self._canonical_cuis[level])} unique canonical topics")
+            log(f"  {level}: {len(seen)} unique canonical topics")
 
     def _find_canonical(self, cui, ic_map, max_depth):
         """Walk up from CUI, find best ancestor at each IC target level."""
         if not self.graph or not self.graph.has_node(cui):
             return {"broad": cui, "standard": cui, "specific": cui}
-
-        # collect ancestors with depth and IC
         ancestors = []
         frontier, visited = {cui}, {cui}
         for depth in range(1, max_depth + 1):
@@ -1482,100 +1441,53 @@ class CanonicalTopicMapper:
             frontier = nxt
             if not frontier:
                 break
-
         if not ancestors:
             return {"broad": cui, "standard": cui, "specific": cui}
-
         cui_ic = ic_map.get(cui, 0.0)
         result = {}
-
         for level, params in self.LEVELS.items():
-            target = params["target"]
-            tol = params["tolerance"]
-
-            # if CUI itself is already at/below target level, it IS the canonical
+            target, tol = params["target"], params["tolerance"]
             if cui_ic <= target + tol:
                 result[level] = cui
-                continue
-
-            # find ancestor with IC closest to target
-            best, best_diff = None, float('inf')
-            for anc, depth, ic in ancestors:
-                diff = abs(ic - target)
-                if diff < best_diff:
-                    best_diff = diff
-                    best = anc
-
-            result[level] = best if best else cui
-
+            else:
+                best = min(ancestors, key=lambda a: abs(a[2] - target))[0]
+                result[level] = best
         return result
 
-    # ── runtime: fast lookup ─────────────────────────────────────────────
-
     def map_cuis(self, cuis, level="standard"):
-        """Map CUIs to canonical topics. Returns {canonical_cui: [member_cuis]}.
-        Works with pre-built mapping (no graph needed) or on-the-fly."""
+        """Map CUIs to canonical topics. Returns {canonical_cui: [member_cuis]}."""
         if level not in self.LEVELS:
             raise ValueError(f"Unknown level '{level}'. Use: {list(self.LEVELS.keys())}")
-
         groups = defaultdict(list)
         for cui in cuis:
-            mapping = self._mapping.get(cui)
-            if mapping:
-                canon = mapping.get(level) or cui
-            elif self.graph and self.ic_computer:
-                ic_map = self.ic_computer.compute([cui], {})
-                mapping = self._find_canonical(cui, ic_map, 8)
-                self._mapping[cui] = mapping
-                canon = mapping.get(level) or cui
-            else:
-                canon = cui
-            groups[canon].append(cui)
+            m = self._ensure_mapping(cui)
+            groups[(m.get(level) or cui) if m else cui].append(cui)
         return dict(groups)
 
     def map_single(self, cui, level="standard"):
-        """Map one CUI to its canonical topic. Fast path for queries."""
-        mapping = self._mapping.get(cui)
-        if mapping:
-            return mapping.get(level) or cui
-        if self.graph and self.ic_computer:
-            ic_map = self.ic_computer.compute([cui], {})
-            mapping = self._find_canonical(cui, ic_map, 8)
-            self._mapping[cui] = mapping
-            return mapping.get(level) or cui
-        return cui
+        """Map one CUI to its canonical topic."""
+        m = self._ensure_mapping(cui)
+        return (m.get(level) or cui) if m else cui
 
     def get_all_levels(self, cui):
-        """Return all three canonical mappings for a CUI.
-        Returns {"broad": cui, "standard": cui, "specific": cui}"""
-        default = {"broad": cui, "standard": cui, "specific": cui}
-        mapping = self._mapping.get(cui)
-        if mapping:
-            return {k: v or cui for k, v in mapping.items()}
-        if self.graph and self.ic_computer:
-            ic_map = self.ic_computer.compute([cui], {})
-            mapping = self._find_canonical(cui, ic_map, 8)
-            self._mapping[cui] = mapping
-            return {k: v or cui for k, v in mapping.items()}
-        return default
+        """Return all three canonical mappings for a CUI."""
+        m = self._ensure_mapping(cui)
+        if m:
+            return {k: v or cui for k, v in m.items()}
+        return {"broad": cui, "standard": cui, "specific": cui}
 
     def get_canonical_topics(self, level="standard"):
         """Return all known canonical topics at a level: {cui: ic_score}"""
         return dict(self._canonical_cuis.get(level, {}))
 
-    # ── persistence: pickle ──────────────────────────────────────────────
-
     def save_mapping(self, path):
-        """Save to pickle for fast reload. No graph needed to load."""
         import pickle as _pk
-        data = {"mapping": self._mapping, "canonical": self._canonical_cuis}
         with open(path, "wb") as f:
-            _pk.dump(data, f)
+            _pk.dump({"mapping": self._mapping, "canonical": self._canonical_cuis}, f)
         log(f"[CanonicalTopicMapper] Saved {len(self._mapping)} mappings to {path}")
 
     @classmethod
     def load_mapping(cls, path):
-        """Load pre-built mapping from pickle. No graph/IC needed at runtime."""
         import pickle as _pk
         with open(path, "rb") as f:
             data = _pk.load(f)
@@ -1585,21 +1497,14 @@ class CanonicalTopicMapper:
         log(f"[CanonicalTopicMapper] Loaded {len(mapper._mapping)} mappings from {path}")
         return mapper
 
-    # ── persistence: BigQuery ────────────────────────────────────────────
-
     def save_to_bq(self, bq_client, project_id, dataset_id,
                    table_name="canonical_topic_mapping"):
-        """Save mapping to BigQuery for production lookup.
-        Schema: cui STRING, broad STRING, standard STRING, specific STRING"""
         table_ref = f"{project_id}.{dataset_id}.{table_name}"
-        rows = [{"cui": cui,
-                 "broad": lvls.get("broad", cui),
-                 "standard": lvls.get("standard", cui),
-                 "specific": lvls.get("specific", cui)}
+        rows = [{"cui": cui, "broad": lvls.get("broad", cui),
+                 "standard": lvls.get("standard", cui), "specific": lvls.get("specific", cui)}
                 for cui, lvls in self._mapping.items()]
         if not rows:
             return
-
         from google.cloud.bigquery import SchemaField, LoadJobConfig
         schema = [SchemaField("cui", "STRING"), SchemaField("broad", "STRING"),
                   SchemaField("standard", "STRING"), SchemaField("specific", "STRING")]
@@ -1611,7 +1516,6 @@ class CanonicalTopicMapper:
     @classmethod
     def load_from_bq(cls, bq_client, project_id, dataset_id,
                      table_name="canonical_topic_mapping"):
-        """Load mapping from BigQuery. No graph needed at runtime."""
         table_ref = f"{project_id}.{dataset_id}.{table_name}"
         mapper = cls()
         for row in bq_client.query(f"SELECT * FROM `{table_ref}`").result():
@@ -1627,34 +1531,11 @@ class CanonicalTopicMapper:
         log(f"[CanonicalTopicMapper] Loaded {len(mapper._mapping)} mappings from {table_ref}")
         return mapper
 
-
 class TopicNavigator:
-    """Navigable clinical topic hierarchy for multi-use access patterns.
+    """Navigable clinical topic hierarchy — FHIR-like operations on UMLS graph.
 
-    Implements the industry-standard "search, drill-up, drill-down" pattern
-    used by Epic/SNOMED CT/FHIR Terminology Services. Serves ALL use cases
-    from a single data structure:
-
-      1. TYPEAHEAD:  user types "knee" → ranked matching CUIs
-      2. DRILL-DOWN: user picks "Knee Disorders" → children list
-      3. DRILL-UP:   system shows breadcrumb path to root
-      4. SUBSUMPTION: does "Left Knee OA" fall under "Arthropathy"?  (doc-query match)
-      5. SIBLINGS:   "Left Knee OA" → also show "Right Knee OA"
-      6. CANONICAL:   map any CUI to topic at desired IC level (wraps CanonicalTopicMapper)
-
-    Architecture (mirrors FHIR Terminology Service):
-      OFFLINE:
-        nav = TopicNavigator(graph, ic_computer, metadata_fetcher)
-        nav.build()                          # build all indexes
-        nav.save("topic_nav.pkl")            # serialize
-
-      RUNTIME (no graph needed):
-        nav = TopicNavigator.load("topic_nav.pkl")
-        results  = nav.typeahead("knee", limit=10)
-        children = nav.drill_down("C0022742")
-        parents  = nav.drill_up("C0409959")
-        match    = nav.subsumes("C0003862", "C0409959")
-        sibs     = nav.siblings("C0409959")
+    APIs: typeahead, drill_down, drill_up, subsumes, siblings, match_topics.
+    Offline: build() → save(). Runtime: load() (no graph/BQ needed).
     """
 
     _MAX_PREFIX_LEN = 6       # prefix index caps at 6 chars (covers realistic typing)
@@ -1678,8 +1559,6 @@ class TopicNavigator:
         self._subsumes_cache = OrderedDict()    # (anc,desc) → bool  (LRU, lazy)
         self._built = False
 
-    # ── OFFLINE: build all indexes ────────────────────────────────────────
-
     @timed("topic_navigator_build")
     def build(self, max_closure_depth=12):
         """Build all navigation indexes. Run once offline."""
@@ -1691,94 +1570,64 @@ class TopicNavigator:
         n = len(all_cuis)
         log(f"[TopicNavigator] Building indexes for {n} CUIs...")
 
-        # 1. Parent/child maps from graph edges
         for node in all_cuis:
             for parent in self.graph.predecessors(node):
                 self._parent_map[node].add(parent)
                 self._child_map[parent].add(node)
+        log(f"  Parent/child: {len(self._parent_map)} with parents, {len(self._child_map)} with children")
 
-        log(f"  Parent/child maps: {len(self._parent_map)} nodes with parents, "
-            f"{len(self._child_map)} nodes with children")
-
-        # 2. IC scores
         if self.ic_computer:
             self._ic_map = self.ic_computer.compute(all_cuis, {})
-        log(f"  IC scores: {len(self._ic_map)} computed")
+        log(f"  IC scores: {len(self._ic_map)}")
 
-        # 3. Metadata (terms + synonyms) — batch fetch
         if self.metadata_fetcher:
             meta = self.metadata_fetcher.fetch(all_cuis)
             for cui, m in meta.items():
-                pref = m.preferred_term if m and m.preferred_term else cui
-                self._term_map[cui] = pref
-                syns = list(m.alternative_terms) if m and hasattr(m, 'alternative_terms') and m.alternative_terms else []
-                self._synonyms[cui] = syns
+                self._term_map[cui] = m.preferred_term if m and m.preferred_term else cui
+                self._synonyms[cui] = list(m.alternative_terms) if m and hasattr(m, 'alternative_terms') and m.alternative_terms else []
         else:
             for cui in all_cuis:
                 self._term_map[cui] = cui
-        log(f"  Terms indexed: {len(self._term_map)} CUIs")
+        log(f"  Terms: {len(self._term_map)} CUIs")
 
-        # 4. Term index — inverted index of word prefixes → CUIs
-        #    Cap prefix length at _MAX_PREFIX_LEN to control memory
         max_pfx = self._MAX_PREFIX_LEN
         for cui, term in self._term_map.items():
-            all_terms = [term] + self._synonyms.get(cui, [])
-            for t in all_terms:
-                tokens = t.lower().split()
-                for token in tokens:
-                    end = min(len(token), max_pfx)
-                    for prefix_len in range(2, end + 1):
-                        self._term_index[token[:prefix_len]].add(cui)
-                    # also index full token if longer than max_pfx (for exact match)
+            for t in [term] + self._synonyms.get(cui, []):
+                for token in t.lower().split():
+                    for pl in range(2, min(len(token), max_pfx) + 1):
+                        self._term_index[token[:pl]].add(cui)
                     if len(token) > max_pfx:
                         self._term_index[token].add(cui)
-        log(f"  Term index: {len(self._term_index)} unique prefixes "
-            f"(max_prefix_len={max_pfx})")
+        log(f"  Term index: {len(self._term_index)} prefixes (max={max_pfx})")
 
-        # 5. Descendant counts — single bottom-up pass O(N), not per-node BFS
-        #    Process leaves first (topological order), propagate counts up
         self._descendant_count = {cui: 0 for cui in all_cuis}
-        # nodes with no children = leaves, start from them
         in_progress = {cui: len(self._child_map.get(cui, set())) for cui in all_cuis}
         queue = deque(cui for cui, cnt in in_progress.items() if cnt == 0)
         processed = 0
         while queue:
             node = queue.popleft()
             processed += 1
-            # this node's desc_count is already finalized
             my_count = self._descendant_count[node]
             for parent in self._parent_map.get(node, set()):
-                # parent gains: this node + all descendants of this node
                 self._descendant_count[parent] += my_count + 1
                 in_progress[parent] -= 1
                 if in_progress[parent] == 0:
                     queue.append(parent)
             if processed % 100000 == 0:
-                log(f"    Descendant count progress: {processed}/{n}")
-        log(f"  Descendant counts: {processed} nodes processed (O(N) bottom-up)")
-
-        # NOTE: ancestor closure NOT precomputed — subsumption uses on-demand BFS
-        # This saves potentially GB of RAM for large UMLS graphs (300K+ nodes)
+                log(f"    Descendant progress: {processed}/{n}")
+        log(f"  Descendant counts: {processed} nodes (O(N) bottom-up)")
 
         self._built = True
-        log(f"[TopicNavigator] Build complete: {n} CUIs, "
-            f"{len(self._term_index)} prefix entries")
-
-    # ── INTERNAL: on-demand subsumption BFS ───────────────────────────────
+        log(f"[TopicNavigator] Build complete: {n} CUIs, {len(self._term_index)} prefixes")
 
     def _is_ancestor_of(self, candidate_ancestor, candidate_descendant):
-        """BFS up from descendant checking if ancestor is reached. Cached.
-
-        O(depth × avg_parents) per call, not O(N). LRU cached for repeat queries.
-        """
+        """BFS up from descendant. O(depth × avg_parents), LRU cached."""
         key = (candidate_ancestor, candidate_descendant)
 
-        # check cache (LRU)
         if key in self._subsumes_cache:
             self._subsumes_cache.move_to_end(key)
             return self._subsumes_cache[key]
 
-        # BFS up from descendant
         found = False
         frontier = {candidate_descendant}
         visited = {candidate_descendant}
@@ -1798,7 +1647,6 @@ class TopicNavigator:
                 break
             frontier = nxt
 
-        # cache result
         self._subsumes_cache[key] = found
         while len(self._subsumes_cache) > self._SUBSUMES_CACHE_SIZE:
             self._subsumes_cache.popitem(last=False)
@@ -1822,17 +1670,9 @@ class TopicNavigator:
                 break
         return ancestors
 
-    # ── USE CASE 1: TYPEAHEAD ─────────────────────────────────────────────
-
     def typeahead(self, query, limit=10):
-        """Progressive typeahead search. Returns ranked list of matches.
-
-        User types "knee" → returns CUIs with "knee" in term, ranked by:
-          1. Exact token match > prefix match
-          2. Mid-range IC (navigable nodes) ranked first
-          3. Having children = more navigable
-
-        Returns: [{"cui": str, "term": str, "ic": float, "child_count": int}, ...]
+        """Prefix search: "knee" → ranked CUIs by navigability (IC, children).
+        Returns: [{"cui", "term", "ic", "child_count", "descendant_count"}]
         """
         if not query or not query.strip():
             return []
@@ -1841,7 +1681,6 @@ class TopicNavigator:
         if not tokens:
             return []
 
-        # find CUIs matching ALL tokens (intersection)
         candidate_sets = []
         for token in tokens:
             matches = set()
@@ -1858,14 +1697,12 @@ class TopicNavigator:
                 return []  # a token matches nothing → no results
             candidate_sets.append(matches)
 
-        # intersect — CUI must match ALL typed tokens
         candidates = candidate_sets[0]
         for s in candidate_sets[1:]:
             candidates = candidates & s
             if not candidates:
                 return []
 
-        # score + rank — keep only top N to avoid sorting huge lists
         query_lower = query.lower()
         scored = []
         for cui in candidates:
@@ -1876,16 +1713,14 @@ class TopicNavigator:
 
             # scoring: prefer concepts that are useful navigation nodes
             starts_with = 1.0 if term.lower().startswith(query_lower) else 0.0
-            # mid-range IC (5-9) is most useful for navigation
-            ic_nav_score = 1.0 - min(abs(ic - 7.0) / 7.0, 1.0)
-            # having children = navigable
-            nav_score = min(desc_count / 50.0, 1.0) if desc_count > 0 else 0.0
+            ic_nav_score = 1.0 - min(abs(ic - _TYPEAHEAD_IC_CENTER) / _TYPEAHEAD_IC_CENTER, 1.0)
+            nav_score = min(desc_count / _TYPEAHEAD_DESC_NORM, 1.0) if desc_count > 0 else 0.0
 
-            score = starts_with * 3.0 + ic_nav_score * 2.0 + nav_score * 1.0
+            w_sw, w_ic, w_nav = _TYPEAHEAD_WEIGHTS
+            score = starts_with * w_sw + ic_nav_score * w_ic + nav_score * w_nav
             scored.append((score, -ic, cui, term, ic, children, desc_count))
 
-        # partial sort: only need top `limit` results
-        if len(scored) > limit * 3:
+        if len(scored) > limit * _TYPEAHEAD_OVERSAMPLE:
             scored.sort(reverse=True)
             scored = scored[:limit]
         else:
@@ -1897,16 +1732,8 @@ class TopicNavigator:
             for r in scored[:limit]
         ]
 
-    # ── USE CASE 2: DRILL-DOWN ────────────────────────────────────────────
-
     def drill_down(self, cui):
-        """Get direct children of a CUI, organized for navigation.
-
-        User clicks "Knee Disorders" → shows children grouped by type.
-
-        Returns: {"cui": str, "term": str, "ic": float,
-                  "children": [{"cui", "term", "ic", "child_count", "descendant_count"}]}
-        """
+        """Direct children sorted by navigability. Returns: {"cui", "term", "ic", "children": [...]}"""
         term = self._term_map.get(cui, cui)
         ic = round(self._ic_map.get(cui, 0.0), 2)
         children_cuis = self._child_map.get(cui, set())
@@ -1922,23 +1749,13 @@ class TopicNavigator:
                 "child_count": len(self._child_map.get(c, set())),
                 "descendant_count": self._descendant_count.get(c, 0)
             })
-        # sort: navigable nodes first (those with children), then alphabetical
         children.sort(key=lambda x: (-x["child_count"], x["term"]))
 
         return {"cui": cui, "term": term, "ic": ic, "children": children}
 
-    # ── USE CASE 3: DRILL-UP (breadcrumb path) ───────────────────────────
-
     def drill_up(self, cui, max_depth=8, max_paths=3):
-        """Get ancestor path(s) from CUI to root.
-
-        Shows breadcrumb: Left Knee OA → Knee OA → Arthropathy → Musculoskeletal
-
-        Returns: {"cui": str, "term": str, "paths": [[{"cui", "term", "ic"}]]}
-                 (multiple paths because UMLS is a polyhierarchy)
-
-        SAFETY: exploration capped at _MAX_DRILL_PATHS to prevent exponential
-        blowup in polyhierarchies. Returns best `max_paths` by total IC.
+        """Ancestor breadcrumb path(s) to root. Multiple paths for polyhierarchy.
+        Capped at _MAX_DRILL_PATHS to prevent exponential blowup.
         """
         paths = []
         paths_explored = [0]  # mutable counter for nested function
@@ -1981,14 +1798,8 @@ class TopicNavigator:
             "paths": paths
         }
 
-    # ── USE CASE 4: SUBSUMPTION (FHIR $subsumes equivalent) ──────────────
-
     def subsumes(self, ancestor_cui, descendant_cui):
-        """Test if ancestor_cui subsumes descendant_cui (is-a relationship).
-
-        FHIR $subsumes equivalent. Uses on-demand BFS (not precomputed closure)
-        to keep memory bounded. Results are LRU-cached.
-
+        """FHIR $subsumes: on-demand BFS with LRU cache.
         Returns: "subsumes" | "subsumed-by" | "equivalent" | "not-related"
         """
         if ancestor_cui == descendant_cui:
@@ -2001,10 +1812,7 @@ class TopicNavigator:
         return "not-related"
 
     def find_shared_ancestor(self, cui_a, cui_b):
-        """Find the most specific (highest IC) shared ancestor of two CUIs.
-
-        Useful for: "what topic connects Knee OA and Hip OA?" → "Arthropathy"
-        """
+        """Most specific (highest IC) shared ancestor of two CUIs."""
         anc_a = self._get_ancestors_bfs(cui_a)
         anc_b = self._get_ancestors_bfs(cui_b)
         shared = anc_a & anc_b
@@ -2019,13 +1827,8 @@ class TopicNavigator:
             "ic": round(self._ic_map.get(best, 0.0), 2)
         }
 
-    # ── USE CASE 5: SIBLINGS ──────────────────────────────────────────────
-
     def siblings(self, cui, limit=20):
-        """Get CUIs at same level under same parent(s).
-
-        "Left Knee OA" → siblings: "Right Knee OA", "Bilateral Knee OA"
-        """
+        """CUIs sharing same parent(s), sorted by IC descending."""
         parents = self._parent_map.get(cui, set())
         sibs = set()
         for p in parents:
@@ -2044,18 +1847,8 @@ class TopicNavigator:
         result.sort(key=lambda x: (-x["ic"], x["term"]))
         return result[:limit]
 
-    # ── USE CASE 6: TOPIC MATCHING (document ↔ query) ────────────────────
-
     def match_topics(self, doc_cuis, query_cuis, mode="subsumption"):
-        """Match document CUIs against query CUIs using hierarchy.
-
-        Modes:
-          "exact":       only exact CUI matches
-          "subsumption": query CUI matches if doc has it OR any descendant/ancestor
-          "ancestor":    find shared ancestors at configurable depth
-
-        Returns: {"matched_cuis": [...], "score": float, "details": [...]}
-        """
+        """Match doc CUIs vs query CUIs. Modes: exact, subsumption, ancestor."""
         if not doc_cuis or not query_cuis:
             return {"matched_cuis": [], "score": 0.0, "mode": mode}
 
@@ -2073,33 +1866,42 @@ class TopicNavigator:
         elif mode == "subsumption":
             matched = []
             details = []
+            # precompute: all ancestors of all doc CUIs (one BFS per doc CUI)
+            doc_ancestors = set()  # any ancestor of any doc CUI
+            for d_cui in doc_cuis:
+                doc_ancestors.update(self._get_ancestors_bfs(d_cui))
+            # precompute: all ancestors of all query CUIs
+            query_ancestor_map = {}  # q_cui -> set of ancestors
             for q_cui in query_cuis:
-                # direct match (fast path)
+                if q_cui not in doc_set:
+                    query_ancestor_map[q_cui] = self._get_ancestors_bfs(q_cui)
+
+            for q_cui in query_cuis:
                 if q_cui in doc_set:
                     matched.append(q_cui)
                     details.append({
                         "query_cui": q_cui, "match_type": "exact", "doc_cui": q_cui
                     })
                     continue
-                # subsumption: use on-demand BFS (not closure lookup)
-                found = False
-                for d_cui in doc_cuis:
-                    if self._is_ancestor_of(q_cui, d_cui):
-                        matched.append(q_cui)
-                        details.append({
-                            "query_cui": q_cui, "match_type": "subsumes",
-                            "doc_cui": d_cui
-                        })
-                        found = True
-                        break
-                    elif self._is_ancestor_of(d_cui, q_cui):
-                        matched.append(q_cui)
-                        details.append({
-                            "query_cui": q_cui, "match_type": "subsumed-by",
-                            "doc_cui": d_cui
-                        })
-                        found = True
-                        break
+                # q is ancestor of some doc CUI? (q in doc_ancestors)
+                if q_cui in doc_ancestors:
+                    # find which doc CUI it subsumes (for detail reporting)
+                    d_match = next((d for d in doc_cuis if self._is_ancestor_of(q_cui, d)), None)
+                    matched.append(q_cui)
+                    details.append({
+                        "query_cui": q_cui, "match_type": "subsumes",
+                        "doc_cui": d_match or "unknown"
+                    })
+                    continue
+                # some doc CUI is ancestor of q? (doc_set & q_ancestors)
+                q_anc = query_ancestor_map.get(q_cui, set())
+                d_match = next((d for d in doc_cuis if d in q_anc), None)
+                if d_match:
+                    matched.append(q_cui)
+                    details.append({
+                        "query_cui": q_cui, "match_type": "subsumed-by",
+                        "doc_cui": d_match
+                    })
 
             return {
                 "matched_cuis": matched,
@@ -2113,7 +1915,7 @@ class TopicNavigator:
             for q_cui in query_cuis:
                 for d_cui in doc_cuis:
                     shared = self.find_shared_ancestor(q_cui, d_cui)
-                    if shared and shared["ic"] >= 4.0:
+                    if shared and shared["ic"] >= _MATCH_ANCESTOR_IC_MIN:
                         matched_topics.append({
                             "query_cui": q_cui, "doc_cui": d_cui,
                             "shared_ancestor": shared
@@ -2134,8 +1936,6 @@ class TopicNavigator:
             }
 
         return {"matched_cuis": [], "score": 0.0, "mode": mode}
-
-    # ── PERSISTENCE ───────────────────────────────────────────────────────
 
     def save(self, path):
         """Serialize navigator for runtime use (no graph/fetcher needed)."""
@@ -2177,11 +1977,7 @@ class TopicNavigator:
 
     def save_to_bq(self, bq_client, project_id, dataset_id,
                     table_name="topic_navigator"):
-        """Save core indexes to BigQuery for distributed runtime.
-
-        NOTE: BQ mode stores parent/child adjacency. Subsumption testing still
-        works via on-demand BFS over parent_map (same as pickle mode).
-        """
+        """Save core indexes to BigQuery for distributed runtime."""
         table_ref = f"{project_id}.{dataset_id}.{table_name}"
         rows = []
         for cui in self._term_map:
@@ -2217,40 +2013,33 @@ class TopicNavigator:
             jc = LoadJobConfig(schema=schema, write_disposition="WRITE_APPEND")
         log(f"[TopicNavigator] Saved {len(rows)} rows to {table_ref}")
 
-
 class Evaluator:
-    """Quality evaluation without ground truth.
-
-    intrinsic_metrics: reduction ratio, confidence spread, topic coherence, removal breakdown.
-    reconstruction_check: verify each merge (embedding dist, shared parent/ancestors/semtypes).
-    Both return flat row lists for direct CSV output.
+    """Quality evaluation: intrinsic_metrics (reduction, confidence, topic coherence) +
+    reconstruction_check (verify each merge). Both return flat row lists for CSV output.
     """
 
     def __init__(self, graph):
         self.graph = graph
 
     def intrinsic_metrics(self, case_name, entity_results, topics, embeddings):
-        """entity_results: list of (entity_text, ReductionResult).
-        Returns rows: [case, metric_type, scope, metric_name, value, flag]"""
+        """Returns rows: [case, metric_type, scope, metric_name, value, flag]"""
         rows = []
 
-        # 1. reduction ratio per entity
         for entity_text, result in entity_results:
             inp = result.input_count
             final = result.after_redundancy_count
             ratio = 1 - (final / inp) if inp > 0 else 0
             flag = ""
-            if ratio > 0.95:
-                flag = "WARNING: very aggressive (>95% removed)"
-            elif ratio < 0.10:
-                flag = "WARNING: minimal reduction (<10% removed)"
+            if ratio > _EVAL_AGGRESSIVE_RATIO:
+                flag = f"WARNING: very aggressive (>{_EVAL_AGGRESSIVE_RATIO*100:.0f}% removed)"
+            elif ratio < _EVAL_MINIMAL_RATIO:
+                flag = f"WARNING: minimal reduction (<{_EVAL_MINIMAL_RATIO*100:.0f}% removed)"
             rows.append([case_name, "reduction", entity_text, "input_count", inp, ""])
             rows.append([case_name, "reduction", entity_text, "after_sab", result.after_filter_count, ""])
             rows.append([case_name, "reduction", entity_text, "after_hierarchy", result.after_hierarchy_count, ""])
             rows.append([case_name, "reduction", entity_text, "final_count", final, ""])
             rows.append([case_name, "reduction", entity_text, "reduction_ratio", round(ratio, 3), flag])
 
-        # 2. confidence spread per entity
         for entity_text, result in entity_results:
             if not result.confidence:
                 continue
@@ -2258,14 +2047,13 @@ class Evaluator:
             spread = max(scores) - min(scores)
             std = float(np.std(scores))
             flag = ""
-            if spread < 0.1:
+            if spread < _EVAL_COMPRESSED_SPREAD:
                 flag = "WARNING: scores too compressed, not discriminating"
             rows.append([case_name, "confidence", entity_text, "min", round(min(scores), 4), ""])
             rows.append([case_name, "confidence", entity_text, "max", round(max(scores), 4), ""])
             rows.append([case_name, "confidence", entity_text, "spread", round(spread, 4), flag])
             rows.append([case_name, "confidence", entity_text, "std", round(std, 4), ""])
 
-        # 3. topic coherence
         if topics and embeddings:
             intra_sims, inter_sims = [], []
             topic_centroids = {}
@@ -2292,13 +2080,12 @@ class Evaluator:
             avg_intra = float(np.mean(intra_sims)) if intra_sims else 0
             avg_inter = float(np.mean(inter_sims)) if inter_sims else 0
             separation = avg_intra - avg_inter
-            flag = "WARNING: topics not well separated" if separation < 0.05 else ""
+            flag = "WARNING: topics not well separated" if separation < _EVAL_SEPARATION_MIN else ""
             rows.append([case_name, "topic_coherence", "ALL", "avg_intra_similarity", round(avg_intra, 4), ""])
             rows.append([case_name, "topic_coherence", "ALL", "avg_inter_similarity", round(avg_inter, 4), ""])
             rows.append([case_name, "topic_coherence", "ALL", "separation", round(separation, 4), flag])
             rows.append([case_name, "topic_coherence", "ALL", "topic_count", len(topics), ""])
 
-        # 4. removal breakdown by reason
         reason_counts = defaultdict(int)
         for _, result in entity_results:
             for a in result.audit_trail:
@@ -2309,9 +2096,7 @@ class Evaluator:
         return rows
 
     def reconstruction_check(self, case_name, entity_results, embeddings, metadata, terms):
-        """Verify each merge was reasonable.
-        Returns rows: [case, entity, removed_cui, removed_term, kept_cui, kept_term,
-                       reason, cosine_dist, same_parent, shared_ancestors, shared_semtypes, verdict]"""
+        """Verify each merge: embedding dist, shared parent/ancestors/semtypes → verdict."""
         rows = []
         check_reasons = {"true_duplicate", "cross_topic_dedup", "ancestor_subsumed"}
         graph = self.graph
@@ -2320,49 +2105,31 @@ class Evaluator:
             for a in result.audit_trail:
                 if a.reason not in check_reasons or not a.removed_cui or not a.kept_cui:
                     continue
-                removed, kept = a.removed_cui, a.kept_cui
-
-                # cosine distance
-                cos_dist = ""
-                if removed in embeddings and kept in embeddings:
-                    cos_dist = round(1.0 - float(np.dot(embeddings[removed], embeddings[kept])), 4)
-
-                # same immediate parent?
-                same_parent = ""
+                rm, kp = a.removed_cui, a.kept_cui
+                cos_dist = round(1.0 - float(np.dot(embeddings[rm], embeddings[kp])), 4) \
+                    if rm in embeddings and kp in embeddings else ""
+                same_parent, shared_anc, shared_st = "", "", 0
                 if graph:
-                    r_par = set(graph.predecessors(removed)) if graph.has_node(removed) else set()
-                    k_par = set(graph.predecessors(kept)) if graph.has_node(kept) else set()
+                    r_par = set(graph.predecessors(rm)) if graph.has_node(rm) else set()
+                    k_par = set(graph.predecessors(kp)) if graph.has_node(kp) else set()
                     same_parent = "YES" if (r_par & k_par) else "NO"
-
-                # shared ancestors (depth 3)?
-                shared_anc = ""
-                if graph:
-                    r_anc = _get_ancestors(graph, removed, 3)
-                    k_anc = _get_ancestors(graph, kept, 3)
+                    r_anc, k_anc = _get_ancestors(graph, rm, _EVAL_RECON_DEPTH), _get_ancestors(graph, kp, _EVAL_RECON_DEPTH)
                     shared_anc = len(r_anc & k_anc) if r_anc and k_anc else 0
-
-                # shared semantic types?
-                r_m, k_m = metadata.get(removed), metadata.get(kept)
+                r_m, k_m = metadata.get(rm), metadata.get(kp)
                 r_t = set(r_m.semantic_types) if r_m and r_m.semantic_types else set()
                 k_t = set(k_m.semantic_types) if k_m and k_m.semantic_types else set()
                 shared_st = len(r_t & k_t) if r_t and k_t else 0
-
-                # verdict
                 problems = []
-                if cos_dist and cos_dist > 0.3:
+                if cos_dist and cos_dist > _EVAL_SUSPECT_DIST:
                     problems.append(f"distant embedding ({cos_dist})")
                 if same_parent == "NO" and shared_anc == 0:
                     problems.append("no shared ancestors")
                 if shared_st == 0 and r_t and k_t:
                     problems.append("no shared semantic types")
                 verdict = "SUSPECT: " + "; ".join(problems) if problems else "OK"
-
-                rows.append([
-                    case_name, entity_text,
-                    removed, terms.get(removed, removed),
-                    kept, terms.get(kept, kept),
-                    a.reason, cos_dist, same_parent, shared_anc, shared_st, verdict])
-
+                rows.append([case_name, entity_text, rm, terms.get(rm, rm),
+                    kp, terms.get(kp, kp), a.reason, cos_dist, same_parent,
+                    shared_anc, shared_st, verdict])
         return rows
 
     @staticmethod
@@ -2374,7 +2141,6 @@ class Evaluator:
         return ["case", "entity", "removed_cui", "removed_term", "kept_cui", "kept_term",
                 "reason", "cosine_dist", "same_parent", "shared_ancestors", "shared_semtypes", "verdict"]
 
-
 class CUIExtractor:
     def __init__(self, api_url, top_k=3, top_p=5000,
                  cluster_set="umls", combined=True, cache_dir=None):
@@ -2384,19 +2150,20 @@ class CUIExtractor:
         self.cluster_set = cluster_set
         self.combined = combined
         path = os.path.join(cache_dir, "extraction_cache.pkl") if cache_dir else None
-        self._cache = Cache(10_000, persist_path=path)
+        self._cache = Cache(_CACHE_EXTRACTION, persist_path=path)
         self.session = requests.Session()
         try:
             token = subprocess.run(
                 ["gcloud", "auth", "print-identity-token"],
                 stdout=subprocess.PIPE, universal_newlines=True,
-                timeout=30).stdout.strip()
+                timeout=_GCLOUD_TIMEOUT).stdout.strip()
             self.headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         except Exception:
             self.headers = {"Content-Type": "application/json"}
         from requests.adapters import HTTPAdapter
         from urllib3.util.retry import Retry
-        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        retry = Retry(total=_RETRY_TOTAL, backoff_factor=_RETRY_BACKOFF,
+                      status_forcelist=list(_RETRY_STATUS_CODES))
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     @timed("cui_extraction")
@@ -2405,7 +2172,6 @@ class CUIExtractor:
         cache_key = f"{'||'.join(sorted(text_list))}||{self.top_k}||{self.top_p}"
         cached = self._cache.get(cache_key)
         if cached is not None:
-            # handle old cache format (flat list from previous code version)
             if isinstance(cached, list):
                 log("    Cache format outdated (flat list), re-extracting...", level="DEBUG")
             elif isinstance(cached, dict):
@@ -2424,7 +2190,7 @@ class CUIExtractor:
         try:
             resp = self.session.post(
                 self.url, headers=self.headers,
-                json=payload, timeout=200)
+                json=payload, timeout=_API_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
         except requests.exceptions.RequestException as e:
@@ -2434,8 +2200,6 @@ class CUIExtractor:
             log(f"    Extraction API response parse error: {e}", level="ERROR")
             return {}
 
-        # Response: { "output": { phrase: [ { cluster_code, members } ] } }
-        # Return per-phrase: { phrase: { cui: distance } }
         per_phrase = {}
         output = data.get("output", {})
         for phrase, clusters in output.items():
