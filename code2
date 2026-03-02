@@ -1,17 +1,3 @@
-import json
-import re
-from datetime import datetime, timezone
-from typing import List, Optional
-from google import genai
-from google.genai import types
-from pydantic import BaseModel, Field, field_validator, model_validator
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-# =====================================================================
-#  PROMPTS
-# =====================================================================
-
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 
@@ -55,598 +41,79 @@ When uncertain, default to clinical. It is better to process a borderline query 
 When is_clinical = false, set reason and return empty intents.
 
 ====================================================
-CORE PRINCIPLES
+EXTRACTION PRINCIPLES
 ====================================================
 
-Extraction Philosophy:
-When someone requests clinical information, extract everything needed to fully understand, act upon, or make decisions about that information safely and effectively.
+Extract everything needed to fully understand, act upon, or make decisions about the clinical information safely and effectively.
 
-Guiding Questions:
-1. What is being requested?
-2. What contextual information is inseparable from this concept?
-3. What would be incomplete or unsafe without?
-4. How is this information naturally organized?
+For each concept ask:
+- What is being requested?
+- What contextual information is inseparable from this concept?
+- What would be incomplete or unsafe without?
+- How is this information naturally organized?
 
-Inseparability Concept:
 Some information types are inherently connected for safety, understanding, or completeness. When extracting one, consider whether the other is contextually necessary.
 
 ====================================================
 INTENT GENERATION
 ====================================================
 
-Analyze the expanded query and identify distinct clinical intents.
+Analyze the expanded query and identify distinct clinical intents. Each intent represents a clinically independent concept that could be documented or understood separately. Generate as many intents as the expanded query contains. Let the content guide the count.
 
-Each intent represents a clinically independent concept that could be documented or understood separately.
-
-Generate as many intents as the expanded query contains. Let the content guide the count.
-
-====================================================
-INTENT STRUCTURE
-====================================================
-
-For each intent:
-
+For each intent provide:
 1. intent_title - What is this about?
 2. description - What does this represent and why does it matter?
-3. nature - What is the primary informational purpose? (Format: [Context] / [Purpose])
-4. sub_natures[] - What are the distinct dimensions of this information?
+3. nature - Primary informational purpose (Format: [Context] / [Purpose])
+4. sub_natures[] - Distinct dimensions of this information
 5. final_queries[] - How would this appear in clinical documents?
 
 ====================================================
 SUB_NATURE DECOMPOSITION
 ====================================================
 
-Core Question: "What are the meaningful aspects of this clinical concept?"
+Each sub_nature has:
+- category_path: "Broad >> Specific >> Detail" — the navigation path from general to specific
+- atomic_concepts: the specific data points at the end of that path
 
-Structure:
-{{
-  "category_path": "Broad >> Specific >> Detail",
-  "atomic_concepts": ["terminal1", "terminal2"]
-}}
-
-CATEGORY_PATH:
-Think of this as organizing information from general to specific. Each level adds meaningful distinction. Use " >> " as the separator.
-
-ATOMIC_CONCEPTS:
-These are the actual data points - the most specific, granular elements at the end of the navigation path. Include all specific details mentioned: exact values, names, dates, measurements, descriptors.
-
-Key Understanding:
-- category_path = How to get there (the folders)
-- atomic_concepts = What's there (the files - be specific)
-
-Grouping Logic:
 If multiple pieces of information answer the same type of question, group them in one sub_nature. Build depth in the category_path rather than creating many shallow sub_natures.
 
 ====================================================
-FINAL_QUERIES: ATOMIC SPECIFICITY
+FINAL QUERIES
 ====================================================
 
-Purpose:
-Generate concise, atomic-level queries that map to precise clinical concepts without generating excessive CUIs.
-
-Atomic Query Principle:
 Each query should represent ONE atomic clinical concept or a tight pairing of inseparable concepts.
 
-Query Characteristics:
+Characteristics:
 - 2-4 words maximum
 - One clinical concept per query
-- Include only essential modifiers
-- Use standard medical terminology
-- Each query -> 1-3 CUIs ideally
+- Standard medical terminology
+- Each query targets 1-3 CUIs
 
-Coverage:
-Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
+Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query.
 
 User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
-CONTEXTUAL_ENVIRONMENT_PROMPT = """Map the documentation footprint of each clinical concept across real-world clinical workflow. For each concept, determine where it is substantively documented — not merely listed or referenced in passing.
+CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist mapping where each clinical concept substantively lives within medical records. You are NOT explaining the concept. You ARE mapping its documentation footprint across real-world clinical workflow.
 
 Return exactly {concept_count} entries. Each entry MUST have at least one temporal_phase with ALL fields populated. Return atomic_concept and intent_title exactly as provided.
 
-For each concept, return temporal phases ordered chronologically. Each phase groups what co-occurs: which documents are generated, who writes them, where, and what signals indicate the concept. A new phase is justified only when the documentation pattern changes. Same author, setting, or document type can appear in multiple phases.
+For each concept, return temporal phases ordered chronologically. Each phase represents a distinct documentation moment — group what co-occurs: which documents are generated, who writes them, where, and what signals indicate the concept.
+
+For each concept, reason through its complete documentation lifecycle:
+- Where is this concept first recorded? By whom? In what document? At what setting?
+- Who evaluates or acts on it further? What additional documents are generated?
+- If severity or complexity increases, who gets involved? Where does documentation shift?
+- How is it tracked or summarized over time? Where does longitudinal documentation live?
+- Could it appear across different care settings depending on clinical circumstances?
+
+A new phase is justified only when the documentation pattern changes — different people, different documents, different settings, or different signals. If nothing changes, it is the same phase. The same author, setting, or document type can appear in multiple phases when clinically realistic.
+
+Include only sources where this concept is substantively documented — where a clinician would find meaningful clinical detail, assessment, or action. Exclude sources where the concept is merely listed, copied, or referenced in passing.
 
 All values must follow: "snake_case_term - documentation-focused definition"
 
 Original query: {original_query}
 Expanded query: {expanded_query}
 Concepts: {concepts_json}"""
-
-
-# =====================================================================
-#  LLM SCHEMAS — internal only
-# =====================================================================
-
-class QueryExpansionOutput(BaseModel):
-    expanded_query: str
-    abbreviations_expanded: List[str] = Field(default_factory=list)
-
-
-class SubNature(BaseModel):
-    category_path: str
-    atomic_concepts: List[str] = Field(default_factory=list)
-
-    @field_validator('category_path')
-    @classmethod
-    def normalize_separator(cls, v):
-        v = str(v) if not isinstance(v, str) else v
-        v = re.sub(r'\s*[/>]{1,2}\s*', ' >> ', v).strip()
-        return v if '>>' in v else f"{v} >> General"
-
-
-class Intent(BaseModel):
-    intent_title: str
-    description: str = ""
-    nature: str = ""
-    sub_natures: List[SubNature] = Field(default_factory=list)
-    final_queries: List[str] = Field(default_factory=list)
-
-
-class IntentExtractionResponse(BaseModel):
-    is_clinical: bool
-    reason: Optional[str] = None
-    total_intents_detected: int = 0
-    intents: List[Intent] = Field(default_factory=list)
-
-    @model_validator(mode='after')
-    def fix_intent_count(self):
-        self.total_intents_detected = len(self.intents)
-        return self
-
-
-class IntentExtractionOutput(BaseModel):
-    is_clinical: bool
-    reason: Optional[str] = None
-    original_query: str
-    expanded_query: str
-    total_intents_detected: int = 0
-    intents: List[Intent] = Field(default_factory=list)
-
-
-class TemporalPhase(BaseModel):
-    phase_name: str = ""
-    document_types: List[str] = Field(default_factory=list)
-    author_roles: List[str] = Field(default_factory=list)
-    content_signals: List[str] = Field(default_factory=list)
-    clinical_settings: List[str] = Field(default_factory=list)
-
-
-class ConceptContext(BaseModel):
-    atomic_concept: str
-    intent_title: str = ""
-    temporal_phases: List[TemporalPhase] = Field(default_factory=list)
-
-
-class ContextualEnvironmentOutput(BaseModel):
-    concepts_with_context: List[ConceptContext] = Field(default_factory=list)
-
-
-# =====================================================================
-#  OUTPUT SCHEMAS
-# =====================================================================
-
-class RetrievalContext(BaseModel):
-    document_types: List[str] = Field(default_factory=list)
-    author_roles: List[str] = Field(default_factory=list)
-    temporal_scope: List[str] = Field(default_factory=list)
-    content_signals: List[str] = Field(default_factory=list)
-    clinical_setting: List[str] = Field(default_factory=list)
-    context_sentences: List[str] = Field(default_factory=list)
-
-
-class IntentSummaryItem(BaseModel):
-    intent_title: str
-    description: str
-
-
-class IntentWithoutQueries(BaseModel):
-    intent_title: str
-    description: str
-    nature: str
-    sub_natures: List[SubNature]
-
-
-class IntentWithContext(BaseModel):
-    intent_title: str
-    description: str
-    nature: str
-    sub_natures: List[SubNature]
-    final_candidates: List[str]
-    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
-
-
-class FinalCandidateItem(BaseModel):
-    candidate_id: str
-    intent_title: str
-    atomic_concept: str
-    candidate: str
-    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
-
-
-class Format_IntentExtraction(BaseModel):
-    user_query: str
-    intents: List[IntentSummaryItem]
-    is_clinical: bool
-    rejected_reason: Optional[str] = None
-    timestamp: str
-
-
-class Format_FinalQueries(BaseModel):
-    user_query: str
-    is_clinical: bool
-    rejected_reason: Optional[str] = None
-    total_candidates: int
-    final_candidates: List[FinalCandidateItem]
-    timestamp: str
-
-
-class Format_NatureBreakdown(BaseModel):
-    is_clinical: bool
-    reason: Optional[str] = None
-    original_query: str
-    total_intents_detected: int
-    intents: List[IntentWithoutQueries]
-    timestamp: str
-
-
-class Format_FullPipeline(BaseModel):
-    is_clinical: bool
-    reason: Optional[str] = None
-    original_query: str
-    expanded_query: str
-    total_intents_detected: int
-    intents: List[IntentWithContext]
-    timestamp: str
-
-
-# =====================================================================
-#  EXTRACTION RESULT
-# =====================================================================
-
-class ExtractionResult:
-
-    def __init__(self, original_query, expansion, intents, context,
-                 processing_time):
-        self.original_query = original_query
-        self.expansion = expansion
-        self.intents = intents
-        self.context = context
-        self.processing_time = processing_time
-        self.timestamp = datetime.now(timezone.utc).isoformat()
-
-    @staticmethod
-    def _clean(v):
-        if not v:
-            return ""
-        if " - " in v:
-            k, d = v.split(" - ", 1)
-            return k.replace("_", " ") + " - " + d
-        return v.replace("_", " ")
-
-    @staticmethod
-    def _pfx(v):
-        if not v:
-            return ""
-        return (v.split(" - ", 1)[0].replace("_", " ")
-                if " - " in v else v.replace("_", " "))
-
-    @staticmethod
-    def _join(items):
-        parts = [ExtractionResult._pfx(v) for v in (items or []) if v]
-        if not parts:
-            return ""
-        if len(parts) == 1:
-            return parts[0]
-        if len(parts) == 2:
-            return f"{parts[0]} and {parts[1]}"
-        return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
-    @staticmethod
-    def _dedup(values):
-        seen, out = set(), []
-        for v in (values or []):
-            if not v:
-                continue
-            k = v.split(" - ", 1)[0].strip().lower()
-            if k and k not in seen:
-                out.append(v)
-                seen.add(k)
-        return out
-
-    @staticmethod
-    def _flatten_and_build(concept_name, phases):
-        docs, auths, temps, sigs, setts = [], [], [], [], []
-        sentences = []
-        for p in (phases or []):
-            if not p.document_types or not p.author_roles:
-                continue
-            if p.phase_name:
-                temps.append(p.phase_name)
-            docs.extend(p.document_types or [])
-            auths.extend(p.author_roles or [])
-            sigs.extend(p.content_signals or [])
-            setts.extend(p.clinical_settings or [])
-            d = ExtractionResult._join(p.document_types)
-            a = ExtractionResult._join(p.author_roles)
-            se = ExtractionResult._join(p.clinical_settings)
-            si = ExtractionResult._join(p.content_signals)
-            parts = [concept_name, f"documented in {d}", f"by {a}"]
-            if se:
-                parts.append(f"at {se}")
-            if si:
-                parts.append(f"capturing {si}")
-            sentences.append(", ".join(parts) + ".")
-        cl = ExtractionResult._clean
-        dd = ExtractionResult._dedup
-        return (dd([cl(v) for v in docs]),
-                dd([cl(v) for v in auths]),
-                dd([cl(v) for v in temps]),
-                dd([cl(v) for v in sigs]),
-                dd([cl(v) for v in setts]),
-                sentences)
-
-    def _get_phases(self, atomic_concept):
-        if not self.context or not self.context.concepts_with_context:
-            return []
-        key = atomic_concept.strip().lower()
-        for cc in self.context.concepts_with_context:
-            if cc.atomic_concept.strip().lower() == key:
-                return cc.temporal_phases or []
-        return []
-
-    def _build_ctx(self, concept_name):
-        phases = self._get_phases(concept_name)
-        if not phases:
-            return RetrievalContext()
-        docs, auths, temps, sigs, setts, sents = (
-            self._flatten_and_build(concept_name, phases))
-        return RetrievalContext(
-            document_types=docs, author_roles=auths,
-            temporal_scope=temps, content_signals=sigs,
-            clinical_setting=setts, context_sentences=sents)
-
-    def _build_intent_ctx(self, intent_title):
-        if not self.context or not self.context.concepts_with_context:
-            return RetrievalContext()
-        all_phases = []
-        key = intent_title.strip().lower()
-        for cc in self.context.concepts_with_context:
-            if cc.intent_title.strip().lower() == key:
-                all_phases.extend(cc.temporal_phases or [])
-        if not all_phases:
-            return RetrievalContext()
-        docs, auths, temps, sigs, setts, sents = (
-            self._flatten_and_build(intent_title, all_phases))
-        return RetrievalContext(
-            document_types=docs, author_roles=auths,
-            temporal_scope=temps, content_signals=sigs,
-            clinical_setting=setts, context_sentences=sents)
-
-    def to_intent_extraction(self):
-        return Format_IntentExtraction(
-            user_query=self.original_query,
-            intents=[IntentSummaryItem(
-                intent_title=i.intent_title, description=i.description)
-                for i in self.intents.intents],
-            is_clinical=self.intents.is_clinical,
-            rejected_reason=self.intents.reason,
-            timestamp=self.timestamp).model_dump()
-
-    def to_final_queries(self):
-        candidates, seen, idx = [], set(), 0
-        for i in self.intents.intents:
-            for sn in i.sub_natures:
-                for c in sn.atomic_concepts:
-                    key = c.strip().lower()
-                    if not key or key in seen:
-                        continue
-                    seen.add(key)
-                    idx += 1
-                    candidates.append(FinalCandidateItem(
-                        candidate_id=f"fc_{idx:03d}",
-                        intent_title=i.intent_title,
-                        atomic_concept=c.strip(),
-                        candidate=c.strip(),
-                        retrieval_context=self._build_ctx(c.strip())))
-        return Format_FinalQueries(
-            user_query=self.original_query,
-            is_clinical=self.intents.is_clinical,
-            rejected_reason=self.intents.reason,
-            total_candidates=len(candidates),
-            final_candidates=candidates,
-            timestamp=self.timestamp).model_dump()
-
-    def to_nature_breakdown(self):
-        return Format_NatureBreakdown(
-            is_clinical=self.intents.is_clinical,
-            reason=self.intents.reason,
-            original_query=self.intents.original_query,
-            total_intents_detected=self.intents.total_intents_detected,
-            intents=[IntentWithoutQueries(
-                intent_title=i.intent_title, description=i.description,
-                nature=i.nature, sub_natures=i.sub_natures)
-                for i in self.intents.intents],
-            timestamp=self.timestamp).model_dump()
-
-    def to_full_pipeline(self):
-        return Format_FullPipeline(
-            is_clinical=self.intents.is_clinical,
-            reason=self.intents.reason,
-            original_query=self.original_query,
-            expanded_query=self.expansion.expanded_query,
-            total_intents_detected=self.intents.total_intents_detected,
-            intents=[IntentWithContext(
-                intent_title=i.intent_title, description=i.description,
-                nature=i.nature, sub_natures=i.sub_natures,
-                final_candidates=[c for sn in i.sub_natures
-                                  for c in sn.atomic_concepts],
-                retrieval_context=self._build_intent_ctx(i.intent_title))
-                for i in self.intents.intents],
-            timestamp=self.timestamp).model_dump()
-
-    def to_all_formats(self):
-        return {
-            "intent_extraction": self.to_intent_extraction(),
-            "final_queries": self.to_final_queries(),
-            "nature_breakdown": self.to_nature_breakdown(),
-            "full_pipeline": self.to_full_pipeline(),
-        }
-
-
-# =====================================================================
-#  PIPELINE
-# =====================================================================
-
-class ContextualIntentPipeline:
-
-    def __init__(self, project, location="us-central1",
-                 model="gemini-2.5-flash"):
-        self.client = genai.Client(
-            vertexai=True, project=project, location=location)
-        self.model_name = model
-
-    def _call(self, prompt, schema, fallback=None, max_tokens=8192):
-        for attempt in range(2):
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0, top_p=0.2, seed=34,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=schema)
-                resp = self.client.models.generate_content(
-                    model=self.model_name, contents=prompt, config=config)
-                text = (resp.text if hasattr(resp, 'text') and resp.text
-                        else resp.candidates[0].content.parts[0].text)
-                if not text or not text.strip():
-                    raise ValueError("Empty LLM response")
-                text = re.sub(r'^```(?:json)?\s*', '',
-                              text.strip()).rstrip('`').strip()
-                return schema.model_validate(json.loads(text))
-            except Exception as e:
-                if attempt == 0:
-                    print(f"  Retry: {str(e)[:100]}")
-                    continue
-                print(f"  Failed: {str(e)[:150]}")
-                if fallback is not None:
-                    return fallback
-                raise
-        return fallback
-
-    def extract(self, query, verbose=False):
-        if not query or not query.strip():
-            raise ValueError("Empty query")
-        start = datetime.now(timezone.utc)
-
-        expansion = self._call(
-            QUERY_EXPANSION_PROMPT.format(query=query),
-            QueryExpansionOutput,
-            fallback=QueryExpansionOutput(expanded_query=query),
-            max_tokens=2048)
-
-        intents = self._call(
-            INTENT_EXTRACTION_PROMPT.format(
-                expanded_query=expansion.expanded_query,
-                timestamp=datetime.now(timezone.utc).isoformat()),
-            IntentExtractionResponse,
-            fallback=IntentExtractionResponse(
-                is_clinical=False, reason="LLM call failed"),
-            max_tokens=8192)
-        intent_out = IntentExtractionOutput(
-            is_clinical=intents.is_clinical, reason=intents.reason,
-            original_query=query, expanded_query=expansion.expanded_query,
-            total_intents_detected=len(intents.intents),
-            intents=intents.intents)
-
-        context = None
-        if intent_out.is_clinical and intent_out.intents:
-            concepts, seen = [], set()
-            for i in intent_out.intents:
-                for sn in i.sub_natures:
-                    for c in sn.atomic_concepts:
-                        k = c.strip().lower()
-                        if k and k not in seen:
-                            concepts.append({"atomic_concept": c.strip(),
-                                             "intent_title": i.intent_title})
-                            seen.add(k)
-            if concepts:
-                context = self._call(
-                    CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                        original_query=query,
-                        expanded_query=expansion.expanded_query,
-                        concepts_json=json.dumps(concepts, indent=2),
-                        concept_count=len(concepts)),
-                    ContextualEnvironmentOutput,
-                    fallback=ContextualEnvironmentOutput(),
-                    max_tokens=32768)
-                covered = {cc.atomic_concept.strip().lower()
-                           for cc in context.concepts_with_context
-                           if cc.temporal_phases}
-                missing = [c for c in concepts
-                           if c["atomic_concept"].strip().lower()
-                           not in covered]
-                if missing:
-                    print(f"  Retrying {len(missing)} missing concepts...")
-                    retry = self._call(
-                        CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                            original_query=query,
-                            expanded_query=expansion.expanded_query,
-                            concepts_json=json.dumps(missing, indent=2),
-                            concept_count=len(missing)),
-                        ContextualEnvironmentOutput,
-                        fallback=ContextualEnvironmentOutput(),
-                        max_tokens=32768)
-                    context.concepts_with_context.extend(
-                        retry.concepts_with_context)
-
-        elapsed = (datetime.now(timezone.utc) - start).total_seconds()
-        if verbose:
-            nc = len(context.concepts_with_context) if context else 0
-            print(f"  {query[:60]} | {elapsed:.1f}s | "
-                  f"intents={len(intent_out.intents)} contexts={nc}")
-
-        return ExtractionResult(
-            query, expansion, intent_out, context, elapsed)
-
-    def run(self, query, output_format="full_pipeline", verbose=False):
-        try:
-            result = self.extract(query, verbose)
-            return getattr(result, f"to_{output_format}")()
-        except Exception as e:
-            return {"error": str(e), "query": query,
-                    "timestamp": datetime.now(timezone.utc).isoformat()}
-
-
-# =====================================================================
-#  MAIN
-# =====================================================================
-
-def save_json(data, filename):
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
-    print(f"  Saved: {filename}")
-
-
-if __name__ == "__main__":
-    PROJECT_ID = PROJECT_ID
-    LOCATION = LOCATION
-    MODEL_VERSION = MODEL_VERSION
-
-    pipeline = ContextualIntentPipeline(
-        project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION)
-
-    queries = [
-        "HAVE YOU RECEIVED ANY TREATMENT FOR YOUR CANCER?",
-        "sever caugh",
-        "summarize the patient info",
-    ]
-
-    def run_query(args):
-        idx, q = args
-        result = pipeline.extract(q, verbose=True)
-        for name, data in result.to_all_formats().items():
-            save_json(data, f"query{idx}_{name}.json")
-        return {"query": q, "status": "done"}
-
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        list(ex.map(run_query, enumerate(queries, 1)))
