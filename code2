@@ -238,7 +238,7 @@ Every single entry MUST have ALL fields populated. No empty arrays. No exception
 - temporal_scope: MINIMUM 2 values, maximum 4
 - content_signals: MINIMUM 4 values, maximum 6
 - clinical_setting: MINIMUM 2 values, maximum 4
-- context_stories: MINIMUM 5 values, maximum 10
+- context_narrative: REQUIRED, a single natural paragraph (3-6 sentences)
 
 An entry with any empty array is a FAILED entry. Do not return it.
 
@@ -284,19 +284,19 @@ FORMAT REQUIREMENTS
 ====================================================
 Each value must follow: "snake_case_term - direct documentation-focused definition". Definitions must describe record location, workflow context, or documentation behavior — not pathophysiology. atomic_concept and intent_title must exactly match the provided input values. Do not rely on rigid templates or fixed specialty lists. Use adaptive clinical reasoning grounded in real-world documentation patterns.
 ====================================================
-STRUCTURED CONTEXT STORY GENERATION (REQUIRED)
+CONTEXT NARRATIVE (REQUIRED)
 ====================================================
-For each atomic_concept you MUST generate 5-10 structured context stories.
-This field MUST NOT be empty. Every concept gets stories.
-Each story MUST follow this EXACT template:
-"The [document_type] for [atomic_concept] is documented by the [author_role] during [temporal_scope] using [content_signal] in the [clinical_setting]."
+For each atomic_concept you MUST generate a context_narrative field.
+This is a single natural paragraph (3-6 sentences) that tells the documentation lifecycle story of the concept by weaving together ALL the document_types, author_roles, temporal_scope, content_signals, and clinical_settings you generated above.
+
 Rules:
-- Use ONLY the snake_case_term prefix (the part before " - ") from the fields generated above.
-- Do NOT introduce any new terminology not present in the generated fields.
-- Each story must use a DIFFERENT combination of fields.
-- Collectively, stories must cover ALL document_types and ALL author_roles at least once.
-- One sentence per story. Must end with period.
-Return stories under: context_stories: ["sentence1", "sentence2"]
+- Write in natural clinical language, NOT templated sentences.
+- Follow the chronological documentation flow: who captures it first, who evaluates further, who monitors over time, where it escalates.
+- Reference ALL document_types and ALL author_roles at least once in the paragraph.
+- Include content_signals as the specific markers clinicians use.
+- Include clinical_settings as the locations where documentation occurs.
+- Do NOT use bullet points. Write as flowing prose.
+- This field MUST NOT be empty. Every concept gets a narrative.
 ====================================================
 CONCEPTS TO PROCESS ({concept_count} total — return all {concept_count})
 ====================================================
@@ -369,7 +369,7 @@ class ConceptContext(BaseModel):
     temporal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
-    context_stories: List[str] = Field(default_factory=list)
+    context_narrative: str = ""
 
 
 class ContextualEnvironmentOutput(BaseModel):
@@ -386,7 +386,7 @@ class RetrievalContext(BaseModel):
     temporal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
-    context_stories: List[str] = Field(default_factory=list)
+    context_narrative: str = ""
 
 
 class IntentSummaryItem(BaseModel):
@@ -528,14 +528,14 @@ class ExtractionResult:
             temporal_scope=self._clean_list(cc.temporal_scope),
             content_signals=self._clean_list(cc.content_signals),
             clinical_setting=self._clean_list(cc.clinical_setting),
-            context_stories=self._clean_list(cc.context_stories),
+            context_narrative=cc.context_narrative,
         )
 
     def _build_intent_ctx(self, intent_title: str) -> RetrievalContext:
         if not self.context:
             return RetrievalContext()
         doc, auth, temp, sig, sett = set(), set(), set(), set(), set()
-        stories = []
+        narratives = []
         for cc in self.context.concepts_with_context:
             if cc.intent_title == intent_title:
                 doc.update(cc.document_types)
@@ -543,7 +543,8 @@ class ExtractionResult:
                 temp.update(cc.temporal_scope)
                 sig.update(cc.content_signals)
                 sett.update(cc.clinical_setting)
-                stories.extend(cc.context_stories)
+                if cc.context_narrative:
+                    narratives.append(cc.context_narrative)
         if not any([doc, auth, temp, sig, sett]):
             return RetrievalContext()
         return RetrievalContext(
@@ -552,7 +553,7 @@ class ExtractionResult:
             temporal_scope=self._clean_list(sorted(temp)),
             content_signals=self._clean_list(sorted(sig)),
             clinical_setting=self._clean_list(sorted(sett)),
-            context_stories=self._clean_list(stories),
+            context_narrative=" ".join(narratives),
         )
 
     def _match_concept(self, query: str, concepts: List[str]) -> str:
