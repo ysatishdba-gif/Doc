@@ -233,8 +233,7 @@ Timestamp: {timestamp}
 
 # =====================================================================
 #  PROMPT 3 - Contextual Environment (Step 3)
-#  Clinical reasoning only. No JSON examples, no format specs.
-#  Schema enforces structure. Prompt guides thinking.
+#  Clinical reasoning only. Schema enforces structure.
 # =====================================================================
 
 CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. Your task is to determine where each clinical concept most realistically lives within a medical record ecosystem. You are NOT explaining the medical concept itself. You ARE mapping its full documentation footprint across real-world clinical workflow. Each concept must be evaluated independently. Even closely related concepts may reside in different documentation environments.
@@ -300,7 +299,7 @@ Concepts: {concepts_json}"""
 
 
 # =====================================================================
-#  LLM SCHEMAS -- what Gemini returns
+#  LLM SCHEMAS — internal, never exposed in output
 # =====================================================================
 
 class QueryExpansionOutput(BaseModel):
@@ -354,8 +353,8 @@ class IntentExtractionOutput(BaseModel):
 
 
 class TemporalPhase(BaseModel):
-    """One phase of the documentation lifecycle.
-    All fields grouped by WHEN they co-occur in clinical workflow."""
+    """Internal LLM schema — never exposed in output.
+    Groups fields by WHEN they co-occur in clinical workflow."""
     phase_name: str
     document_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
@@ -364,7 +363,7 @@ class TemporalPhase(BaseModel):
 
 
 class ConceptContext(BaseModel):
-    """Phase-grouped documentation footprint. Sentences built in code."""
+    """Internal LLM schema — phase-grouped documentation footprint."""
     atomic_concept: str
     intent_title: str = ""
     temporal_phases: List[TemporalPhase] = Field(default_factory=list)
@@ -375,16 +374,19 @@ class ContextualEnvironmentOutput(BaseModel):
 
 
 # =====================================================================
-#  OUTPUT SCHEMAS
+#  OUTPUT SCHEMAS — what downstream consumers see
 # =====================================================================
 
 class RetrievalContext(BaseModel):
-    """Each context_sentence = one phase = one embedding unit.
-    Entity name in every sentence. No pronouns.
-    No temporal scaffolding. Domain terms only.
-    temporal_phases preserved for programmatic filtering."""
+    """Same 5 flat fields as before + context_sentences for topic modeling.
+    Flat fields flattened from internal phase-grouped structure.
+    Sentences built in code — one per phase, self-contained, domain-only."""
+    document_types: List[str] = Field(default_factory=list)
+    author_roles: List[str] = Field(default_factory=list)
+    temporal_scope: List[str] = Field(default_factory=list)
+    content_signals: List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
     context_sentences: List[str] = Field(default_factory=list)
-    temporal_phases: List[TemporalPhase] = Field(default_factory=list)
 
 
 class IntentSummaryItem(BaseModel):
@@ -467,11 +469,11 @@ class ExtractionResult:
         self.processing_time = processing_time
         self.timestamp = datetime.now(timezone.utc).isoformat()
 
-    # ---- cleaning helpers ----
+    # ---- cleaning ----
 
     @staticmethod
     def _clean_val(v):
-        """Clean a single value: remove underscores in the prefix."""
+        """Clean underscores in prefix of 'snake_case_term - description'."""
         if " - " in v:
             key, desc = v.split(" - ", 1)
             return key.replace("_", " ") + " - " + desc
@@ -479,7 +481,6 @@ class ExtractionResult:
 
     @staticmethod
     def _clean_list(vals):
-        """Clean underscores in a list of values."""
         return [ExtractionResult._clean_val(v) for v in vals]
 
     @staticmethod
@@ -494,10 +495,64 @@ class ExtractionResult:
             content_signals=cl(phase.content_signals),
             clinical_settings=cl(phase.clinical_settings))
 
+    # ---- phase validation ----
+
     @staticmethod
-    def _dedup_phases(phases_list):
-        """Deduplicate phases by phase_name prefix across multiple concepts.
-        Merges fields from phases with the same temporal stage."""
+    def _phase_is_valid(phase):
+        """A phase is valid if it has at least document_types AND author_roles.
+        content_signals and clinical_settings are desirable but not blocking.
+        This prevents blanking entire concepts because one optional field
+        is missing in one phase."""
+        return bool(phase.document_types and phase.author_roles)
+
+    # ---- flattening: phases -> flat lists (deduped by prefix) ----
+
+    @staticmethod
+    def _flatten_phases(phases):
+        """Extract deduplicated flat lists from phase-grouped structure.
+        Each phase contributes to all 5 flat fields.
+        phase_name -> temporal_scope."""
+        docs, auths, temps, sigs, setts = [], [], [], [], []
+        seen_d, seen_a, seen_t, seen_s, seen_se = set(), set(), set(), set(), set()
+
+        for phase in phases:
+            pk = phase.phase_name.split(" - ", 1)[0].strip().lower()
+            if pk and pk not in seen_t:
+                temps.append(phase.phase_name)
+                seen_t.add(pk)
+
+            for d in phase.document_types:
+                dk = d.split(" - ", 1)[0].strip().lower()
+                if dk not in seen_d:
+                    docs.append(d)
+                    seen_d.add(dk)
+
+            for a in phase.author_roles:
+                ak = a.split(" - ", 1)[0].strip().lower()
+                if ak not in seen_a:
+                    auths.append(a)
+                    seen_a.add(ak)
+
+            for s in phase.content_signals:
+                sk = s.split(" - ", 1)[0].strip().lower()
+                if sk not in seen_s:
+                    sigs.append(s)
+                    seen_s.add(sk)
+
+            for se in phase.clinical_settings:
+                sek = se.split(" - ", 1)[0].strip().lower()
+                if sek not in seen_se:
+                    setts.append(se)
+                    seen_se.add(sek)
+
+        return docs, auths, temps, sigs, setts
+
+    # ---- merge phases for intent-level context ----
+
+    @staticmethod
+    def _merge_phases(phases_list):
+        """Merge phases with the same name across multiple concepts.
+        Deduplicates fields within each merged phase by prefix."""
         merged = {}
         for phase in phases_list:
             key = phase.phase_name.split(" - ", 1)[0].strip().lower()
@@ -510,12 +565,12 @@ class ExtractionResult:
                     clinical_settings=list(phase.clinical_settings))
             else:
                 existing = merged[key]
-                for field_name in ['document_types', 'author_roles',
-                                   'content_signals', 'clinical_settings']:
-                    existing_vals = getattr(existing, field_name)
+                for field in ['document_types', 'author_roles',
+                              'content_signals', 'clinical_settings']:
+                    existing_vals = getattr(existing, field)
                     seen = {v.split(" - ", 1)[0].strip().lower()
                             for v in existing_vals}
-                    for v in getattr(phase, field_name):
+                    for v in getattr(phase, field):
                         pfx = v.split(" - ", 1)[0].strip().lower()
                         if pfx not in seen:
                             existing_vals.append(v)
@@ -537,19 +592,14 @@ class ExtractionResult:
 
     @staticmethod
     def _build_sentences(concept_name, phases):
-        """Build one sentence per phase for topic modeling.
-
-        Each sentence is:
+        """One sentence per valid phase. Each sentence is:
         - Self-contained: entity name repeated, no pronouns
         - Domain-specific: no temporal scaffolding words
         - Embedding-ready: one sentence = one vector = one cluster vote
 
         Format: "{entity}, documented in {docs}, by {authors},
                  at {settings}, capturing {signals}."
-
-        No 'first documented', 'subsequently tracked', 'over time'.
-        These workflow words are identical across all concepts and
-        dilute domain signal in vector space."""
+        """
         if not phases:
             return []
 
@@ -592,7 +642,6 @@ class ExtractionResult:
     # ---- context lookup (3-pass) ----
 
     def _find_context(self, atomic_concept):
-        """3-pass: exact -> substring guarded -> word overlap."""
         if not self.context:
             return None
         key = atomic_concept.strip().lower()
@@ -622,34 +671,53 @@ class ExtractionResult:
     # ---- context builders ----
 
     def _build_ctx(self, atomic_concept):
-        """Build RetrievalContext for a single atomic concept."""
+        """Build RetrievalContext for a single atomic concept.
+        1. Clean phases
+        2. Filter to valid phases only
+        3. Flatten into 5 flat lists
+        4. Build sentences
+        Output has both flat fields AND sentences."""
         cc = self._find_context(atomic_concept)
-        if not cc:
+        if not cc or not cc.temporal_phases:
             return RetrievalContext()
-        cleaned = [self._clean_phase(p) for p in cc.temporal_phases]
+        cleaned = [self._clean_phase(p) for p in cc.temporal_phases
+                   if self._phase_is_valid(p)]
+        if not cleaned:
+            return RetrievalContext()
+        docs, auths, temps, sigs, setts = self._flatten_phases(cleaned)
         sentences = self._build_sentences(atomic_concept, cleaned)
         return RetrievalContext(
-            context_sentences=sentences,
-            temporal_phases=cleaned)
+            document_types=docs,
+            author_roles=auths,
+            temporal_scope=temps,
+            content_signals=sigs,
+            clinical_setting=setts,
+            context_sentences=sentences)
 
     def _build_intent_ctx(self, intent_title):
         """Build merged RetrievalContext across all concepts in an intent.
-        Deduplicates phases by name, merges fields within same phase."""
+        Merges phases with same name, deduplicates fields, then flattens."""
         if not self.context:
             return RetrievalContext()
         all_phases = []
         title_key = intent_title.strip().lower()
         for cc in self.context.concepts_with_context:
             if cc.intent_title.strip().lower() == title_key:
-                all_phases.extend(cc.temporal_phases)
+                for p in cc.temporal_phases:
+                    if self._phase_is_valid(p):
+                        all_phases.append(self._clean_phase(p))
         if not all_phases:
             return RetrievalContext()
-        cleaned = [self._clean_phase(p) for p in all_phases]
-        deduped = self._dedup_phases(cleaned)
-        sentences = self._build_sentences(intent_title, deduped)
+        merged = self._merge_phases(all_phases)
+        docs, auths, temps, sigs, setts = self._flatten_phases(merged)
+        sentences = self._build_sentences(intent_title, merged)
         return RetrievalContext(
-            context_sentences=sentences,
-            temporal_phases=deduped)
+            document_types=docs,
+            author_roles=auths,
+            temporal_scope=temps,
+            content_signals=sigs,
+            clinical_setting=setts,
+            context_sentences=sentences)
 
     # ---- 4 output builders ----
 
@@ -664,8 +732,7 @@ class ExtractionResult:
             timestamp=self.timestamp).model_dump()
 
     def to_final_queries(self):
-        """atomic_concepts iterated directly as candidates.
-        atomic_concept = candidate. No matching layer."""
+        """atomic_concepts as candidates directly. No matching layer."""
         candidates = []
         idx = 0
         seen = set()
@@ -704,7 +771,7 @@ class ExtractionResult:
             timestamp=self.timestamp).model_dump()
 
     def to_full_pipeline(self):
-        """final_candidates populated from atomic_concepts."""
+        """final_candidates from atomic_concepts."""
         return Format_FullPipeline(
             is_clinical=self.intents.is_clinical,
             reason=self.intents.reason,
@@ -730,7 +797,7 @@ class ExtractionResult:
 
 
 # =====================================================================
-#  PIPELINE -- 3 LLM calls per query
+#  PIPELINE — 3 LLM calls per query
 # =====================================================================
 
 class ContextualIntentPipeline:
@@ -804,7 +871,7 @@ class ContextualIntentPipeline:
             total_intents_detected=len(response.intents),
             intents=response.intents)
 
-    # -- Step 3: Context (phase-grouped) --
+    # -- Step 3: Context (phase-grouped internally) --
 
     @staticmethod
     def _prepare_context_input(intents):
@@ -821,12 +888,11 @@ class ContextualIntentPipeline:
 
     @staticmethod
     def _has_content(cc):
-        """At least one phase with all fields populated."""
+        """At least one phase with docs + authors (minimum viable)."""
         if not cc.temporal_phases:
             return False
         for phase in cc.temporal_phases:
-            if (phase.document_types and phase.author_roles
-                    and phase.content_signals and phase.clinical_settings):
+            if phase.document_types and phase.author_roles:
                 return True
         return False
 
