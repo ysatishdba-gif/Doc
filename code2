@@ -238,7 +238,7 @@ Every single entry MUST have ALL fields populated. No empty arrays. No exception
 - temporal_scope: MINIMUM 2 values, maximum 4
 - content_signals: MINIMUM 4 values, maximum 6
 - clinical_setting: MINIMUM 2 values, maximum 4
-- context_narrative: REQUIRED, a single natural paragraph (3-6 sentences)
+- context_narrative: REQUIRED, exactly 2-3 concise sentences
 
 An entry with any empty array is a FAILED entry. Do not return it.
 
@@ -287,15 +287,16 @@ Each value must follow: "snake_case_term - direct documentation-focused definiti
 CONTEXT NARRATIVE (REQUIRED)
 ====================================================
 For each atomic_concept you MUST generate a context_narrative field.
-This is a single natural paragraph (3-6 sentences) that tells the documentation lifecycle story of the concept by weaving together ALL the document_types, author_roles, temporal_scope, content_signals, and clinical_settings you generated above.
+This is a concise paragraph of exactly 2-3 sentences that maps the documentation trail of the concept.
 
 Rules:
-- Write in natural clinical language, NOT templated sentences.
-- Follow the chronological documentation flow: who captures it first, who evaluates further, who monitors over time, where it escalates.
-- Reference ALL document_types and ALL author_roles at least once in the paragraph.
-- Include content_signals as the specific markers clinicians use.
-- Include clinical_settings as the locations where documentation occurs.
-- Do NOT use bullet points. Write as flowing prose.
+- Write in concise clinical documentation style. NOT an essay, NOT a story, NOT flowing prose.
+- When referencing fields in the narrative, use their natural language form (e.g., "primary care physician" not "primary_care_physician", "history of present illness" not "history_of_present_illness").
+- Sentence 1: Who first captures it, in what document, at what setting.
+- Sentence 2: Who evaluates or monitors it further, what signals they look for.
+- Sentence 3 (optional): Where it escalates or how it is tracked longitudinally.
+- Reference ALL document_types and ALL author_roles at least once across the sentences.
+- Do NOT pad with background medical knowledge. Only describe the documentation trail.
 - This field MUST NOT be empty. Every concept gets a narrative.
 ====================================================
 CONCEPTS TO PROCESS ({concept_count} total — return all {concept_count})
@@ -406,7 +407,7 @@ class IntentWithContext(BaseModel):
     description: str
     nature: str
     sub_natures: List[SubNature]
-    final_queries: List[str]
+    final_candidates: List[str]
     retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
 
 
@@ -504,10 +505,14 @@ class ExtractionResult:
         for cc in self.context.concepts_with_context:
             if cc.atomic_concept.strip().lower() == key:
                 return cc
-        for cc in self.context.concepts_with_context:
-            cl = cc.atomic_concept.strip().lower()
-            if cl in key or key in cl:
-                return cc
+        # Pass 2: substring (guarded: both >= 5 chars, shorter >= 50% of longer)
+        if len(key) >= 5:
+            for cc in self.context.concepts_with_context:
+                cl = cc.atomic_concept.strip().lower()
+                if len(cl) >= 5 and (cl in key or key in cl):
+                    ratio = min(len(key), len(cl)) / max(len(key), len(cl))
+                    if ratio >= 0.5:
+                        return cc
         best_score, best_cc = 0.0, None
         for cc in self.context.concepts_with_context:
             score = self._word_overlap(atomic_concept, cc.atomic_concept)
@@ -517,6 +522,14 @@ class ExtractionResult:
         if best_cc and best_score >= 0.5:
             return best_cc
         return None
+
+    @staticmethod
+    def _clean_narrative(text: str) -> str:
+        """Remove snake_case underscores from narrative text."""
+        if not text:
+            return text
+        # Replace underscores between word characters (snake_case → natural)
+        return re.sub(r'(?<=[a-zA-Z])_(?=[a-zA-Z])', ' ', text)
 
     def _build_ctx(self, atomic_concept: str) -> RetrievalContext:
         cc = self._find_context(atomic_concept)
@@ -528,52 +541,45 @@ class ExtractionResult:
             temporal_scope=self._clean_list(cc.temporal_scope),
             content_signals=self._clean_list(cc.content_signals),
             clinical_setting=self._clean_list(cc.clinical_setting),
-            context_narrative=cc.context_narrative,
+            context_narrative=self._clean_narrative(cc.context_narrative),
         )
+
+    @staticmethod
+    def _dedup_by_prefix(vals: List[str]) -> List[str]:
+        """Deduplicate values by their snake_case prefix (before ' - ').
+        Keeps first seen description for each prefix."""
+        seen = {}
+        for v in vals:
+            prefix = v.split(" - ", 1)[0].strip().lower() if " - " in v else v.strip().lower()
+            if prefix not in seen:
+                seen[prefix] = v
+        return sorted(seen.values())
 
     def _build_intent_ctx(self, intent_title: str) -> RetrievalContext:
         if not self.context:
             return RetrievalContext()
-        doc, auth, temp, sig, sett = set(), set(), set(), set(), set()
+        doc, auth, temp, sig, sett = [], [], [], [], []
         narratives = []
+        title_key = intent_title.strip().lower()
         for cc in self.context.concepts_with_context:
-            if cc.intent_title == intent_title:
-                doc.update(cc.document_types)
-                auth.update(cc.author_roles)
-                temp.update(cc.temporal_scope)
-                sig.update(cc.content_signals)
-                sett.update(cc.clinical_setting)
+            if cc.intent_title.strip().lower() == title_key:
+                doc.extend(cc.document_types)
+                auth.extend(cc.author_roles)
+                temp.extend(cc.temporal_scope)
+                sig.extend(cc.content_signals)
+                sett.extend(cc.clinical_setting)
                 if cc.context_narrative:
                     narratives.append(cc.context_narrative)
         if not any([doc, auth, temp, sig, sett]):
             return RetrievalContext()
         return RetrievalContext(
-            document_types=self._clean_list(sorted(doc)),
-            author_roles=self._clean_list(sorted(auth)),
-            temporal_scope=self._clean_list(sorted(temp)),
-            content_signals=self._clean_list(sorted(sig)),
-            clinical_setting=self._clean_list(sorted(sett)),
-            context_narrative=" ".join(narratives),
+            document_types=self._clean_list(self._dedup_by_prefix(doc)),
+            author_roles=self._clean_list(self._dedup_by_prefix(auth)),
+            temporal_scope=self._clean_list(self._dedup_by_prefix(temp)),
+            content_signals=self._clean_list(self._dedup_by_prefix(sig)),
+            clinical_setting=self._clean_list(self._dedup_by_prefix(sett)),
+            context_narrative=self._clean_narrative(" ".join(narratives)),
         )
-
-    def _match_concept(self, query: str, concepts: List[str]) -> str:
-        ql = query.lower().strip()
-        for c in concepts:
-            if c.lower().strip() == ql:
-                return c
-        for c in concepts:
-            cl = c.lower().strip()
-            if cl in ql or ql in cl:
-                return c
-        best_score, best_match = 0.0, None
-        for c in concepts:
-            score = self._word_overlap(query, c)
-            if score > best_score:
-                best_score = score
-                best_match = c
-        if best_match and best_score >= 0.5:
-            return best_match
-        return query
 
     # -- 4 output builders --
 
@@ -590,18 +596,22 @@ class ExtractionResult:
     def to_final_queries(self) -> Dict[str, Any]:
         candidates = []
         idx = 0
+        seen = set()
         for i in self.intents.intents:
-            concepts = [c for sn in i.sub_natures for c in sn.atomic_concepts]
-            for q in i.final_queries:
-                idx += 1
-                matched = self._match_concept(q, concepts)
-                candidates.append(FinalCandidateItem(
-                    candidate_id=f"fc_{idx:03d}",
-                    intent_title=i.intent_title,
-                    atomic_concept=matched,
-                    candidate=q,
-                    retrieval_context=self._build_ctx(matched),
-                ))
+            for sn in i.sub_natures:
+                for concept in sn.atomic_concepts:
+                    key = concept.strip().lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    idx += 1
+                    candidates.append(FinalCandidateItem(
+                        candidate_id=f"fc_{idx:03d}",
+                        intent_title=i.intent_title,
+                        atomic_concept=concept.strip(),
+                        candidate=concept.strip(),
+                        retrieval_context=self._build_ctx(concept),
+                    ))
         return Format_FinalQueries(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
@@ -634,7 +644,8 @@ class ExtractionResult:
             intents=[IntentWithContext(
                 intent_title=i.intent_title, description=i.description,
                 nature=i.nature, sub_natures=i.sub_natures,
-                final_queries=i.final_queries,
+                final_candidates=[c for sn in i.sub_natures
+                                  for c in sn.atomic_concepts],
                 retrieval_context=self._build_intent_ctx(i.intent_title),
             ) for i in self.intents.intents],
             timestamp=self.timestamp,
@@ -669,12 +680,14 @@ class ContextualIntentPipeline:
             text = response.candidates[0].content.parts[0].text
         else:
             text = str(response)
+        if not text or not text.strip():
+            raise ValueError("Empty or blocked LLM response")
         text = re.sub(r'```json\s*', '', text)
         text = re.sub(r'```\s*', '', text).strip()
         return json.loads(text)
 
     def _call_model(self, prompt: str, response_schema: type[BaseModel],
-                    context_query: str = "", max_tokens: int = 8096) -> BaseModel:
+                    context_query: str = "", max_tokens: int = 8192) -> BaseModel:
         try:
             config = types.GenerateContentConfig(
                 temperature=0,
@@ -747,7 +760,8 @@ class ContextualIntentPipeline:
 
     @staticmethod
     def _has_content(cc: ConceptContext) -> bool:
-        return bool(cc.document_types and cc.author_roles and cc.content_signals)
+        return bool(cc.document_types and cc.author_roles and cc.content_signals
+                     and cc.context_narrative)
 
     def generate_context(self, original_query: str, expanded_query: str,
                          intents: List[Intent]) -> ContextualEnvironmentOutput:
@@ -817,7 +831,8 @@ class ContextualIntentPipeline:
             print(f"Query: {query}")
             print(f"Expanded: {expansion.expanded_query}")
             if intents.is_clinical:
-                nq = sum(len(i.final_queries) for i in intents.intents)
+                nq = len({c.strip().lower() for i in intents.intents
+                          for sn in i.sub_natures for c in sn.atomic_concepts})
                 nc = len(context.concepts_with_context) if context else 0
                 print(f"Clinical | Intents: {intents.total_intents_detected} | "
                       f"Candidates: {nq} | Contexts: {nc}")
