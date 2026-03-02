@@ -233,118 +233,66 @@ Timestamp: {timestamp}
 
 # =====================================================================
 #  PROMPT 3 - Contextual Environment (Step 3)
-#  Returns PHASE-GROUPED structured fields.
-#  No narrative -- sentences built in code.
+#  Clinical reasoning only. No JSON examples, no format specs.
+#  Schema enforces structure. Prompt guides thinking.
 # =====================================================================
 
 CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. Your task is to determine where each clinical concept most realistically lives within a medical record ecosystem. You are NOT explaining the medical concept itself. You ARE mapping its full documentation footprint across real-world clinical workflow. Each concept must be evaluated independently. Even closely related concepts may reside in different documentation environments.
 ====================================================
-CRITICAL CONTRACT
+CONTRACT
 ====================================================
 You will receive exactly {concept_count} concepts.
 You MUST return exactly {concept_count} entries in concepts_with_context.
 
-COMPLETENESS IS MANDATORY:
-Every single entry MUST have at least one temporal_phase.
-Every temporal_phase MUST have ALL of these fields populated with at least ONE value:
-- phase_name
-- document_types
-- author_roles
-- content_signals
-- clinical_settings
-
-An entry with zero temporal_phases is a FAILED entry.
-A temporal_phase with any empty field is a FAILED phase. Do not return it.
+Every entry MUST have at least one temporal_phase.
+Every temporal_phase MUST have ALL fields populated with at least one value.
+An entry with zero phases or a phase with any empty field is FAILED.
 
 Return each atomic_concept and intent_title EXACTLY as provided in the input.
-Do not rephrase, expand, abbreviate, or modify them in any way.
+Do not rephrase, expand, abbreviate, or modify them.
+====================================================
+REASONING TASK
+====================================================
+For each concept, map its documentation lifecycle as a sequence of temporal phases ordered chronologically.
 
-HANDLING GENERIC CONCEPTS:
-Every clinical concept -- no matter how broad -- appears somewhere in documentation.
-If a concept seems generic (e.g., "cough pattern", "dyspnea", "bronchitis"), ask:
-- Where would a clinician FIRST write this down?
-- Who would write it?
-- When in the care timeline?
-Reason from clinical workflow, not from concept complexity.
+Each phase represents a DISTINCT STAGE in clinical workflow where this concept gets documented. For each phase, determine:
+- WHEN in the care timeline does this stage occur?
+- WHAT documents are generated at this stage?
+- WHO writes about this concept at this stage?
+- WHAT documentation markers indicate this concept at this stage?
+- WHERE does this stage take place?
 
-DO NOT leave any field empty because you are uncertain. Reason through it.
+Group fields by WHEN they occur together. A single phase can have multiple authors, multiple document types, multiple settings, and multiple signals when they co-occur at the same clinical stage.
+
+The same author, setting, or document type CAN appear in multiple phases when clinically realistic.
 ====================================================
-CORE OBJECTIVE
+CLINICAL REASONING
 ====================================================
-For each concept, identify how it propagates through care delivery. Consider where it is first recorded, where it is evaluated, where it may be escalated, where it is monitored over time, and where related downstream effects may appear. Think in terms of documentation flow, not disease description.
-====================================================
-EXPANSIVE CLINICAL REASONING
-====================================================
-Treat the concept as an atomic clinical signal and reason outward dynamically. Ask:
-- Who would reasonably encounter this first?
-- Who would evaluate it further?
-- Who might be consulted if severity increases or diagnosis is unclear?
-- What other body systems could plausibly be involved?
-- What other conditions could produce or resemble it?
-- Could it appear as a complication, side effect, or secondary manifestation?
+For each concept, reason outward from the clinical signal:
+- Who encounters this first? In what document? At what setting?
+- Who evaluates it further? What additional documents are generated?
+- If severity increases, who gets consulted? Where does care escalate?
+- How is it monitored longitudinally? Where does it get summarized?
 - Could it transition across care settings depending on severity?
-Expand across clinically plausible pathways without restricting yourself to a predefined set of systems or specialties. Avoid artificial narrowing, but also avoid speculative extremes that lack realistic documentation presence.
+
+Every clinical concept -- no matter how broad -- appears somewhere in documentation. If uncertain, reason from clinical workflow: where would a clinician FIRST write this down?
 ====================================================
-PHASE-GROUPED DOCUMENTATION FOOTPRINT
+COVERAGE
 ====================================================
-For each concept, return a list of temporal_phases ordered chronologically.
-Each phase represents a DISTINCT STAGE in the documentation lifecycle.
-
-PHASE GROUPING PRINCIPLE:
-Group fields by WHEN they occur together in clinical workflow.
-For each phase ask: "During this specific timing window, WHO writes WHAT in WHICH document at WHICH setting about WHAT signals?"
-
-Each temporal_phase MUST contain:
-
-phase_name (REQUIRED): "snake_case_term - documentation-focused description of this timing window"
-
-document_types (REQUIRED, at least 1): Document types where this concept is captured during THIS specific phase. Include every document type that would realistically contain this concept at this stage. One phase can involve multiple document types when multiple documents are generated simultaneously (e.g., both an emergency physician note and an ECG report during acute evaluation).
-
-author_roles (REQUIRED, at least 1): Clinicians who document this concept during THIS specific phase. Include every author who would realistically write about this concept at this stage. One phase can involve multiple authors when multiple clinicians are active simultaneously (e.g., both the emergency physician and cardiologist during acute evaluation).
-
-content_signals (REQUIRED, at least 1): Documentation markers present during THIS specific phase. These are the clinical terms, measurements, assessment language, and documentation patterns a retrieval system would need to find this concept at this stage.
-
-clinical_settings (REQUIRED, at least 1): Care environments where THIS specific phase occurs. Include every setting where this phase could realistically take place. One phase can occur in multiple settings when the same clinical activity happens across different locations (e.g., initial triage at emergency department or urgent care).
-
-COVERAGE PRINCIPLE:
 Let clinical reality guide the count at every level.
 - A simple concept may have 2 phases; a complex one may have 4+.
-- A phase may involve 1 author or 5 authors.
-- A phase may occur in 1 setting or 3 settings.
-Do NOT pad with hallucinated values. Do NOT truncate realistic values.
-
-EXAMPLE for "chest pain":
-Phase 1 - initial_triage:
-  document_types: [emergency_triage_note, urgent_care_intake_form]
-  author_roles: [triage_nurse]
-  content_signals: [pain_severity_scale, onset_characterization]
-  clinical_settings: [emergency_department, urgent_care]
-
-Phase 2 - acute_evaluation:
-  document_types: [emergency_physician_note, ecg_report, chest_imaging_report]
-  author_roles: [emergency_physician, cardiologist]
-  content_signals: [troponin_level, ecg_findings, imaging_correlation]
-  clinical_settings: [emergency_department]
-
-Phase 3 - follow_up_monitoring:
-  document_types: [cardiology_consultation, stress_test_report]
-  author_roles: [cardiologist, primary_care_physician]
-  content_signals: [exercise_tolerance, risk_stratification]
-  clinical_settings: [outpatient_cardiology_clinic, primary_care_office]
-
-Notice: triage_nurse is at emergency_department and urgent_care (both realistic for triage).
-Cardiologist appears in phase 2 AND phase 3 (realistic -- same specialist, different stages).
-Emergency_department appears in phase 1 AND phase 2 (realistic -- same location, different activities).
+- A phase may involve 1 author or 5 authors, 1 setting or 3 settings.
+- Do NOT pad with hallucinated values to reach any target count.
+- Do NOT truncate realistic values to stay under any cap.
 ====================================================
-FORMAT REQUIREMENTS
+VALUE FORMAT
 ====================================================
-Each value in document_types, author_roles, content_signals, and clinical_settings must follow: "snake_case_term - direct documentation-focused definition". Definitions must describe record location, workflow context, or documentation behavior -- not pathophysiology.
+Every value in document_types, author_roles, content_signals, clinical_settings, and phase_name must follow this format:
+"snake_case_term - documentation-focused definition"
 
-phase_name must follow the same format: "snake_case_term - documentation-focused description".
-
-atomic_concept and intent_title must exactly match the provided input values. Do not rephrase, expand, abbreviate, or modify them in any way.
+The definition must describe record location, workflow context, or documentation behavior. Not pathophysiology.
 ====================================================
-CONCEPTS TO PROCESS ({concept_count} total -- return all {concept_count})
+CONCEPTS ({concept_count} total)
 ====================================================
 Original query: {original_query}
 Expanded query: {expanded_query}
@@ -407,7 +355,7 @@ class IntentExtractionOutput(BaseModel):
 
 class TemporalPhase(BaseModel):
     """One phase of the documentation lifecycle.
-    All fields grouped by WHEN they occur together."""
+    All fields grouped by WHEN they co-occur in clinical workflow."""
     phase_name: str
     document_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
@@ -416,7 +364,7 @@ class TemporalPhase(BaseModel):
 
 
 class ConceptContext(BaseModel):
-    """LLM returns phase-grouped fields. Sentences built in code."""
+    """Phase-grouped documentation footprint. Sentences built in code."""
     atomic_concept: str
     intent_title: str = ""
     temporal_phases: List[TemporalPhase] = Field(default_factory=list)
@@ -431,10 +379,9 @@ class ContextualEnvironmentOutput(BaseModel):
 # =====================================================================
 
 class RetrievalContext(BaseModel):
-    """Each context_sentence is one phase -- self-contained, embedding-ready.
-    Entity name repeated in every sentence (no pronouns).
-    No temporal scaffolding (no 'first documented', 'subsequently').
-    Only domain-specific clinical terms for clean topic modeling signal.
+    """Each context_sentence = one phase = one embedding unit.
+    Entity name in every sentence. No pronouns.
+    No temporal scaffolding. Domain terms only.
     temporal_phases preserved for programmatic filtering."""
     context_sentences: List[str] = Field(default_factory=list)
     temporal_phases: List[TemporalPhase] = Field(default_factory=list)
@@ -523,33 +470,34 @@ class ExtractionResult:
     # ---- cleaning helpers ----
 
     @staticmethod
+    def _clean_val(v):
+        """Clean a single value: remove underscores in the prefix."""
+        if " - " in v:
+            key, desc = v.split(" - ", 1)
+            return key.replace("_", " ") + " - " + desc
+        return v.replace("_", " ")
+
+    @staticmethod
     def _clean_list(vals):
-        """Remove underscores between words in context values."""
-        cleaned = []
-        for v in vals:
-            if " - " in v:
-                key, desc = v.split(" - ", 1)
-                cleaned.append(key.replace("_", " ") + " - " + desc)
-            else:
-                cleaned.append(v.replace("_", " "))
-        return cleaned
+        """Clean underscores in a list of values."""
+        return [ExtractionResult._clean_val(v) for v in vals]
 
     @staticmethod
     def _clean_phase(phase):
         """Clean underscores in all fields of a TemporalPhase."""
-        clean = ExtractionResult._clean_list
+        cl = ExtractionResult._clean_list
+        cv = ExtractionResult._clean_val
         return TemporalPhase(
-            phase_name=phase.phase_name.replace("_", " ") if " - " not in phase.phase_name
-                else phase.phase_name.split(" - ", 1)[0].replace("_", " ") + " - " + phase.phase_name.split(" - ", 1)[1],
-            document_types=clean(phase.document_types),
-            author_roles=clean(phase.author_roles),
-            content_signals=clean(phase.content_signals),
-            clinical_settings=clean(phase.clinical_settings))
+            phase_name=cv(phase.phase_name),
+            document_types=cl(phase.document_types),
+            author_roles=cl(phase.author_roles),
+            content_signals=cl(phase.content_signals),
+            clinical_settings=cl(phase.clinical_settings))
 
     @staticmethod
     def _dedup_phases(phases_list):
         """Deduplicate phases by phase_name prefix across multiple concepts.
-        Merges fields from phases with the same name."""
+        Merges fields from phases with the same temporal stage."""
         merged = {}
         for phase in phases_list:
             key = phase.phase_name.split(" - ", 1)[0].strip().lower()
@@ -562,30 +510,16 @@ class ExtractionResult:
                     clinical_settings=list(phase.clinical_settings))
             else:
                 existing = merged[key]
-                seen_docs = {d.split(" - ", 1)[0].strip().lower()
-                             for d in existing.document_types}
-                for d in phase.document_types:
-                    if d.split(" - ", 1)[0].strip().lower() not in seen_docs:
-                        existing.document_types.append(d)
-                        seen_docs.add(d.split(" - ", 1)[0].strip().lower())
-                seen_auths = {a.split(" - ", 1)[0].strip().lower()
-                              for a in existing.author_roles}
-                for a in phase.author_roles:
-                    if a.split(" - ", 1)[0].strip().lower() not in seen_auths:
-                        existing.author_roles.append(a)
-                        seen_auths.add(a.split(" - ", 1)[0].strip().lower())
-                seen_sigs = {s.split(" - ", 1)[0].strip().lower()
-                             for s in existing.content_signals}
-                for s in phase.content_signals:
-                    if s.split(" - ", 1)[0].strip().lower() not in seen_sigs:
-                        existing.content_signals.append(s)
-                        seen_sigs.add(s.split(" - ", 1)[0].strip().lower())
-                seen_setts = {se.split(" - ", 1)[0].strip().lower()
-                              for se in existing.clinical_settings}
-                for se in phase.clinical_settings:
-                    if se.split(" - ", 1)[0].strip().lower() not in seen_setts:
-                        existing.clinical_settings.append(se)
-                        seen_setts.add(se.split(" - ", 1)[0].strip().lower())
+                for field_name in ['document_types', 'author_roles',
+                                   'content_signals', 'clinical_settings']:
+                    existing_vals = getattr(existing, field_name)
+                    seen = {v.split(" - ", 1)[0].strip().lower()
+                            for v in existing_vals}
+                    for v in getattr(phase, field_name):
+                        pfx = v.split(" - ", 1)[0].strip().lower()
+                        if pfx not in seen:
+                            existing_vals.append(v)
+                            seen.add(pfx)
         return list(merged.values())
 
     @staticmethod
@@ -603,22 +537,25 @@ class ExtractionResult:
 
     @staticmethod
     def _build_sentences(concept_name, phases):
-        """Build one sentence per phase. Each sentence is:
-        - Self-contained (entity name repeated, no pronouns)
-        - Domain-specific only (no temporal scaffolding words)
-        - Embedding-ready for topic modeling
+        """Build one sentence per phase for topic modeling.
+
+        Each sentence is:
+        - Self-contained: entity name repeated, no pronouns
+        - Domain-specific: no temporal scaffolding words
+        - Embedding-ready: one sentence = one vector = one cluster vote
+
+        Format: "{entity}, documented in {docs}, by {authors},
+                 at {settings}, capturing {signals}."
 
         No 'first documented', 'subsequently tracked', 'over time'.
         These workflow words are identical across all concepts and
-        dilute domain signal in vector space.
-
-        Each sentence = one phase = one data point for topic model.
-        Multiple sentences per entity = more data points = better clustering."""
+        dilute domain signal in vector space."""
         if not phases:
             return []
 
         def pfx(v):
-            return v.split(" - ", 1)[0].replace("_", " ") if " - " in v else v.replace("_", " ")
+            return (v.split(" - ", 1)[0].replace("_", " ")
+                    if " - " in v else v.replace("_", " "))
 
         def join_items(items):
             cleaned = [pfx(v) for v in items]
@@ -652,10 +589,10 @@ class ExtractionResult:
 
         return sentences
 
-    # ---- context lookup ----
+    # ---- context lookup (3-pass) ----
 
     def _find_context(self, atomic_concept):
-        """3-pass lookup: exact -> substring guarded -> word overlap."""
+        """3-pass: exact -> substring guarded -> word overlap."""
         if not self.context:
             return None
         key = atomic_concept.strip().lower()
@@ -689,11 +626,11 @@ class ExtractionResult:
         cc = self._find_context(atomic_concept)
         if not cc:
             return RetrievalContext()
-        cleaned_phases = [self._clean_phase(p) for p in cc.temporal_phases]
-        sentences = self._build_sentences(atomic_concept, cleaned_phases)
+        cleaned = [self._clean_phase(p) for p in cc.temporal_phases]
+        sentences = self._build_sentences(atomic_concept, cleaned)
         return RetrievalContext(
             context_sentences=sentences,
-            temporal_phases=cleaned_phases)
+            temporal_phases=cleaned)
 
     def _build_intent_ctx(self, intent_title):
         """Build merged RetrievalContext across all concepts in an intent.
@@ -728,7 +665,7 @@ class ExtractionResult:
 
     def to_final_queries(self):
         """atomic_concepts iterated directly as candidates.
-        atomic_concept = candidate (identical, no matching layer)."""
+        atomic_concept = candidate. No matching layer."""
         candidates = []
         idx = 0
         seen = set()
@@ -867,7 +804,7 @@ class ContextualIntentPipeline:
             total_intents_detected=len(response.intents),
             intents=response.intents)
 
-    # -- Step 3: Context (phase-grouped structured fields) --
+    # -- Step 3: Context (phase-grouped) --
 
     @staticmethod
     def _prepare_context_input(intents):
@@ -884,7 +821,7 @@ class ContextualIntentPipeline:
 
     @staticmethod
     def _has_content(cc):
-        """Validate at least one temporal_phase with all fields populated."""
+        """At least one phase with all fields populated."""
         if not cc.temporal_phases:
             return False
         for phase in cc.temporal_phases:
