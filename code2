@@ -246,8 +246,8 @@ class ContextualEnvironmentOutput(BaseModel):
 # =====================================================================
 
 class LabeledItem(BaseModel):
-    name: str
-    description: str = ""
+    title: str
+    explanation: str = ""
 
 
 class SentenceContext(BaseModel):
@@ -348,15 +348,6 @@ class ExtractionResult:
         self.timestamp = datetime.now(timezone.utc).isoformat()
 
     @staticmethod
-    def _clean(v):
-        if not v:
-            return ""
-        if " - " in v:
-            k, d = v.split(" - ", 1)
-            return k.replace("_", " ") + " - " + d
-        return v.replace("_", " ")
-
-    @staticmethod
     def _pfx(v):
         if not v:
             return ""
@@ -366,12 +357,13 @@ class ExtractionResult:
     @staticmethod
     def _to_labeled(v):
         if not v:
-            return LabeledItem(name="")
-        cleaned = ExtractionResult._clean(v)
-        if " - " in cleaned:
-            name, desc = cleaned.split(" - ", 1)
-            return LabeledItem(name=name.strip(), description=desc.strip())
-        return LabeledItem(name=cleaned.strip())
+            return LabeledItem(title="")
+        if " - " in v:
+            k, d = v.split(" - ", 1)
+            return LabeledItem(
+                title=k.replace("_", " ").strip(),
+                explanation=d.strip())
+        return LabeledItem(title=v.replace("_", " ").strip())
 
     @staticmethod
     def _join(items):
@@ -391,7 +383,7 @@ class ExtractionResult:
             if not v:
                 continue
             item = ExtractionResult._to_labeled(v)
-            k = item.name.strip().lower()
+            k = item.title.strip().lower()
             if k and k not in seen:
                 out.append(item)
                 seen.add(k)
@@ -551,6 +543,8 @@ class ExtractionResult:
 
 class ContextualIntentPipeline:
 
+    BATCH_SIZE = 5
+
     def __init__(self, project, location="us-central1",
                  model="gemini-2.5-flash"):
         self.client = genai.Client(
@@ -576,13 +570,30 @@ class ContextualIntentPipeline:
                 return schema.model_validate(json.loads(text))
             except Exception as e:
                 if attempt == 0:
-                    print(f"  Retry: {str(e)[:100]}")
-                    continue
-                print(f"  Failed: {str(e)[:150]}")
-                if fallback is not None:
-                    return fallback
-                raise
-        return fallback
+                    print(f"  Attempt 1 failed, retrying: {str(e)[:80]}")
+                else:
+                    print(f"  Attempt 2 failed: {str(e)[:80]}")
+        if fallback is not None:
+            return fallback
+        raise ValueError("LLM call failed after 2 attempts")
+
+    def _generate_context_batched(self, query, expanded_query, concepts):
+        """Process concepts in batches to prevent token truncation."""
+        all_results = []
+        for i in range(0, len(concepts), self.BATCH_SIZE):
+            batch = concepts[i:i + self.BATCH_SIZE]
+            result = self._call(
+                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+                    original_query=query,
+                    expanded_query=expanded_query,
+                    concepts_json=json.dumps(batch, indent=2),
+                    concept_count=len(batch)),
+                ContextualEnvironmentOutput,
+                fallback=ContextualEnvironmentOutput(),
+                max_tokens=16384)
+            all_results.extend(result.concepts_with_context)
+        return ContextualEnvironmentOutput(
+            concepts_with_context=all_results)
 
     def extract(self, query, verbose=False):
         if not query or not query.strip():
@@ -621,34 +632,8 @@ class ContextualIntentPipeline:
                                              "intent_title": i.intent_title})
                             seen.add(k)
             if concepts:
-                context = self._call(
-                    CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                        original_query=query,
-                        expanded_query=expansion.expanded_query,
-                        concepts_json=json.dumps(concepts, indent=2),
-                        concept_count=len(concepts)),
-                    ContextualEnvironmentOutput,
-                    fallback=ContextualEnvironmentOutput(),
-                    max_tokens=32768)
-                covered = {cc.atomic_concept.strip().lower()
-                           for cc in context.concepts_with_context
-                           if cc.temporal_phases}
-                missing = [c for c in concepts
-                           if c["atomic_concept"].strip().lower()
-                           not in covered]
-                if missing:
-                    print(f"  Retrying {len(missing)} missing concepts...")
-                    retry = self._call(
-                        CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                            original_query=query,
-                            expanded_query=expansion.expanded_query,
-                            concepts_json=json.dumps(missing, indent=2),
-                            concept_count=len(missing)),
-                        ContextualEnvironmentOutput,
-                        fallback=ContextualEnvironmentOutput(),
-                        max_tokens=32768)
-                    context.concepts_with_context.extend(
-                        retry.concepts_with_context)
+                context = self._generate_context_batched(
+                    query, expansion.expanded_query, concepts)
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         if verbose:
