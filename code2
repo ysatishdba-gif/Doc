@@ -174,7 +174,7 @@ Concepts: {concepts_json}"""
 
 
 # =====================================================================
-#  LLM SCHEMAS — internal only
+#  LLM SCHEMAS — internal only, never exposed in output
 # =====================================================================
 
 class QueryExpansionOutput(BaseModel):
@@ -224,6 +224,7 @@ class IntentExtractionOutput(BaseModel):
 
 
 class TemporalPhase(BaseModel):
+    """Internal LLM schema. Groups co-occurring fields by clinical stage."""
     phase_name: str = ""
     document_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
@@ -232,6 +233,7 @@ class TemporalPhase(BaseModel):
 
 
 class ConceptContext(BaseModel):
+    """Internal LLM schema. Phase-grouped documentation footprint."""
     atomic_concept: str
     intent_title: str = ""
     temporal_phases: List[TemporalPhase] = Field(default_factory=list)
@@ -242,15 +244,18 @@ class ContextualEnvironmentOutput(BaseModel):
 
 
 # =====================================================================
-#  OUTPUT SCHEMAS
+#  OUTPUT SCHEMAS — what downstream consumers see
 # =====================================================================
 
 class LabeledItem(BaseModel):
+    """Structured item with title and explanation for the 5 retrieval fields."""
     title: str
     explanation: str = ""
 
 
 class SentenceContext(BaseModel):
+    """One context sentence with its phase-level retrieval fields.
+    Fields use prefix-only values (no descriptions) for machine readability."""
     sentence: str = ""
     document_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
@@ -259,6 +264,8 @@ class SentenceContext(BaseModel):
 
 
 class RetrievalContext(BaseModel):
+    """5 labeled flat lists for broad filtering + structured sentences
+    for precise retrieval and topic modeling."""
     document_types: List[LabeledItem] = Field(default_factory=list)
     author_roles: List[LabeledItem] = Field(default_factory=list)
     temporal_scope: List[LabeledItem] = Field(default_factory=list)
@@ -347,8 +354,11 @@ class ExtractionResult:
         self.processing_time = processing_time
         self.timestamp = datetime.now(timezone.utc).isoformat()
 
+    # ---- value helpers ----
+
     @staticmethod
     def _pfx(v):
+        """Extract prefix before ' - ', replace underscores with spaces."""
         if not v:
             return ""
         return (v.split(" - ", 1)[0].replace("_", " ")
@@ -356,6 +366,7 @@ class ExtractionResult:
 
     @staticmethod
     def _to_labeled(v):
+        """Convert 'snake_case_term - definition' to LabeledItem."""
         if not v:
             return LabeledItem(title="")
         if " - " in v:
@@ -367,6 +378,7 @@ class ExtractionResult:
 
     @staticmethod
     def _join(items):
+        """Natural language join for sentence building."""
         parts = [ExtractionResult._pfx(v) for v in (items or []) if v]
         if not parts:
             return ""
@@ -378,6 +390,7 @@ class ExtractionResult:
 
     @staticmethod
     def _dedup_labeled(values):
+        """Deduplicate by title, return List[LabeledItem]."""
         seen, out = set(), []
         for v in (values or []):
             if not v:
@@ -389,14 +402,22 @@ class ExtractionResult:
                 seen.add(k)
         return out
 
+    # ---- core builder: phases -> flat lists + sentences ----
+
     @staticmethod
     def _flatten_and_build(concept_name, phases):
+        """Single pass over phases. Produces:
+        - 5 deduped LabeledItem lists (title + explanation)
+        - List of SentenceContext (sentence + prefix-only lists)"""
         docs, auths, temps, sigs, setts = [], [], [], [], []
         sentences = []
 
         for p in (phases or []):
+            # Skip phases missing required fields
             if not p.document_types or not p.author_roles:
                 continue
+
+            # Accumulate raw values for flat lists
             if p.phase_name:
                 temps.append(p.phase_name)
             docs.extend(p.document_types or [])
@@ -404,6 +425,7 @@ class ExtractionResult:
             sigs.extend(p.content_signals or [])
             setts.extend(p.clinical_settings or [])
 
+            # Build sentence from this phase
             d = ExtractionResult._join(p.document_types)
             a = ExtractionResult._join(p.author_roles)
             se = ExtractionResult._join(p.clinical_settings)
@@ -414,6 +436,7 @@ class ExtractionResult:
             if si:
                 parts.append(f"capturing {si}")
 
+            # SentenceContext uses prefix-only values
             sentences.append(SentenceContext(
                 sentence=", ".join(parts) + ".",
                 document_types=[ExtractionResult._pfx(v)
@@ -425,11 +448,14 @@ class ExtractionResult:
                 clinical_setting=[ExtractionResult._pfx(v)
                                   for v in (p.clinical_settings or []) if v]))
 
+        # Flat lists use LabeledItem (title + explanation)
         dl = ExtractionResult._dedup_labeled
-        return (dl(docs), dl(auths), dl(temps),
-                dl(sigs), dl(setts), sentences)
+        return dl(docs), dl(auths), dl(temps), dl(sigs), dl(setts), sentences
+
+    # ---- context lookup ----
 
     def _get_phases(self, atomic_concept):
+        """Find temporal phases for an atomic concept. Exact match."""
         if not self.context or not self.context.concepts_with_context:
             return []
         key = atomic_concept.strip().lower()
@@ -438,7 +464,10 @@ class ExtractionResult:
                 return cc.temporal_phases or []
         return []
 
+    # ---- context builders ----
+
     def _build_ctx(self, concept_name):
+        """Build RetrievalContext for one atomic concept."""
         phases = self._get_phases(concept_name)
         if not phases:
             return RetrievalContext()
@@ -450,6 +479,7 @@ class ExtractionResult:
             clinical_setting=setts, context_sentences=sents)
 
     def _build_intent_ctx(self, intent_title):
+        """Build merged RetrievalContext for all concepts in an intent."""
         if not self.context or not self.context.concepts_with_context:
             return RetrievalContext()
         all_phases = []
@@ -465,6 +495,8 @@ class ExtractionResult:
             document_types=docs, author_roles=auths,
             temporal_scope=temps, content_signals=sigs,
             clinical_setting=setts, context_sentences=sents)
+
+    # ---- output format builders ----
 
     def to_intent_extraction(self):
         return Format_IntentExtraction(
@@ -543,8 +575,6 @@ class ExtractionResult:
 
 class ContextualIntentPipeline:
 
-    BATCH_SIZE = 5
-
     def __init__(self, project, location="us-central1",
                  model="gemini-2.5-flash"):
         self.client = genai.Client(
@@ -552,6 +582,7 @@ class ContextualIntentPipeline:
         self.model_name = model
 
     def _call(self, prompt, schema, fallback=None, max_tokens=8192):
+        """Call Gemini with structured output. Retry once on failure."""
         for attempt in range(2):
             try:
                 config = types.GenerateContentConfig(
@@ -577,35 +608,20 @@ class ContextualIntentPipeline:
             return fallback
         raise ValueError("LLM call failed after 2 attempts")
 
-    def _generate_context_batched(self, query, expanded_query, concepts):
-        """Process concepts in batches to prevent token truncation."""
-        all_results = []
-        for i in range(0, len(concepts), self.BATCH_SIZE):
-            batch = concepts[i:i + self.BATCH_SIZE]
-            result = self._call(
-                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                    original_query=query,
-                    expanded_query=expanded_query,
-                    concepts_json=json.dumps(batch, indent=2),
-                    concept_count=len(batch)),
-                ContextualEnvironmentOutput,
-                fallback=ContextualEnvironmentOutput(),
-                max_tokens=16384)
-            all_results.extend(result.concepts_with_context)
-        return ContextualEnvironmentOutput(
-            concepts_with_context=all_results)
-
     def extract(self, query, verbose=False):
+        """Run the 3-step pipeline: expand -> intents -> context."""
         if not query or not query.strip():
             raise ValueError("Empty query")
         start = datetime.now(timezone.utc)
 
+        # Step 1: Query expansion
         expansion = self._call(
             QUERY_EXPANSION_PROMPT.format(query=query),
             QueryExpansionOutput,
             fallback=QueryExpansionOutput(expanded_query=query),
             max_tokens=2048)
 
+        # Step 2: Intent extraction
         intents = self._call(
             INTENT_EXTRACTION_PROMPT.format(
                 expanded_query=expansion.expanded_query,
@@ -620,6 +636,7 @@ class ContextualIntentPipeline:
             total_intents_detected=len(intents.intents),
             intents=intents.intents)
 
+        # Step 3: Contextual environment (phase-grouped internally)
         context = None
         if intent_out.is_clinical and intent_out.intents:
             concepts, seen = [], set()
@@ -632,8 +649,15 @@ class ContextualIntentPipeline:
                                              "intent_title": i.intent_title})
                             seen.add(k)
             if concepts:
-                context = self._generate_context_batched(
-                    query, expansion.expanded_query, concepts)
+                context = self._call(
+                    CONTEXTUAL_ENVIRONMENT_PROMPT.format(
+                        original_query=query,
+                        expanded_query=expansion.expanded_query,
+                        concepts_json=json.dumps(concepts, indent=2),
+                        concept_count=len(concepts)),
+                    ContextualEnvironmentOutput,
+                    fallback=ContextualEnvironmentOutput(),
+                    max_tokens=32768)
 
         elapsed = (datetime.now(timezone.utc) - start).total_seconds()
         if verbose:
@@ -645,6 +669,7 @@ class ContextualIntentPipeline:
             query, expansion, intent_out, context, elapsed)
 
     def run(self, query, output_format="full_pipeline", verbose=False):
+        """Run pipeline and return specified output format."""
         try:
             result = self.extract(query, verbose)
             return getattr(result, f"to_{output_format}")()
