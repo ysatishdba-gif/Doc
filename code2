@@ -72,12 +72,17 @@ Some information types are inherently connected for safety, understanding, or co
 INTENT GENERATION
 ====================================================
 
-Analyze the expanded query and identify distinct clinical intents. Each intent represents a clinically independent concept that could be documented or understood separately. Generate as many intents as the expanded query contains. Let the content guide the count.
+Analyze the expanded query and identify distinct clinical intents. Each intent represents a clinically independent concept that:
+- Could be documented separately in different areas of the chart
+- Could be retrieved independently
+- Could exist in different sections of the medical record
+
+If two concepts would be documented in separate areas, they are separate intents. Generate as many intents as the expanded query contains. Let the content guide the count.
 
 For each intent provide:
 1. intent_title - What is this about?
 2. description - What does this represent and why does it matter?
-3. nature - Primary informational purpose (Format: [Context] / [Purpose])
+3. nature - Primary informational purpose. Format: [Context Type] / [Purpose Type]. Keep consistent phrasing across outputs.
 4. sub_natures[] - Distinct dimensions of this information
 5. final_queries[] - How would this appear in clinical documents?
 
@@ -85,11 +90,30 @@ For each intent provide:
 SUB_NATURE DECOMPOSITION
 ====================================================
 
+Sub_natures represent meaningful dimensions of the intent, not random splits.
+
+Ask:
+- What different types of information exist for this concept?
+- Would clinicians document these in different ways?
+
 Each sub_nature has:
-- category_path: "Broad >> Specific >> Detail" — the navigation path from general to specific
+- category_path: "Broad >> Specific >> Detail" — the navigation path from general to specific. Each level must add meaningful distinction. Never create shallow paths.
 - atomic_concepts: the specific data points at the end of that path
 
 If multiple pieces of information answer the same type of question, group them in one sub_nature. Build depth in the category_path rather than creating many shallow sub_natures.
+
+====================================================
+ATOMIC CONCEPTS
+====================================================
+
+Atomic concepts must:
+- Be 2-4 words
+- Represent ONE concept
+- Be directly retrievable in EHR text
+- Avoid long descriptive phrasing
+- Avoid combining independent ideas
+
+Keep atomic. Keep reusable.
 
 ====================================================
 FINAL QUERIES
@@ -105,26 +129,42 @@ Characteristics:
 
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query.
 
+====================================================
+BOUNDARIES
+====================================================
+
+Do NOT:
+- Introduce severity not stated in the query
+- Add medications not mentioned
+- Infer diagnoses beyond what is stated or directly implied
+- Broaden scope to related diseases not referenced
+
+Only extract what is explicitly present or clinically inseparable from what is stated.
+
 User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
-CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist mapping where each clinical concept substantively lives within medical records. You are NOT explaining the concept. You ARE mapping its documentation footprint across real-world clinical workflow.
+CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist mapping where each clinical concept substantively lives within medical records. You are NOT explaining the concept. You ARE mapping its documentation footprint across real-world clinical workflow. Each concept must be evaluated independently. Even closely related concepts may reside in different documentation environments.
 
 Return exactly {concept_count} entries. Each entry MUST have at least one temporal_phase with ALL fields populated. Return atomic_concept and intent_title exactly as provided.
 
 For each concept, return temporal phases ordered chronologically. Each phase represents a distinct documentation moment — group what co-occurs: which documents are generated, who writes them, where, and what signals indicate the concept.
 
 For each concept, reason through its complete documentation lifecycle:
-- Where is this concept first recorded? By whom? In what document? At what setting?
+- Who first writes this down? In what document? In what care setting?
 - Who evaluates or acts on it further? What additional documents are generated?
+- Where is it monitored over time?
 - If severity or complexity increases, who gets involved? Where does documentation shift?
-- How is it tracked or summarized over time? Where does longitudinal documentation live?
-- Could it appear across different care settings depending on clinical circumstances?
+- Where is it summarized longitudinally?
 
 A new phase is justified only when the documentation pattern changes — different people, different documents, different settings, or different signals. If nothing changes, it is the same phase. The same author, setting, or document type can appear in multiple phases when clinically realistic.
 
 Include only sources where this concept is substantively documented — where a clinician would find meaningful clinical detail, assessment, or action. Exclude sources where the concept is merely listed, copied, or referenced in passing.
+
+Be specific in all values. Use precise clinical document names, specific clinician roles, and concrete clinical settings. Avoid vague terms.
+
+Do not escalate to emergency or inpatient care unless the concept's severity or clinical context realistically warrants it. Do not add subspecialty consultations without clinical logic connecting them to this concept. When uncertain about the documentation path, default to primary care documentation structure.
 
 All values must follow: "snake_case_term - documentation-focused definition"
 
@@ -205,24 +245,25 @@ class ContextualEnvironmentOutput(BaseModel):
 #  OUTPUT SCHEMAS
 # =====================================================================
 
+class LabeledItem(BaseModel):
+    name: str
+    description: str = ""
+
+
 class SentenceContext(BaseModel):
-    """One sentence with its exact retrieval fields from one phase."""
     sentence: str = ""
     document_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
-    temporal_phase: str = ""
 
 
 class RetrievalContext(BaseModel):
-    """Top-level flat lists = union across all phases for broad filtering.
-    context_sentences = per-phase structured context for precise retrieval."""
-    document_types: List[str] = Field(default_factory=list)
-    author_roles: List[str] = Field(default_factory=list)
-    temporal_scope: List[str] = Field(default_factory=list)
-    content_signals: List[str] = Field(default_factory=list)
-    clinical_setting: List[str] = Field(default_factory=list)
+    document_types: List[LabeledItem] = Field(default_factory=list)
+    author_roles: List[LabeledItem] = Field(default_factory=list)
+    temporal_scope: List[LabeledItem] = Field(default_factory=list)
+    content_signals: List[LabeledItem] = Field(default_factory=list)
+    clinical_setting: List[LabeledItem] = Field(default_factory=list)
     context_sentences: List[SentenceContext] = Field(default_factory=list)
 
 
@@ -323,6 +364,16 @@ class ExtractionResult:
                 if " - " in v else v.replace("_", " "))
 
     @staticmethod
+    def _to_labeled(v):
+        if not v:
+            return LabeledItem(name="")
+        cleaned = ExtractionResult._clean(v)
+        if " - " in cleaned:
+            name, desc = cleaned.split(" - ", 1)
+            return LabeledItem(name=name.strip(), description=desc.strip())
+        return LabeledItem(name=cleaned.strip())
+
+    @staticmethod
     def _join(items):
         parts = [ExtractionResult._pfx(v) for v in (items or []) if v]
         if not parts:
@@ -334,14 +385,15 @@ class ExtractionResult:
         return ", ".join(parts[:-1]) + f", and {parts[-1]}"
 
     @staticmethod
-    def _dedup(values):
+    def _dedup_labeled(values):
         seen, out = set(), []
         for v in (values or []):
             if not v:
                 continue
-            k = v.split(" - ", 1)[0].strip().lower()
+            item = ExtractionResult._to_labeled(v)
+            k = item.name.strip().lower()
             if k and k not in seen:
-                out.append(v)
+                out.append(item)
                 seen.add(k)
         return out
 
@@ -349,7 +401,6 @@ class ExtractionResult:
     def _flatten_and_build(concept_name, phases):
         docs, auths, temps, sigs, setts = [], [], [], [], []
         sentences = []
-        cl = ExtractionResult._clean
 
         for p in (phases or []):
             if not p.document_types or not p.author_roles:
@@ -373,19 +424,18 @@ class ExtractionResult:
 
             sentences.append(SentenceContext(
                 sentence=", ".join(parts) + ".",
-                document_types=[cl(v) for v in p.document_types if v],
-                author_roles=[cl(v) for v in p.author_roles if v],
-                content_signals=[cl(v) for v in (p.content_signals or []) if v],
-                clinical_setting=[cl(v) for v in (p.clinical_settings or []) if v],
-                temporal_phase=cl(p.phase_name) if p.phase_name else ""))
+                document_types=[ExtractionResult._pfx(v)
+                                for v in p.document_types if v],
+                author_roles=[ExtractionResult._pfx(v)
+                              for v in p.author_roles if v],
+                content_signals=[ExtractionResult._pfx(v)
+                                 for v in (p.content_signals or []) if v],
+                clinical_setting=[ExtractionResult._pfx(v)
+                                  for v in (p.clinical_settings or []) if v]))
 
-        dd = ExtractionResult._dedup
-        return (dd([cl(v) for v in docs]),
-                dd([cl(v) for v in auths]),
-                dd([cl(v) for v in temps]),
-                dd([cl(v) for v in sigs]),
-                dd([cl(v) for v in setts]),
-                sentences)
+        dl = ExtractionResult._dedup_labeled
+        return (dl(docs), dl(auths), dl(temps),
+                dl(sigs), dl(setts), sentences)
 
     def _get_phases(self, atomic_concept):
         if not self.context or not self.context.concepts_with_context:
