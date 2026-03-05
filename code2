@@ -1,1 +1,187 @@
-test
+import json
+import hashlib
+import joblib
+import time
+import warnings
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, f1_score, brier_score_loss, confusion_matrix
+
+warnings.filterwarnings("ignore")
+
+SEED = 42
+np.random.seed(SEED)
+
+ROOT = Path(__file__).resolve().parent
+DATA = ROOT / "datasets"
+OUT  = ROOT / "submission"
+OUT.mkdir(parents=True, exist_ok=True)
+
+# --- task 1 ---
+
+df = pd.read_csv(DATA / "patient_readmission.csv")
+
+feature_cols = [
+    "age", "bmi", "systolic_bp", "diastolic_bp", "hba1c",
+    "prior_admissions", "smoker", "sex", "sdoh_index", "notes_length"
+]
+target = "readmitted_30d"
+
+y  = df[target].astype(int)
+Xf = df[["patient_id"] + feature_cols].copy()
+
+X_train, X_test, y_train, y_test = train_test_split(
+    Xf, y, test_size=0.2, random_state=SEED, stratify=y
+)
+
+pre = ColumnTransformer(
+    transformers=[("num", Pipeline([
+        ("imp", SimpleImputer(strategy="median")),
+        ("sc",  StandardScaler()),
+    ]), feature_cols)],
+    remainder="drop"
+)
+
+pipe = Pipeline([
+    ("pre",   pre),
+    ("model", LogisticRegression(max_iter=2000, solver="lbfgs", random_state=SEED)),
+])
+pipe.fit(X_train[feature_cols], y_train)
+
+y_score = pipe.predict_proba(X_test[feature_cols])[:, 1]
+y_pred  = (y_score >= 0.5).astype(int)
+
+print("model trained")
+
+pd.DataFrame({
+    "patient_id": X_test["patient_id"].astype(int).values,
+    "y_true":     y_test.astype(int).values,
+    "y_score":    y_score,
+    "y_pred":     y_pred.astype(int),
+}).sort_values("patient_id").to_csv(OUT / "predictions.csv", index=False)
+
+joblib.dump(pipe, OUT / "model_weights.bin")
+with open(OUT / "model_weights.bin", "rb") as fh:
+    sha = hashlib.sha256(fh.read()).hexdigest()
+
+cm = confusion_matrix(y_test, y_pred).tolist()
+
+metrics = {
+    "roc_auc":          float(roc_auc_score(y_test, y_score)),
+    "f1":               float(f1_score(y_test, y_pred)),
+    "brier":            float(brier_score_loss(y_test, y_score)),
+    "confusion_matrix": cm,
+    "n_train":          int(len(X_train)),
+    "n_test":           int(len(X_test)),
+    "model_sha256":     sha,
+}
+(OUT / "metrics.json").write_text(json.dumps(metrics, indent=2))
+print(f"metrics saved  roc_auc={metrics['roc_auc']:.4f}  f1={metrics['f1']:.4f}")
+
+# --- task 2 ---
+
+smoker = X_test["smoker"].astype(int).values
+yp     = y_pred
+yt     = y_test.astype(int).values
+
+def _rate(mask):
+    return float(yp[mask].mean()) if mask.sum() else 0.0
+
+def _tpr(mask):
+    pos = (yt == 1) & mask
+    return float(yp[pos].mean()) if pos.sum() else 0.0
+
+m0, m1 = smoker == 0, smoker == 1
+
+fairness = {
+    "demographic_parity_diff": abs(_rate(m1) - _rate(m0)),
+    "equal_opportunity_diff":  abs(_tpr(m1)  - _tpr(m0)),
+    "positive_rate_smoker_0":  _rate(m0),
+    "positive_rate_smoker_1":  _rate(m1),
+    "tpr_smoker_0":            _tpr(m0),
+    "tpr_smoker_1":            _tpr(m1),
+}
+(OUT / "fairness.json").write_text(json.dumps(fairness, indent=2))
+print("fairness saved")
+
+# --- task 3 ---
+
+def _psi(base, new, eps=1e-6):
+    q = np.quantile(base, np.linspace(0, 1, 11))
+    q[0], q[-1] = -np.inf, np.inf
+    b = np.histogram(base, bins=q)[0].astype(float)
+    s = np.histogram(new,  bins=q)[0].astype(float)
+    p, r = b / b.sum() + eps, s / s.sum() + eps
+    return float(np.sum((r - p) * np.log(r / p)))
+
+def _kl(ps, pb, eps=1e-9):
+    ps, pb = np.clip(ps, eps, 1-eps), np.clip(pb, eps, 1-eps)
+    return float(ps*np.log(ps/pb) + (1-ps)*np.log((1-ps)/(1-pb)))
+
+base = pd.read_csv(DATA / "patient_readmission.csv")
+shft = pd.read_csv(DATA / "patient_readmission_shifted.csv")
+
+drift = {
+    "psi_age":         _psi(base["age"].values, shft["age"].values),
+    "psi_bmi":         _psi(base["bmi"].values, shft["bmi"].values),
+    "psi_systolic_bp": _psi(base["systolic_bp"].values, shft["systolic_bp"].values),
+    "psi_hba1c":       _psi(
+        base["hba1c"].fillna(base["hba1c"].median()).values,
+        shft["hba1c"].fillna(shft["hba1c"].median()).values,
+    ),
+    "baseline_positive_rate": float(base[target].mean()),
+    "shifted_positive_rate":  float(shft[target].mean()),
+}
+drift["kl_label"] = _kl(drift["shifted_positive_rate"], drift["baseline_positive_rate"])
+
+(OUT / "drift.json").write_text(json.dumps(drift, indent=2))
+print(f"drift saved  psi_age={drift['psi_age']:.4f}  kl={drift['kl_label']:.4f}")
+
+# --- task 4 ---
+
+doc_emb = np.load(DATA / "doc_embeddings.npy").astype("float32")
+qry_emb = np.load(DATA / "query_embeddings.npy").astype("float32")
+
+def _retrieve():
+    return np.argsort(-(qry_emb @ doc_emb.T), axis=1)[:, :3] + 1
+
+top3 = _retrieve()
+
+qa   = pd.read_csv(DATA / "rag_qa.csv")
+gt   = [set(map(int, s.split())) for s in qa["gt_doc_ids"]]
+pred = [set(row.tolist()) for row in top3]
+
+rag_results = {
+    "top3_doc_ids_by_qid": {str(i+1): top3[i].tolist() for i in range(len(top3))},
+    "recall_at_3": float(np.mean([len(pred[i] & gt[i]) / len(gt[i]) for i in range(len(gt))])),
+    "exact_match": float(np.mean([pred[i] == gt[i] for i in range(len(gt))])),
+}
+(OUT / "rag_results.json").write_text(json.dumps(rag_results, indent=2))
+print(f"rag done  recall@3={rag_results['recall_at_3']:.4f}")
+
+# --- task 5 ---
+
+times = []
+for _ in range(100):
+    t0 = time.perf_counter()
+    _retrieve()
+    times.append((time.perf_counter() - t0) * 1000)
+
+t = np.array(times) / len(qry_emb)  # per-query ms for each run
+latency = {
+    "avg_ms_per_query": float(t.mean()),
+    "p95_ms_per_query": float(np.percentile(t, 95)),
+    "notes": "brute-force cosine, L2-normalized, 100 runs",
+}
+(OUT / "latency.json").write_text(json.dumps(latency, indent=2))
+print(f"latency done  avg={latency['avg_ms_per_query']:.4f}ms")
+
+print("\ndone:", OUT)
