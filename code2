@@ -1,1 +1,218 @@
-test
+"""
+CUI Reduction Runner — Pickle Files (GCS)
+Loads pickle files, batch reduction per entity, case-level topics, evaluation.
+"""
+
+import os
+import csv
+import pickle
+import numpy as np
+from google.cloud import storage, bigquery
+
+from config import (
+    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR,
+    ALLOWED_SABS, GCS_BUCKET, PICKLE_PREFIX, OUTPUT_DIR,
+    hierarchy, ic_precomputed
+)
+from cui_reduction_system import CUIReductionSystem, TopicBuilder, Evaluator
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def load_pickles_from_gcs(bucket_name, prefix):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    print(f"  Found {len(blobs)} blobs in gs://{bucket_name}/{prefix}")
+    results = []
+    for blob in blobs:
+        if blob.name.endswith("/"):
+            continue
+        if blob.name.endswith((".pk", ".pkl", ".pickle")):
+            data = pickle.loads(blob.download_as_bytes())
+            fname = blob.name.split("/")[-1]
+            results.append((fname, data))
+            print(f"  Loaded: {fname}")
+    print(f"Total pickle files: {len(results)}")
+    return results
+
+
+def parse_pickle(data):
+    text = data.get("text", "")
+    entities = []
+    extracted = data.get("extracted", {})
+    for key, block in extracted.items():
+        for item in block.get("matching_items", []):
+            entity_text = item[0]
+            sentence = item[1]
+            cui_list = item[2] if len(item) > 2 else []
+            cuis, distances = [], {}
+            for entry in cui_list:
+                cuis.append(entry[0])
+                distances[entry[0]] = entry[1]
+            if cuis:
+                entities.append((entity_text, sentence, cuis, distances))
+    return text, entities
+
+
+def fetch_preferred_terms(bq, cuis):
+    if not cuis:
+        return {}
+    terms, cuis = {}, list(cuis)
+    for i in range(0, len(cuis), 500):
+        batch = cuis[i:i+500]
+        query = f"""
+        SELECT CUI, STR
+        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+        for row in bq.query(query, job_config=jc).result():
+            if row.CUI not in terms:
+                terms[row.CUI] = row.STR
+    for c in cuis:
+        if c not in terms:
+            terms[c] = c
+    return terms
+
+
+def save_csv(path, headers, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
+
+
+# ── process one pickle 
+
+def process_one_pickle(fname, data, system, evaluator, bq):
+    text, entities = parse_pickle(data)
+    if not entities:
+        print(f"  {fname} — no entities found")
+        return None, [], []
+
+    case_name = fname.rsplit(".", 1)[0]
+    total_cuis = sum(len(c) for _, _, c, _ in entities)
+    print(f"\n{'='*80}")
+    print(f"CASE: {fname}")
+    print(f"TEXT: {text[:150]}...")
+    print(f"ENTITIES: {len(entities)}, TOTAL INPUT CUIs: {total_cuis}")
+    print(f"{'='*80}")
+
+    # batch reduction
+    batch_inputs = [(cuis, entity_text, distances)
+                    for entity_text, sentence, cuis, distances in entities]
+    results = system.reduce_batch(batch_inputs)
+    entity_results = [(entities[i][0], results[i]) for i in range(len(entities))]
+
+    all_surviving = set()
+    all_cuis = set()
+    for _, result in entity_results:
+        all_surviving.update(result.all_reduced_cuis)
+        for e in result.confidence:
+            all_cuis.update(e.explains_cuis)
+        for a in result.audit_trail:
+            all_cuis.add(a.removed_cui)
+            if a.kept_cui:
+                all_cuis.add(a.kept_cui)
+    for _, _, cuis, _ in entities:
+        all_cuis.update(cuis)
+    all_cuis.update(all_surviving)
+
+    terms = fetch_preferred_terms(bq, all_cuis)
+
+    # case-level topics
+    surviving_list = list(all_surviving)
+    embeddings = system.emb_fetcher.fetch(surviving_list)
+    removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
+    all_embeddings = {**embeddings, **removed_embs}
+
+    with_emb = [c for c in surviving_list if c in embeddings]
+    case_topics = {}
+    if len(with_emb) >= 2:
+        case_topics = TopicBuilder.build(with_emb, embeddings)
+    elif with_emb:
+        case_topics = {0: with_emb}
+
+    # entity CSV
+    entity_rows = []
+    for entity_text, result in entity_results:
+        print(f"\n  ENTITY: \"{entity_text}\"  "
+              f"({result.input_count} → {result.after_redundancy_count})")
+        for e in result.confidence:
+            explains_str = " | ".join(
+                f"{ec}:{terms.get(ec, ec)}" for ec in e.explains_cuis
+            ) if e.explains_cuis else ""
+            entity_rows.append([
+                entity_text, e.cui, terms.get(e.cui, e.cui),
+                round(e.confidence, 4), round(e.extraction_proximity, 3),
+                round(e.centrality, 3), round(e.retention_power, 3),
+                len(e.explains_cuis), explains_str
+            ])
+        for e in result.confidence[:5]:
+            exp = len(e.explains_cuis)
+            exp_s = f"  explains {exp}" if exp else ""
+            print(f"    {e.cui}  conf={e.confidence:.3f}{exp_s}  |  {terms.get(e.cui, e.cui)}")
+
+    save_csv(os.path.join(OUTPUT_DIR, f"{case_name}_entities.csv"),
+             ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
+              "explains_count", "explains"], entity_rows)
+
+    # topic CSV
+    topic_rows = []
+    print(f"\n  TOPICS: {len(case_topics)} topics, {len(with_emb)} CUIs")
+    for tid, members in sorted(case_topics.items()):
+        print(f"    Topic {tid}: {len(members)} CUIs")
+        for c in members:
+            topic_rows.append([tid, c, terms.get(c, c)])
+
+    save_csv(os.path.join(OUTPUT_DIR, f"{case_name}_topics.csv"),
+             ["topic_id", "cui", "preferred_term"], topic_rows)
+
+    # evaluation
+    metadata = system.fetcher.fetch(list(all_cuis))
+    metric_rows = evaluator.intrinsic_metrics(case_name, entity_results, case_topics, all_embeddings)
+    recon_rows = evaluator.reconstruction_check(case_name, entity_results, all_embeddings, metadata, terms)
+
+    return case_name, metric_rows, recon_rows
+
+
+#  main
+
+system = CUIReductionSystem(
+    project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
+    allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
+    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
+
+evaluator = Evaluator(hierarchy)
+bq = bigquery.Client(project=PROJECT_ID)
+pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+all_metric_rows, all_recon_rows = [], []
+for fname, data in pickles:
+    case_name, metric_rows, recon_rows = process_one_pickle(fname, data, system, evaluator, bq)
+    if case_name:
+        all_metric_rows.extend(metric_rows)
+        all_recon_rows.extend(recon_rows)
+
+save_csv(os.path.join(OUTPUT_DIR, "eval_metrics.csv"), Evaluator.metric_headers(), all_metric_rows)
+save_csv(os.path.join(OUTPUT_DIR, "eval_reconstruction.csv"), Evaluator.reconstruction_headers(), all_recon_rows)
+
+# summary
+suspect = sum(1 for r in all_recon_rows if "SUSPECT" in str(r[-1]))
+ok = sum(1 for r in all_recon_rows if r[-1] == "OK")
+total = len(all_recon_rows)
+print(f"\n{'='*80}\nEVALUATION SUMMARY\n{'='*80}")
+if total:
+    print(f"  Reconstruction: {ok}/{total} OK, {suspect}/{total} SUSPECT")
+for r in all_metric_rows:
+    if r[3] == "reduction_ratio":
+        flag = f"  ← {r[5]}" if r[5] else ""
+        print(f"  Reduction: {r[2][:40]}: {r[4]}{flag}")
+for r in all_metric_rows:
+    if r[3] == "separation":
+        flag = f"  ← {r[5]}" if r[5] else ""
+        print(f"  Topic separation: {r[0]}: {r[4]}{flag}")
+print(f"\nDONE — {len(pickles)} cases")
