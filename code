@@ -1,4 +1,4 @@
-_VERSION = "2026-02-27-v7.2"  # verify with: from cui_reduction_system import _VERSION; print(_VERSION)
+_VERSION = "2026-03-11-v7.3"  # verify with: from cui_reduction_system import _VERSION; print(_VERSION)
 import os
 import time
 import logging
@@ -60,6 +60,18 @@ _COMP_DEPTH_MEAN_THRESHOLD = 1.5     # min mean in-degree for component depth > 
 _DEFAULT_ANCESTOR_DEPTH = 3          # fallback ancestor depth when graph too sparse
 _TYPEAHEAD_OVERSAMPLE = 3            # oversample factor before final sort in typeahead
 _CANONICAL_MAX_DEPTH = 8             # default max depth for canonical topic mapping
+
+# ── TopicRepresentativeSelector constants ─────────────────────────────────────
+_REP_HAC_THRESHOLD = 0.5             # cosine distance threshold for sub-clustering within sem-type groups
+_REP_MIN_SUBCLUSTER = 2              # minimum CUIs to form a sub-cluster (else singleton)
+
+# ── TopicBuilder singleton merge ──────────────────────────────────────────────
+_SINGLETON_MERGE_MIN_SIM = 0.3       # minimum cosine similarity to merge singleton into a group
+
+# ── TopicAnchorAssigner constants ─────────────────────────────────────────────
+_ANCHOR_IC_MIN = 4.0                 # minimum IC for an anchor CUI to be meaningful
+_ANCHOR_BFS_DEPTH = 4                # max BFS depth when searching for LCA
+_ANCHOR_IC_MAX_BROAD = 3.0           # below this IC, ancestor is too broad to be an anchor
 
 logger = logging.getLogger("cui_reduction")
 logger.setLevel(logging.DEBUG)
@@ -248,6 +260,28 @@ class ConfidenceEntry:
     retention_power: float
     semantic_types: List[str]
     explains_cuis: List[str]
+
+@dataclass
+class RepresentativeInfo:
+    """One representative code for a sub-cluster within a topic."""
+    cui: str
+    category: str           # coarse semantic group (Disease, Drug, Lab, Finding, Procedure, Other)
+    method: str             # how chosen: parent_within_set | embedding_medoid | highest_ic | singleton
+    member_count: int       # how many CUIs this representative covers
+    members: List[str]      # the CUIs it represents
+    ic_score: float         # IC of the representative
+    snomed_code: str = ""   # resolved SNOMED code (filled externally)
+    snomed_term: str = ""   # resolved SNOMED preferred term (filled externally)
+
+@dataclass
+class AnchorInfo:
+    """An anchor CUI that identifies a topic for storage and matching."""
+    anchor_cui: str         # the anchor CUI (LCA or rep itself)
+    anchor_ic: float        # IC of the anchor
+    category: str           # Disease, Drug, Lab, Finding, Procedure, Anatomy, Other
+    rep_cuis: List[str]     # representative CUIs covered by this anchor
+    topic_ids: List[int]    # which topic(s) this anchor covers
+    ancestor_cuis: List[str] = None  # precomputed ancestors for matching (filled by assigner)
 
 @dataclass
 class ReductionResult:
@@ -639,7 +673,13 @@ class TopicBuilder:
                 vec = matrix[si]
                 best_gid = max(group_centroids,
                                key=lambda g: float(np.dot(vec, group_centroids[g])))
-                groups[best_gid].append(cuis[si])
+                best_sim = float(np.dot(vec, group_centroids[best_gid]))
+                if best_sim >= _SINGLETON_MERGE_MIN_SIM:
+                    groups[best_gid].append(cuis[si])
+                else:
+                    # too dissimilar — keep as own topic
+                    groups[label] = [cuis[si]]
+                    label += 1
         elif singleton_indices:
             for si in singleton_indices:
                 groups[label] = [cuis[si]]
@@ -2012,6 +2052,431 @@ class TopicNavigator:
             job.result()
             jc = LoadJobConfig(schema=schema, write_disposition="WRITE_APPEND")
         log(f"[TopicNavigator] Saved {len(rows)} rows to {table_ref}")
+
+# ── Semantic type → coarse category mapping ──────────────────────────────────
+# Based on UMLS Semantic Network (McCray 2003). Maps TUI prefixes and common
+# semantic types to 6 coarse categories for representative grouping.
+_STY_TO_CATEGORY = {
+    # Disorders
+    "Disease or Syndrome": "Disease", "Neoplastic Process": "Disease",
+    "Mental or Behavioral Dysfunction": "Disease", "Pathologic Function": "Disease",
+    "Congenital Abnormality": "Disease", "Acquired Abnormality": "Disease",
+    "Injury or Poisoning": "Disease", "Cell or Molecular Dysfunction": "Disease",
+    "Anatomical Abnormality": "Disease",
+    # Chemicals & Drugs
+    "Pharmacologic Substance": "Drug", "Clinical Drug": "Drug",
+    "Antibiotic": "Drug", "Organic Chemical": "Drug",
+    "Amino Acid, Peptide, or Protein": "Drug", "Hormone": "Drug",
+    "Immunologic Factor": "Drug", "Biomedical or Dental Material": "Drug",
+    "Vitamin": "Drug", "Enzyme": "Drug", "Receptor": "Drug",
+    "Biologically Active Substance": "Drug", "Indicator, Reagent, or Diagnostic Aid": "Drug",
+    # Procedures
+    "Therapeutic or Preventive Procedure": "Procedure",
+    "Diagnostic Procedure": "Procedure", "Laboratory Procedure": "Procedure",
+    "Research Activity": "Procedure", "Health Care Activity": "Procedure",
+    "Molecular Biology Research Technique": "Procedure",
+    "Laboratory or Test Result": "Lab",
+    # Findings & Observations
+    "Finding": "Finding", "Sign or Symptom": "Finding",
+    "Clinical Attribute": "Finding", "Organism Attribute": "Finding",
+    # Anatomy
+    "Body Part, Organ, or Organ Component": "Anatomy",
+    "Tissue": "Anatomy", "Cell": "Anatomy", "Body Location or Region": "Anatomy",
+    "Body Space or Junction": "Anatomy", "Body System": "Anatomy",
+    "Body Substance": "Anatomy", "Embryonic Structure": "Anatomy",
+    "Fully Formed Anatomical Structure": "Anatomy",
+}
+
+def _sty_to_category(semantic_types):
+    """Map a list of semantic type strings to a single coarse category."""
+    for sty in semantic_types:
+        if sty in _STY_TO_CATEGORY:
+            return _STY_TO_CATEGORY[sty]
+    return "Other"
+
+
+class TopicRepresentativeSelector:
+    """Select representative CUI(s) for each topic.
+
+    Algorithm (per topic):
+      1. Group member CUIs by coarse semantic category (Disease/Drug/Lab/Finding/Procedure/Other)
+      2. Within each category group, sub-cluster via HAC on cosine distance
+      3. For each sub-cluster, pick representative:
+         a. Parent-within-set: if any CUI is ancestor of 2+ others → highest IC ancestor
+         b. Embedding medoid: CUI with highest mean cosine to others
+         c. Fallback: highest IC
+      4. Singletons become their own representative
+
+    References:
+      Resnik 1995 (IC-based selection), Pesquita 2009 (set medoid),
+      McCray 2003 (UMLS Semantic Network grouping)
+    """
+
+    @staticmethod
+    @timed("representative_selection")
+    def select(h_topics, metadata, embeddings, ic_map, graph=None):
+        """Select representatives for all topics.
+
+        Args:
+            h_topics: output of HierarchicalTopicBuilder.build()
+                      {tid: {topic_cui, members, subtopics, ungrouped}}
+            metadata: dict {cui: CUIMetadata}
+            embeddings: dict {cui: np.array (normalized)}
+            ic_map: dict {cui: float}
+            graph: nx.DiGraph (UMLS hierarchy) or None
+
+        Returns:
+            dict {topic_id: list[RepresentativeInfo]}
+        """
+        all_reps = {}
+        for tid, tinfo in h_topics.items():
+            members = tinfo["members"]
+            if not members:
+                all_reps[tid] = []
+                continue
+            all_reps[tid] = TopicRepresentativeSelector._select_for_topic(
+                members, metadata, embeddings, ic_map, graph)
+        total = sum(len(v) for v in all_reps.values())
+        log(f"    Representatives: {total} reps across {len(all_reps)} topics")
+        return all_reps
+
+    @staticmethod
+    def _select_for_topic(members, metadata, embeddings, ic_map, graph):
+        """Select representatives for a single topic's member CUIs."""
+        # Step 1: Group by coarse semantic category
+        groups = defaultdict(list)
+        for cui in members:
+            meta = metadata.get(cui)
+            stys = meta.semantic_types if meta and meta.semantic_types else []
+            cat = _sty_to_category(stys)
+            groups[cat].append(cui)
+
+        reps = []
+        for cat, cat_cuis in groups.items():
+            if len(cat_cuis) == 1:
+                reps.append(RepresentativeInfo(
+                    cui=cat_cuis[0], category=cat, method="singleton",
+                    member_count=1, members=cat_cuis,
+                    ic_score=ic_map.get(cat_cuis[0], 0.0)))
+                continue
+
+            # Step 2: Sub-cluster within category
+            subclusters = TopicRepresentativeSelector._subcluster(
+                cat_cuis, embeddings)
+
+            # Step 3: Pick representative per sub-cluster
+            for sc_cuis in subclusters:
+                rep = TopicRepresentativeSelector._pick_representative(
+                    sc_cuis, embeddings, ic_map, graph)
+                reps.append(RepresentativeInfo(
+                    cui=rep, category=cat,
+                    method=TopicRepresentativeSelector._last_method,
+                    member_count=len(sc_cuis), members=sorted(sc_cuis),
+                    ic_score=ic_map.get(rep, 0.0)))
+
+        return reps
+
+    # internal state for method tracking (thread-local would be better,
+    # but this runs single-threaded in the pipeline)
+    _last_method = "unknown"
+
+    @staticmethod
+    def _subcluster(cuis, embeddings):
+        """HAC sub-clustering on cosine distance within a semantic category group.
+        Returns list of lists (each sub-cluster's CUIs)."""
+        # Filter to CUIs with embeddings
+        with_emb = [c for c in cuis if c in embeddings]
+        without_emb = [c for c in cuis if c not in embeddings]
+
+        if len(with_emb) <= 1:
+            # Can't cluster 0 or 1 items; return each CUI as own cluster
+            result = [[c] for c in cuis]
+            return result
+
+        # Build cosine distance matrix
+        vecs = np.array([embeddings[c] for c in with_emb])  # already L2-normalized
+        sim = vecs @ vecs.T
+        np.clip(sim, -1.0, 1.0, out=sim)
+        dist = 1.0 - sim
+        np.fill_diagonal(dist, 0.0)
+
+        # HAC with average linkage
+        condensed = squareform(dist, checks=False)
+        Z = linkage(condensed, method="average")
+        labels = fcluster(Z, t=_REP_HAC_THRESHOLD, criterion="distance")
+
+        # Group by cluster label
+        cluster_map = defaultdict(list)
+        for i, lab in enumerate(labels):
+            cluster_map[lab].append(with_emb[i])
+
+        result = list(cluster_map.values())
+
+        # CUIs without embeddings become singletons
+        for c in without_emb:
+            result.append([c])
+
+        return result
+
+    @staticmethod
+    def _pick_representative(sc_cuis, embeddings, ic_map, graph):
+        """Pick the best representative from a sub-cluster.
+        Priority: parent-within-set → embedding medoid → highest IC."""
+
+        if len(sc_cuis) == 1:
+            TopicRepresentativeSelector._last_method = "singleton"
+            return sc_cuis[0]
+
+        # Strategy A: Parent-within-set (MICA)
+        # If any CUI in the sub-cluster is a UMLS ancestor of 2+ others, pick it
+        if graph is not None and graph.number_of_nodes() > 0:
+            sc_set = set(sc_cuis)
+            parent_scores = {}
+            for candidate in sc_cuis:
+                if not graph.has_node(candidate):
+                    continue
+                # count how many other sub-cluster members this candidate subsumes
+                children_in_set = 0
+                for other in sc_cuis:
+                    if other == candidate:
+                        continue
+                    if graph.has_node(other):
+                        # quick check: is candidate a direct or 2-hop ancestor of other?
+                        ancs = _get_ancestors(graph, other, 3)
+                        if candidate in ancs:
+                            children_in_set += 1
+                if children_in_set >= 2:
+                    parent_scores[candidate] = (children_in_set, ic_map.get(candidate, 0.0))
+
+            if parent_scores:
+                # pick parent that subsumes the most, break ties by highest IC
+                best = max(parent_scores, key=lambda c: parent_scores[c])
+                TopicRepresentativeSelector._last_method = "parent_within_set"
+                return best
+
+        # Strategy B: Embedding medoid
+        with_emb = [c for c in sc_cuis if c in embeddings]
+        if len(with_emb) >= 2:
+            vecs = np.array([embeddings[c] for c in with_emb])
+            sim = vecs @ vecs.T
+            mean_sim = sim.mean(axis=1)
+            best_idx = int(np.argmax(mean_sim))
+            TopicRepresentativeSelector._last_method = "embedding_medoid"
+            return with_emb[best_idx]
+
+        # Strategy C: Highest IC
+        best = max(sc_cuis, key=lambda c: ic_map.get(c, 0.0))
+        TopicRepresentativeSelector._last_method = "highest_ic"
+        return best
+
+    @staticmethod
+    def resolve_snomed(bq_client, project_id, dataset_id, all_reps):
+        """Resolve representative CUIs to SNOMED codes via MRCONSO.
+
+        Args:
+            bq_client: BigQuery client
+            project_id: GCP project
+            dataset_id: UMLS dataset
+            all_reps: dict {topic_id: list[RepresentativeInfo]}
+
+        Returns:
+            dict {cui: (snomed_code, snomed_term)} — also mutates RepresentativeInfo in place
+        """
+        rep_cuis = set()
+        for reps in all_reps.values():
+            for r in reps:
+                rep_cuis.add(r.cui)
+
+        if not rep_cuis:
+            return {}
+
+        snomed_map = {}
+        cui_list = list(rep_cuis)
+        for i in range(0, len(cui_list), 500):
+            batch = cui_list[i:i + 500]
+            query = f"""
+            SELECT CUI, CODE, STR
+            FROM `{project_id}.{dataset_id}.MRCONSO`
+            WHERE CUI IN UNNEST(@cuis)
+              AND SAB = 'SNOMEDCT_US'
+              AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+              AND LAT = 'ENG'
+            """
+            jc = bigquery.QueryJobConfig(query_parameters=[
+                bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+            for row in bq_client.query(query, job_config=jc).result():
+                if row.CUI not in snomed_map:
+                    snomed_map[row.CUI] = (row.CODE, row.STR)
+
+        # mutate in place
+        for reps in all_reps.values():
+            for r in reps:
+                if r.cui in snomed_map:
+                    r.snomed_code, r.snomed_term = snomed_map[r.cui]
+
+        resolved = sum(1 for c in rep_cuis if c in snomed_map)
+        log(f"    SNOMED resolution: {resolved}/{len(rep_cuis)} representatives mapped")
+        return snomed_map
+
+
+class TopicAnchorAssigner:
+    """Assign anchor CUIs to topics for storage and query matching.
+
+    For each topic, groups representatives by category, then finds the most
+    specific common ancestor (LCA) that covers all reps in that category.
+    If no good LCA exists (IC too low), each rep becomes its own anchor.
+    One anchor can cover multiple topics (deduplicated at the end).
+
+    References:
+      Resnik 1995 (IC-based ancestor selection),
+      Couto & Silva 2011 (disjoint common ancestors for multiple codes)
+    """
+
+    @staticmethod
+    @timed("anchor_assignment")
+    def assign(topic_reps, ic_map, graph=None):
+        """Assign anchors to all topics.
+
+        Args:
+            topic_reps: dict {topic_id: list[RepresentativeInfo]}
+                        output of TopicRepresentativeSelector.select()
+            ic_map: dict {cui: float}
+            graph: nx.DiGraph (UMLS hierarchy) or None
+
+        Returns:
+            list[AnchorInfo] — deduplicated anchors with topic_ids
+        """
+        # Phase 1: compute raw anchors per (topic, category)
+        raw_anchors = []  # list of (anchor_cui, anchor_ic, category, rep_cuis, topic_id)
+
+        for tid, reps in topic_reps.items():
+            if not reps:
+                continue
+
+            # group reps by category
+            cat_groups = defaultdict(list)
+            for r in reps:
+                cat_groups[r.category].append(r)
+
+            for cat, cat_reps in cat_groups.items():
+                rep_cuis = [r.cui for r in cat_reps]
+
+                if len(rep_cuis) == 1:
+                    # single rep → anchor is the rep itself
+                    raw_anchors.append((
+                        rep_cuis[0],
+                        ic_map.get(rep_cuis[0], 0.0),
+                        cat,
+                        rep_cuis,
+                        tid
+                    ))
+                    continue
+
+                # multiple reps in same category → find LCA
+                lca = TopicAnchorAssigner._find_lca(
+                    rep_cuis, ic_map, graph)
+
+                if lca is not None and ic_map.get(lca, 0.0) >= _ANCHOR_IC_MIN:
+                    # good LCA found → single anchor for this category group
+                    raw_anchors.append((
+                        lca,
+                        ic_map.get(lca, 0.0),
+                        cat,
+                        rep_cuis,
+                        tid
+                    ))
+                else:
+                    # no good LCA → too diverse, each rep is its own anchor
+                    for rc in rep_cuis:
+                        raw_anchors.append((
+                            rc,
+                            ic_map.get(rc, 0.0),
+                            cat,
+                            [rc],
+                            tid
+                        ))
+
+        # Phase 2: deduplicate — same (anchor_cui, category) across topics
+        dedup = defaultdict(lambda: {"ic": 0.0, "rep_cuis": set(), "topic_ids": set()})
+        for anchor_cui, anchor_ic, cat, reps, tid in raw_anchors:
+            key = (anchor_cui, cat)
+            dedup[key]["ic"] = max(dedup[key]["ic"], anchor_ic)
+            dedup[key]["rep_cuis"].update(reps)
+            dedup[key]["topic_ids"].add(tid)
+
+        # Phase 3: precompute ancestors for each anchor
+        anchors = []
+        for (anchor_cui, cat), info in dedup.items():
+            anc_cuis = []
+            if graph is not None:
+                anc_set = _get_ancestors(graph, anchor_cui, _ANCHOR_BFS_DEPTH)
+                anc_cuis = sorted(anc_set)
+
+            anchors.append(AnchorInfo(
+                anchor_cui=anchor_cui,
+                anchor_ic=info["ic"],
+                category=cat,
+                rep_cuis=sorted(info["rep_cuis"]),
+                topic_ids=sorted(info["topic_ids"]),
+                ancestor_cuis=anc_cuis
+            ))
+
+        # sort by IC descending for consistent ordering
+        anchors.sort(key=lambda a: (-a.anchor_ic, a.category, a.anchor_cui))
+
+        n_topics = len(set(tid for a in anchors for tid in a.topic_ids))
+        n_shared = sum(1 for a in anchors if len(a.topic_ids) > 1)
+        log(f"    Anchors: {len(anchors)} anchors across {n_topics} topics "
+            f"({n_shared} shared across topics)")
+        return anchors
+
+    @staticmethod
+    def _find_lca(cuis, ic_map, graph):
+        """Find the Least Common Ancestor with highest IC for a set of CUIs.
+
+        Walks up from each CUI, intersects ancestor sets, picks highest IC
+        from the intersection. Returns None if no meaningful LCA found.
+        """
+        if graph is None or graph.number_of_nodes() == 0:
+            return None
+        if len(cuis) < 2:
+            return cuis[0] if cuis else None
+
+        # collect ancestors for each CUI
+        per_cui_ancestors = []
+        for cui in cuis:
+            ancs = _get_ancestors(graph, cui, _ANCHOR_BFS_DEPTH)
+            if not ancs:
+                return None  # CUI not in graph, can't find LCA
+            per_cui_ancestors.append(ancs)
+
+        # intersect all ancestor sets
+        common = set(per_cui_ancestors[0])
+        for anc_set in per_cui_ancestors[1:]:
+            common &= anc_set
+            if not common:
+                return None  # no common ancestors
+
+        # remove ancestors that are too broad
+        candidates = {c for c in common if ic_map.get(c, 0.0) >= _ANCHOR_IC_MAX_BROAD}
+        if not candidates:
+            return None
+
+        # pick highest IC (most specific common ancestor)
+        return max(candidates, key=lambda c: ic_map.get(c, 0.0))
+
+    @staticmethod
+    def precompute_anchor_ancestors(anchors, graph, depth=None):
+        """Ensure all anchors have their ancestor_cuis populated.
+        Call this if anchors were loaded from storage without ancestors."""
+        d = depth or _ANCHOR_BFS_DEPTH
+        for a in anchors:
+            if a.ancestor_cuis is None or len(a.ancestor_cuis) == 0:
+                if graph is not None:
+                    a.ancestor_cuis = sorted(_get_ancestors(graph, a.anchor_cui, d))
+                else:
+                    a.ancestor_cuis = []
+
 
 class Evaluator:
     """Quality evaluation: intrinsic_metrics (reduction, confidence, topic coherence) +
