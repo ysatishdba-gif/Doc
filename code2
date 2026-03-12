@@ -1,13 +1,12 @@
 """
 CUI Reduction Runner — Pickle Files (GCS)
-Loads pickle files, batch reduction per entity, topics, reps, anchors, matching.
+Loads pickle files, batch reduction per entity, topics, reps, anchors, CSVs.
 
 Usage:
-    # Run as script — processes all pickles + optional query + match:
     python run_cui_reduction.py
 
-    # Or import functions:
-    from run_cui_reduction import process_one_pickle, process_query, match_query
+    # Or import:
+    from run_cui_reduction import process_one_pickle
 """
 
 import os
@@ -19,14 +18,12 @@ from google.cloud import storage, bigquery
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR,
     ALLOWED_SABS, GCS_BUCKET, PICKLE_PREFIX, OUTPUT_DIR,
-    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
     hierarchy, ic_precomputed
 )
 from cui_reduction_system import (
-    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
+    CUIReductionSystem, HierarchicalTopicBuilder, Evaluator,
     TopicRepresentativeSelector, TopicAnchorAssigner
 )
-from topic_matcher import TopicMatcher
 
 
 # ── shared instances (initialized once) ──────────────────────────────────────
@@ -35,10 +32,6 @@ system = CUIReductionSystem(
     project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
     allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
     ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
-
-extractor = CUIExtractor(
-    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
-    cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
 
 evaluator = Evaluator(hierarchy)
 bq = bigquery.Client(project=PROJECT_ID)
@@ -289,106 +282,10 @@ def write_case_csvs(result):
               "rep_cuis", "topic_ids", "topic_count", "ancestor_count"], anchor_rows)
 
 
-# ── query: text → pipeline → anchors (uses API extractor) ───────────────────
-
-def process_query(query_text, context=""):
-    """Process a query string through the full pipeline.
-
-    Args:
-        query_text: free text query
-        context: optional surrounding context
-
-    Returns:
-        dict same as process_one_pickle but for query, or None
-    """
-    context_list = [context or query_text]
-    per_phrase = extractor.extract([query_text], context_list)
-    extractor._cache.flush()
-
-    if not per_phrase:
-        print(f"[query] No CUIs extracted for: \"{query_text}\"")
-        return None
-
-    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase.items()]
-    results = system.reduce_batch(batch_inputs)
-    entity_results = [(batch_inputs[i][1], results[i]) for i in range(len(results))]
-
-    surviving = set()
-    for _, r in entity_results:
-        surviving.update(r.all_reduced_cuis)
-
-    if not surviving:
-        print(f"[query] No CUIs survived for: \"{query_text}\"")
-        return None
-
-    ic_map = system.ic_computer.compute(list(surviving), {})
-    h_topics = HierarchicalTopicBuilder.build(list(surviving), hierarchy, ic_map)
-
-    all_cuis = set(surviving)
-    for tid, t in h_topics.items():
-        if t["topic_cui"]:
-            all_cuis.add(t["topic_cui"])
-    terms = fetch_preferred_terms(all_cuis)
-
-    embeddings = system.emb_fetcher.fetch(list(surviving))
-    metadata = system.fetcher.fetch(list(all_cuis))
-    reps = TopicRepresentativeSelector.select(h_topics, metadata, embeddings, ic_map, hierarchy)
-    anchors = TopicAnchorAssigner.assign(reps, ic_map, hierarchy)
-
-    anchor_extra = set(a.anchor_cui for a in anchors) - set(terms.keys())
-    terms.update(fetch_preferred_terms(anchor_extra))
-
-    print(f"[query] \"{query_text}\" → {len(surviving)} CUIs → {len(anchors)} anchors")
-    for a in anchors:
-        print(f"  [{a.category}] {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)}")
-
-    return {"anchors": anchors, "ic_map": ic_map, "terms": terms}
-
-
-def match_query(query_text, doc_anchors_map, context=""):
-    """End-to-end: query text → pipeline → match against stored doc anchors.
-
-    Args:
-        query_text: free text query
-        doc_anchors_map: dict {chunk_id: [AnchorInfo, ...]}
-        context: optional context
-
-    Returns:
-        list[MatchResult] sorted by score
-    """
-    q = process_query(query_text, context)
-    if q is None:
-        return []
-
-    all_ic = dict(q["ic_map"])
-    for anchors_list in doc_anchors_map.values():
-        for a in anchors_list:
-            if a.anchor_cui not in all_ic:
-                all_ic[a.anchor_cui] = a.anchor_ic
-
-    matcher = TopicMatcher(ic_map=all_ic)
-    results = matcher.match(q["anchors"], doc_anchors_map)
-
-    print(f"\n{'='*80}")
-    print(f"MATCH RESULTS: \"{query_text}\" → {len(results)} chunks matched")
-    print(f"{'='*80}")
-    for r in results[:10]:
-        print(TopicMatcher.explain_match(r, q["terms"]))
-        print()
-
-    return results
-
-
 # ── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    # ── QUERY (edit this — set to None to skip) ─────────────────────────
-    QUERY = "rheumatoid arthritis treatment with methotrexate"
-
-    # ═════════════════════════════════════════════════════════════════════
-    # Process all pickle files
-    # ═════════════════════════════════════════════════════════════════════
     pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
 
     all_metric_rows, all_recon_rows = [], []
@@ -411,16 +308,9 @@ if __name__ == "__main__":
     suspect = sum(1 for r in all_recon_rows if "SUSPECT" in str(r[-1]))
     ok = sum(1 for r in all_recon_rows if r[-1] == "OK")
     total = len(all_recon_rows)
-    print(f"\n{'='*80}\nEVALUATION SUMMARY\n{'='*80}")
+    print(f"\n{'='*80}\nSUMMARY\n{'='*80}")
     if total:
         print(f"  Reconstruction: {ok}/{total} OK, {suspect}/{total} SUSPECT")
     total_anchors = sum(len(a) for a in all_case_anchors.values())
     print(f"  Cases: {len(all_case_anchors)}, Total anchors: {total_anchors}")
-
-    # ═════════════════════════════════════════════════════════════════════
-    # Query + match against all processed documents
-    # ═════════════════════════════════════════════════════════════════════
-    if QUERY and all_case_anchors:
-        match_results = match_query(QUERY, all_case_anchors)
-
-    print(f"\n{'='*80}\nDONE — {len(pickles)} cases\n{'='*80}")
+    print(f"\nDONE — {len(pickles)} cases")
