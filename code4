@@ -1,301 +1,301 @@
 """
-Topic Matcher — CUI-based topic-to-topic matching.
-
-Matches query anchors against stored document anchors using
-category-aligned, IC-weighted BMA scoring with three match levels:
-exact, subsumption, and shared ancestor.
+CUI Reduction Runner — API
+Extracts CUIs via API, reduction, topics, representatives, anchors, CSVs.
 
 Usage:
-    from cui_reduction_system import AnchorInfo
-    from topic_matcher import TopicMatcher, MatchResult
+    python run_cui_reduction_api.py
 
-    matcher = TopicMatcher(ic_map=ic_map)
-    results = matcher.match(query_anchors, doc_chunk_anchors)
-    for r in results[:10]:
-        print(matcher.explain_match(r, terms))
-
-References:
-    Pesquita et al. 2009 (BMA for set similarity)
-    Resnik 1995 (IC weighting)
-    Garla & Brandt 2012 (ontological matching in clinical domain)
+    # Or import:
+    from run_cui_reduction_api import process_text
 """
 
-import time
-import logging
-from typing import List, Dict
-from dataclasses import dataclass
-from collections import defaultdict
+import os
+import csv
+import numpy as np
+from google.cloud import bigquery
 
-from cui_reduction_system import AnchorInfo
-
-logger = logging.getLogger("cui_reduction")
-
-# ── Tunable constants ─────────────────────────────────────────────────────────
-MATCH_EXACT_SCORE = 1.0              # score weight for exact CUI match
-MATCH_QUERY_SUBSUMES_SCORE = 0.8     # query CUI is ancestor of doc CUI
-MATCH_DOC_SUBSUMES_SCORE = 0.7       # doc CUI is ancestor of query CUI
-MATCH_SHARED_ANCESTOR_SCORE = 0.5    # shared ancestor match
-MATCH_ANCESTOR_IC_THRESHOLD = 4.0    # minimum IC for shared ancestor to count
+from config import (
+    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
+    hierarchy, ic_precomputed
+)
+from cui_reduction_system import (
+    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
+    TopicRepresentativeSelector, TopicAnchorAssigner
+)
 
 
-# ── Data model ────────────────────────────────────────────────────────────────
+# ── shared instances (initialized once) ──────────────────────────────────────
 
-@dataclass
-class MatchResult:
-    """Result of matching a query against one document chunk."""
-    chunk_id: str
-    score: float                            # overall BMA score [0, 1]
-    matched_categories: List[str]           # which categories matched
-    category_scores: Dict[str, float]       # {category: best_score}
-    match_details: List[Dict]               # per-category match details
+system = CUIReductionSystem(
+    project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
+    allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
+    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
+
+extractor = CUIExtractor(
+    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
+    cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
+
+evaluator = Evaluator(hierarchy)
+bq = bigquery.Client(project=PROJECT_ID)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ── Matcher ───────────────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-class TopicMatcher:
-    """Match query anchors against stored document anchors.
+def fetch_preferred_terms(cuis):
+    if not cuis:
+        return {}
+    terms, cuis = {}, list(cuis)
+    for i in range(0, len(cuis), 500):
+        batch = cuis[i:i+500]
+        query = f"""
+        SELECT CUI, STR
+        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+        for row in bq.query(query, job_config=jc).result():
+            if row.CUI not in terms:
+                terms[row.CUI] = row.STR
+    for c in cuis:
+        if c not in terms:
+            terms[c] = c
+    return terms
 
-    Two-pass algorithm:
-      Pass 1 (coarse): anchor-level category-filtered match to narrow candidates
-      Pass 2 (precise): rep-level IC-weighted scoring with BMA
 
-    Match types (in priority order):
-      - exact:           query rep CUI == doc rep CUI                    (score 1.0)
-      - query_subsumes:  query rep CUI is ancestor of doc rep CUI        (score 0.8)
-      - doc_subsumes:    doc rep CUI is ancestor of query rep CUI        (score 0.7)
-      - shared_ancestor: highest-IC common ancestor above IC threshold   (score 0.5)
+def save_csv(path, headers, rows):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
 
-    Scoring: Best Match Average (BMA) — each query anchor gets its best
-    same-category match from the doc, then average across all query anchors.
+
+# ── core pipeline: text → anchors ────────────────────────────────────────────
+
+def process_text(text_list, context, label="doc"):
+    """Full pipeline: text → extract → reduce → topics → reps → anchors.
+
+    Args:
+        text_list: list of phrases to extract CUIs from
+        context: surrounding text for extraction context
+        label: name for output (e.g. "doc", case name)
+
+    Returns:
+        dict with keys: anchors, ic_map, terms, h_topics, topic_reps,
+                        entity_results, all_embeddings, metadata
+        or None if nothing extracted
     """
+    context_list = [context] * len(text_list)
+    per_phrase = extractor.extract(text_list, context_list)
+    extractor._cache.flush()
 
-    def __init__(self, ic_map=None):
-        """Initialize matcher.
+    print(f"\n[{label}] Extracted CUIs for {len(per_phrase)} phrases")
+    for phrase, cui_dists in per_phrase.items():
+        print(f"  \"{phrase}\": {len(cui_dists)} CUIs")
 
-        Args:
-            ic_map: dict {cui: float} — IC scores for scoring.
-                    If None, all IC weights default to 1.0.
-        """
-        self.ic_map = ic_map or {}
-        self._ic_max = max(self.ic_map.values()) if self.ic_map else 1.0
-        if self._ic_max < 1e-9:
-            self._ic_max = 1.0
+    if not per_phrase:
+        print(f"[{label}] No CUIs extracted")
+        return None
 
-    def match(self, query_anchors, doc_chunk_anchors):
-        """Match query against multiple document chunks.
+    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase.items()]
+    results = system.reduce_batch(batch_inputs)
+    entity_results = [(batch_inputs[i][1], results[i]) for i in range(len(results))]
 
-        Args:
-            query_anchors: list[AnchorInfo] — from query pipeline
-            doc_chunk_anchors: dict {chunk_id: list[AnchorInfo]} — stored doc anchors
+    all_surviving, all_cuis = set(), set()
+    for entity_text, result in entity_results:
+        all_surviving.update(result.all_reduced_cuis)
+        for e in result.confidence:
+            all_cuis.update(e.explains_cuis)
+        for a in result.audit_trail:
+            all_cuis.add(a.removed_cui)
+            if a.kept_cui:
+                all_cuis.add(a.kept_cui)
+    all_cuis.update(all_surviving)
+    for ph, cd in per_phrase.items():
+        all_cuis.update(cd.keys())
 
-        Returns:
-            list[MatchResult] sorted by score descending
-        """
-        t0 = time.perf_counter()
-        if not query_anchors or not doc_chunk_anchors:
-            return []
+    if not all_surviving:
+        print(f"[{label}] No CUIs survived reduction")
+        return None
 
-        results = []
-        for chunk_id, doc_anchors in doc_chunk_anchors.items():
-            score, cat_scores, details = self._score_chunk(
-                query_anchors, doc_anchors)
-            if score > 0:
-                matched_cats = [cat for cat, s in cat_scores.items() if s > 0]
-                results.append(MatchResult(
-                    chunk_id=chunk_id,
-                    score=round(score, 4),
-                    matched_categories=matched_cats,
-                    category_scores={k: round(v, 4) for k, v in cat_scores.items()},
-                    match_details=details
-                ))
+    ic_map = system.ic_computer.compute(list(all_surviving), {})
+    h_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
 
-        results.sort(key=lambda r: (-r.score, r.chunk_id))
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.debug(f"    TopicMatcher: {len(doc_chunk_anchors)} chunks -> "
-                     f"{len(results)} matches ({elapsed:.1f}ms)")
-        return results
+    ancestor_cuis = set()
+    for tid, t in h_topics.items():
+        if t["topic_cui"]:
+            ancestor_cuis.add(t["topic_cui"])
+        for stid, st in t.get("subtopics", {}).items():
+            if st["subtopic_cui"]:
+                ancestor_cuis.add(st["subtopic_cui"])
+    all_cuis.update(ancestor_cuis)
 
-    def match_single(self, query_anchors, doc_anchors):
-        """Match query against a single chunk's anchors.
+    terms = fetch_preferred_terms(all_cuis)
 
-        Args:
-            query_anchors: list[AnchorInfo]
-            doc_anchors: list[AnchorInfo]
+    embeddings = system.emb_fetcher.fetch(list(all_surviving))
+    removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
+    all_embeddings = {**embeddings, **removed_embs}
 
-        Returns:
-            (score, category_scores, details)
-        """
-        return self._score_chunk(query_anchors, doc_anchors)
+    metadata = system.fetcher.fetch(list(all_cuis))
+    topic_reps = TopicRepresentativeSelector.select(
+        h_topics, metadata, all_embeddings, ic_map, hierarchy)
 
-    def _score_chunk(self, query_anchors, doc_anchors):
-        """BMA scoring: each query anchor gets best same-category doc match."""
-        if not query_anchors:
-            return 0.0, {}, []
+    anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
 
-        # index doc anchors by category for fast lookup
-        doc_by_cat = defaultdict(list)
-        for da in doc_anchors:
-            doc_by_cat[da.category].append(da)
+    anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
+    anchor_cuis_for_terms.update(c for a in anchors for c in a.ancestor_cuis or [])
+    extra_terms = fetch_preferred_terms(anchor_cuis_for_terms - set(terms.keys()))
+    terms.update(extra_terms)
 
-        cat_scores = {}
-        all_details = []
+    print(f"[{label}] {sum(len(cd) for cd in per_phrase.values())} raw CUIs "
+          f"→ {len(all_surviving)} surviving → {len(h_topics)} topics "
+          f"→ {len(anchors)} anchors")
+    for a in anchors:
+        rep_terms_list = [terms.get(rc, rc) for rc in a.rep_cuis]
+        print(f"    {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)} "
+              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms_list)}], "
+              f"topics={a.topic_ids})")
 
-        for qa in query_anchors:
-            cat = qa.category
-            best_score = 0.0
-            best_detail = None
+    return {
+        "anchors": anchors,
+        "ic_map": ic_map,
+        "terms": terms,
+        "h_topics": h_topics,
+        "topic_reps": topic_reps,
+        "entity_results": entity_results,
+        "all_embeddings": all_embeddings,
+        "metadata": metadata,
+    }
 
-            for da in doc_by_cat.get(cat, []):
-                score, detail = self._score_anchor_pair(qa, da)
-                if score > best_score:
-                    best_score = score
-                    best_detail = detail
 
-            # accumulate per category — if multiple query anchors in same category,
-            # take the average of their best scores
-            if cat not in cat_scores:
-                cat_scores[cat] = []
-            cat_scores[cat].append(best_score)
+# ── CSV writers ──────────────────────────────────────────────────────────────
 
-            if best_detail:
-                all_details.append(best_detail)
+INCLUDE_SUBTOPICS = False   # set True to include subtopic columns in topics CSV
 
-        # average within each category, then average across categories
-        cat_avg = {}
-        for cat, scores in cat_scores.items():
-            cat_avg[cat] = sum(scores) / len(scores) if scores else 0.0
+def write_csvs(result, label="doc"):
+    """Write all CSVs from a process_text result."""
+    terms = result["terms"]
+    h_topics = result["h_topics"]
 
-        # BMA: average across all query categories
-        if cat_avg:
-            overall = sum(cat_avg.values()) / len(cat_avg)
-        else:
-            overall = 0.0
+    # ── entities CSV (unchanged) ─────────────────────────────────────────
+    entity_rows = []
+    for entity_text, r in result["entity_results"]:
+        for e in r.confidence:
+            explains_str = " | ".join(
+                f"{ec}:{terms.get(ec, ec)}" for ec in e.explains_cuis
+            ) if e.explains_cuis else ""
+            entity_rows.append([
+                entity_text, e.cui, terms.get(e.cui, e.cui),
+                round(e.confidence, 4), round(e.extraction_proximity, 3),
+                round(e.centrality, 3), round(e.retention_power, 3),
+                len(e.explains_cuis), explains_str])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_entities.csv"),
+             ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
+              "explains_count", "explains"], entity_rows)
 
-        return overall, cat_avg, all_details
+    # ── topics CSV: topic_id + CUIs, no ancestor labels ──────────────────
+    topic_rows = []
+    if INCLUDE_SUBTOPICS:
+        for tid, t in sorted(h_topics.items()):
+            for stid, st in sorted(t.get("subtopics", {}).items()):
+                st_cui = st["subtopic_cui"] or ""
+                st_name = terms.get(st_cui, st_cui) if st_cui else ""
+                for c in st["members"]:
+                    topic_rows.append([tid, stid, st_name, c, terms.get(c, c)])
+            for c in sorted(t.get("ungrouped", [])):
+                topic_rows.append([tid, "", "", c, terms.get(c, c)])
+        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+                 ["topic_id", "subtopic_id", "subtopic_name",
+                  "cui", "preferred_term"], topic_rows)
+    else:
+        for tid, t in sorted(h_topics.items()):
+            for c in t["members"]:
+                topic_rows.append([tid, c, terms.get(c, c)])
+        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+                 ["topic_id", "cui", "preferred_term"], topic_rows)
 
-    def _score_anchor_pair(self, query_anchor, doc_anchor):
-        """Score a single query anchor vs a single doc anchor.
-        Returns (score, detail_dict)."""
-        # original rep sets for IC scoring
-        qa_reps_orig = set(query_anchor.rep_cuis)
-        da_reps_orig = set(doc_anchor.rep_cuis)
-        # expanded sets include anchor CUI for matching checks —
-        # when anchor is LCA it's different from reps but still meaningful
-        qa_reps = qa_reps_orig | {query_anchor.anchor_cui}
-        da_reps = da_reps_orig | {doc_anchor.anchor_cui}
-        qa_ancs = set(query_anchor.ancestor_cuis or [])
-        da_ancs = set(doc_anchor.ancestor_cuis or [])
+    # ── representatives CSV: one rep per row, simple ─────────────────────
+    rep_rows = []
+    for tid in sorted(result["topic_reps"].keys()):
+        for r in result["topic_reps"][tid]:
+            rep_rows.append([
+                tid, r.cui, terms.get(r.cui, r.cui),
+                r.method, r.member_count, round(r.ic_score, 2),
+                " | ".join(f"{m}:{terms.get(m, m)}" for m in r.members)])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_representatives.csv"),
+             ["topic_id", "rep_cui", "rep_term", "method", "member_count",
+              "ic_score", "members"], rep_rows)
 
-        best_score = 0.0
-        best_match_type = None
-        best_q_cui = None
-        best_d_cui = None
+    # ── anchors CSV: what gets stored for matching ───────────────────────
+    anchor_rows = []
+    for a in result["anchors"]:
+        rep_detail = " | ".join(f"{rc}:{terms.get(rc, rc)}" for rc in a.rep_cuis)
+        topic_detail_parts = []
+        for tid in a.topic_ids:
+            t = h_topics.get(tid, {})
+            member_count = len(t.get("members", []))
+            topic_detail_parts.append(f"topic_{tid}({member_count} CUIs)")
+        topic_detail = " | ".join(topic_detail_parts)
 
-        # Level 1: exact CUI overlap between rep sets
-        overlap = qa_reps & da_reps
-        if overlap:
-            ic_matched = sum(self.ic_map.get(c, 1.0) for c in overlap)
-            ic_total = sum(self.ic_map.get(c, 1.0) for c in qa_reps_orig) or 1.0
-            score = MATCH_EXACT_SCORE * (ic_matched / ic_total) if ic_total > 0 else MATCH_EXACT_SCORE
-            if score > best_score:
-                best_score = score
-                best_match_type = "exact"
-                best_q_cui = sorted(overlap)[0]
-                best_d_cui = best_q_cui
+        anchor_rows.append([
+            a.anchor_cui, terms.get(a.anchor_cui, a.anchor_cui),
+            round(a.anchor_ic, 2),
+            rep_detail,
+            len(a.topic_ids), topic_detail,
+            len(a.ancestor_cuis) if a.ancestor_cuis else 0])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_anchors.csv"),
+             ["anchor_cui", "anchor_term", "anchor_ic",
+              "representatives", "topics_covered", "topic_details",
+              "ancestor_count"], anchor_rows)
 
-        # Level 2: subsumption (only if no exact match found)
-        if best_score < MATCH_EXACT_SCORE:
-            for q_cui in qa_reps:
-                for d_cui in da_reps:
-                    if q_cui == d_cui:
-                        continue  # already handled in exact
+    print(f"[{label}] CSVs written to {OUTPUT_DIR}")
 
-                    # query subsumes doc: query CUI is ancestor of doc CUI
-                    if q_cui in da_ancs:
-                        q_ic = self.ic_map.get(q_cui, 1.0)
-                        score = MATCH_QUERY_SUBSUMES_SCORE * (q_ic / self._ic_max)
-                        if score > best_score:
-                            best_score = score
-                            best_match_type = "query_subsumes_doc"
-                            best_q_cui = q_cui
-                            best_d_cui = d_cui
 
-                    # doc subsumes query: doc CUI is ancestor of query CUI
-                    elif d_cui in qa_ancs:
-                        d_ic = self.ic_map.get(d_cui, 1.0)
-                        score = MATCH_DOC_SUBSUMES_SCORE * (d_ic / self._ic_max)
-                        if score > best_score:
-                            best_score = score
-                            best_match_type = "doc_subsumes_query"
-                            best_q_cui = q_cui
-                            best_d_cui = d_cui
+def run_evaluation(result, label="doc"):
+    flat_topics = {tid: t["members"] for tid, t in result["h_topics"].items()}
+    metric_rows = evaluator.intrinsic_metrics(
+        label, result["entity_results"], flat_topics, result["all_embeddings"])
+    recon_rows = evaluator.reconstruction_check(
+        label, result["entity_results"], result["all_embeddings"],
+        result["metadata"], result["terms"])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_metrics.csv"),
+             Evaluator.metric_headers(), metric_rows)
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_reconstruction.csv"),
+             Evaluator.reconstruction_headers(), recon_rows)
+    suspect = sum(1 for r in recon_rows if "SUSPECT" in str(r[-1]))
+    ok = sum(1 for r in recon_rows if r[-1] == "OK")
+    total = len(recon_rows)
+    if total:
+        print(f"[{label}] Evaluation: {ok}/{total} OK, {suspect}/{total} SUSPECT")
+    return metric_rows, recon_rows
 
-        # Level 3: shared ancestor (only if no subsumption found)
-        if best_score < MATCH_DOC_SUBSUMES_SCORE * 0.5:
-            shared = qa_ancs & da_ancs
-            if shared:
-                best_anc = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
-                anc_ic = self.ic_map.get(best_anc, 0.0)
-                if anc_ic >= MATCH_ANCESTOR_IC_THRESHOLD:
-                    score = MATCH_SHARED_ANCESTOR_SCORE * (anc_ic / self._ic_max)
-                    if score > best_score:
-                        best_score = score
-                        best_match_type = "shared_ancestor"
-                        # pick first rep from each side for reporting
-                        best_q_cui = sorted(qa_reps)[0] if qa_reps else None
-                        best_d_cui = sorted(da_reps)[0] if da_reps else None
 
-        if best_score <= 0:
-            return 0.0, None
+# ── main ─────────────────────────────────────────────────────────────────────
 
-        detail = {
-            "query_anchor": query_anchor.anchor_cui,
-            "doc_anchor": doc_anchor.anchor_cui,
-            "category": query_anchor.category,
-            "match_type": best_match_type,
-            "score": round(best_score, 4),
-            "query_cui": best_q_cui,
-            "doc_cui": best_d_cui,
-        }
-        return best_score, detail
+if __name__ == "__main__":
 
-    # ── Display helpers ───────────────────────────────────────────────────────
+    # ── INPUT (edit these) ───────────────────────────────────────────────
+    CONTEXT = (
+        "Patient presented with left knee pain and swelling for the past three days. "
+        "Pain worsens with weight bearing and climbing stairs. No history of trauma. "
+        "Mild effusion noted on examination."
+    )
+    TEXT_LIST = [
+        "left knee pain",
+        "swelling",
+        "weight bearing pain",
+        "climbing stairs difficulty",
+        "knee effusion",
+    ]
 
-    @staticmethod
-    def format_results(results, terms=None, top_k=10):
-        """Format match results for display.
+    # ═════════════════════════════════════════════════════════════════════
+    # Process
+    # ═════════════════════════════════════════════════════════════════════
+    result = process_text(TEXT_LIST, CONTEXT, label="api")
+    if result:
+        write_csvs(result, label="api")
+        run_evaluation(result, label="api")
 
-        Args:
-            results: list[MatchResult] from match()
-            terms: optional dict {cui: str} for human-readable output
-            top_k: max results to show
-
-        Returns:
-            list of formatted dicts
-        """
-        terms = terms or {}
-        formatted = []
-        for r in results[:top_k]:
-            cats = ", ".join(f"{c}={r.category_scores.get(c, 0):.2f}"
-                            for c in r.matched_categories)
-            formatted.append({
-                "chunk_id": r.chunk_id,
-                "score": r.score,
-                "categories": cats,
-                "details": r.match_details
-            })
-        return formatted
-
-    @staticmethod
-    def explain_match(result, terms=None):
-        """Generate human-readable explanation of a match result."""
-        terms = terms or {}
-        lines = [f"Chunk: {result.chunk_id}  Score: {result.score:.3f}"]
-        for d in result.match_details:
-            q_term = terms.get(d["query_cui"], d["query_cui"])
-            d_term = terms.get(d["doc_cui"], d["doc_cui"])
-            lines.append(
-                f"  [{d['category']}] {d['match_type']} "
-                f"(score={d['score']:.2f}): "
-                f"query={q_term} → doc={d_term}")
-        return "\n".join(lines)
+    print(f"\n{'='*80}\nDONE\n{'='*80}")
