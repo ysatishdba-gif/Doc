@@ -892,14 +892,14 @@ class HierarchicalTopicBuilder:
             for cui in remaining:
                 ancs = cui_ancestors.get(cui, set())
                 if ancs:
-                    # attach to nearest existing topic by shared ancestors
-                    best_topic, best_overlap = None, 0
+                    # attach to nearest existing topic by highest-IC shared ancestor
+                    best_topic, best_ic = None, -1.0
                     for t_id, t_info in topics.items():
                         t_anc_cui = t_info["topic_cui"]
                         if t_anc_cui and t_anc_cui in ancs:
-                            overlap = len(ancs)
-                            if overlap > best_overlap:
-                                best_overlap = overlap
+                            t_ic = ic_scores.get(t_anc_cui, 0.0)
+                            if t_ic > best_ic:
+                                best_ic = t_ic
                                 best_topic = t_id
                     if best_topic is not None:
                         topics[best_topic]["members"].append(cui)
@@ -2070,15 +2070,19 @@ _STY_TO_CATEGORY = {
     "Immunologic Factor": "Drug", "Biomedical or Dental Material": "Drug",
     "Vitamin": "Drug", "Enzyme": "Drug", "Receptor": "Drug",
     "Biologically Active Substance": "Drug", "Indicator, Reagent, or Diagnostic Aid": "Drug",
+    "Inorganic Chemical": "Drug", "Element, Ion, or Isotope": "Drug",
+    "Nucleic Acid, Nucleotide, or Nucleoside": "Drug",
     # Procedures
     "Therapeutic or Preventive Procedure": "Procedure",
     "Diagnostic Procedure": "Procedure", "Laboratory Procedure": "Procedure",
     "Research Activity": "Procedure", "Health Care Activity": "Procedure",
     "Molecular Biology Research Technique": "Procedure",
+    "Medical Device": "Procedure", "Manufactured Object": "Procedure",
     "Laboratory or Test Result": "Lab",
     # Findings & Observations
     "Finding": "Finding", "Sign or Symptom": "Finding",
     "Clinical Attribute": "Finding", "Organism Attribute": "Finding",
+    "Gene or Genome": "Finding",
     # Anatomy
     "Body Part, Organ, or Organ Component": "Anatomy",
     "Tissue": "Anatomy", "Cell": "Anatomy", "Body Location or Region": "Anatomy",
@@ -2087,11 +2091,21 @@ _STY_TO_CATEGORY = {
     "Fully Formed Anatomical Structure": "Anatomy",
 }
 
+_STY_CATEGORY_PRIORITY = ["Disease", "Drug", "Lab", "Procedure", "Finding", "Anatomy"]
+
 def _sty_to_category(semantic_types):
-    """Map a list of semantic type strings to a single coarse category."""
+    """Map a list of semantic type strings to a single coarse category.
+    Uses priority order: Disease > Drug > Lab > Procedure > Finding > Anatomy."""
+    found = set()
     for sty in semantic_types:
-        if sty in _STY_TO_CATEGORY:
-            return _STY_TO_CATEGORY[sty]
+        cat = _STY_TO_CATEGORY.get(sty)
+        if cat:
+            found.add(cat)
+    if not found:
+        return "Other"
+    for cat in _STY_CATEGORY_PRIORITY:
+        if cat in found:
+            return cat
     return "Other"
 
 
@@ -2230,7 +2244,6 @@ class TopicRepresentativeSelector:
         # Strategy A: Parent-within-set (MICA)
         # If any CUI in the sub-cluster is a UMLS ancestor of 2+ others, pick it
         if graph is not None and graph.number_of_nodes() > 0:
-            sc_set = set(sc_cuis)
             parent_scores = {}
             for candidate in sc_cuis:
                 if not graph.has_node(candidate):
@@ -2405,12 +2418,18 @@ class TopicAnchorAssigner:
             dedup[key]["topic_ids"].add(tid)
 
         # Phase 3: precompute ancestors for each anchor
+        # IMPORTANT: ancestors include all rep CUIs' ancestors + anchor's ancestors
+        # so subsumption matching works for rep-to-rep checks (not just anchor-to-anchor)
         anchors = []
         for (anchor_cui, cat), info in dedup.items():
-            anc_cuis = []
+            anc_set = set()
             if graph is not None:
-                anc_set = _get_ancestors(graph, anchor_cui, _ANCHOR_BFS_DEPTH)
-                anc_cuis = sorted(anc_set)
+                # ancestors of the anchor itself
+                anc_set |= _get_ancestors(graph, anchor_cui, _ANCHOR_BFS_DEPTH)
+                # ancestors of each representative CUI
+                for rc in info["rep_cuis"]:
+                    anc_set |= _get_ancestors(graph, rc, _ANCHOR_BFS_DEPTH)
+            anc_cuis = sorted(anc_set)
 
             anchors.append(AnchorInfo(
                 anchor_cui=anchor_cui,
@@ -2468,12 +2487,16 @@ class TopicAnchorAssigner:
     @staticmethod
     def precompute_anchor_ancestors(anchors, graph, depth=None):
         """Ensure all anchors have their ancestor_cuis populated.
+        Includes ancestors of all rep CUIs + anchor CUI.
         Call this if anchors were loaded from storage without ancestors."""
         d = depth or _ANCHOR_BFS_DEPTH
         for a in anchors:
             if a.ancestor_cuis is None or len(a.ancestor_cuis) == 0:
                 if graph is not None:
-                    a.ancestor_cuis = sorted(_get_ancestors(graph, a.anchor_cui, d))
+                    anc_set = _get_ancestors(graph, a.anchor_cui, d)
+                    for rc in a.rep_cuis:
+                        anc_set |= _get_ancestors(graph, rc, d)
+                    a.ancestor_cuis = sorted(anc_set)
                 else:
                     a.ancestor_cuis = []
 
