@@ -1,6 +1,13 @@
 """
 CUI Reduction Runner — Pickle Files (GCS)
-Loads pickle files, batch reduction per entity, case-level topics, evaluation.
+Loads pickle files, batch reduction per entity, topics, reps, anchors, matching.
+
+Usage:
+    # Run as script — processes all pickles + optional query + match:
+    python run_cui_reduction.py
+
+    # Or import functions:
+    from run_cui_reduction import process_one_pickle, process_query, match_query
 """
 
 import os
@@ -12,9 +19,30 @@ from google.cloud import storage, bigquery
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR,
     ALLOWED_SABS, GCS_BUCKET, PICKLE_PREFIX, OUTPUT_DIR,
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
     hierarchy, ic_precomputed
 )
-from cui_reduction_system import CUIReductionSystem, TopicBuilder, Evaluator
+from cui_reduction_system import (
+    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
+    TopicRepresentativeSelector, TopicAnchorAssigner
+)
+from topic_matcher import TopicMatcher
+
+
+# ── shared instances (initialized once) ──────────────────────────────────────
+
+system = CUIReductionSystem(
+    project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
+    allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
+    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
+
+extractor = CUIExtractor(
+    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
+    cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
+
+evaluator = Evaluator(hierarchy)
+bq = bigquery.Client(project=PROJECT_ID)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -55,7 +83,7 @@ def parse_pickle(data):
     return text, entities
 
 
-def fetch_preferred_terms(bq, cuis):
+def fetch_preferred_terms(cuis):
     if not cuis:
         return {}
     terms, cuis = {}, list(cuis)
@@ -84,13 +112,21 @@ def save_csv(path, headers, rows):
         w.writerows(rows)
 
 
-# ── process one pickle 
+# ── core: process one pickle → anchors ───────────────────────────────────────
 
-def process_one_pickle(fname, data, system, evaluator, bq):
+def process_one_pickle(fname, data):
+    """Full pipeline for one pickle file.
+
+    Returns:
+        dict with keys: case_name, anchors, ic_map, terms, h_topics,
+                        topic_reps, entity_results, all_embeddings, metadata,
+                        metric_rows, recon_rows
+        or None if no entities found
+    """
     text, entities = parse_pickle(data)
     if not entities:
         print(f"  {fname} — no entities found")
-        return None, [], []
+        return None
 
     case_name = fname.rsplit(".", 1)[0]
     total_cuis = sum(len(c) for _, _, c, _ in entities)
@@ -120,27 +156,82 @@ def process_one_pickle(fname, data, system, evaluator, bq):
         all_cuis.update(cuis)
     all_cuis.update(all_surviving)
 
-    terms = fetch_preferred_terms(bq, all_cuis)
+    # hierarchical topics
+    ic_map = system.ic_computer.compute(list(all_surviving), {})
+    h_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
 
-    # case-level topics
+    ancestor_cuis = set()
+    for tid, t in h_topics.items():
+        if t["topic_cui"]:
+            ancestor_cuis.add(t["topic_cui"])
+        for stid, st in t.get("subtopics", {}).items():
+            if st["subtopic_cui"]:
+                ancestor_cuis.add(st["subtopic_cui"])
+    all_cuis.update(ancestor_cuis)
+
+    terms = fetch_preferred_terms(all_cuis)
+
+    # embeddings
     surviving_list = list(all_surviving)
     embeddings = system.emb_fetcher.fetch(surviving_list)
     removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
     all_embeddings = {**embeddings, **removed_embs}
 
-    with_emb = [c for c in surviving_list if c in embeddings]
-    case_topics = {}
-    if len(with_emb) >= 2:
-        case_topics = TopicBuilder.build(with_emb, embeddings)
-    elif with_emb:
-        case_topics = {0: with_emb}
+    # metadata + representatives
+    metadata = system.fetcher.fetch(list(all_cuis))
+    topic_reps = TopicRepresentativeSelector.select(
+        h_topics, metadata, all_embeddings, ic_map, hierarchy)
+    TopicRepresentativeSelector.resolve_snomed(bq, PROJECT_ID, DATASET_ID, topic_reps)
 
-    # entity CSV
-    entity_rows = []
+    # anchors
+    anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
+
+    anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
+    anchor_cuis_for_terms.update(c for a in anchors for c in a.ancestor_cuis or [])
+    extra_terms = fetch_preferred_terms(anchor_cuis_for_terms - set(terms.keys()))
+    terms.update(extra_terms)
+
+    # print summary
     for entity_text, result in entity_results:
-        print(f"\n  ENTITY: \"{entity_text}\"  "
+        print(f"  ENTITY: \"{entity_text}\" "
               f"({result.input_count} → {result.after_redundancy_count})")
-        for e in result.confidence:
+
+    print(f"\n  ANCHORS: {len(anchors)}")
+    for a in anchors:
+        print(f"    [{a.category}] {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)} "
+              f"(IC={a.anchor_ic:.1f}, reps={len(a.rep_cuis)})")
+
+    # evaluation
+    flat_topics = {tid: t["members"] for tid, t in h_topics.items()}
+    metric_rows = evaluator.intrinsic_metrics(case_name, entity_results, flat_topics, all_embeddings)
+    recon_rows = evaluator.reconstruction_check(case_name, entity_results, all_embeddings, metadata, terms)
+
+    return {
+        "case_name": case_name,
+        "anchors": anchors,
+        "ic_map": ic_map,
+        "terms": terms,
+        "h_topics": h_topics,
+        "topic_reps": topic_reps,
+        "entity_results": entity_results,
+        "all_embeddings": all_embeddings,
+        "metadata": metadata,
+        "metric_rows": metric_rows,
+        "recon_rows": recon_rows,
+    }
+
+
+# ── CSV writers ──────────────────────────────────────────────────────────────
+
+def write_case_csvs(result):
+    """Write all CSVs for one processed pickle."""
+    case = result["case_name"]
+    terms = result["terms"]
+    h_topics = result["h_topics"]
+
+    entity_rows = []
+    for entity_text, r in result["entity_results"]:
+        for e in r.confidence:
             explains_str = " | ".join(
                 f"{ec}:{terms.get(ec, ec)}" for ec in e.explains_cuis
             ) if e.explains_cuis else ""
@@ -148,71 +239,188 @@ def process_one_pickle(fname, data, system, evaluator, bq):
                 entity_text, e.cui, terms.get(e.cui, e.cui),
                 round(e.confidence, 4), round(e.extraction_proximity, 3),
                 round(e.centrality, 3), round(e.retention_power, 3),
-                len(e.explains_cuis), explains_str
-            ])
-        for e in result.confidence[:5]:
-            exp = len(e.explains_cuis)
-            exp_s = f"  explains {exp}" if exp else ""
-            print(f"    {e.cui}  conf={e.confidence:.3f}{exp_s}  |  {terms.get(e.cui, e.cui)}")
-
-    save_csv(os.path.join(OUTPUT_DIR, f"{case_name}_entities.csv"),
+                len(e.explains_cuis), explains_str])
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_entities.csv"),
              ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
               "explains_count", "explains"], entity_rows)
 
-    # topic CSV
     topic_rows = []
-    print(f"\n  TOPICS: {len(case_topics)} topics, {len(with_emb)} CUIs")
-    for tid, members in sorted(case_topics.items()):
-        print(f"    Topic {tid}: {len(members)} CUIs")
-        for c in members:
-            topic_rows.append([tid, c, terms.get(c, c)])
+    for tid, t in sorted(h_topics.items()):
+        t_cui = t["topic_cui"] or ""
+        t_name = terms.get(t_cui, t_cui) if t_cui else "(ungrouped)"
+        for stid, st in sorted(t.get("subtopics", {}).items()):
+            st_cui = st["subtopic_cui"] or ""
+            st_name = terms.get(st_cui, st_cui) if st_cui else ""
+            for c in st["members"]:
+                topic_rows.append([tid, t_cui, t_name, stid, st_cui, st_name, c, terms.get(c, c)])
+        for c in sorted(t.get("ungrouped", [])):
+            topic_rows.append([tid, t_cui, t_name, "", "", "", c, terms.get(c, c)])
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_topics.csv"),
+             ["topic_id", "topic_cui", "topic_name",
+              "subtopic_id", "subtopic_cui", "subtopic_name",
+              "cui", "preferred_term"], topic_rows)
 
-    save_csv(os.path.join(OUTPUT_DIR, f"{case_name}_topics.csv"),
-             ["topic_id", "cui", "preferred_term"], topic_rows)
+    rep_rows = []
+    for tid in sorted(result["topic_reps"].keys()):
+        reps = result["topic_reps"][tid]
+        t_info = h_topics[tid]
+        t_cui = t_info["topic_cui"] or ""
+        t_name = terms.get(t_cui, t_cui) if t_cui else "(ungrouped)"
+        for r in reps:
+            rep_rows.append([
+                tid, t_cui, t_name, r.cui, terms.get(r.cui, r.cui),
+                r.category, r.method, r.member_count, r.ic_score,
+                r.snomed_code, r.snomed_term, " | ".join(r.members)])
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_representatives.csv"),
+             ["topic_id", "topic_cui", "topic_name",
+              "rep_cui", "rep_term", "category", "method", "member_count",
+              "ic_score", "snomed_code", "snomed_term", "members"], rep_rows)
 
-    # evaluation
+    anchor_rows = []
+    for a in result["anchors"]:
+        anchor_rows.append([
+            a.anchor_cui, terms.get(a.anchor_cui, a.anchor_cui),
+            round(a.anchor_ic, 2), a.category,
+            " | ".join(a.rep_cuis),
+            " | ".join(str(t) for t in a.topic_ids),
+            len(a.topic_ids), len(a.ancestor_cuis) if a.ancestor_cuis else 0])
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_anchors.csv"),
+             ["anchor_cui", "anchor_term", "anchor_ic", "category",
+              "rep_cuis", "topic_ids", "topic_count", "ancestor_count"], anchor_rows)
+
+
+# ── query: text → pipeline → anchors (uses API extractor) ───────────────────
+
+def process_query(query_text, context=""):
+    """Process a query string through the full pipeline.
+
+    Args:
+        query_text: free text query
+        context: optional surrounding context
+
+    Returns:
+        dict same as process_one_pickle but for query, or None
+    """
+    context_list = [context or query_text]
+    per_phrase = extractor.extract([query_text], context_list)
+    extractor._cache.flush()
+
+    if not per_phrase:
+        print(f"[query] No CUIs extracted for: \"{query_text}\"")
+        return None
+
+    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase.items()]
+    results = system.reduce_batch(batch_inputs)
+    entity_results = [(batch_inputs[i][1], results[i]) for i in range(len(results))]
+
+    surviving = set()
+    for _, r in entity_results:
+        surviving.update(r.all_reduced_cuis)
+
+    if not surviving:
+        print(f"[query] No CUIs survived for: \"{query_text}\"")
+        return None
+
+    ic_map = system.ic_computer.compute(list(surviving), {})
+    h_topics = HierarchicalTopicBuilder.build(list(surviving), hierarchy, ic_map)
+
+    all_cuis = set(surviving)
+    for tid, t in h_topics.items():
+        if t["topic_cui"]:
+            all_cuis.add(t["topic_cui"])
+    terms = fetch_preferred_terms(all_cuis)
+
+    embeddings = system.emb_fetcher.fetch(list(surviving))
     metadata = system.fetcher.fetch(list(all_cuis))
-    metric_rows = evaluator.intrinsic_metrics(case_name, entity_results, case_topics, all_embeddings)
-    recon_rows = evaluator.reconstruction_check(case_name, entity_results, all_embeddings, metadata, terms)
+    reps = TopicRepresentativeSelector.select(h_topics, metadata, embeddings, ic_map, hierarchy)
+    anchors = TopicAnchorAssigner.assign(reps, ic_map, hierarchy)
 
-    return case_name, metric_rows, recon_rows
+    anchor_extra = set(a.anchor_cui for a in anchors) - set(terms.keys())
+    terms.update(fetch_preferred_terms(anchor_extra))
+
+    print(f"[query] \"{query_text}\" → {len(surviving)} CUIs → {len(anchors)} anchors")
+    for a in anchors:
+        print(f"  [{a.category}] {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)}")
+
+    return {"anchors": anchors, "ic_map": ic_map, "terms": terms}
 
 
-#  main
+def match_query(query_text, doc_anchors_map, context=""):
+    """End-to-end: query text → pipeline → match against stored doc anchors.
 
-system = CUIReductionSystem(
-    project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
-    allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
-    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
+    Args:
+        query_text: free text query
+        doc_anchors_map: dict {chunk_id: [AnchorInfo, ...]}
+        context: optional context
 
-evaluator = Evaluator(hierarchy)
-bq = bigquery.Client(project=PROJECT_ID)
-pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    Returns:
+        list[MatchResult] sorted by score
+    """
+    q = process_query(query_text, context)
+    if q is None:
+        return []
 
-all_metric_rows, all_recon_rows = [], []
-for fname, data in pickles:
-    case_name, metric_rows, recon_rows = process_one_pickle(fname, data, system, evaluator, bq)
-    if case_name:
-        all_metric_rows.extend(metric_rows)
-        all_recon_rows.extend(recon_rows)
+    all_ic = dict(q["ic_map"])
+    for anchors_list in doc_anchors_map.values():
+        for a in anchors_list:
+            if a.anchor_cui not in all_ic:
+                all_ic[a.anchor_cui] = a.anchor_ic
 
-save_csv(os.path.join(OUTPUT_DIR, "eval_metrics.csv"), Evaluator.metric_headers(), all_metric_rows)
-save_csv(os.path.join(OUTPUT_DIR, "eval_reconstruction.csv"), Evaluator.reconstruction_headers(), all_recon_rows)
+    matcher = TopicMatcher(ic_map=all_ic)
+    results = matcher.match(q["anchors"], doc_anchors_map)
 
-# summary
-suspect = sum(1 for r in all_recon_rows if "SUSPECT" in str(r[-1]))
-ok = sum(1 for r in all_recon_rows if r[-1] == "OK")
-total = len(all_recon_rows)
-print(f"\n{'='*80}\nEVALUATION SUMMARY\n{'='*80}")
-if total:
-    print(f"  Reconstruction: {ok}/{total} OK, {suspect}/{total} SUSPECT")
-for r in all_metric_rows:
-    if r[3] == "reduction_ratio":
-        flag = f"  ← {r[5]}" if r[5] else ""
-        print(f"  Reduction: {r[2][:40]}: {r[4]}{flag}")
-for r in all_metric_rows:
-    if r[3] == "separation":
-        flag = f"  ← {r[5]}" if r[5] else ""
-        print(f"  Topic separation: {r[0]}: {r[4]}{flag}")
-print(f"\nDONE — {len(pickles)} cases")
+    print(f"\n{'='*80}")
+    print(f"MATCH RESULTS: \"{query_text}\" → {len(results)} chunks matched")
+    print(f"{'='*80}")
+    for r in results[:10]:
+        print(TopicMatcher.explain_match(r, q["terms"]))
+        print()
+
+    return results
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    # ── QUERY (edit this — set to None to skip) ─────────────────────────
+    QUERY = "rheumatoid arthritis treatment with methotrexate"
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Process all pickle files
+    # ═════════════════════════════════════════════════════════════════════
+    pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
+
+    all_metric_rows, all_recon_rows = [], []
+    all_case_anchors = {}  # {case_name: [AnchorInfo, ...]}
+
+    for fname, data in pickles:
+        result = process_one_pickle(fname, data)
+        if result:
+            write_case_csvs(result)
+            all_metric_rows.extend(result["metric_rows"])
+            all_recon_rows.extend(result["recon_rows"])
+            all_case_anchors[result["case_name"]] = result["anchors"]
+
+    # evaluation summary
+    save_csv(os.path.join(OUTPUT_DIR, "eval_metrics.csv"),
+             Evaluator.metric_headers(), all_metric_rows)
+    save_csv(os.path.join(OUTPUT_DIR, "eval_reconstruction.csv"),
+             Evaluator.reconstruction_headers(), all_recon_rows)
+
+    suspect = sum(1 for r in all_recon_rows if "SUSPECT" in str(r[-1]))
+    ok = sum(1 for r in all_recon_rows if r[-1] == "OK")
+    total = len(all_recon_rows)
+    print(f"\n{'='*80}\nEVALUATION SUMMARY\n{'='*80}")
+    if total:
+        print(f"  Reconstruction: {ok}/{total} OK, {suspect}/{total} SUSPECT")
+    total_anchors = sum(len(a) for a in all_case_anchors.values())
+    print(f"  Cases: {len(all_case_anchors)}, Total anchors: {total_anchors}")
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Query + match against all processed documents
+    # ═════════════════════════════════════════════════════════════════════
+    if QUERY and all_case_anchors:
+        match_results = match_query(QUERY, all_case_anchors)
+
+    print(f"\n{'='*80}\nDONE — {len(pickles)} cases\n{'='*80}")
