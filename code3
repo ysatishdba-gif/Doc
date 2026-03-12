@@ -1,13 +1,12 @@
 """
 CUI Reduction Runner — API
-Extracts CUIs via API, reduction, topics, representatives, anchors, matching.
+Extracts CUIs via API, reduction, topics, representatives, anchors, CSVs.
 
 Usage:
-    # Run as script — processes doc + query + match:
     python run_cui_reduction_api.py
 
-    # Or import functions:
-    from run_cui_reduction_api import process_text, process_query, match_query
+    # Or import:
+    from run_cui_reduction_api import process_text
 """
 
 import os
@@ -24,7 +23,6 @@ from cui_reduction_system import (
     CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
     TopicRepresentativeSelector, TopicAnchorAssigner
 )
-from topic_matcher import TopicMatcher
 
 
 # ── shared instances (initialized once) ──────────────────────────────────────
@@ -38,6 +36,7 @@ extractor = CUIExtractor(
     api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
     cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
 
+evaluator = Evaluator(hierarchy)
 bq = bigquery.Client(project=PROJECT_ID)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -81,7 +80,7 @@ def process_text(text_list, context, label="doc"):
     Args:
         text_list: list of phrases to extract CUIs from
         context: surrounding text for extraction context
-        label: name for output (e.g. "doc", "query", case name)
+        label: name for output (e.g. "doc", case name)
 
     Returns:
         dict with keys: anchors, ic_map, terms, h_topics, topic_reps,
@@ -170,46 +169,6 @@ def process_text(text_list, context, label="doc"):
     }
 
 
-def process_query(query_text, context=""):
-    """Process a query string through the full pipeline.
-    Same as process_text but takes a single query string."""
-    return process_text([query_text], context or query_text, label="query")
-
-
-def match_query(query_text, doc_anchors_map, context=""):
-    """End-to-end: query text → pipeline → match against stored doc anchors.
-
-    Args:
-        query_text: free text query
-        doc_anchors_map: dict {chunk_id: [AnchorInfo, ...]}
-        context: optional context
-
-    Returns:
-        list[MatchResult] sorted by score, or empty list
-    """
-    q = process_query(query_text, context)
-    if q is None:
-        return []
-
-    all_ic = dict(q["ic_map"])
-    for anchors_list in doc_anchors_map.values():
-        for a in anchors_list:
-            if a.anchor_cui not in all_ic:
-                all_ic[a.anchor_cui] = a.anchor_ic
-
-    matcher = TopicMatcher(ic_map=all_ic)
-    results = matcher.match(q["anchors"], doc_anchors_map)
-
-    print(f"\n{'='*80}")
-    print(f"MATCH RESULTS: \"{query_text}\" → {len(results)} chunks matched")
-    print(f"{'='*80}")
-    for r in results[:10]:
-        print(TopicMatcher.explain_match(r, q["terms"]))
-        print()
-
-    return results
-
-
 # ── CSV writers ──────────────────────────────────────────────────────────────
 
 def write_csvs(result, label="doc"):
@@ -280,7 +239,6 @@ def write_csvs(result, label="doc"):
 
 
 def run_evaluation(result, label="doc"):
-    evaluator = Evaluator(hierarchy)
     flat_topics = {tid: t["members"] for tid, t in result["h_topics"].items()}
     metric_rows = evaluator.intrinsic_metrics(
         label, result["entity_results"], flat_topics, result["all_embeddings"])
@@ -303,13 +261,13 @@ def run_evaluation(result, label="doc"):
 
 if __name__ == "__main__":
 
-    # ── DOCUMENT (edit these) ────────────────────────────────────────────
-    DOC_CONTEXT = (
+    # ── INPUT (edit these) ───────────────────────────────────────────────
+    CONTEXT = (
         "Patient presented with left knee pain and swelling for the past three days. "
         "Pain worsens with weight bearing and climbing stairs. No history of trauma. "
         "Mild effusion noted on examination."
     )
-    DOC_TEXT_LIST = [
+    TEXT_LIST = [
         "left knee pain",
         "swelling",
         "weight bearing pain",
@@ -317,21 +275,12 @@ if __name__ == "__main__":
         "knee effusion",
     ]
 
-    # ── QUERY (edit this) ────────────────────────────────────────────────
-    QUERY = "rheumatoid arthritis treatment with methotrexate"
-
     # ═════════════════════════════════════════════════════════════════════
-    # Process document
+    # Process
     # ═════════════════════════════════════════════════════════════════════
-    doc = process_text(DOC_TEXT_LIST, DOC_CONTEXT, label="doc")
-    if doc:
-        write_csvs(doc, label="doc")
-        run_evaluation(doc, label="doc")
-
-        # ═════════════════════════════════════════════════════════════════
-        # Process query + match
-        # ═════════════════════════════════════════════════════════════════
-        doc_anchors_map = {"doc_chunk_1": doc["anchors"]}
-        match_results = match_query(QUERY, doc_anchors_map)
+    result = process_text(TEXT_LIST, CONTEXT, label="api")
+    if result:
+        write_csvs(result, label="api")
+        run_evaluation(result, label="api")
 
     print(f"\n{'='*80}\nDONE\n{'='*80}")
