@@ -1,0 +1,296 @@
+"""
+Topic Matcher — CUI-based topic-to-topic matching.
+
+Matches query anchors against stored document anchors using
+category-aligned, IC-weighted BMA scoring with three match levels:
+exact, subsumption, and shared ancestor.
+
+Usage:
+    from cui_reduction_system import AnchorInfo
+    from topic_matcher import TopicMatcher, MatchResult
+
+    matcher = TopicMatcher(ic_map=ic_map)
+    results = matcher.match(query_anchors, doc_chunk_anchors)
+    for r in results[:10]:
+        print(matcher.explain_match(r, terms))
+
+References:
+    Pesquita et al. 2009 (BMA for set similarity)
+    Resnik 1995 (IC weighting)
+    Garla & Brandt 2012 (ontological matching in clinical domain)
+"""
+
+import time
+import logging
+from typing import List, Dict
+from dataclasses import dataclass
+from collections import defaultdict
+
+from cui_reduction_system import AnchorInfo
+
+logger = logging.getLogger("cui_reduction")
+
+# ── Tunable constants ─────────────────────────────────────────────────────────
+MATCH_EXACT_SCORE = 1.0              # score weight for exact CUI match
+MATCH_QUERY_SUBSUMES_SCORE = 0.8     # query CUI is ancestor of doc CUI
+MATCH_DOC_SUBSUMES_SCORE = 0.7       # doc CUI is ancestor of query CUI
+MATCH_SHARED_ANCESTOR_SCORE = 0.5    # shared ancestor match
+MATCH_ANCESTOR_IC_THRESHOLD = 4.0    # minimum IC for shared ancestor to count
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+@dataclass
+class MatchResult:
+    """Result of matching a query against one document chunk."""
+    chunk_id: str
+    score: float                            # overall BMA score [0, 1]
+    matched_categories: List[str]           # which categories matched
+    category_scores: Dict[str, float]       # {category: best_score}
+    match_details: List[Dict]               # per-category match details
+
+
+# ── Matcher ───────────────────────────────────────────────────────────────────
+
+class TopicMatcher:
+    """Match query anchors against stored document anchors.
+
+    Two-pass algorithm:
+      Pass 1 (coarse): anchor-level category-filtered match to narrow candidates
+      Pass 2 (precise): rep-level IC-weighted scoring with BMA
+
+    Match types (in priority order):
+      - exact:           query rep CUI == doc rep CUI                    (score 1.0)
+      - query_subsumes:  query rep CUI is ancestor of doc rep CUI        (score 0.8)
+      - doc_subsumes:    doc rep CUI is ancestor of query rep CUI        (score 0.7)
+      - shared_ancestor: highest-IC common ancestor above IC threshold   (score 0.5)
+
+    Scoring: Best Match Average (BMA) — each query anchor gets its best
+    same-category match from the doc, then average across all query anchors.
+    """
+
+    def __init__(self, ic_map=None):
+        """Initialize matcher.
+
+        Args:
+            ic_map: dict {cui: float} — IC scores for scoring.
+                    If None, all IC weights default to 1.0.
+        """
+        self.ic_map = ic_map or {}
+        self._ic_max = max(self.ic_map.values()) if self.ic_map else 1.0
+        if self._ic_max < 1e-9:
+            self._ic_max = 1.0
+
+    def match(self, query_anchors, doc_chunk_anchors):
+        """Match query against multiple document chunks.
+
+        Args:
+            query_anchors: list[AnchorInfo] — from query pipeline
+            doc_chunk_anchors: dict {chunk_id: list[AnchorInfo]} — stored doc anchors
+
+        Returns:
+            list[MatchResult] sorted by score descending
+        """
+        t0 = time.perf_counter()
+        if not query_anchors or not doc_chunk_anchors:
+            return []
+
+        results = []
+        for chunk_id, doc_anchors in doc_chunk_anchors.items():
+            score, cat_scores, details = self._score_chunk(
+                query_anchors, doc_anchors)
+            if score > 0:
+                matched_cats = [cat for cat, s in cat_scores.items() if s > 0]
+                results.append(MatchResult(
+                    chunk_id=chunk_id,
+                    score=round(score, 4),
+                    matched_categories=matched_cats,
+                    category_scores={k: round(v, 4) for k, v in cat_scores.items()},
+                    match_details=details
+                ))
+
+        results.sort(key=lambda r: (-r.score, r.chunk_id))
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug(f"    TopicMatcher: {len(doc_chunk_anchors)} chunks -> "
+                     f"{len(results)} matches ({elapsed:.1f}ms)")
+        return results
+
+    def match_single(self, query_anchors, doc_anchors):
+        """Match query against a single chunk's anchors.
+
+        Args:
+            query_anchors: list[AnchorInfo]
+            doc_anchors: list[AnchorInfo]
+
+        Returns:
+            (score, category_scores, details)
+        """
+        return self._score_chunk(query_anchors, doc_anchors)
+
+    def _score_chunk(self, query_anchors, doc_anchors):
+        """BMA scoring: each query anchor gets best same-category doc match."""
+        if not query_anchors:
+            return 0.0, {}, []
+
+        # index doc anchors by category for fast lookup
+        doc_by_cat = defaultdict(list)
+        for da in doc_anchors:
+            doc_by_cat[da.category].append(da)
+
+        cat_scores = {}
+        all_details = []
+
+        for qa in query_anchors:
+            cat = qa.category
+            best_score = 0.0
+            best_detail = None
+
+            for da in doc_by_cat.get(cat, []):
+                score, detail = self._score_anchor_pair(qa, da)
+                if score > best_score:
+                    best_score = score
+                    best_detail = detail
+
+            # accumulate per category — if multiple query anchors in same category,
+            # take the average of their best scores
+            if cat not in cat_scores:
+                cat_scores[cat] = []
+            cat_scores[cat].append(best_score)
+
+            if best_detail:
+                all_details.append(best_detail)
+
+        # average within each category, then average across categories
+        cat_avg = {}
+        for cat, scores in cat_scores.items():
+            cat_avg[cat] = sum(scores) / len(scores) if scores else 0.0
+
+        # BMA: average across all query categories
+        if cat_avg:
+            overall = sum(cat_avg.values()) / len(cat_avg)
+        else:
+            overall = 0.0
+
+        return overall, cat_avg, all_details
+
+    def _score_anchor_pair(self, query_anchor, doc_anchor):
+        """Score a single query anchor vs a single doc anchor.
+        Returns (score, detail_dict)."""
+        qa_reps = set(query_anchor.rep_cuis)
+        da_reps = set(doc_anchor.rep_cuis)
+        qa_ancs = set(query_anchor.ancestor_cuis or [])
+        da_ancs = set(doc_anchor.ancestor_cuis or [])
+
+        best_score = 0.0
+        best_match_type = None
+        best_q_cui = None
+        best_d_cui = None
+
+        # Level 1: exact CUI overlap between rep sets
+        overlap = qa_reps & da_reps
+        if overlap:
+            ic_matched = sum(self.ic_map.get(c, 1.0) for c in overlap)
+            ic_total = sum(self.ic_map.get(c, 1.0) for c in qa_reps)
+            score = MATCH_EXACT_SCORE * (ic_matched / ic_total) if ic_total > 0 else MATCH_EXACT_SCORE
+            if score > best_score:
+                best_score = score
+                best_match_type = "exact"
+                best_q_cui = sorted(overlap)[0]
+                best_d_cui = best_q_cui
+
+        # Level 2: subsumption (only if no exact match found)
+        if best_score < MATCH_EXACT_SCORE:
+            for q_cui in qa_reps:
+                for d_cui in da_reps:
+                    if q_cui == d_cui:
+                        continue  # already handled in exact
+
+                    # query subsumes doc: query CUI is ancestor of doc CUI
+                    if q_cui in da_ancs:
+                        q_ic = self.ic_map.get(q_cui, 1.0)
+                        score = MATCH_QUERY_SUBSUMES_SCORE * (q_ic / self._ic_max)
+                        if score > best_score:
+                            best_score = score
+                            best_match_type = "query_subsumes_doc"
+                            best_q_cui = q_cui
+                            best_d_cui = d_cui
+
+                    # doc subsumes query: doc CUI is ancestor of query CUI
+                    elif d_cui in qa_ancs:
+                        d_ic = self.ic_map.get(d_cui, 1.0)
+                        score = MATCH_DOC_SUBSUMES_SCORE * (d_ic / self._ic_max)
+                        if score > best_score:
+                            best_score = score
+                            best_match_type = "doc_subsumes_query"
+                            best_q_cui = q_cui
+                            best_d_cui = d_cui
+
+        # Level 3: shared ancestor (only if no subsumption found)
+        if best_score < MATCH_DOC_SUBSUMES_SCORE * 0.5:
+            shared = qa_ancs & da_ancs
+            if shared:
+                best_anc = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
+                anc_ic = self.ic_map.get(best_anc, 0.0)
+                if anc_ic >= MATCH_ANCESTOR_IC_THRESHOLD:
+                    score = MATCH_SHARED_ANCESTOR_SCORE * (anc_ic / self._ic_max)
+                    if score > best_score:
+                        best_score = score
+                        best_match_type = "shared_ancestor"
+                        # pick first rep from each side for reporting
+                        best_q_cui = sorted(qa_reps)[0] if qa_reps else None
+                        best_d_cui = sorted(da_reps)[0] if da_reps else None
+
+        if best_score <= 0:
+            return 0.0, None
+
+        detail = {
+            "query_anchor": query_anchor.anchor_cui,
+            "doc_anchor": doc_anchor.anchor_cui,
+            "category": query_anchor.category,
+            "match_type": best_match_type,
+            "score": round(best_score, 4),
+            "query_cui": best_q_cui,
+            "doc_cui": best_d_cui,
+        }
+        return best_score, detail
+
+    # ── Display helpers ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def format_results(results, terms=None, top_k=10):
+        """Format match results for display.
+
+        Args:
+            results: list[MatchResult] from match()
+            terms: optional dict {cui: str} for human-readable output
+            top_k: max results to show
+
+        Returns:
+            list of formatted dicts
+        """
+        terms = terms or {}
+        formatted = []
+        for r in results[:top_k]:
+            cats = ", ".join(f"{c}={r.category_scores.get(c, 0):.2f}"
+                            for c in r.matched_categories)
+            formatted.append({
+                "chunk_id": r.chunk_id,
+                "score": r.score,
+                "categories": cats,
+                "details": r.match_details
+            })
+        return formatted
+
+    @staticmethod
+    def explain_match(result, terms=None):
+        """Generate human-readable explanation of a match result."""
+        terms = terms or {}
+        lines = [f"Chunk: {result.chunk_id}  Score: {result.score:.3f}"]
+        for d in result.match_details:
+            q_term = terms.get(d["query_cui"], d["query_cui"])
+            d_term = terms.get(d["doc_cui"], d["doc_cui"])
+            lines.append(
+                f"  [{d['category']}] {d['match_type']} "
+                f"(score={d['score']:.2f}): "
+                f"query={q_term} → doc={d_term}")
+        return "\n".join(lines)
