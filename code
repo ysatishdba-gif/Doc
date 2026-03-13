@@ -39,16 +39,11 @@ _ANCESTOR_DEPTH_CLAMP = (1, 5)       # min/max for computed ancestor depth
 _COMPONENT_DEPTH_RATIO = 0.4         # component depth as fraction of ancestor depth
 _HT_MAX_COVERAGE = 0.6              # HierarchicalTopicBuilder: exclude ancestors covering >60%
 
-_TYPEAHEAD_IC_CENTER = 7.0           # preferred IC for navigable typeahead results
-_TYPEAHEAD_WEIGHTS = (3.0, 2.0, 1.0) # (starts_with, ic_nav, descendant_nav) scoring weights
-_TYPEAHEAD_DESC_NORM = 50.0          # descendant count normalization divisor
-
 _EVAL_AGGRESSIVE_RATIO = 0.95        # reduction ratio above this = WARNING
 _EVAL_MINIMAL_RATIO = 0.10           # reduction ratio below this = WARNING
 _EVAL_COMPRESSED_SPREAD = 0.1        # confidence spread below this = WARNING
 _EVAL_SEPARATION_MIN = 0.05          # topic separation below this = WARNING
 _EVAL_SUSPECT_DIST = 0.3             # embedding distance above this in recon = SUSPECT
-_MATCH_ANCESTOR_IC_MIN = 4.0         # min IC for shared ancestor to count in match_topics
 _XTD_KNN_K = 10                      # k-NN neighbors for cross-topic dedup
 _LOUVAIN_SPLIT_RESOLUTION = 2.0      # Louvain resolution for oversized community sub-splits
 _COSINE_FALLBACK_THRESHOLD = 0.5     # TopicBuilder: fallback if no valid kNN distances
@@ -58,12 +53,9 @@ _RETRY_BACKOFF = 1                   # HTTP retry backoff factor (seconds)
 _RETRY_STATUS_CODES = (429, 500, 502, 503, 504)  # HTTP status codes to retry
 _COMP_DEPTH_MEAN_THRESHOLD = 1.5     # min mean in-degree for component depth > 1
 _DEFAULT_ANCESTOR_DEPTH = 3          # fallback ancestor depth when graph too sparse
-_TYPEAHEAD_OVERSAMPLE = 3            # oversample factor before final sort in typeahead
-_CANONICAL_MAX_DEPTH = 8             # default max depth for canonical topic mapping
 
 # ── TopicRepresentativeSelector constants ─────────────────────────────────────
 _REP_HAC_THRESHOLD = 0.5             # cosine distance threshold for sub-clustering within sem-type groups
-_REP_MIN_SUBCLUSTER = 2              # minimum CUIs to form a sub-cluster (else singleton)
 
 # ── TopicBuilder singleton merge ──────────────────────────────────────────────
 _SINGLETON_MERGE_MIN_SIM = 0.3       # minimum cosine similarity to merge singleton into a group
@@ -1399,6 +1391,7 @@ class CUIReductionSystem:
     def _flush_caches(self):
         self.fetcher._cache.flush()
         self.emb_fetcher._cache.flush()
+        self.emb_fetcher._pool.shutdown(wait=False)
 
     def _empty(self, ctx, t0, audit=None):
         return ReductionResult(
@@ -1414,644 +1407,6 @@ class CUIReductionSystem:
                     out[k] = {"count": len(vals), "mean_ms": float(np.mean(vals)),
                               "p99_ms": float(np.percentile(vals, 99))}
             return out
-
-class CanonicalTopicMapper:
-    """Map any CUI to standardized canonical topic CUIs at 3 IC-based granularity levels.
-    Offline: build_full_mapping() → save. Runtime: load → map_cuis/map_single (no graph needed).
-    """
-
-    LEVELS = {
-        "broad":    {"target": 4.0, "tolerance": 1.5},
-        "standard": {"target": 6.0, "tolerance": 1.5},
-        "specific": {"target": 8.0, "tolerance": 2.0},
-    }
-
-    def __init__(self, graph=None, ic_computer=None):
-        self.graph = graph
-        self.ic_computer = ic_computer
-        self._mapping = {}
-        self._canonical_cuis = {l: {} for l in self.LEVELS}
-
-    def _ensure_mapping(self, cui):
-        """Lazily compute mapping for a single CUI if not already cached."""
-        if cui in self._mapping:
-            return self._mapping[cui]
-        if self.graph and self.ic_computer:
-            ic_map = self.ic_computer.compute([cui], {})
-            m = self._find_canonical(cui, ic_map, _CANONICAL_MAX_DEPTH)
-            self._mapping[cui] = m
-            return m
-        return None
-
-    @timed("build_topic_mapping")
-    def build_full_mapping(self, cuis=None, max_depth=_CANONICAL_MAX_DEPTH):
-        """Build canonical mapping for all CUIs (or subset). Call once offline."""
-        if cuis is None:
-            cuis = list(self.graph.nodes()) if self.graph else []
-        if not cuis:
-            return
-        all_nodes = list(self.graph.nodes()) if self.graph else []
-        ic_map = self.ic_computer.compute(all_nodes, {})
-        log(f"[CanonicalTopicMapper] Building mapping for {len(cuis)} CUIs")
-        for cui in cuis:
-            self._mapping[cui] = self._find_canonical(cui, ic_map, max_depth)
-        for level in self.LEVELS:
-            seen = {}
-            for cui, lvls in self._mapping.items():
-                canon = lvls.get(level)
-                if canon and canon not in seen:
-                    seen[canon] = ic_map.get(canon, 0.0)
-            self._canonical_cuis[level] = seen
-            log(f"  {level}: {len(seen)} unique canonical topics")
-
-    def _find_canonical(self, cui, ic_map, max_depth):
-        """Walk up from CUI, find best ancestor at each IC target level."""
-        if not self.graph or not self.graph.has_node(cui):
-            return {"broad": cui, "standard": cui, "specific": cui}
-        ancestors = []
-        frontier, visited = {cui}, {cui}
-        for depth in range(1, max_depth + 1):
-            nxt = set()
-            for node in frontier:
-                for parent in self.graph.predecessors(node):
-                    if parent not in visited:
-                        visited.add(parent)
-                        nxt.add(parent)
-                        ancestors.append((parent, depth, ic_map.get(parent, 0.0)))
-            frontier = nxt
-            if not frontier:
-                break
-        if not ancestors:
-            return {"broad": cui, "standard": cui, "specific": cui}
-        cui_ic = ic_map.get(cui, 0.0)
-        result = {}
-        for level, params in self.LEVELS.items():
-            target, tol = params["target"], params["tolerance"]
-            if cui_ic <= target + tol:
-                result[level] = cui
-            else:
-                best = min(ancestors, key=lambda a: abs(a[2] - target))[0]
-                result[level] = best
-        return result
-
-    def map_cuis(self, cuis, level="standard"):
-        """Map CUIs to canonical topics. Returns {canonical_cui: [member_cuis]}."""
-        if level not in self.LEVELS:
-            raise ValueError(f"Unknown level '{level}'. Use: {list(self.LEVELS.keys())}")
-        groups = defaultdict(list)
-        for cui in cuis:
-            m = self._ensure_mapping(cui)
-            groups[(m.get(level) or cui) if m else cui].append(cui)
-        return dict(groups)
-
-    def map_single(self, cui, level="standard"):
-        """Map one CUI to its canonical topic."""
-        m = self._ensure_mapping(cui)
-        return (m.get(level) or cui) if m else cui
-
-    def get_all_levels(self, cui):
-        """Return all three canonical mappings for a CUI."""
-        m = self._ensure_mapping(cui)
-        if m:
-            return {k: v or cui for k, v in m.items()}
-        return {"broad": cui, "standard": cui, "specific": cui}
-
-    def get_canonical_topics(self, level="standard"):
-        """Return all known canonical topics at a level: {cui: ic_score}"""
-        return dict(self._canonical_cuis.get(level, {}))
-
-    def save_mapping(self, path):
-        import pickle as _pk
-        with open(path, "wb") as f:
-            _pk.dump({"mapping": self._mapping, "canonical": self._canonical_cuis}, f)
-        log(f"[CanonicalTopicMapper] Saved {len(self._mapping)} mappings to {path}")
-
-    @classmethod
-    def load_mapping(cls, path):
-        import pickle as _pk
-        with open(path, "rb") as f:
-            data = _pk.load(f)
-        mapper = cls()
-        mapper._mapping = data["mapping"]
-        mapper._canonical_cuis = data["canonical"]
-        log(f"[CanonicalTopicMapper] Loaded {len(mapper._mapping)} mappings from {path}")
-        return mapper
-
-    def save_to_bq(self, bq_client, project_id, dataset_id,
-                   table_name="canonical_topic_mapping"):
-        table_ref = f"{project_id}.{dataset_id}.{table_name}"
-        rows = [{"cui": cui, "broad": lvls.get("broad", cui),
-                 "standard": lvls.get("standard", cui), "specific": lvls.get("specific", cui)}
-                for cui, lvls in self._mapping.items()]
-        if not rows:
-            return
-        from google.cloud.bigquery import SchemaField, LoadJobConfig
-        schema = [SchemaField("cui", "STRING"), SchemaField("broad", "STRING"),
-                  SchemaField("standard", "STRING"), SchemaField("specific", "STRING")]
-        jc = LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-        job = bq_client.load_table_from_json(rows, table_ref, job_config=jc)
-        job.result()
-        log(f"[CanonicalTopicMapper] Saved {len(rows)} rows to {table_ref}")
-
-    @classmethod
-    def load_from_bq(cls, bq_client, project_id, dataset_id,
-                     table_name="canonical_topic_mapping"):
-        table_ref = f"{project_id}.{dataset_id}.{table_name}"
-        mapper = cls()
-        for row in bq_client.query(f"SELECT * FROM `{table_ref}`").result():
-            mapper._mapping[row.cui] = {
-                "broad": row.broad, "standard": row.standard, "specific": row.specific}
-        for level in cls.LEVELS:
-            seen = set()
-            for cui, lvls in mapper._mapping.items():
-                c = lvls.get(level)
-                if c:
-                    seen.add(c)
-            mapper._canonical_cuis[level] = {c: 0.0 for c in seen}
-        log(f"[CanonicalTopicMapper] Loaded {len(mapper._mapping)} mappings from {table_ref}")
-        return mapper
-
-class TopicNavigator:
-    """Navigable clinical topic hierarchy — FHIR-like operations on UMLS graph.
-
-    APIs: typeahead, drill_down, drill_up, subsumes, siblings, match_topics.
-    Offline: build() → save(). Runtime: load() (no graph/BQ needed).
-    """
-
-    _MAX_PREFIX_LEN = 6       # prefix index caps at 6 chars (covers realistic typing)
-    _MAX_DRILL_PATHS = 50     # cap recursive exploration in drill_up
-    _SUBSUMES_DEPTH = 15      # max BFS depth for on-demand subsumption
-    _SUBSUMES_CACHE_SIZE = 50_000
-
-    def __init__(self, graph=None, ic_computer=None, metadata_fetcher=None):
-        self.graph = graph
-        self.ic_computer = ic_computer
-        self.metadata_fetcher = metadata_fetcher
-
-        # core indexes (built offline, serialized for runtime)
-        self._term_index = defaultdict(set)     # lowercase_prefix → {CUIs}
-        self._term_map = {}                     # CUI → preferred_term
-        self._synonyms = {}                     # CUI → [synonyms]
-        self._ic_map = {}                       # CUI → IC score
-        self._parent_map = defaultdict(set)     # CUI → {direct parent CUIs}
-        self._child_map = defaultdict(set)      # CUI → {direct child CUIs}
-        self._descendant_count = {}             # CUI → count of all descendants
-        self._subsumes_cache = OrderedDict()    # (anc,desc) → bool  (LRU, lazy)
-        self._built = False
-
-    @timed("topic_navigator_build")
-    def build(self, max_closure_depth=12):
-        """Build all navigation indexes. Run once offline."""
-        if not self.graph or self.graph.number_of_nodes() == 0:
-            log("[TopicNavigator] Empty graph, nothing to build", level="WARNING")
-            return
-
-        all_cuis = list(self.graph.nodes())
-        n = len(all_cuis)
-        log(f"[TopicNavigator] Building indexes for {n} CUIs...")
-
-        for node in all_cuis:
-            for parent in self.graph.predecessors(node):
-                self._parent_map[node].add(parent)
-                self._child_map[parent].add(node)
-        log(f"  Parent/child: {len(self._parent_map)} with parents, {len(self._child_map)} with children")
-
-        if self.ic_computer:
-            self._ic_map = self.ic_computer.compute(all_cuis, {})
-        log(f"  IC scores: {len(self._ic_map)}")
-
-        if self.metadata_fetcher:
-            meta = self.metadata_fetcher.fetch(all_cuis)
-            for cui, m in meta.items():
-                self._term_map[cui] = m.preferred_term if m and m.preferred_term else cui
-                self._synonyms[cui] = list(m.alternative_terms) if m and hasattr(m, 'alternative_terms') and m.alternative_terms else []
-        else:
-            for cui in all_cuis:
-                self._term_map[cui] = cui
-        log(f"  Terms: {len(self._term_map)} CUIs")
-
-        max_pfx = self._MAX_PREFIX_LEN
-        for cui, term in self._term_map.items():
-            for t in [term] + self._synonyms.get(cui, []):
-                for token in t.lower().split():
-                    for pl in range(2, min(len(token), max_pfx) + 1):
-                        self._term_index[token[:pl]].add(cui)
-                    if len(token) > max_pfx:
-                        self._term_index[token].add(cui)
-        log(f"  Term index: {len(self._term_index)} prefixes (max={max_pfx})")
-
-        self._descendant_count = {cui: 0 for cui in all_cuis}
-        in_progress = {cui: len(self._child_map.get(cui, set())) for cui in all_cuis}
-        queue = deque(cui for cui, cnt in in_progress.items() if cnt == 0)
-        processed = 0
-        while queue:
-            node = queue.popleft()
-            processed += 1
-            my_count = self._descendant_count[node]
-            for parent in self._parent_map.get(node, set()):
-                self._descendant_count[parent] += my_count + 1
-                in_progress[parent] -= 1
-                if in_progress[parent] == 0:
-                    queue.append(parent)
-            if processed % 100000 == 0:
-                log(f"    Descendant progress: {processed}/{n}")
-        log(f"  Descendant counts: {processed} nodes (O(N) bottom-up)")
-
-        self._built = True
-        log(f"[TopicNavigator] Build complete: {n} CUIs, {len(self._term_index)} prefixes")
-
-    def _is_ancestor_of(self, candidate_ancestor, candidate_descendant):
-        """BFS up from descendant. O(depth × avg_parents), LRU cached."""
-        key = (candidate_ancestor, candidate_descendant)
-
-        if key in self._subsumes_cache:
-            self._subsumes_cache.move_to_end(key)
-            return self._subsumes_cache[key]
-
-        found = False
-        frontier = {candidate_descendant}
-        visited = {candidate_descendant}
-        for _ in range(self._SUBSUMES_DEPTH):
-            nxt = set()
-            for node in frontier:
-                for parent in self._parent_map.get(node, set()):
-                    if parent == candidate_ancestor:
-                        found = True
-                        break
-                    if parent not in visited:
-                        visited.add(parent)
-                        nxt.add(parent)
-                if found:
-                    break
-            if found or not nxt:
-                break
-            frontier = nxt
-
-        self._subsumes_cache[key] = found
-        while len(self._subsumes_cache) > self._SUBSUMES_CACHE_SIZE:
-            self._subsumes_cache.popitem(last=False)
-
-        return found
-
-    def _get_ancestors_bfs(self, cui, max_depth=None):
-        """On-demand ancestor collection via BFS up. For find_shared_ancestor."""
-        depth = max_depth or self._SUBSUMES_DEPTH
-        ancestors = set()
-        frontier = {cui}
-        for _ in range(depth):
-            nxt = set()
-            for node in frontier:
-                for parent in self._parent_map.get(node, set()):
-                    if parent not in ancestors:
-                        ancestors.add(parent)
-                        nxt.add(parent)
-            frontier = nxt
-            if not frontier:
-                break
-        return ancestors
-
-    def typeahead(self, query, limit=10):
-        """Prefix search: "knee" → ranked CUIs by navigability (IC, children).
-        Returns: [{"cui", "term", "ic", "child_count", "descendant_count"}]
-        """
-        if not query or not query.strip():
-            return []
-
-        tokens = query.lower().split()
-        if not tokens:
-            return []
-
-        candidate_sets = []
-        for token in tokens:
-            matches = set()
-            # try exact full token first
-            exact = self._term_index.get(token)
-            if exact:
-                matches |= exact
-            # if token is longer than indexed prefix, truncate for prefix match
-            if not exact and len(token) > self._MAX_PREFIX_LEN:
-                pfx = self._term_index.get(token[:self._MAX_PREFIX_LEN])
-                if pfx:
-                    matches |= pfx
-            if not matches:
-                return []  # a token matches nothing → no results
-            candidate_sets.append(matches)
-
-        candidates = candidate_sets[0]
-        for s in candidate_sets[1:]:
-            candidates = candidates & s
-            if not candidates:
-                return []
-
-        query_lower = query.lower()
-        scored = []
-        for cui in candidates:
-            term = self._term_map.get(cui, cui)
-            ic = self._ic_map.get(cui, 0.0)
-            children = len(self._child_map.get(cui, set()))
-            desc_count = self._descendant_count.get(cui, 0)
-
-            # scoring: prefer concepts that are useful navigation nodes
-            starts_with = 1.0 if term.lower().startswith(query_lower) else 0.0
-            ic_nav_score = 1.0 - min(abs(ic - _TYPEAHEAD_IC_CENTER) / _TYPEAHEAD_IC_CENTER, 1.0)
-            nav_score = min(desc_count / _TYPEAHEAD_DESC_NORM, 1.0) if desc_count > 0 else 0.0
-
-            w_sw, w_ic, w_nav = _TYPEAHEAD_WEIGHTS
-            score = starts_with * w_sw + ic_nav_score * w_ic + nav_score * w_nav
-            scored.append((score, -ic, cui, term, ic, children, desc_count))
-
-        if len(scored) > limit * _TYPEAHEAD_OVERSAMPLE:
-            scored.sort(reverse=True)
-            scored = scored[:limit]
-        else:
-            scored.sort(reverse=True)
-
-        return [
-            {"cui": r[2], "term": r[3], "ic": round(r[4], 2),
-             "child_count": r[5], "descendant_count": r[6]}
-            for r in scored[:limit]
-        ]
-
-    def drill_down(self, cui):
-        """Direct children sorted by navigability. Returns: {"cui", "term", "ic", "children": [...]}"""
-        term = self._term_map.get(cui, cui)
-        ic = round(self._ic_map.get(cui, 0.0), 2)
-        children_cuis = self._child_map.get(cui, set())
-        if not children_cuis:
-            return {"cui": cui, "term": term, "ic": ic, "children": []}
-
-        children = []
-        for c in children_cuis:
-            children.append({
-                "cui": c,
-                "term": self._term_map.get(c, c),
-                "ic": round(self._ic_map.get(c, 0.0), 2),
-                "child_count": len(self._child_map.get(c, set())),
-                "descendant_count": self._descendant_count.get(c, 0)
-            })
-        children.sort(key=lambda x: (-x["child_count"], x["term"]))
-
-        return {"cui": cui, "term": term, "ic": ic, "children": children}
-
-    def drill_up(self, cui, max_depth=8, max_paths=3):
-        """Ancestor breadcrumb path(s) to root. Multiple paths for polyhierarchy.
-        Capped at _MAX_DRILL_PATHS to prevent exponential blowup.
-        """
-        paths = []
-        paths_explored = [0]  # mutable counter for nested function
-
-        def _walk(node, path, depth):
-            if paths_explored[0] >= self._MAX_DRILL_PATHS:
-                return
-            if depth >= max_depth:
-                paths.append(list(path))
-                paths_explored[0] += 1
-                return
-            parents = self._parent_map.get(node, set())
-            if not parents:
-                paths.append(list(path))
-                paths_explored[0] += 1
-                return
-            # sort by IC descending — explore most specific (clinically useful) first
-            for parent in sorted(parents,
-                                 key=lambda p: self._ic_map.get(p, 0.0), reverse=True):
-                if paths_explored[0] >= self._MAX_DRILL_PATHS:
-                    break
-                path.append({
-                    "cui": parent,
-                    "term": self._term_map.get(parent, parent),
-                    "ic": round(self._ic_map.get(parent, 0.0), 2)
-                })
-                _walk(parent, path, depth + 1)
-                path.pop()
-
-        _walk(cui, [], 0)
-
-        if len(paths) > max_paths:
-            paths.sort(key=lambda p: sum(n["ic"] for n in p), reverse=True)
-            paths = paths[:max_paths]
-
-        return {
-            "cui": cui,
-            "term": self._term_map.get(cui, cui),
-            "ic": round(self._ic_map.get(cui, 0.0), 2),
-            "paths": paths
-        }
-
-    def subsumes(self, ancestor_cui, descendant_cui):
-        """FHIR $subsumes: on-demand BFS with LRU cache.
-        Returns: "subsumes" | "subsumed-by" | "equivalent" | "not-related"
-        """
-        if ancestor_cui == descendant_cui:
-            return "equivalent"
-
-        if self._is_ancestor_of(ancestor_cui, descendant_cui):
-            return "subsumes"
-        if self._is_ancestor_of(descendant_cui, ancestor_cui):
-            return "subsumed-by"
-        return "not-related"
-
-    def find_shared_ancestor(self, cui_a, cui_b):
-        """Most specific (highest IC) shared ancestor of two CUIs."""
-        anc_a = self._get_ancestors_bfs(cui_a)
-        anc_b = self._get_ancestors_bfs(cui_b)
-        shared = anc_a & anc_b
-
-        if not shared:
-            return None
-
-        best = max(shared, key=lambda c: self._ic_map.get(c, 0.0))
-        return {
-            "cui": best,
-            "term": self._term_map.get(best, best),
-            "ic": round(self._ic_map.get(best, 0.0), 2)
-        }
-
-    def siblings(self, cui, limit=20):
-        """CUIs sharing same parent(s), sorted by IC descending."""
-        parents = self._parent_map.get(cui, set())
-        sibs = set()
-        for p in parents:
-            for child in self._child_map.get(p, set()):
-                if child != cui:
-                    sibs.add(child)
-
-        result = []
-        for s in sibs:
-            result.append({
-                "cui": s,
-                "term": self._term_map.get(s, s),
-                "ic": round(self._ic_map.get(s, 0.0), 2),
-                "child_count": len(self._child_map.get(s, set()))
-            })
-        result.sort(key=lambda x: (-x["ic"], x["term"]))
-        return result[:limit]
-
-    def match_topics(self, doc_cuis, query_cuis, mode="subsumption"):
-        """Match doc CUIs vs query CUIs. Modes: exact, subsumption, ancestor."""
-        if not doc_cuis or not query_cuis:
-            return {"matched_cuis": [], "score": 0.0, "mode": mode}
-
-        doc_set = set(doc_cuis)
-        query_set = set(query_cuis)
-
-        if mode == "exact":
-            matched = doc_set & query_set
-            return {
-                "matched_cuis": sorted(matched),
-                "score": len(matched) / max(len(query_set), 1),
-                "mode": "exact"
-            }
-
-        elif mode == "subsumption":
-            matched = []
-            details = []
-            # precompute: all ancestors of all doc CUIs (one BFS per doc CUI)
-            doc_ancestors = set()  # any ancestor of any doc CUI
-            for d_cui in doc_cuis:
-                doc_ancestors.update(self._get_ancestors_bfs(d_cui))
-            # precompute: all ancestors of all query CUIs
-            query_ancestor_map = {}  # q_cui -> set of ancestors
-            for q_cui in query_cuis:
-                if q_cui not in doc_set:
-                    query_ancestor_map[q_cui] = self._get_ancestors_bfs(q_cui)
-
-            for q_cui in query_cuis:
-                if q_cui in doc_set:
-                    matched.append(q_cui)
-                    details.append({
-                        "query_cui": q_cui, "match_type": "exact", "doc_cui": q_cui
-                    })
-                    continue
-                # q is ancestor of some doc CUI? (q in doc_ancestors)
-                if q_cui in doc_ancestors:
-                    # find which doc CUI it subsumes (for detail reporting)
-                    d_match = next((d for d in doc_cuis if self._is_ancestor_of(q_cui, d)), None)
-                    matched.append(q_cui)
-                    details.append({
-                        "query_cui": q_cui, "match_type": "subsumes",
-                        "doc_cui": d_match or "unknown"
-                    })
-                    continue
-                # some doc CUI is ancestor of q? (doc_set & q_ancestors)
-                q_anc = query_ancestor_map.get(q_cui, set())
-                d_match = next((d for d in doc_cuis if d in q_anc), None)
-                if d_match:
-                    matched.append(q_cui)
-                    details.append({
-                        "query_cui": q_cui, "match_type": "subsumed-by",
-                        "doc_cui": d_match
-                    })
-
-            return {
-                "matched_cuis": matched,
-                "score": len(matched) / max(len(query_set), 1),
-                "mode": "subsumption",
-                "details": details
-            }
-
-        elif mode == "ancestor":
-            matched_topics = []
-            for q_cui in query_cuis:
-                for d_cui in doc_cuis:
-                    shared = self.find_shared_ancestor(q_cui, d_cui)
-                    if shared and shared["ic"] >= _MATCH_ANCESTOR_IC_MIN:
-                        matched_topics.append({
-                            "query_cui": q_cui, "doc_cui": d_cui,
-                            "shared_ancestor": shared
-                        })
-                        break  # one match per query CUI is enough
-            seen = set()
-            unique_topics = []
-            for t in matched_topics:
-                anc = t["shared_ancestor"]["cui"]
-                if anc not in seen:
-                    seen.add(anc)
-                    unique_topics.append(t)
-
-            return {
-                "matched_topics": unique_topics,
-                "score": len(unique_topics) / max(len(query_set), 1),
-                "mode": "ancestor"
-            }
-
-        return {"matched_cuis": [], "score": 0.0, "mode": mode}
-
-    def save(self, path):
-        """Serialize navigator for runtime use (no graph/fetcher needed)."""
-        import pickle
-        data = {
-            "term_index": dict(self._term_index),
-            "term_map": self._term_map,
-            "synonyms": self._synonyms,
-            "ic_map": self._ic_map,
-            "parent_map": {k: v for k, v in self._parent_map.items()},
-            "child_map": {k: v for k, v in self._child_map.items()},
-            "descendant_count": self._descendant_count,
-            "version": _VERSION,
-        }
-        with open(path, "wb") as f:
-            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-        size_mb = os.path.getsize(path) / (1024 * 1024)
-        log(f"[TopicNavigator] Saved to {path} "
-            f"({len(self._term_map)} CUIs, {size_mb:.1f} MB)")
-
-    @classmethod
-    def load(cls, path):
-        """Load pre-built navigator. Fast — no graph or BQ needed."""
-        import pickle
-        nav = cls()
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-        nav._term_index = defaultdict(set, data.get("term_index", {}))
-        nav._term_map = data.get("term_map", {})
-        nav._synonyms = data.get("synonyms", {})
-        nav._ic_map = data.get("ic_map", {})
-        nav._parent_map = defaultdict(set, data.get("parent_map", {}))
-        nav._child_map = defaultdict(set, data.get("child_map", {}))
-        nav._descendant_count = data.get("descendant_count", {})
-        nav._built = True
-        log(f"[TopicNavigator] Loaded from {path} "
-            f"({len(nav._term_map)} CUIs, {len(nav._term_index)} prefixes)")
-        return nav
-
-    def save_to_bq(self, bq_client, project_id, dataset_id,
-                    table_name="topic_navigator"):
-        """Save core indexes to BigQuery for distributed runtime."""
-        table_ref = f"{project_id}.{dataset_id}.{table_name}"
-        rows = []
-        for cui in self._term_map:
-            ic = self._ic_map.get(cui, 0.0)
-            term = self._term_map.get(cui, cui)
-            parents = ",".join(sorted(self._parent_map.get(cui, set())))
-            children_count = len(self._child_map.get(cui, set()))
-            desc_count = self._descendant_count.get(cui, 0)
-            syns = "||".join(self._synonyms.get(cui, []))
-            rows.append({
-                "cui": cui, "preferred_term": term, "ic": round(ic, 4),
-                "parents": parents, "children_count": children_count,
-                "descendant_count": desc_count, "synonyms": syns
-            })
-        if not rows:
-            return
-
-        from google.cloud.bigquery import SchemaField, LoadJobConfig
-        schema = [
-            SchemaField("cui", "STRING"),
-            SchemaField("preferred_term", "STRING"),
-            SchemaField("ic", "FLOAT64"),
-            SchemaField("parents", "STRING"),
-            SchemaField("children_count", "INT64"),
-            SchemaField("descendant_count", "INT64"),
-            SchemaField("synonyms", "STRING"),
-        ]
-        jc = LoadJobConfig(schema=schema, write_disposition="WRITE_TRUNCATE")
-        for start in range(0, len(rows), _BQ_BATCH):
-            batch = rows[start:start + _BQ_BATCH]
-            job = bq_client.load_table_from_json(batch, table_ref, job_config=jc)
-            job.result()
-            jc = LoadJobConfig(schema=schema, write_disposition="WRITE_APPEND")
-        log(f"[TopicNavigator] Saved {len(rows)} rows to {table_ref}")
 
 # ── Semantic type → coarse category mapping ──────────────────────────────────
 # Based on UMLS Semantic Network (McCray 2003). Maps TUI prefixes and common
@@ -2180,19 +1535,15 @@ class TopicRepresentativeSelector:
 
             # Step 3: Pick representative per sub-cluster
             for sc_cuis in subclusters:
-                rep = TopicRepresentativeSelector._pick_representative(
+                rep, method = TopicRepresentativeSelector._pick_representative(
                     sc_cuis, embeddings, ic_map, graph)
                 reps.append(RepresentativeInfo(
                     cui=rep, category=cat,
-                    method=TopicRepresentativeSelector._last_method,
+                    method=method,
                     member_count=len(sc_cuis), members=sorted(sc_cuis),
                     ic_score=ic_map.get(rep, 0.0)))
 
         return reps
-
-    # internal state for method tracking (thread-local would be better,
-    # but this runs single-threaded in the pipeline)
-    _last_method = "unknown"
 
     @staticmethod
     def _subcluster(cuis, embeddings):
@@ -2235,11 +1586,11 @@ class TopicRepresentativeSelector:
     @staticmethod
     def _pick_representative(sc_cuis, embeddings, ic_map, graph):
         """Pick the best representative from a sub-cluster.
-        Priority: parent-within-set → embedding medoid → highest IC."""
+        Priority: parent-within-set → embedding medoid → highest IC.
+        Returns: (cui, method_string)"""
 
         if len(sc_cuis) == 1:
-            TopicRepresentativeSelector._last_method = "singleton"
-            return sc_cuis[0]
+            return sc_cuis[0], "singleton"
 
         # Strategy A: Parent-within-set (MICA)
         # If any CUI in the sub-cluster is a UMLS ancestor of 2+ others, pick it
@@ -2264,8 +1615,7 @@ class TopicRepresentativeSelector:
             if parent_scores:
                 # pick parent that subsumes the most, break ties by highest IC
                 best = max(parent_scores, key=lambda c: parent_scores[c])
-                TopicRepresentativeSelector._last_method = "parent_within_set"
-                return best
+                return best, "parent_within_set"
 
         # Strategy B: Embedding medoid
         with_emb = [c for c in sc_cuis if c in embeddings]
@@ -2274,13 +1624,11 @@ class TopicRepresentativeSelector:
             sim = vecs @ vecs.T
             mean_sim = sim.mean(axis=1)
             best_idx = int(np.argmax(mean_sim))
-            TopicRepresentativeSelector._last_method = "embedding_medoid"
-            return with_emb[best_idx]
+            return with_emb[best_idx], "embedding_medoid"
 
         # Strategy C: Highest IC
         best = max(sc_cuis, key=lambda c: ic_map.get(c, 0.0))
-        TopicRepresentativeSelector._last_method = "highest_ic"
-        return best
+        return best, "highest_ic"
 
     @staticmethod
     def resolve_snomed(bq_client, project_id, dataset_id, all_reps):
