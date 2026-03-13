@@ -88,7 +88,7 @@ class ChunkMatch:
 # ── ChunkStore ────────────────────────────────────────────────────────────────
 
 class ChunkStore:
-    """Stores surviving CUIs per chunk per patient, with topic grouping.
+    """Stores surviving CUIs and topic structure per chunk per patient.
 
     In-memory dict for development/testing.
     For production, replace with PostgreSQL or BigQuery reads.
@@ -99,27 +99,21 @@ class ChunkStore:
         self._data = defaultdict(dict)
 
     def add(self, patient_id, chunk_id, document_id, surviving_cuis, topics=None):
-        """Store surviving CUIs and topic grouping for one chunk.
+        """Store surviving CUIs and topics for one chunk.
 
         Args:
             patient_id: patient identifier
             chunk_id: chunk identifier
             document_id: source document identifier
             surviving_cuis: set/list of CUI strings
-            topics: optional dict {topic_id: {"members": [cuis], ...}}
-                    from HierarchicalTopicBuilder.build()
+            topics: dict from HierarchicalTopicBuilder.build()
+                    {topic_id: {"topic_cui": str, "members": [cuis],
+                                "subtopics": {...}, "ungrouped": [...]}}
         """
-        # build cui → topic_id mapping
-        cui_to_topic = {}
-        if topics:
-            for tid, t in topics.items():
-                for cui in t.get("members", []):
-                    cui_to_topic[cui] = tid
-
         self._data[patient_id][chunk_id] = {
             "doc_id": document_id,
             "cuis": set(surviving_cuis),
-            "topics": cui_to_topic   # {cui: topic_id}
+            "topics": topics or {}
         }
 
     def get_patient(self, patient_id):
@@ -353,13 +347,19 @@ class ChunkScorer:
                 # sort details: exact first, then by weight descending
                 details.sort(key=lambda d: (-d["weight"], d["hops"]))
 
-                # group matched CUIs by topic
-                cui_to_topic = chunk_data.get("topics", {})
-                topics_matched = defaultdict(list)
-                for cui in matched:
-                    tid = cui_to_topic.get(cui)
-                    topics_matched[tid].append(cui)
-                topics_matched = dict(topics_matched)
+                # group matched CUIs by topic from stored topic structure
+                topics_matched = {}
+                stored_topics = chunk_data.get("topics", {})
+                if stored_topics:
+                    for tid, t_info in stored_topics.items():
+                        topic_members = set(t_info.get("members", []))
+                        hits = matched & topic_members
+                        if hits:
+                            topics_matched[tid] = {
+                                "topic_cui": t_info.get("topic_cui"),
+                                "matched_cuis": sorted(hits),
+                                "total_members": len(topic_members),
+                            }
 
                 results.append(ChunkMatch(
                     chunk_id=chunk_id,
@@ -389,15 +389,16 @@ class ChunkScorer:
             f"{result.total_chunk_cuis} chunk CUIs / "
             f"{result.total_query_cuis} query CUIs)"
         ]
-        # show topic grouping if available
+        # show which topics were hit
         if result.topics_matched:
-            topic_parts = []
-            for tid, cuis in sorted(result.topics_matched.items(),
-                                     key=lambda x: (x[0] is None, x[0])):
-                cui_names = [terms.get(c, c) for c in cuis]
-                label = f"topic_{tid}" if tid is not None else "ungrouped"
-                topic_parts.append(f"{label}({', '.join(cui_names)})")
-            lines.append(f"  Topics hit: {' | '.join(topic_parts)}")
+            for tid, t_info in sorted(result.topics_matched.items()):
+                t_cui = t_info.get("topic_cui")
+                t_label = terms.get(t_cui, t_cui) if t_cui else "(ungrouped)"
+                hit_names = [terms.get(c, c) for c in t_info["matched_cuis"]]
+                lines.append(
+                    f"  Topic {tid} [{t_label}]: "
+                    f"{len(t_info['matched_cuis'])}/{t_info['total_members']} CUIs hit "
+                    f"({', '.join(hit_names)})")
 
         for d in result.details:
             cui_term = terms.get(d["chunk_cui"], d["chunk_cui"])
