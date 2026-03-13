@@ -136,7 +136,8 @@ def process_text(text_list, context, label="doc"):
     terms = fetch_preferred_terms(all_cuis)
 
     embeddings = system.emb_fetcher.fetch(list(all_surviving))
-    all_embeddings = dict(embeddings)
+    removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
+    all_embeddings = {**embeddings, **removed_embs}
 
     metadata = system.fetcher.fetch(list(all_cuis))
     topic_reps = TopicRepresentativeSelector.select(
@@ -256,21 +257,10 @@ def write_csvs(result, label="doc"):
 
 def run_evaluation(result, label="doc"):
     flat_topics = {tid: t["members"] for tid, t in result["h_topics"].items()}
-    # fetch removed embeddings for eval only (not fetched during main pipeline)
-    surviving = result["surviving_cuis"]
-    all_tracked_cuis = set()
-    for _, r in result["entity_results"]:
-        for a in r.audit_trail:
-            all_tracked_cuis.add(a.removed_cui)
-            if a.kept_cui:
-                all_tracked_cuis.add(a.kept_cui)
-    removed_cuis = all_tracked_cuis - surviving
-    removed_embs = system.emb_fetcher.fetch(list(removed_cuis)) if removed_cuis else {}
-    eval_embeddings = {**result["all_embeddings"], **removed_embs}
     metric_rows = evaluator.intrinsic_metrics(
-        label, result["entity_results"], flat_topics, eval_embeddings)
+        label, result["entity_results"], flat_topics, result["all_embeddings"])
     recon_rows = evaluator.reconstruction_check(
-        label, result["entity_results"], eval_embeddings,
+        label, result["entity_results"], result["all_embeddings"],
         result["metadata"], result["terms"])
     save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_metrics.csv"),
              Evaluator.metric_headers(), metric_rows)
