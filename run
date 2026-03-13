@@ -1,0 +1,350 @@
+"""
+Query Runner — takes a clinical query, finds the best matching chunks.
+
+Usage:
+    python run_query.py
+
+    Or from code:
+        from run_query import run_query
+        results = run_query("left knee osteoarthritis treatment with methotrexate")
+
+Flow:
+    Query text → CUI extraction (API) → CUI reduction (pipeline)
+    → Query expansion (hierarchy walk) → Score stored chunks → Ranked results
+"""
+
+import os
+import sys
+import csv
+import time
+
+from google.cloud import bigquery
+
+from config import (
+    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
+    hierarchy, ic_precomputed
+)
+from cui_reduction_system import (
+    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder,
+    TopicRepresentativeSelector
+)
+from topic_matcher import ChunkStore, QueryExpander, ChunkScorer
+
+# ── Setup (runs once) ────────────────────────────────────────────────────────
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+bq = bigquery.Client(project=PROJECT_ID)
+
+system = CUIReductionSystem(
+    project_id=PROJECT_ID, dataset_id=DATASET_ID,
+    full_network=hierarchy, allowed_sabs=ALLOWED_SABS,
+    embedding_table=EMBEDDING_TABLE, ic_scores=ic_precomputed,
+    cache_dir=CACHE_DIR)
+
+extractor = CUIExtractor(
+    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
+    cluster_set=CLUSTER_SET, combined=COMBINED,
+    cache_dir=CACHE_DIR)
+
+expander = QueryExpander(hierarchy, ic_precomputed)
+scorer = ChunkScorer(ic_precomputed)
+
+
+# ── Term lookup ──────────────────────────────────────────────────────────────
+
+def fetch_preferred_terms(cuis):
+    """Fetch preferred terms from MRCONSO."""
+    cuis = list(cuis)
+    if not cuis:
+        return {}
+    terms = {}
+    for i in range(0, len(cuis), 500):
+        batch = cuis[i:i+500]
+        query = f"""
+        SELECT CUI, STR
+        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+        for row in bq.query(query, job_config=jc).result():
+            if row.CUI not in terms:
+                terms[row.CUI] = row.STR
+    for c in cuis:
+        if c not in terms:
+            terms[c] = c
+    return terms
+
+
+# ── Query processing ─────────────────────────────────────────────────────────
+
+def process_query(query_text):
+    """Extract and reduce CUIs from query text.
+
+    Args:
+        query_text: clinical query string
+
+    Returns:
+        dict with keys: surviving_cuis (set), terms (dict), query_phrases (list)
+        or None if nothing extracted
+    """
+    # split query into phrases (simple: each phrase is the full query)
+    text_list = [query_text]
+    context_list = [query_text]
+
+    print(f"\n{'='*80}")
+    print(f"QUERY: {query_text}")
+    print(f"{'='*80}")
+
+    # extract CUIs
+    print(f"  → Extracting CUIs...", flush=True)
+    per_phrase = extractor.extract(text_list, context_list)
+    extractor._cache.flush()
+
+    if not per_phrase:
+        print(f"  → No CUIs extracted")
+        return None
+
+    total_cuis = sum(len(cd) for cd in per_phrase.values())
+    print(f"  → Extracted: {total_cuis} CUIs across {len(per_phrase)} phrase(s)", flush=True)
+    for phrase, cui_dists in per_phrase.items():
+        print(f"      \"{phrase}\": {len(cui_dists)} CUIs")
+
+    # reduce
+    print(f"  → Reducing...", flush=True)
+    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase.items()]
+    results = system.reduce_batch(batch_inputs)
+
+    # collect surviving CUIs
+    surviving = set()
+    for r in results:
+        surviving.update(r.all_reduced_cuis)
+
+    if not surviving:
+        print(f"  → No CUIs survived reduction")
+        return None
+
+    print(f"  → Surviving: {len(surviving)} CUIs (from {total_cuis} raw)", flush=True)
+
+    # fetch terms
+    terms = fetch_preferred_terms(surviving)
+    for cui in surviving:
+        print(f"      {cui} | {terms.get(cui, cui)}")
+
+    return {
+        "surviving_cuis": surviving,
+        "terms": terms,
+        "query_phrases": list(per_phrase.keys()),
+    }
+
+
+# ── Full query → ranked chunks ───────────────────────────────────────────────
+
+def run_query(query_text, patient_id, store_path=None, top_k=10):
+    """Run a clinical query against stored patient chunks.
+
+    Args:
+        query_text: clinical question in free text
+        patient_id: which patient to search
+        store_path: path to chunk_store.pkl (default: output/chunk_store.pkl)
+        top_k: max results to return
+
+    Returns:
+        list of ChunkMatch results, sorted by score
+    """
+    t0 = time.perf_counter()
+
+    # load stored chunks
+    store_path = store_path or os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+    if not os.path.exists(store_path):
+        print(f"ERROR: chunk store not found at {store_path}")
+        print(f"  → Run run_cui_reduction.py first to build the store")
+        return []
+
+    store = ChunkStore.load(store_path)
+    patient_chunks = store.get_patient(patient_id)
+    if not patient_chunks:
+        print(f"ERROR: no chunks found for patient '{patient_id}'")
+        print(f"  → Available patients: {store.patient_ids()}")
+        return []
+
+    stats = store.stats(patient_id)
+    print(f"\nPatient {patient_id}: {stats['chunks']} chunks, "
+          f"{stats['total_cuis']} stored CUIs")
+
+    # process query
+    query_result = process_query(query_text)
+    if not query_result:
+        return []
+
+    query_cuis = list(query_result["surviving_cuis"])
+    terms = query_result["terms"]
+
+    # expand query through hierarchy
+    print(f"\n  → Expanding query through hierarchy...", flush=True)
+    reach_set = expander.expand(query_cuis)
+    print(f"  → Reach set: {len(reach_set)} CUIs", flush=True)
+
+    # show reach set
+    for cui, entry in sorted(reach_set.items(), key=lambda x: -x[1].weight):
+        if entry.weight >= 0.3:
+            cui_term = terms.get(cui, cui)
+            if cui_term == cui:
+                # might be an ancestor not yet in terms
+                extra = fetch_preferred_terms([cui])
+                terms.update(extra)
+                cui_term = terms.get(cui, cui)
+            print(f"      {cui_term:40s} w={entry.weight:.2f} ({entry.relation}, {entry.hops}hop)")
+
+    # score chunks
+    print(f"\n  → Scoring {len(patient_chunks)} chunks...", flush=True)
+    results = scorer.score(reach_set, patient_chunks, top_k=top_k)
+
+    # fetch terms for matched chunk CUIs
+    all_matched_cuis = set()
+    for r in results:
+        for d in r.details:
+            all_matched_cuis.add(d["chunk_cui"])
+            all_matched_cuis.add(d["matched_via"])
+    # also topic label CUIs
+    for r in results:
+        for tid, t_info in r.topics_matched.items():
+            if t_info.get("topic_cui"):
+                all_matched_cuis.add(t_info["topic_cui"])
+    missing = all_matched_cuis - set(terms.keys())
+    if missing:
+        terms.update(fetch_preferred_terms(missing))
+
+    elapsed = (time.perf_counter() - t0) * 1000
+
+    # display results
+    print(f"\n{'='*80}")
+    print(f"RESULTS: {len(results)} chunks matched ({elapsed:.0f}ms total)")
+    print(f"{'='*80}\n")
+
+    if not results:
+        print("  No matching chunks found.")
+    else:
+        for rank, r in enumerate(results, 1):
+            print(f"  #{rank}  {ChunkScorer.explain(r, terms)}")
+            print()
+
+    return results
+
+
+# ── Save results to CSV ──────────────────────────────────────────────────────
+
+def save_results_csv(query_text, results, terms, path=None):
+    """Save query results to CSV."""
+    path = path or os.path.join(OUTPUT_DIR, "query_results.csv")
+    rows = []
+    for rank, r in enumerate(results, 1):
+        # topic summary
+        topic_parts = []
+        for tid, t_info in sorted(r.topics_matched.items()):
+            t_cui = t_info.get("topic_cui")
+            t_label = terms.get(t_cui, t_cui) if t_cui else "(ungrouped)"
+            hit_names = [terms.get(c, c) for c in t_info["matched_cuis"]]
+            topic_parts.append(f"{t_label}({', '.join(hit_names)})")
+        topic_summary = " | ".join(topic_parts) if topic_parts else ""
+
+        # match details
+        detail_parts = []
+        for d in r.details:
+            cui_term = terms.get(d["chunk_cui"], d["chunk_cui"])
+            if d["match_type"] == "exact":
+                detail_parts.append(f"exact:{cui_term}")
+            else:
+                via_term = terms.get(d["matched_via"], d["matched_via"])
+                detail_parts.append(f"{d['match_type']}({d['hops']}hop):{cui_term}")
+
+        rows.append([
+            query_text, rank, r.chunk_id, r.document_id,
+            round(r.score, 4), r.matched_cuis, r.total_chunk_cuis,
+            topic_summary, " | ".join(detail_parts)
+        ])
+
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["query", "rank", "chunk_id", "document_id",
+                     "score", "matched_cuis", "total_chunk_cuis",
+                     "topics_hit", "match_details"])
+        w.writerows(rows)
+    print(f"Results saved to {path}")
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    # ── CONFIG (edit these) ──────────────────────────────────────────────
+    PATIENT_ID = "patient_001"
+    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+
+    # ── QUERIES (edit these) ─────────────────────────────────────────────
+    QUERIES = [
+        "left knee osteoarthritis treatment with methotrexate",
+        "rheumatoid arthritis of knee",
+        "elevated CRP and ESR",
+        "methotrexate side effects",
+    ]
+
+    # ═════════════════════════════════════════════════════════════════════
+    # Run all queries
+    # ═════════════════════════════════════════════════════════════════════
+    all_results = {}
+    all_terms = {}
+
+    for query_text in QUERIES:
+        results = run_query(query_text, PATIENT_ID, STORE_PATH, top_k=5)
+        if results:
+            all_results[query_text] = results
+            # collect terms for CSV
+            for r in results:
+                for d in r.details:
+                    all_terms[d["chunk_cui"]] = d["chunk_cui"]
+                    all_terms[d["matched_via"]] = d["matched_via"]
+
+    # fetch all terms once
+    missing = set(all_terms.keys()) - set(fetch_preferred_terms([]).keys())
+    if missing:
+        all_terms.update(fetch_preferred_terms(list(missing)))
+
+    # save combined results
+    all_rows = []
+    for query_text, results in all_results.items():
+        for rank, r in enumerate(results, 1):
+            topic_parts = []
+            for tid, t_info in sorted(r.topics_matched.items()):
+                t_cui = t_info.get("topic_cui")
+                t_label = all_terms.get(t_cui, t_cui) if t_cui else ""
+                hit_names = [all_terms.get(c, c) for c in t_info["matched_cuis"]]
+                topic_parts.append(f"{t_label}({', '.join(hit_names)})")
+            detail_parts = []
+            for d in r.details:
+                cui_term = all_terms.get(d["chunk_cui"], d["chunk_cui"])
+                if d["match_type"] == "exact":
+                    detail_parts.append(f"exact:{cui_term}")
+                else:
+                    detail_parts.append(
+                        f"{d['match_type']}({d['hops']}hop):{cui_term}")
+            all_rows.append([
+                query_text, rank, r.chunk_id, r.document_id,
+                round(r.score, 4), r.matched_cuis, r.total_chunk_cuis,
+                " | ".join(topic_parts), " | ".join(detail_parts)
+            ])
+
+    if all_rows:
+        csv_path = os.path.join(OUTPUT_DIR, "query_results.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["query", "rank", "chunk_id", "document_id",
+                         "score", "matched_cuis", "total_chunk_cuis",
+                         "topics_hit", "match_details"])
+            w.writerows(all_rows)
+        print(f"\n{'='*80}")
+        print(f"All results saved to {csv_path}")
+
+    print(f"\nDONE — {len(QUERIES)} queries processed")
