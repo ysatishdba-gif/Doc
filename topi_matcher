@@ -2,7 +2,7 @@
 Topic Matcher — Query expansion + chunk scoring on surviving CUIs.
 
 Three components:
-  ChunkStore:     Stores and loads surviving CUIs per chunk per patient
+  ChunkStore:     Stores and loads surviving CUIs per chunk
   QueryExpander:  Builds reach set from query CUIs using UMLS hierarchy
   ChunkScorer:    Scores stored chunks against query reach set
 
@@ -11,17 +11,17 @@ Usage:
 
     # Store (offline, after pipeline)
     store = ChunkStore()
-    store.add(patient_id, chunk_id, doc_id, surviving_cuis)
-    store.save("patient_cuis.pkl")
+    store.add(chunk_id, doc_id, surviving_cuis)
+    store.save("chunk_store.pkl")
 
     # Match (online)
-    store = ChunkStore.load("patient_cuis.pkl")
+    store = ChunkStore.load("chunk_store.pkl")
     expander = QueryExpander(hierarchy, ic_map)
     scorer = ChunkScorer(ic_map)
 
-    patient_chunks = store.get_patient(patient_id)
+    chunks = store.get_all()
     reach_set = expander.expand(query_surviving_cuis)
-    results = scorer.score(reach_set, patient_chunks)
+    results = scorer.score(reach_set, chunks)
 
 References:
     Resnik 1995 (IC-based similarity)
@@ -88,21 +88,20 @@ class ChunkMatch:
 # ── ChunkStore ────────────────────────────────────────────────────────────────
 
 class ChunkStore:
-    """Stores surviving CUIs and topic structure per chunk per patient.
+    """Stores surviving CUIs and topic structure per chunk.
 
     In-memory dict for development/testing.
     For production, replace with PostgreSQL or BigQuery reads.
     """
 
     def __init__(self):
-        # {patient_id: {chunk_id: {"doc_id": str, "cuis": set, "topics": dict}}}
-        self._data = defaultdict(dict)
+        # {chunk_id: {"doc_id": str, "cuis": set, "topics": dict}}
+        self._data = {}
 
-    def add(self, patient_id, chunk_id, document_id, surviving_cuis, topics=None):
+    def add(self, chunk_id, document_id, surviving_cuis, topics=None):
         """Store surviving CUIs and topics for one chunk.
 
         Args:
-            patient_id: patient identifier
             chunk_id: chunk identifier
             document_id: source document identifier
             surviving_cuis: set/list of CUI strings
@@ -110,64 +109,50 @@ class ChunkStore:
                     {topic_id: {"topic_cui": str, "members": [cuis],
                                 "subtopics": {...}, "ungrouped": [...]}}
         """
-        self._data[patient_id][chunk_id] = {
+        self._data[chunk_id] = {
             "doc_id": document_id,
             "cuis": set(surviving_cuis),
             "topics": topics or {}
         }
 
-    def get_patient(self, patient_id):
-        """Load all chunks for one patient.
+    def get_all(self):
+        """Load all stored chunks.
 
         Returns:
-            dict {chunk_id: {"doc_id": str, "cuis": set}}
+            dict {chunk_id: {"doc_id": str, "cuis": set, "topics": dict}}
         """
-        return dict(self._data.get(patient_id, {}))
+        return dict(self._data)
 
-    def get_chunk(self, patient_id, chunk_id):
+    def get_chunk(self, chunk_id):
         """Load CUIs for one specific chunk."""
-        return self._data.get(patient_id, {}).get(chunk_id)
+        return self._data.get(chunk_id)
 
-    def patient_ids(self):
-        """List all patient IDs in the store."""
+    def chunk_ids(self):
+        """List all chunk IDs in the store."""
         return list(self._data.keys())
 
-    def stats(self, patient_id=None):
+    def stats(self):
         """Return storage stats."""
-        if patient_id:
-            chunks = self._data.get(patient_id, {})
-            total_cuis = sum(len(c["cuis"]) for c in chunks.values())
-            return {
-                "patient_id": patient_id,
-                "chunks": len(chunks),
-                "total_cuis": total_cuis,
-                "avg_cuis_per_chunk": total_cuis / len(chunks) if chunks else 0
-            }
-        total_patients = len(self._data)
-        total_chunks = sum(len(v) for v in self._data.values())
-        total_cuis = sum(len(c["cuis"])
-                        for p in self._data.values()
-                        for c in p.values())
+        total_cuis = sum(len(c["cuis"]) for c in self._data.values())
         return {
-            "patients": total_patients,
-            "chunks": total_chunks,
+            "chunks": len(self._data),
             "total_cuis": total_cuis,
+            "avg_cuis_per_chunk": total_cuis / len(self._data) if self._data else 0
         }
 
     def save(self, path):
         """Save store to pickle file."""
         with open(path, "wb") as f:
             pickle.dump(dict(self._data), f, protocol=pickle.HIGHEST_PROTOCOL)
-        logger.info(f"ChunkStore saved: {len(self._data)} patients to {path}")
+        logger.info(f"ChunkStore saved: {len(self._data)} chunks to {path}")
 
     @classmethod
     def load(cls, path):
         """Load store from pickle file."""
         store = cls()
         with open(path, "rb") as f:
-            raw = pickle.load(f)
-        store._data = defaultdict(dict, raw)
-        logger.info(f"ChunkStore loaded: {len(store._data)} patients from {path}")
+            store._data = pickle.load(f)
+        logger.info(f"ChunkStore loaded: {len(store._data)} chunks from {path}")
         return store
 
 
@@ -291,20 +276,20 @@ class ChunkScorer:
     def __init__(self, ic_map):
         self.ic_map = ic_map
 
-    def score(self, reach_set, patient_chunks, top_k=10):
-        """Score all chunks for a patient against the query reach set.
+    def score(self, reach_set, chunks, top_k=10):
+        """Score all chunks against the query reach set.
 
         Args:
             reach_set: dict {cui: ReachEntry} from QueryExpander.expand()
-            patient_chunks: dict {chunk_id: {"doc_id": str, "cuis": set}}
-                           from ChunkStore.get_patient()
+            chunks: dict {chunk_id: {"doc_id": str, "cuis": set}}
+                           from ChunkStore.get_all()
             top_k: max results to return
 
         Returns:
             list[ChunkMatch] sorted by score descending
         """
         t0 = time.perf_counter()
-        if not reach_set or not patient_chunks:
+        if not reach_set or not chunks:
             return []
 
         # total query IC for normalization (only exact/self entries)
@@ -315,7 +300,7 @@ class ChunkScorer:
 
         results = []
         reach_keys = set(reach_set.keys())  # precompute once, not per-chunk
-        for chunk_id, chunk_data in patient_chunks.items():
+        for chunk_id, chunk_data in chunks.items():
             chunk_cuis = chunk_data["cuis"]
             doc_id = chunk_data["doc_id"]
 
@@ -374,7 +359,7 @@ class ChunkScorer:
 
         results.sort(key=lambda r: (-r.score, -r.matched_cuis, r.chunk_id))
         elapsed = (time.perf_counter() - t0) * 1000
-        logger.debug(f"    ChunkScorer: {len(patient_chunks)} chunks → "
+        logger.debug(f"    ChunkScorer: {len(chunks)} chunks → "
                      f"{len(results)} matches ({elapsed:.1f}ms)")
         return results[:top_k]
 
