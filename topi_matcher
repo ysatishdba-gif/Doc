@@ -1,0 +1,411 @@
+"""
+Topic Matcher — Query expansion + chunk scoring on surviving CUIs.
+
+Three components:
+  ChunkStore:     Stores and loads surviving CUIs per chunk per patient
+  QueryExpander:  Builds reach set from query CUIs using UMLS hierarchy
+  ChunkScorer:    Scores stored chunks against query reach set
+
+Usage:
+    from topic_matcher import ChunkStore, QueryExpander, ChunkScorer
+
+    # Store (offline, after pipeline)
+    store = ChunkStore()
+    store.add(patient_id, chunk_id, doc_id, surviving_cuis)
+    store.save("patient_cuis.pkl")
+
+    # Match (online)
+    store = ChunkStore.load("patient_cuis.pkl")
+    expander = QueryExpander(hierarchy, ic_map)
+    scorer = ChunkScorer(ic_map)
+
+    patient_chunks = store.get_patient(patient_id)
+    reach_set = expander.expand(query_surviving_cuis)
+    results = scorer.score(reach_set, patient_chunks)
+
+References:
+    Resnik 1995 (IC-based similarity)
+    Pesquita et al. 2009 (set-based BMA scoring)
+    PubMed ATM (query expansion via controlled vocabulary)
+"""
+
+import time
+import pickle
+import logging
+from typing import Dict, List
+from dataclasses import dataclass
+from collections import defaultdict
+
+logger = logging.getLogger("cui_reduction")
+
+
+# ── Tunable constants ─────────────────────────────────────────────────────────
+
+# reach set weights by relationship type
+WEIGHT_EXACT = 1.0           # self match
+WEIGHT_CHILD_1HOP = 0.9      # direct child of query CUI
+WEIGHT_PARENT_1HOP = 0.7     # direct parent of query CUI
+WEIGHT_CHILD_2HOP = 0.8      # grandchild
+WEIGHT_PARENT_2HOP = 0.5     # grandparent
+WEIGHT_PARENT_3HOP = 0.3     # great-grandparent
+WEIGHT_SIBLING = 0.3         # same parent, different concept
+
+# BFS limits
+EXPAND_UP_DEPTH = 3          # how many hops upward (parents)
+EXPAND_DOWN_DEPTH = 2        # how many hops downward (children)
+EXPAND_DOWN_MAX_CHILDREN = 50 # skip down-walk if a node has more children than this
+EXPAND_SIBLING_MAX = 20       # max siblings to include per query CUI
+
+# scoring
+IC_MIN_ANCESTOR = 4.0        # ignore ancestors with IC below this (too broad)
+SCORE_MIN_THRESHOLD = 0.05   # chunks below this score are dropped
+
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
+@dataclass
+class ReachEntry:
+    """One CUI in the query reach set with its weight and source."""
+    cui: str
+    weight: float             # 0.0 to 1.0
+    relation: str             # exact | parent | child | sibling
+    hops: int                 # 0 for exact, 1-3 for hierarchy
+    source_cui: str           # which query CUI produced this reach entry
+
+@dataclass
+class ChunkMatch:
+    """Result of scoring one chunk against the query."""
+    chunk_id: str
+    document_id: str
+    score: float              # 0.0 to 1.0
+    matched_cuis: int         # how many chunk CUIs matched something in reach set
+    total_chunk_cuis: int     # total CUIs in this chunk
+    total_query_cuis: int     # total CUIs in the query
+    topics_matched: Dict      # {topic_id: [matched_cuis]} — which topics were hit
+    details: List[Dict]       # per-CUI match details
+
+
+# ── ChunkStore ────────────────────────────────────────────────────────────────
+
+class ChunkStore:
+    """Stores surviving CUIs per chunk per patient, with topic grouping.
+
+    In-memory dict for development/testing.
+    For production, replace with PostgreSQL or BigQuery reads.
+    """
+
+    def __init__(self):
+        # {patient_id: {chunk_id: {"doc_id": str, "cuis": set, "topics": dict}}}
+        self._data = defaultdict(dict)
+
+    def add(self, patient_id, chunk_id, document_id, surviving_cuis, topics=None):
+        """Store surviving CUIs and topic grouping for one chunk.
+
+        Args:
+            patient_id: patient identifier
+            chunk_id: chunk identifier
+            document_id: source document identifier
+            surviving_cuis: set/list of CUI strings
+            topics: optional dict {topic_id: {"members": [cuis], ...}}
+                    from HierarchicalTopicBuilder.build()
+        """
+        # build cui → topic_id mapping
+        cui_to_topic = {}
+        if topics:
+            for tid, t in topics.items():
+                for cui in t.get("members", []):
+                    cui_to_topic[cui] = tid
+
+        self._data[patient_id][chunk_id] = {
+            "doc_id": document_id,
+            "cuis": set(surviving_cuis),
+            "topics": cui_to_topic   # {cui: topic_id}
+        }
+
+    def get_patient(self, patient_id):
+        """Load all chunks for one patient.
+
+        Returns:
+            dict {chunk_id: {"doc_id": str, "cuis": set}}
+        """
+        return dict(self._data.get(patient_id, {}))
+
+    def get_chunk(self, patient_id, chunk_id):
+        """Load CUIs for one specific chunk."""
+        return self._data.get(patient_id, {}).get(chunk_id)
+
+    def patient_ids(self):
+        """List all patient IDs in the store."""
+        return list(self._data.keys())
+
+    def stats(self, patient_id=None):
+        """Return storage stats."""
+        if patient_id:
+            chunks = self._data.get(patient_id, {})
+            total_cuis = sum(len(c["cuis"]) for c in chunks.values())
+            return {
+                "patient_id": patient_id,
+                "chunks": len(chunks),
+                "total_cuis": total_cuis,
+                "avg_cuis_per_chunk": total_cuis / len(chunks) if chunks else 0
+            }
+        total_patients = len(self._data)
+        total_chunks = sum(len(v) for v in self._data.values())
+        total_cuis = sum(len(c["cuis"])
+                        for p in self._data.values()
+                        for c in p.values())
+        return {
+            "patients": total_patients,
+            "chunks": total_chunks,
+            "total_cuis": total_cuis,
+        }
+
+    def save(self, path):
+        """Save store to pickle file."""
+        with open(path, "wb") as f:
+            pickle.dump(dict(self._data), f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"ChunkStore saved: {len(self._data)} patients to {path}")
+
+    @classmethod
+    def load(cls, path):
+        """Load store from pickle file."""
+        store = cls()
+        with open(path, "rb") as f:
+            raw = pickle.load(f)
+        store._data = defaultdict(dict, raw)
+        logger.info(f"ChunkStore loaded: {len(store._data)} patients from {path}")
+        return store
+
+
+# ── QueryExpander ─────────────────────────────────────────────────────────────
+
+class QueryExpander:
+    """Expands query CUIs into a weighted reach set using UMLS hierarchy.
+
+    For each query CUI, walks UP (parents), DOWN (children), and
+    SIDEWAYS (siblings) in the hierarchy graph. Each reached CUI gets
+    an IC-decay weight based on distance and relationship type.
+    """
+
+    def __init__(self, graph, ic_map):
+        """
+        Args:
+            graph: networkx.DiGraph — UMLS hierarchy (loaded from umls_hierarchy.pkl)
+            ic_map: dict {cui: float} — precomputed IC scores
+        """
+        self.graph = graph
+        self.ic_map = ic_map
+
+    def expand(self, query_cuis):
+        """Build reach set from query surviving CUIs.
+
+        Args:
+            query_cuis: list of CUI strings from query pipeline
+
+        Returns:
+            dict {cui: ReachEntry} — the full reach set with weights
+        """
+        t0 = time.perf_counter()
+        reach = {}  # {cui: ReachEntry}
+
+        for q_cui in query_cuis:
+            q_ic = self.ic_map.get(q_cui, 0.0)
+
+            # self
+            self._add(reach, q_cui, WEIGHT_EXACT, "exact", 0, q_cui)
+
+            if self.graph is None or not self.graph.has_node(q_cui):
+                continue
+
+            # walk UP — parents, grandparents, great-grandparents
+            up_weights = [WEIGHT_PARENT_1HOP, WEIGHT_PARENT_2HOP, WEIGHT_PARENT_3HOP]
+            frontier = {q_cui}
+            visited_up = {q_cui}
+            for depth in range(EXPAND_UP_DEPTH):
+                next_frontier = set()
+                for node in frontier:
+                    for parent in self.graph.predecessors(node):
+                        if parent not in visited_up:
+                            visited_up.add(parent)
+                            next_frontier.add(parent)
+                            p_ic = self.ic_map.get(parent, 0.0)
+                            if p_ic >= IC_MIN_ANCESTOR:
+                                weight = up_weights[depth] * (p_ic / q_ic) if q_ic > 0 else up_weights[depth]
+                                weight = min(weight, up_weights[depth])  # cap at max for this depth
+                                self._add(reach, parent, weight, "parent", depth + 1, q_cui)
+                frontier = next_frontier
+                if not frontier:
+                    break
+
+            # walk DOWN — children, grandchildren
+            # skip if node has too many children (e.g., "Disease" with 50K descendants)
+            down_weights = [WEIGHT_CHILD_1HOP, WEIGHT_CHILD_2HOP]
+            frontier = {q_cui}
+            visited_down = {q_cui}
+            for depth in range(EXPAND_DOWN_DEPTH):
+                next_frontier = set()
+                for node in frontier:
+                    n_children = self.graph.out_degree(node) if self.graph.has_node(node) else 0
+                    if n_children > EXPAND_DOWN_MAX_CHILDREN:
+                        continue  # too broad, skip this node's children
+                    for child in self.graph.successors(node):
+                        if child not in visited_down:
+                            visited_down.add(child)
+                            next_frontier.add(child)
+                            self._add(reach, child, down_weights[depth], "child", depth + 1, q_cui)
+                frontier = next_frontier
+                if not frontier:
+                    break
+
+            # siblings — same parent, different concept (capped)
+            for parent in self.graph.predecessors(q_cui):
+                p_ic = self.ic_map.get(parent, 0.0)
+                if p_ic < IC_MIN_ANCESTOR:
+                    continue  # parent too broad, siblings meaningless
+                n_siblings = self.graph.out_degree(parent) if self.graph.has_node(parent) else 0
+                if n_siblings > EXPAND_SIBLING_MAX:
+                    continue  # too many siblings, not useful
+                for sibling in self.graph.successors(parent):
+                    if sibling != q_cui and sibling not in reach:
+                        self._add(reach, sibling, WEIGHT_SIBLING, "sibling", 1, q_cui)
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug(f"    QueryExpander: {len(query_cuis)} query CUIs → "
+                     f"{len(reach)} reach set ({elapsed:.1f}ms)")
+        return reach
+
+    @staticmethod
+    def _add(reach, cui, weight, relation, hops, source_cui):
+        """Add or update reach entry, keeping highest weight."""
+        if cui in reach:
+            if weight > reach[cui].weight:
+                reach[cui] = ReachEntry(cui, weight, relation, hops, source_cui)
+        else:
+            reach[cui] = ReachEntry(cui, weight, relation, hops, source_cui)
+
+
+# ── ChunkScorer ───────────────────────────────────────────────────────────────
+
+class ChunkScorer:
+    """Scores stored chunks against a query reach set.
+
+    For each chunk, checks how many of its surviving CUIs appear
+    in the reach set. Score is the IC-weighted sum of match weights,
+    normalized by total query IC.
+    """
+
+    def __init__(self, ic_map):
+        self.ic_map = ic_map
+
+    def score(self, reach_set, patient_chunks, top_k=10):
+        """Score all chunks for a patient against the query reach set.
+
+        Args:
+            reach_set: dict {cui: ReachEntry} from QueryExpander.expand()
+            patient_chunks: dict {chunk_id: {"doc_id": str, "cuis": set}}
+                           from ChunkStore.get_patient()
+            top_k: max results to return
+
+        Returns:
+            list[ChunkMatch] sorted by score descending
+        """
+        t0 = time.perf_counter()
+        if not reach_set or not patient_chunks:
+            return []
+
+        # total query IC for normalization (only exact/self entries)
+        query_cuis = [r.cui for r in reach_set.values() if r.relation == "exact"]
+        total_query_ic = sum(self.ic_map.get(c, 1.0) for c in query_cuis)
+        if total_query_ic < 1e-9:
+            total_query_ic = 1.0
+
+        results = []
+        reach_keys = set(reach_set.keys())  # precompute once, not per-chunk
+        for chunk_id, chunk_data in patient_chunks.items():
+            chunk_cuis = chunk_data["cuis"]
+            doc_id = chunk_data["doc_id"]
+
+            # find which chunk CUIs appear in reach set
+            matched = chunk_cuis & reach_keys
+            if not matched:
+                continue
+
+            # compute weighted score
+            weighted_sum = 0.0
+            details = []
+            for cui in matched:
+                entry = reach_set[cui]
+                cui_ic = self.ic_map.get(cui, 1.0)
+                contribution = entry.weight * cui_ic
+                weighted_sum += contribution
+                details.append({
+                    "chunk_cui": cui,
+                    "match_type": entry.relation,
+                    "hops": entry.hops,
+                    "weight": round(entry.weight, 2),
+                    "ic": round(cui_ic, 2),
+                    "matched_via": entry.source_cui,
+                })
+
+            score = min(weighted_sum / total_query_ic, 1.0)
+
+            if score >= SCORE_MIN_THRESHOLD:
+                # sort details: exact first, then by weight descending
+                details.sort(key=lambda d: (-d["weight"], d["hops"]))
+
+                # group matched CUIs by topic
+                cui_to_topic = chunk_data.get("topics", {})
+                topics_matched = defaultdict(list)
+                for cui in matched:
+                    tid = cui_to_topic.get(cui)
+                    topics_matched[tid].append(cui)
+                topics_matched = dict(topics_matched)
+
+                results.append(ChunkMatch(
+                    chunk_id=chunk_id,
+                    document_id=doc_id,
+                    score=round(score, 4),
+                    matched_cuis=len(matched),
+                    total_chunk_cuis=len(chunk_cuis),
+                    total_query_cuis=len(query_cuis),
+                    topics_matched=topics_matched,
+                    details=details
+                ))
+
+        results.sort(key=lambda r: (-r.score, -r.matched_cuis, r.chunk_id))
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug(f"    ChunkScorer: {len(patient_chunks)} chunks → "
+                     f"{len(results)} matches ({elapsed:.1f}ms)")
+        return results[:top_k]
+
+    @staticmethod
+    def explain(result, terms=None):
+        """Human-readable explanation of a chunk match."""
+        terms = terms or {}
+        lines = [
+            f"Chunk: {result.chunk_id}  Doc: {result.document_id}",
+            f"  Score: {result.score:.3f}  "
+            f"({result.matched_cuis} matched / "
+            f"{result.total_chunk_cuis} chunk CUIs / "
+            f"{result.total_query_cuis} query CUIs)"
+        ]
+        # show topic grouping if available
+        if result.topics_matched:
+            topic_parts = []
+            for tid, cuis in sorted(result.topics_matched.items(),
+                                     key=lambda x: (x[0] is None, x[0])):
+                cui_names = [terms.get(c, c) for c in cuis]
+                label = f"topic_{tid}" if tid is not None else "ungrouped"
+                topic_parts.append(f"{label}({', '.join(cui_names)})")
+            lines.append(f"  Topics hit: {' | '.join(topic_parts)}")
+
+        for d in result.details:
+            cui_term = terms.get(d["chunk_cui"], d["chunk_cui"])
+            via_term = terms.get(d["matched_via"], d["matched_via"])
+            if d["match_type"] == "exact":
+                lines.append(f"    ✓ exact: {cui_term}")
+            else:
+                lines.append(
+                    f"    ~ {d['match_type']}({d['hops']}hop, w={d['weight']}): "
+                    f"{cui_term} ← via {via_term}")
+        return "\n".join(lines)
