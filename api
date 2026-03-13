@@ -124,15 +124,6 @@ def process_text(text_list, context, label="doc"):
     ic_map = system.ic_computer.compute(list(all_surviving), {})
     h_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
 
-    ancestor_cuis = set()
-    for tid, t in h_topics.items():
-        if t["topic_cui"]:
-            ancestor_cuis.add(t["topic_cui"])
-        for stid, st in t.get("subtopics", {}).items():
-            if st["subtopic_cui"]:
-                ancestor_cuis.add(st["subtopic_cui"])
-    all_cuis.update(ancestor_cuis)
-
     terms = fetch_preferred_terms(all_cuis)
 
     embeddings = system.emb_fetcher.fetch(list(all_surviving))
@@ -142,6 +133,7 @@ def process_text(text_list, context, label="doc"):
     metadata = system.fetcher.fetch(list(all_cuis))
     topic_reps = TopicRepresentativeSelector.select(
         h_topics, metadata, all_embeddings, ic_map, hierarchy)
+    HierarchicalTopicBuilder.label_topics(h_topics, topic_reps)
 
     anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
 
@@ -197,26 +189,30 @@ def write_csvs(result, label="doc"):
              ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
               "explains_count", "explains"], entity_rows)
 
-    # ── topics CSV: topic_id + CUIs, no ancestor labels ──────────────────
+    # ── topics CSV: topic_id + label + CUIs ────────────────────────────────
     topic_rows = []
     if INCLUDE_SUBTOPICS:
         for tid, t in sorted(h_topics.items()):
+            t_label_cui = t.get("topic_cui") or ""
+            t_label = terms.get(t_label_cui, t_label_cui) if t_label_cui else ""
             for stid, st in sorted(t.get("subtopics", {}).items()):
                 st_cui = st["subtopic_cui"] or ""
                 st_name = terms.get(st_cui, st_cui) if st_cui else ""
                 for c in st["members"]:
-                    topic_rows.append([tid, stid, st_name, c, terms.get(c, c)])
+                    topic_rows.append([tid, t_label, stid, st_name, c, terms.get(c, c)])
             for c in sorted(t.get("ungrouped", [])):
-                topic_rows.append([tid, "", "", c, terms.get(c, c)])
+                topic_rows.append([tid, t_label, "", "", c, terms.get(c, c)])
         save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
-                 ["topic_id", "subtopic_id", "subtopic_name",
+                 ["topic_id", "topic_label", "subtopic_id", "subtopic_name",
                   "cui", "preferred_term"], topic_rows)
     else:
         for tid, t in sorted(h_topics.items()):
+            t_label_cui = t.get("topic_cui") or ""
+            t_label = terms.get(t_label_cui, t_label_cui) if t_label_cui else ""
             for c in t["members"]:
-                topic_rows.append([tid, c, terms.get(c, c)])
+                topic_rows.append([tid, t_label, c, terms.get(c, c)])
         save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
-                 ["topic_id", "cui", "preferred_term"], topic_rows)
+                 ["topic_id", "topic_label", "cui", "preferred_term"], topic_rows)
 
     # ── representatives CSV: one rep per row, simple ─────────────────────
     rep_rows = []
