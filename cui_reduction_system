@@ -769,7 +769,12 @@ class GraphComponentBuilder:
 
 class HierarchicalTopicBuilder:
     """Build 2-level topic hierarchy from UMLS ancestor convergence.
-    Output: {tid: {topic_cui, members, subtopics: {stid: {subtopic_cui, members}}, ungrouped}}.
+
+    Uses hierarchy ancestors internally for GROUPING, but does NOT expose
+    ancestor CUIs as topic labels. Topics are labeled later using
+    representative CUIs from the actual surviving set (label_topics).
+
+    Output: {tid: {topic_cui: None, members: [...], subtopics: {}, ungrouped: [...]}}.
     """
 
     @staticmethod
@@ -779,7 +784,8 @@ class HierarchicalTopicBuilder:
         if len(surviving) < 2 or graph is None or graph.number_of_nodes() == 0:
             if surviving:
                 return {0: {"topic_cui": None, "members": sorted(surviving),
-                            "subtopics": {}, "ungrouped": sorted(surviving)}}
+                            "subtopics": {}, "ungrouped": sorted(surviving),
+                            "_grouping_cui": None}}
             return {}
 
         def _bfs_up(node):
@@ -814,13 +820,14 @@ class HierarchicalTopicBuilder:
 
         if not convergence:
             return {0: {"topic_cui": None, "members": sorted(surviving),
-                        "subtopics": {}, "ungrouped": sorted(surviving)}}
+                        "subtopics": {}, "ungrouped": sorted(surviving),
+                        "_grouping_cui": None}}
 
         # Subtopics: most specific convergence points (highest IC). Topics: broader groupers.
         by_specificity = sorted(convergence.items(),
                                 key=lambda x: (-ic_scores.get(x[0], 0), len(x[1])))
 
-        subtopic_map = {}   # subtopic_cui -> set of members
+        subtopic_map = {}   # ancestor_cui -> set of members (internal grouping only)
         assigned = set()    # CUIs already in a subtopic
 
         for anc, members in by_specificity:
@@ -844,26 +851,27 @@ class HierarchicalTopicBuilder:
         topics = {}
         tid = 0
 
-        for topic_cui, sub_cuis in by_topic_specificity:
+        for grouping_cui, sub_cuis in by_topic_specificity:
             available = sub_cuis - used_subtopics
             if len(available) < 2:
                 continue
 
-            # build this topic
+            # build this topic — grouping_cui is internal, NOT exposed as label
             all_members = set()
             subtopics = {}
             stid = 0
             for sc in sorted(available, key=lambda x: -ic_scores.get(x, 0)):
                 members = subtopic_map[sc]
-                subtopics[stid] = {"subtopic_cui": sc, "members": sorted(members)}
+                subtopics[stid] = {"subtopic_cui": None, "members": sorted(members)}
                 all_members |= members
                 stid += 1
 
             topics[tid] = {
-                "topic_cui": topic_cui,
+                "topic_cui": None,            # labeled later by label_topics()
                 "members": sorted(all_members),
                 "subtopics": subtopics,
-                "ungrouped": []
+                "ungrouped": [],
+                "_grouping_cui": grouping_cui  # internal, for orphan attachment
             }
             used_subtopics |= available
             tid += 1
@@ -872,10 +880,11 @@ class HierarchicalTopicBuilder:
             if sc not in used_subtopics:
                 members = subtopic_map[sc]
                 topics[tid] = {
-                    "topic_cui": sc,
+                    "topic_cui": None,
                     "members": sorted(members),
-                    "subtopics": {0: {"subtopic_cui": sc, "members": sorted(members)}},
-                    "ungrouped": []
+                    "subtopics": {0: {"subtopic_cui": None, "members": sorted(members)}},
+                    "ungrouped": [],
+                    "_grouping_cui": sc
                 }
                 tid += 1
 
@@ -887,9 +896,9 @@ class HierarchicalTopicBuilder:
                     # attach to nearest existing topic by highest-IC shared ancestor
                     best_topic, best_ic = None, -1.0
                     for t_id, t_info in topics.items():
-                        t_anc_cui = t_info["topic_cui"]
-                        if t_anc_cui and t_anc_cui in ancs:
-                            t_ic = ic_scores.get(t_anc_cui, 0.0)
+                        g_cui = t_info.get("_grouping_cui")
+                        if g_cui and g_cui in ancs:
+                            t_ic = ic_scores.get(g_cui, 0.0)
                             if t_ic > best_ic:
                                 best_ic = t_ic
                                 best_topic = t_id
@@ -902,7 +911,8 @@ class HierarchicalTopicBuilder:
                 # truly orphaned
                 topics[tid] = {
                     "topic_cui": None, "members": [cui],
-                    "subtopics": {}, "ungrouped": [cui]
+                    "subtopics": {}, "ungrouped": [cui],
+                    "_grouping_cui": None
                 }
                 tid += 1
 
@@ -911,6 +921,30 @@ class HierarchicalTopicBuilder:
             f"{len(surviving) - len(assigned)} singletons")
 
         return topics
+
+    @staticmethod
+    def label_topics(h_topics, topic_reps):
+        """Label each topic using the hierarchy ancestor that grouped it.
+
+        The builder stores _grouping_cui (the ancestor convergence point)
+        internally. This method promotes it to topic_cui as a human-readable
+        label. Falls back to the rep with most members if no grouping ancestor.
+
+        Args:
+            h_topics: output from build()
+            topic_reps: {tid: [RepresentativeInfo, ...]} from selector
+        """
+        for tid, t_info in h_topics.items():
+            # prefer the ancestor that grouped these CUIs together
+            grouping = t_info.get("_grouping_cui")
+            if grouping:
+                t_info["topic_cui"] = grouping
+            else:
+                # no ancestor found — use best rep from actual text
+                reps = topic_reps.get(tid, [])
+                if reps:
+                    best_rep = max(reps, key=lambda r: (r.member_count, r.ic_score))
+                    t_info["topic_cui"] = best_rep.cui
 
 class EmbeddingReducer:
     @staticmethod
