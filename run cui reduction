@@ -1,26 +1,27 @@
 """
-CUI Reduction Runner — API
-Extracts CUIs via API, reduction, topics, representatives, anchors, CSVs.
+CUI Reduction Runner — Pickle Files (GCS)
+Loads pickle files, batch reduction per entity, topics, reps, anchors, CSVs.
 
 Usage:
-    python run_cui_reduction_api.py
+    python run_cui_reduction.py
 
     # Or import:
-    from run_cui_reduction_api import process_text
+    from run_cui_reduction import process_one_pickle
 """
 
 import os
 import csv
+import pickle
 import numpy as np
-from google.cloud import bigquery
+from google.cloud import storage, bigquery
 
 from config import (
-    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
-    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
+    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR,
+    ALLOWED_SABS, GCS_BUCKET, PICKLE_PREFIX, OUTPUT_DIR,
     hierarchy, ic_precomputed
 )
 from cui_reduction_system import (
-    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
+    CUIReductionSystem, HierarchicalTopicBuilder, Evaluator,
     TopicRepresentativeSelector, TopicAnchorAssigner
 )
 from topic_matcher import ChunkStore
@@ -33,16 +34,48 @@ system = CUIReductionSystem(
     allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
     ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
 
-extractor = CUIExtractor(
-    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
-    cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
-
 evaluator = Evaluator(hierarchy)
 bq = bigquery.Client(project=PROJECT_ID)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+def load_pickles_from_gcs(bucket_name, prefix):
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    print(f"  Found {len(blobs)} blobs in gs://{bucket_name}/{prefix}")
+    results = []
+    for blob in blobs:
+        if blob.name.endswith("/"):
+            continue
+        if blob.name.endswith((".pk", ".pkl", ".pickle")):
+            data = pickle.loads(blob.download_as_bytes())
+            fname = blob.name.split("/")[-1]
+            results.append((fname, data))
+            print(f"  Loaded: {fname}")
+    print(f"Total pickle files: {len(results)}")
+    return results
+
+
+def parse_pickle(data):
+    text = data.get("text", "")
+    entities = []
+    extracted = data.get("extracted", {})
+    for key, block in extracted.items():
+        for item in block.get("matching_items", []):
+            entity_text = item[0]
+            sentence = item[1]
+            cui_list = item[2] if len(item) > 2 else []
+            cuis, distances = [], {}
+            for entry in cui_list:
+                cuis.append(entry[0])
+                distances[entry[0]] = entry[1]
+            if cuis:
+                entities.append((entity_text, sentence, cuis, distances))
+    return text, entities
+
 
 def fetch_preferred_terms(cuis):
     if not cuis:
@@ -73,39 +106,41 @@ def save_csv(path, headers, rows):
         w.writerows(rows)
 
 
-# ── core pipeline: text → anchors ────────────────────────────────────────────
+# ── core: process one pickle → anchors ───────────────────────────────────────
 
-def process_text(text_list, context, label="doc"):
-    """Full pipeline: text → extract → reduce → topics → reps → anchors.
-
-    Args:
-        text_list: list of phrases to extract CUIs from
-        context: surrounding text for extraction context
-        label: name for output (e.g. "doc", case name)
+def process_one_pickle(fname, data):
+    """Full pipeline for one pickle file.
 
     Returns:
-        dict with keys: anchors, ic_map, terms, h_topics, topic_reps,
-                        entity_results, all_embeddings, metadata
-        or None if nothing extracted
+        dict with keys: case_name, anchors, ic_map, terms, h_topics,
+                        topic_reps, entity_results, all_embeddings, metadata,
+                        metric_rows, recon_rows
+        or None if no entities found
     """
-    context_list = [context] * len(text_list)
-    per_phrase = extractor.extract(text_list, context_list)
-    extractor._cache.flush()
-
-    print(f"\n[{label}] Extracted CUIs for {len(per_phrase)} phrases")
-    for phrase, cui_dists in per_phrase.items():
-        print(f"  \"{phrase}\": {len(cui_dists)} CUIs")
-
-    if not per_phrase:
-        print(f"[{label}] No CUIs extracted")
+    text, entities = parse_pickle(data)
+    if not entities:
+        print(f"  {fname} — no entities found")
         return None
 
-    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase.items()]
-    results = system.reduce_batch(batch_inputs)
-    entity_results = [(batch_inputs[i][1], results[i]) for i in range(len(results))]
+    case_name = fname.rsplit(".", 1)[0]
+    total_cuis = sum(len(c) for _, _, c, _ in entities)
+    print(f"\n{'='*80}")
+    print(f"CASE: {fname}")
+    print(f"TEXT: {text[:150]}...")
+    print(f"ENTITIES: {len(entities)}, TOTAL INPUT CUIs: {total_cuis}")
+    print(f"{'='*80}")
 
-    all_surviving, all_cuis = set(), set()
-    for entity_text, result in entity_results:
+    # batch reduction
+    batch_inputs = [(cuis, entity_text, distances)
+                    for entity_text, sentence, cuis, distances in entities]
+    print(f"  → Batch reduction ({len(batch_inputs)} entities, {total_cuis} CUIs)...", flush=True)
+    results = system.reduce_batch(batch_inputs)
+    print(f"  → Batch reduction done", flush=True)
+    entity_results = [(entities[i][0], results[i]) for i in range(len(entities))]
+
+    all_surviving = set()
+    all_cuis = set()
+    for _, result in entity_results:
         all_surviving.update(result.all_reduced_cuis)
         for e in result.confidence:
             all_cuis.update(e.explains_cuis)
@@ -113,27 +148,37 @@ def process_text(text_list, context, label="doc"):
             all_cuis.add(a.removed_cui)
             if a.kept_cui:
                 all_cuis.add(a.kept_cui)
+    for _, _, cuis, _ in entities:
+        all_cuis.update(cuis)
     all_cuis.update(all_surviving)
-    for ph, cd in per_phrase.items():
-        all_cuis.update(cd.keys())
+    print(f"  → Surviving: {len(all_surviving)} CUIs, Total tracked: {len(all_cuis)}", flush=True)
 
-    if not all_surviving:
-        print(f"[{label}] No CUIs survived reduction")
-        return None
-
+    # hierarchical topics
+    print(f"  → Building hierarchical topics...", flush=True)
     ic_map = system.ic_computer.compute(list(all_surviving), {})
     h_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
+    print(f"  → Topics: {len(h_topics)}", flush=True)
 
+    print(f"  → Fetching terms...", flush=True)
     terms = fetch_preferred_terms(all_cuis)
+    print(f"  → Terms: {len(terms)}", flush=True)
 
-    embeddings = system.emb_fetcher.fetch(list(all_surviving))
-    removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
+    # embeddings — all tracked CUIs (surviving + removed, needed for eval)
+    surviving_list = list(all_surviving)
+    removed_list = list(all_cuis - all_surviving)
+    print(f"  → Fetching embeddings ({len(surviving_list)} surviving + {len(removed_list)} removed)...", flush=True)
+    embeddings = system.emb_fetcher.fetch(surviving_list)
+    removed_embs = system.emb_fetcher.fetch(removed_list)
     all_embeddings = {**embeddings, **removed_embs}
+    print(f"  → Embeddings done ({len(all_embeddings)} total)", flush=True)
 
+    # metadata + representatives
+    print(f"  → Fetching metadata + selecting representatives...", flush=True)
     metadata = system.fetcher.fetch(list(all_cuis))
     topic_reps = TopicRepresentativeSelector.select(
         h_topics, metadata, all_embeddings, ic_map, hierarchy)
     HierarchicalTopicBuilder.label_topics(h_topics, topic_reps)
+    print(f"  → Representatives done", flush=True)
 
     # fetch terms for topic labels (ancestor CUIs not in original text)
     label_cuis = {t["topic_cui"] for t in h_topics.values() if t.get("topic_cui")}
@@ -141,23 +186,35 @@ def process_text(text_list, context, label="doc"):
     if missing_label_terms:
         terms.update(fetch_preferred_terms(missing_label_terms))
 
+    # anchors
+    print(f"  → Assigning anchors...", flush=True)
     anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
+    print(f"  → Anchors done ({len(anchors)})", flush=True)
 
     anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
     anchor_cuis_for_terms.update(c for a in anchors for c in a.ancestor_cuis or [])
     extra_terms = fetch_preferred_terms(anchor_cuis_for_terms - set(terms.keys()))
     terms.update(extra_terms)
 
-    print(f"[{label}] {sum(len(cd) for cd in per_phrase.values())} raw CUIs "
-          f"→ {len(all_surviving)} surviving → {len(h_topics)} topics "
-          f"→ {len(anchors)} anchors")
+    # print summary
+    for entity_text, result in entity_results:
+        print(f"  ENTITY: \"{entity_text}\" "
+              f"({result.input_count} → {result.after_redundancy_count})")
+
+    print(f"\n  ANCHORS: {len(anchors)}")
     for a in anchors:
-        rep_terms_list = [terms.get(rc, rc) for rc in a.rep_cuis]
+        rep_terms = [terms.get(rc, rc) for rc in a.rep_cuis]
         print(f"    {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)} "
-              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms_list)}], "
+              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms)}], "
               f"topics={a.topic_ids})")
 
+    # evaluation
+    flat_topics = {tid: t["members"] for tid, t in h_topics.items()}
+    metric_rows = evaluator.intrinsic_metrics(case_name, entity_results, flat_topics, all_embeddings)
+    recon_rows = evaluator.reconstruction_check(case_name, entity_results, all_embeddings, metadata, terms)
+
     return {
+        "case_name": case_name,
         "surviving_cuis": all_surviving,
         "anchors": anchors,
         "ic_map": ic_map,
@@ -167,6 +224,8 @@ def process_text(text_list, context, label="doc"):
         "entity_results": entity_results,
         "all_embeddings": all_embeddings,
         "metadata": metadata,
+        "metric_rows": metric_rows,
+        "recon_rows": recon_rows,
     }
 
 
@@ -174,8 +233,9 @@ def process_text(text_list, context, label="doc"):
 
 INCLUDE_SUBTOPICS = False   # set True to include subtopic columns in topics CSV
 
-def write_csvs(result, label="doc"):
-    """Write all CSVs from a process_text result."""
+def write_case_csvs(result):
+    """Write all CSVs for one processed pickle."""
+    case = result["case_name"]
     terms = result["terms"]
     h_topics = result["h_topics"]
 
@@ -191,7 +251,7 @@ def write_csvs(result, label="doc"):
                 round(e.confidence, 4), round(e.extraction_proximity, 3),
                 round(e.centrality, 3), round(e.retention_power, 3),
                 len(e.explains_cuis), explains_str])
-    save_csv(os.path.join(OUTPUT_DIR, f"{label}_entities.csv"),
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_entities.csv"),
              ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
               "explains_count", "explains"], entity_rows)
 
@@ -208,7 +268,7 @@ def write_csvs(result, label="doc"):
                     topic_rows.append([tid, t_label, stid, st_name, c, terms.get(c, c)])
             for c in sorted(t.get("ungrouped", [])):
                 topic_rows.append([tid, t_label, "", "", c, terms.get(c, c)])
-        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+        save_csv(os.path.join(OUTPUT_DIR, f"{case}_topics.csv"),
                  ["topic_id", "topic_label", "subtopic_id", "subtopic_name",
                   "cui", "preferred_term"], topic_rows)
     else:
@@ -217,7 +277,7 @@ def write_csvs(result, label="doc"):
             t_label = terms.get(t_label_cui, t_label_cui) if t_label_cui else ""
             for c in t["members"]:
                 topic_rows.append([tid, t_label, c, terms.get(c, c)])
-        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+        save_csv(os.path.join(OUTPUT_DIR, f"{case}_topics.csv"),
                  ["topic_id", "topic_label", "cui", "preferred_term"], topic_rows)
 
     # ── representatives CSV: one rep per row, simple ─────────────────────
@@ -228,7 +288,7 @@ def write_csvs(result, label="doc"):
                 tid, r.cui, terms.get(r.cui, r.cui),
                 r.method, r.member_count, round(r.ic_score, 2),
                 " | ".join(f"{m}:{terms.get(m, m)}" for m in r.members)])
-    save_csv(os.path.join(OUTPUT_DIR, f"{label}_representatives.csv"),
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_representatives.csv"),
              ["topic_id", "rep_cui", "rep_term", "method", "member_count",
               "ic_score", "members"], rep_rows)
 
@@ -236,6 +296,7 @@ def write_csvs(result, label="doc"):
     anchor_rows = []
     for a in result["anchors"]:
         rep_detail = " | ".join(f"{rc}:{terms.get(rc, rc)}" for rc in a.rep_cuis)
+        # build topic detail: for each topic_id, list its member CUIs
         topic_detail_parts = []
         for tid in a.topic_ids:
             t = h_topics.get(tid, {})
@@ -249,72 +310,61 @@ def write_csvs(result, label="doc"):
             rep_detail,
             len(a.topic_ids), topic_detail,
             len(a.ancestor_cuis) if a.ancestor_cuis else 0])
-    save_csv(os.path.join(OUTPUT_DIR, f"{label}_anchors.csv"),
+    save_csv(os.path.join(OUTPUT_DIR, f"{case}_anchors.csv"),
              ["anchor_cui", "anchor_term", "anchor_ic",
               "representatives", "topics_covered", "topic_details",
               "ancestor_count"], anchor_rows)
-
-    print(f"[{label}] CSVs written to {OUTPUT_DIR}")
-
-
-def run_evaluation(result, label="doc"):
-    flat_topics = {tid: t["members"] for tid, t in result["h_topics"].items()}
-    metric_rows = evaluator.intrinsic_metrics(
-        label, result["entity_results"], flat_topics, result["all_embeddings"])
-    recon_rows = evaluator.reconstruction_check(
-        label, result["entity_results"], result["all_embeddings"],
-        result["metadata"], result["terms"])
-    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_metrics.csv"),
-             Evaluator.metric_headers(), metric_rows)
-    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_reconstruction.csv"),
-             Evaluator.reconstruction_headers(), recon_rows)
-    suspect = sum(1 for r in recon_rows if "SUSPECT" in str(r[-1]))
-    ok = sum(1 for r in recon_rows if r[-1] == "OK")
-    total = len(recon_rows)
-    if total:
-        print(f"[{label}] Evaluation: {ok}/{total} OK, {suspect}/{total} SUSPECT")
-    return metric_rows, recon_rows
 
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    # ── INPUT (edit these) ───────────────────────────────────────────────
-    CONTEXT = (
-        "Patient presented with left knee pain and swelling for the past three days. "
-        "Pain worsens with weight bearing and climbing stairs. No history of trauma. "
-        "Mild effusion noted on examination."
-    )
-    TEXT_LIST = [
-        "left knee pain",
-        "swelling",
-        "weight bearing pain",
-        "climbing stairs difficulty",
-        "knee effusion",
-    ]
+    # ── CONFIG (edit these) ──────────────────────────────────────────────
+    PATIENT_ID = "patient_001"           # patient these documents belong to
+    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")  # where to save
 
     # ═════════════════════════════════════════════════════════════════════
-    # Process + store
+    # Process all pickle files + store surviving CUIs
     # ═════════════════════════════════════════════════════════════════════
-    PATIENT_ID = "patient_001"
-    CHUNK_ID = "api_chunk_1"
-    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+    pickles = load_pickles_from_gcs(GCS_BUCKET, PICKLE_PREFIX)
+    store = ChunkStore()
 
-    result = process_text(TEXT_LIST, CONTEXT, label="api")
-    if result:
-        write_csvs(result, label="api")
-        run_evaluation(result, label="api")
+    all_metric_rows, all_recon_rows = [], []
 
-        # store surviving CUIs for matching
-        store = ChunkStore()
-        store.add(PATIENT_ID, CHUNK_ID, "api_doc",
-                  result["surviving_cuis"], topics=result["h_topics"])
-        store.save(STORE_PATH)
+    for fname, data in pickles:
+        result = process_one_pickle(fname, data)
+        if result:
+            write_case_csvs(result)
+            all_metric_rows.extend(result["metric_rows"])
+            all_recon_rows.extend(result["recon_rows"])
 
-        stats = store.stats(PATIENT_ID)
-        print(f"\n  Stored: {stats['total_cuis']} surviving CUIs "
-              f"for {stats['chunks']} chunk(s)")
-        print(f"  Store saved to: {STORE_PATH}")
+            # store surviving CUIs + topics for matching
+            store.add(
+                patient_id=PATIENT_ID,
+                chunk_id=result["case_name"],
+                document_id=fname,
+                surviving_cuis=result["surviving_cuis"],
+                topics=result["h_topics"]
+            )
 
-    print(f"\n{'='*80}\nDONE\n{'='*80}")
+    # save store
+    store.save(STORE_PATH)
+
+    # evaluation summary
+    save_csv(os.path.join(OUTPUT_DIR, "eval_metrics.csv"),
+             Evaluator.metric_headers(), all_metric_rows)
+    save_csv(os.path.join(OUTPUT_DIR, "eval_reconstruction.csv"),
+             Evaluator.reconstruction_headers(), all_recon_rows)
+
+    suspect = sum(1 for r in all_recon_rows if "SUSPECT" in str(r[-1]))
+    ok = sum(1 for r in all_recon_rows if r[-1] == "OK")
+    total = len(all_recon_rows)
+    stats = store.stats(PATIENT_ID)
+    print(f"\n{'='*80}\nSUMMARY\n{'='*80}")
+    if total:
+        print(f"  Reconstruction: {ok}/{total} OK, {suspect}/{total} SUSPECT")
+    print(f"  Patient {PATIENT_ID}: {stats['chunks']} chunks, "
+          f"{stats['total_cuis']} surviving CUIs stored")
+    print(f"  Store saved to: {STORE_PATH}")
+    print(f"\nDONE — {len(pickles)} cases")
