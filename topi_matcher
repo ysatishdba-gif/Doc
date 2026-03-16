@@ -45,17 +45,14 @@ from dataclasses import dataclass
 logger = logging.getLogger("cui_reduction")
 
 
-# ── Tunable constants ─────────────────────────────────────────────────────────
-
-MIN_CUI_OVERLAP = 1          # minimum CUI overlap to be a candidate via exact match
-ANCESTOR_DEPTH = 4           # BFS depth for ancestor computation
-IC_MIN_MEANINGFUL = 2.0      # ignore MICA below this IC
-SCORE_MIN_THRESHOLD = 0.01   # drop chunks below this final score
-
-# signal weights (sum to 1.0)
-W_CUI_OVERLAP = 0.40
-W_VECTOR_SIM = 0.30
-W_LIN_SIM = 0.30
+# ── Private implementation constants ──────────────────────────────────────────
+_W_CUI   = 0.40
+_W_VEC   = 0.30
+_W_LIN   = 0.30
+_ANC_DEPTH = 4
+_IC_MIN    = 2.0
+_MIN_OVERLAP = 1
+_SCORE_MIN = 0.01
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -191,7 +188,7 @@ class ChunkMatcher:
         result = {cui}
         if self.graph is not None and self.graph.has_node(cui):
             frontier = {cui}
-            for _ in range(ANCESTOR_DEPTH):
+            for _ in range(_ANC_DEPTH):
                 nxt = set()
                 for n in frontier:
                     for parent in self.graph.predecessors(n):
@@ -217,11 +214,11 @@ class ChunkMatcher:
         # subsumption
         if c1 in c2_anc:
             mica_ic = ic1
-            if mica_ic >= IC_MIN_MEANINGFUL:
+            if mica_ic >= _IC_MIN:
                 return min(2.0 * mica_ic / denom, 1.0), c1, "subsumption"
         if c2 in c1_anc:
             mica_ic = ic2
-            if mica_ic >= IC_MIN_MEANINGFUL:
+            if mica_ic >= _IC_MIN:
                 return min(2.0 * mica_ic / denom, 1.0), c2, "subsumption"
         # shared ancestor — MICA
         shared = c1_anc & c2_anc
@@ -229,7 +226,7 @@ class ChunkMatcher:
             return 0.0, None, "no_match"
         mica = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
         mica_ic = self.ic_map.get(mica, 0.0)
-        if mica_ic < IC_MIN_MEANINGFUL:
+        if mica_ic < _IC_MIN:
             return 0.0, None, "no_match"
         return min(2.0 * mica_ic / denom, 1.0), mica, "shared_ancestor"
 
@@ -340,9 +337,9 @@ class ChunkMatcher:
 
             # ── Combined score ────────────────────────────────────────────
             if has_vectors and has_graph:
-                score = (W_CUI_OVERLAP * cui_ratio +
-                         W_VECTOR_SIM * vector_sim +
-                         W_LIN_SIM * lin_avg)
+                score = (_W_CUI * cui_ratio +
+                         _W_VEC * vector_sim +
+                         _W_LIN * lin_avg)
             elif has_vectors:
                 score = 0.5 * cui_ratio + 0.5 * vector_sim
             elif has_graph:
@@ -350,7 +347,7 @@ class ChunkMatcher:
             else:
                 score = cui_ratio
 
-            if score < SCORE_MIN_THRESHOLD:
+            if score < _SCORE_MIN:
                 continue
 
             # ── Topic grouping ────────────────────────────────────────────
