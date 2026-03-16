@@ -1,6 +1,255 @@
-Signal 1 (CUI overlap):   "do these concepts have a real UMLS link?"
-Signal 2 (Vector cosine):  "do these concepts mean similar things?"
-Signal 3 (Lin via MICA):   "how strong is their shared medical ancestry?"
+Chunk A:  Arthritis ↔ RA
+  MICA = Arthritis (IC=8.4)
+                           Arthritis
+                          /         \
+                        RA          OA
+  Lin = 2 × 8.4 / (8.4 + 14.6) = 0.730
 
-Together: precision from CUI codes, recall from embeddings,
-          ranking quality from hierarchy.
+Chunk B:  Arthritis ↔ Carpal tunnel
+  MICA = Musculoskeletal disorder (IC=4.2)
+                      Musculoskeletal
+                      /             \
+                 Arthritis      Carpal tunnel
+  Lin = 2 × 4.2 / (8.4 + 13.9) = 0.376
+
+Chunk C:  Arthritis ↔ OA left knee
+  MICA = Arthritis (IC=8.4)
+                        Arthritis
+                           |
+                          OA
+                           |
+                      OA left knee
+  Lin = 2 × 8.4 / (8.4 + 14.65) = 0.728
+
+Result:  Chunk A = 0.730    Chunk C = 0.728    Chunk B = 0.376
+
+
+------
+Query CUIs: {C0231749 (Knee pain), C0025598 (Methotrexate)}
+Query embedding: [0.31, -0.22, 0.68, ...]
+
+
+Three chunks to compare:
+
+  Chunk A: {C0582801 (Left knee pain), C0003873 (RA), C0025598 (Methotrexate)}
+  Chunk B: {C0409959 (OA left knee), C0019080 (Hyperuricemia)}
+  Chunk C: {C0030193 (Pain), C0025598 (Methotrexate), C0418840 (CRP)}
+
+
+══════════════════════════════════════════════════════════════════
+SIGNAL 1: CUI OVERLAP (exact + ancestor)
+══════════════════════════════════════════════════════════════════
+
+Chunk A:
+  C0231749 (Knee pain) exact match in chunk?  NO
+    ancestors of C0582801 (Left knee pain):
+                      Knee pain (C0231749)    ← FOUND at hop 1
+                          |
+                    Left knee pain (C0582801)
+    → ANCESTOR MATCH ✓
+
+  C0025598 (Methotrexate) exact match in chunk?  YES ✓
+    → EXACT MATCH ✓
+
+  Matched: 2 out of 2 query CUIs
+  cui_ratio = 2/2 = 1.00
+
+
+Chunk B:
+  C0231749 (Knee pain) exact match in chunk?  NO
+    ancestors of C0409959 (OA left knee):
+                    Knee pain (C0231749)?
+                        |
+      NO. Knee pain is under "Pain" branch.
+      OA left knee is under "Disease" branch.
+                        Pain
+                         |
+                     Knee pain
+                                       Arthritis
+                                          |
+                                         OA
+                                          |
+                                    OA left knee
+    Different branches. C0231749 NOT in ancestors of C0409959.
+    → NO MATCH ✗
+
+  C0025598 (Methotrexate) exact match in chunk?  NO
+    ancestors of C0019080 (Hyperuricemia): {Metabolic, Disease, ...}
+    No Methotrexate in there.
+    → NO MATCH ✗
+
+  Matched: 0 out of 2 query CUIs
+  cui_ratio = 0/2 = 0.00
+  → FILTERED OUT. Not a candidate. No scoring needed.
+
+
+Chunk C:
+  C0231749 (Knee pain) exact match in chunk?  NO
+    ancestors of C0030193 (Pain):
+                      Clinical finding
+                          |
+                        Pain (C0030193)
+    Knee pain is CHILD of Pain, not ancestor.
+    We walk UP from chunk CUI, not down.
+    C0231749 is NOT above C0030193. It's below.
+    → NO MATCH ✗
+
+  C0025598 (Methotrexate) exact match in chunk?  YES ✓
+    → EXACT MATCH ✓
+
+  Matched: 1 out of 2 query CUIs
+  cui_ratio = 1/2 = 0.50
+
+
+Summary Signal 1:
+  Chunk A = 1.00   (both query CUIs matched)
+  Chunk C = 0.50   (only Methotrexate matched)
+  Chunk B = 0.00   (filtered out, no match at all)
+
+
+══════════════════════════════════════════════════════════════════
+SIGNAL 2: VECTOR COSINE (embedding centroids)
+══════════════════════════════════════════════════════════════════
+
+Query centroid:     [0.31, -0.22, 0.68, ...]
+
+Chunk A centroid:   [0.28, -0.18, 0.61, ...]
+  dot product = 0.84
+
+Chunk C centroid:   [0.11, 0.15, 0.30, ...]
+  dot product = 0.45
+
+(Chunk B filtered out, not scored)
+
+
+Summary Signal 2:
+  Chunk A = 0.84
+  Chunk C = 0.45
+
+
+══════════════════════════════════════════════════════════════════
+SIGNAL 3: LIN VIA MICA
+══════════════════════════════════════════════════════════════════
+
+For each query CUI, find best Lin match in chunk.
+Then average.
+
+
+── Chunk A ──
+
+  Query CUI: C0231749 (Knee pain, IC=12.1)
+    vs C0582801 (Left knee pain, IC=14.6):
+      MICA = C0231749 (Knee pain itself, IC=12.1)
+
+                     Knee pain (IC=12.1)    ← MICA
+                         |
+                   Left knee pain (IC=14.6)
+
+      Lin = 2 × 12.1 / (12.1 + 14.6) = 24.2 / 26.7 = 0.906
+
+    vs C0003873 (RA, IC=14.6):
+      MICA = Clinical finding (IC=1.8)
+
+                   Clinical finding (IC=1.8)
+                    /              \
+              Knee pain            Arthritis
+                                      |
+                                     RA
+
+      IC 1.8 < 2.0 threshold → too broad → Lin = 0.0
+
+    Best for Knee pain = 0.906 (via Left knee pain)
+
+
+  Query CUI: C0025598 (Methotrexate, IC=14.5)
+    vs C0025598 in chunk:
+      Same CUI! MICA = itself.
+
+                   Methotrexate (IC=14.5)   ← MICA = itself
+
+      Lin = 2 × 14.5 / (14.5 + 14.5) = 29.0 / 29.0 = 1.000
+
+    Best for Methotrexate = 1.000
+
+  Lin average = (0.906 + 1.000) / 2 = 0.953
+
+
+── Chunk C ──
+
+  Query CUI: C0231749 (Knee pain, IC=12.1)
+    vs C0030193 (Pain, IC=4.2):
+      MICA = C0030193 (Pain itself, IC=4.2)
+
+                       Pain (IC=4.2)         ← MICA
+                        |
+                    Knee pain (IC=12.1)
+
+      Knee pain is CHILD of Pain. Pain is the shared ancestor.
+      But Pain is very broad.
+
+      Lin = 2 × 4.2 / (12.1 + 4.2) = 8.4 / 16.3 = 0.515
+
+    Best for Knee pain = 0.515 (weak, broad ancestor)
+
+
+  Query CUI: C0025598 (Methotrexate, IC=14.5)
+    vs C0025598 in chunk:
+      Same CUI.
+      Lin = 1.000
+
+    Best for Methotrexate = 1.000
+
+  Lin average = (0.515 + 1.000) / 2 = 0.758
+
+
+Summary Signal 3:
+  Chunk A = 0.953   (Knee pain → Left knee pain strong, MTX exact)
+  Chunk C = 0.758   (Knee pain → Pain weak, MTX exact)
+
+
+══════════════════════════════════════════════════════════════════
+FINAL SCORES
+══════════════════════════════════════════════════════════════════
+
+score = 0.40 × CUI + 0.30 × Vector + 0.30 × Lin
+
+Chunk A:
+  = 0.40 × 1.00  + 0.30 × 0.84  + 0.30 × 0.953
+  = 0.400        + 0.252        + 0.286
+  = 0.938
+
+Chunk C:
+  = 0.40 × 0.50  + 0.30 × 0.45  + 0.30 × 0.758
+  = 0.200        + 0.135        + 0.227
+  = 0.562
+
+Chunk B:
+  = filtered out (0 CUI overlap)
+
+
+RANKED:
+  #1  Chunk A  score = 0.938
+  #2  Chunk C  score = 0.562
+  #3  Chunk B  not scored (no CUI match)
+
+
+══════════════════════════════════════════════════════════════════
+WHY CHUNK A WINS
+══════════════════════════════════════════════════════════════════
+
+Signal 1 (CUI):
+  Chunk A: 1.00  (Knee pain found as ancestor of Left knee pain,
+                   Methotrexate exact match)
+  Chunk C: 0.50  (only Methotrexate matched.
+                   Pain is in chunk but Knee pain is NOT ancestor
+                   of Pain — it's the other way around.
+                   Walking UP from Pain reaches Clinical finding,
+                   not down to Knee pain.)
+
+Signal 2 (Vector):
+  Chunk A: 0.84  (Left knee pain + RA + MTX centroid
+                   close to Knee pain + MTX query centroid)
+  Chunk C: 0.45  (Pain is too generic, pulls centroid away)
+
+Signal 3 (Lin):
+  Chunk A: 0.953 (MICA for Knee pain ↔ Left knee pai
