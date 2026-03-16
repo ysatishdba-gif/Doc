@@ -281,27 +281,35 @@ class ChunkMatcher:
             if not chunk_cuis:
                 continue
 
-            # ── Filter: exact CUI overlap OR hierarchy subsumption ────────
+            # ── Filter: exact CUI overlap OR hierarchy (both directions) ──
             exact_overlap = query_cuis & chunk_cuis
 
-            hierarchy_hits = set()
+            hierarchy_query_hits = set()  # query CUIs matched via hierarchy
+            hierarchy_chunk_hits = set()  # chunk CUIs matched via hierarchy
             if has_graph and len(exact_overlap) < len(query_cuis):
                 unmatched_query = query_cuis - exact_overlap
-                for d_cui in chunk_cuis:
-                    if d_cui in exact_overlap:
-                        continue
-                    d_anc = self._ancestor_cache.get(d_cui, frozenset())
-                    for q_cui in unmatched_query:
-                        if q_cui in d_anc:
-                            hierarchy_hits.add(d_cui)
+                for q_cui in unmatched_query:
+                    q_anc = query_ancestors.get(q_cui, frozenset())
+                    for d_cui in chunk_cuis:
+                        if d_cui in exact_overlap:
+                            continue
+                        d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                        # Direction 1: query CUI is ancestor of chunk CUI
+                        #   e.g., query "Arthritis" matches chunk "RA"
+                        # Direction 2: chunk CUI is ancestor of query CUI
+                        #   e.g., query "Seizure" matches chunk "Epilepsy"
+                        if q_cui in d_anc or d_cui in q_anc:
+                            hierarchy_query_hits.add(q_cui)
+                            hierarchy_chunk_hits.add(d_cui)
                             break
 
-            all_matched_chunk_cuis = exact_overlap | hierarchy_hits
-            if not all_matched_chunk_cuis:
+            all_matched_chunk_cuis = exact_overlap | hierarchy_chunk_hits
+            if not (exact_overlap or hierarchy_query_hits):
                 continue
 
             # ── Signal 1: CUI overlap ratio (W=0.40) ─────────────────────
             matched_query_count = len(exact_overlap)
+            matched_query_cuis = set(exact_overlap)
             if has_graph:
                 for q_cui in query_cuis - exact_overlap:
                     q_anc = query_ancestors.get(q_cui, frozenset())
@@ -309,6 +317,7 @@ class ChunkMatcher:
                         d_anc = self._ancestor_cache.get(d_cui, frozenset())
                         if q_cui in d_anc or d_cui in q_anc:
                             matched_query_count += 1
+                            matched_query_cuis.add(q_cui)
                             break
             cui_ratio = matched_query_count / len(query_cuis)
 
@@ -382,13 +391,13 @@ class ChunkMatcher:
                 chunk_id=chunk_id,
                 document_id=doc_id,
                 score=round(score, 4),
-                cui_overlap=len(exact_overlap),
+                cui_overlap=matched_query_count,
                 cui_overlap_ratio=round(cui_ratio, 4),
                 vector_sim=round(vector_sim, 4),
                 lin_score=round(lin_avg, 4),
                 total_chunk_cuis=len(chunk_cuis),
                 total_query_cuis=len(query_cuis),
-                overlapping_cuis=sorted(exact_overlap),
+                overlapping_cuis=sorted(matched_query_cuis),
                 topics_matched=topics_matched,
                 lin_details=lin_details
             ))
