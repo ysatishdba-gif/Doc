@@ -25,8 +25,12 @@ from config import (
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
     hierarchy, ic_precomputed
 )
-from cui_reduction_system import CUIReductionSystem, CUIExtractor
-from topic_matcher import ChunkStore, ChunkMatcher
+from cui_reduction_system import CUIReductionSystem, CUIExtractor, fetch_preferred_terms
+from topic_matcher import ChunkStore, ChunkMatcher, compute_centroid
+
+_LLM_MODEL = "claude-sonnet-4-20250514"
+_LLM_MAX_TOKENS = 1500
+_LLM_TOP_K = 3
 
 # ── Setup (runs once) ────────────────────────────────────────────────────────
 
@@ -49,28 +53,7 @@ matcher = ChunkMatcher(hierarchy, ic_precomputed)
 
 # ── Term lookup ──────────────────────────────────────────────────────────────
 
-def fetch_preferred_terms(cuis):
-    """Fetch preferred terms from MRCONSO."""
-    cuis = list(cuis)
-    if not cuis:
-        return {}
-    terms = {}
-    for i in range(0, len(cuis), 500):
-        batch = cuis[i:i+500]
-        query = f"""
-        SELECT CUI, STR
-        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
-        """
-        jc = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-        for row in bq.query(query, job_config=jc).result():
-            if row.CUI not in terms:
-                terms[row.CUI] = row.STR
-    for c in cuis:
-        if c not in terms:
-            terms[c] = c
-    return terms
+_fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
 
 
 # ── Query processing ─────────────────────────────────────────────────────────
@@ -118,7 +101,7 @@ def process_query(query_text):
     query_embedding = compute_centroid(surviving, query_embeddings)
 
     # terms
-    terms = fetch_preferred_terms(surviving)
+    terms = _fetch_terms(surviving)
     for cui in surviving:
         print(f"      {cui} | {terms.get(cui, cui)}")
 
@@ -190,7 +173,7 @@ def run_query(query_text, store_path=None, top_k=10):
             all_cuis_to_resolve.add(d.query_cui)
     missing = all_cuis_to_resolve - set(terms.keys())
     if missing:
-        terms.update(fetch_preferred_terms(missing))
+        terms.update(_fetch_terms(missing))
 
     elapsed = (time.perf_counter() - t0) * 1000
 
@@ -211,7 +194,7 @@ def run_query(query_text, store_path=None, top_k=10):
 
 # ── LLM Reasoning ────────────────────────────────────────────────────────────
 
-def build_reasoning_prompt(query_text, results, chunks, terms, top_k=3):
+def build_reasoning_prompt(query_text, results, chunks, terms, top_k=_LLM_TOP_K):
     """Build a structured prompt for LLM to reason about match quality.
 
     Args:
@@ -278,7 +261,7 @@ Provide your analysis in clear, structured prose."""
 
 
 def llm_reason(query_text, results, chunks, terms,
-               api_key=None, model="claude-sonnet-4-20250514", top_k=3):
+               api_key=None, model=_LLM_MODEL, top_k=_LLM_TOP_K):
     """Call LLM to reason about match quality.
 
     Args:
@@ -316,7 +299,7 @@ def llm_reason(query_text, results, chunks, terms,
             },
             json={
                 "model": model,
-                "max_tokens": 1500,
+                "max_tokens": _LLM_MAX_TOKENS,
                 "messages": [{"role": "user", "content": prompt}]
             },
             timeout=60
@@ -356,7 +339,7 @@ if __name__ == "__main__":
             print(f"\n{'='*80}")
             print("LLM REASONING")
             print(f"{'='*80}")
-            reasoning = llm_reason(query_text, results, chunks, terms, top_k=3)
+            reasoning = llm_reason(query_text, results, chunks, terms)
             if reasoning:
                 all_reasoning[query_text] = reasoning
                 # if it's actual LLM output (not the prompt), print it
