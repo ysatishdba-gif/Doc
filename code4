@@ -1,107 +1,43 @@
-"""Check why Lin=0. Is the hierarchy connected to chunk CUIs?"""
-import pickle
-from config import hierarchy, ic_precomputed
+Config: 2678304 nodes, 2678304 IC scores
+Hierarchy: 2678304 nodes, 4157226 edges
+IC scores: 2678304 entries
 
-STORE_PATH = "output/chunk_store.pkl"
-with open(STORE_PATH, "rb") as f:
-    data = pickle.load(f)
+Chunk CUIs: 738
+  In hierarchy: 653/738 (88%)
+  In IC map:    653/738 (88%)
 
-print(f"Hierarchy: {hierarchy.number_of_nodes()} nodes, {hierarchy.number_of_edges()} edges")
-print(f"IC scores: {len(ic_precomputed)} entries")
-print()
+Sample hierarchy edges (first 5):
+  C2231176 → C4480917
+  C2231176 → C4480918
+  C2023583 → C2023585
+  C2023583 → C2023584
+  C2023585 → C2023587
+  Edge direction: first node is PARENT, second is CHILD
 
-# Check 1: Are chunk CUIs in the hierarchy?
-all_cuis = set()
-for c in data.values():
-    all_cuis.update(c.get("cuis", set()))
+Walking UP from C0016529:
+  Hop 1: C0035213  IC=10.52  (out of 3 parents)
+  Hop 2: C0678864  IC=9.10  (out of 4 parents)
+  Hop 3: C0678852  IC=6.90  (out of 1 parents)
+  Hop 4: C0678656  IC=5.82  (out of 1 parents)
+  Hop 5: C1140162  IC=2.41  (out of 1 parents)
 
-in_graph = sum(1 for c in all_cuis if c in hierarchy)
-in_ic = sum(1 for c in all_cuis if c in ic_precomputed)
-print(f"Chunk CUIs: {len(all_cuis)}")
-print(f"  In hierarchy: {in_graph}/{len(all_cuis)} ({100*in_graph/len(all_cuis):.0f}%)")
-print(f"  In IC map:    {in_ic}/{len(all_cuis)} ({100*in_ic/len(all_cuis):.0f}%)")
+Ancestor test:
+  CUI from case_1: C0016529
+    Ancestors (4 hops): 81 nodes
+    Sample: ['C0004048', 'C0005526', 'C0005532', 'C0008816', 'C0011900']
+  CUI from case_2: C0039099
+    Ancestors (4 hops): 203 nodes
+    Sample: ['C0002807', 'C0002808', 'C0005526', 'C0005898', 'C0009780']
+  Shared ancestors: 6
+    C0005526  IC=4.73
+    C0011900  IC=2.67
+    C0525034  IC=5.73
+    C0678656  IC=5.82
+    C0700205  IC=3.39
 
-missing_graph = [c for c in sorted(all_cuis)[:10] if c not in hierarchy]
-if missing_graph:
-    print(f"  Sample CUIs NOT in hierarchy: {missing_graph[:5]}")
-print()
-
-# Check 2: What direction are edges?
-sample_edges = list(hierarchy.edges())[:5]
-print(f"Sample hierarchy edges (first 5):")
-for parent, child in sample_edges:
-    print(f"  {parent} → {child}")
-print(f"  Edge direction: first node is PARENT, second is CHILD")
-print()
-
-# Check 3: Can we walk UP from a chunk CUI?
-sample_cui = sorted(all_cuis)[0]
-print(f"Walking UP from {sample_cui}:")
-current = sample_cui
-for hop in range(5):
-    parents = list(hierarchy.predecessors(current))
-    if not parents:
-        print(f"  Hop {hop+1}: no parents (root or not in graph)")
-        break
-    parent = parents[0]
-    ic = ic_precomputed.get(parent, 0)
-    print(f"  Hop {hop+1}: {parent}  IC={ic:.2f}  (out of {len(parents)} parents)")
-    current = parent
-print()
-
-# Check 4: Pick 1 CUI from case_1 and 1 from case_2, find ancestors
-chunk_ids = list(data.keys())
-if len(chunk_ids) >= 2:
-    c1_cuis = sorted(data[chunk_ids[0]].get("cuis", set()))
-    c2_cuis = sorted(data[chunk_ids[1]].get("cuis", set()))
-    
-    test_c1 = c1_cuis[0]
-    test_c2 = c2_cuis[0]
-    
-    # BFS up 4 hops
-    def bfs_up(cui, depth=4):
-        visited = {cui}
-        frontier = {cui}
-        for _ in range(depth):
-            next_f = set()
-            for c in frontier:
-                for p in hierarchy.predecessors(c):
-                    if p not in visited:
-                        visited.add(p)
-                        next_f.add(p)
-            frontier = next_f
-        return visited
-    
-    anc1 = bfs_up(test_c1, 4)
-    anc2 = bfs_up(test_c2, 4)
-    shared = anc1 & anc2
-    
-    print(f"Ancestor test:")
-    print(f"  CUI from {chunk_ids[0]}: {test_c1}")
-    print(f"    Ancestors (4 hops): {len(anc1)} nodes")
-    print(f"    Sample: {sorted(anc1)[:5]}")
-    print(f"  CUI from {chunk_ids[1]}: {test_c2}")
-    print(f"    Ancestors (4 hops): {len(anc2)} nodes")
-    print(f"    Sample: {sorted(anc2)[:5]}")
-    print(f"  Shared ancestors: {len(shared)}")
-    if shared:
-        for s in sorted(shared)[:5]:
-            print(f"    {s}  IC={ic_precomputed.get(s, 0):.2f}")
-    else:
-        print(f"  NO SHARED ANCESTORS in 4 hops!")
-        # try deeper
-        anc1_8 = bfs_up(test_c1, 8)
-        anc2_8 = bfs_up(test_c2, 8)
-        shared_8 = anc1_8 & anc2_8
-        print(f"  Trying 8 hops: {len(shared_8)} shared")
-        if shared_8:
-            for s in sorted(shared_8)[:5]:
-                print(f"    {s}  IC={ic_precomputed.get(s, 0):.2f}")
-
-print()
-
-# Check 5: Reduction ratio
-print(f"CUIs per chunk (are these reduced or raw?):")
-for cid, c in data.items():
-    n = len(c.get("cuis", set()))
-    print(f"  {cid}: {n} CUIs  {'← too many, reduction may not be running' if n > 50 else '← OK'}")
+CUIs per chunk (are these reduced or raw?):
+  case_1: 187 CUIs  ← too many, reduction may not be running
+  case_2: 149 CUIs  ← too many, reduction may not be running
+  case_3: 130 CUIs  ← too many, reduction may not be running
+  case_4: 172 CUIs  ← too many, reduction may not be running
+  case_5: 101 CUIs  ← too many, reduction may not be running
