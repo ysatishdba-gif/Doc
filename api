@@ -17,11 +17,11 @@ from google.cloud import bigquery
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
-    hierarchy, ic_precomputed
+    INCLUDE_SUBTOPICS, hierarchy, ic_precomputed
 )
 from cui_reduction_system import (
     CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
-    TopicRepresentativeSelector, TopicAnchorAssigner
+    TopicRepresentativeSelector, TopicAnchorAssigner, fetch_preferred_terms
 )
 from topic_matcher import ChunkStore, compute_centroid
 
@@ -44,26 +44,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def fetch_preferred_terms(cuis):
-    if not cuis:
-        return {}
-    terms, cuis = {}, list(cuis)
-    for i in range(0, len(cuis), 500):
-        batch = cuis[i:i+500]
-        query = f"""
-        SELECT CUI, STR
-        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
-        """
-        jc = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-        for row in bq.query(query, job_config=jc).result():
-            if row.CUI not in terms:
-                terms[row.CUI] = row.STR
-    for c in cuis:
-        if c not in terms:
-            terms[c] = c
-    return terms
+_fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
 
 
 def save_csv(path, headers, rows):
@@ -124,7 +105,7 @@ def process_text(text_list, context, label="doc"):
     ic_map = system.ic_computer.compute(list(all_surviving), {})
     h_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
 
-    terms = fetch_preferred_terms(all_cuis)
+    terms = _fetch_terms(all_cuis)
 
     embeddings = system.emb_fetcher.fetch(list(all_surviving))
     removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
@@ -139,13 +120,13 @@ def process_text(text_list, context, label="doc"):
     label_cuis = {t["topic_cui"] for t in h_topics.values() if t.get("topic_cui")}
     missing_label_terms = label_cuis - set(terms.keys())
     if missing_label_terms:
-        terms.update(fetch_preferred_terms(missing_label_terms))
+        terms.update(_fetch_terms(missing_label_terms))
 
     anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
 
     anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
     anchor_cuis_for_terms.update(c for a in anchors for c in a.ancestor_cuis or [])
-    extra_terms = fetch_preferred_terms(anchor_cuis_for_terms - set(terms.keys()))
+    extra_terms = _fetch_terms(anchor_cuis_for_terms - set(terms.keys()))
     terms.update(extra_terms)
 
     print(f"[{label}] {sum(len(cd) for cd in per_phrase.values())} raw CUIs "
@@ -173,7 +154,6 @@ def process_text(text_list, context, label="doc"):
 
 # ── CSV writers ──────────────────────────────────────────────────────────────
 
-INCLUDE_SUBTOPICS = False   # set True to include subtopic columns in topics CSV
 
 def write_csvs(result, label="doc"):
     """Write all CSVs from a process_text result."""
