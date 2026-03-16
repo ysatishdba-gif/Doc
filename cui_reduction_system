@@ -262,8 +262,6 @@ class RepresentativeInfo:
     member_count: int       # how many CUIs this representative covers
     members: List[str]      # the CUIs it represents
     ic_score: float         # IC of the representative
-    snomed_code: str = ""   # resolved SNOMED code (filled externally)
-    snomed_term: str = ""   # resolved SNOMED preferred term (filled externally)
 
 @dataclass
 class AnchorInfo:
@@ -1305,11 +1303,21 @@ class CUIReductionSystem:
 
     @timed("query_reduce")
     def reduce_query(self, cuis):
-        """Full 13-stage reduction for query CUIs.
+        """Lightweight reduction for query CUIs — stages 1-4 only.
 
-        Same pipeline as document indexing. Uses cached embeddings from
-        prior runs — first query after indexing is fast because most CUIs
-        are already in the disk cache (.cui_cache/embedding_cache.pkl).
+        Runs: Metadata fetch → IC compute → SAB filter → Hierarchy reduce.
+        Skips: Embedding fetch, Louvain, HAC dedup, confidence scoring.
+
+        WHY this is correct for queries:
+          - Stages 5-13 exist to deduplicate within a document's 80-100 CUIs
+          - A query has 5-20 CUIs — nothing meaningful to cluster or deduplicate
+          - Stages 1-4 remove bad vocabularies and redundant parent CUIs
+          - Embedding centroid is computed separately in run_query.py
+            using emb_fetcher.fetch() on just the 5-10 surviving CUIs
+
+        Performance:
+          Full pipeline: 60-574s (BQ embedding fetch for all CUIs)
+          This method:   1-3s   (BQ metadata fetch only, embeddings cached)
 
         Args:
             cuis: list of raw CUI strings from extraction
@@ -1320,8 +1328,24 @@ class CUIReductionSystem:
         if not cuis:
             return set()
         cuis = list(set(cuis))
-        result = self.reduce(cuis, "query")
-        return set(result.all_reduced_cuis)
+
+        # Stage 1: Metadata fetch
+        metadata = self.fetcher.fetch(cuis)
+
+        # Stage 2: IC compute
+        ic_map = self.ic_computer.compute(cuis, metadata)
+
+        # Stage 3: SAB filter
+        after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
+        if not after_sab:
+            return set()
+
+        # Stage 4: Hierarchy reduce
+        after_hier, hier_audit, _ = self.hierarchy_reducer.run(after_sab, ic_map, metadata)
+
+        log(f"    Query reduce: {len(cuis)} raw → {len(after_sab)} (SAB) → "
+            f"{len(after_hier)} (hierarchy)")
+        return set(after_hier)
 
     @timed("batch_pipeline")
     def reduce_batch(self, inputs):
@@ -1682,55 +1706,6 @@ class TopicRepresentativeSelector:
         # Strategy C: Highest IC
         best = max(sc_cuis, key=lambda c: ic_map.get(c, 0.0))
         return best, "highest_ic"
-
-    @staticmethod
-    def resolve_snomed(bq_client, project_id, dataset_id, all_reps):
-        """Resolve representative CUIs to SNOMED codes via MRCONSO.
-
-        Args:
-            bq_client: BigQuery client
-            project_id: GCP project
-            dataset_id: UMLS dataset
-            all_reps: dict {topic_id: list[RepresentativeInfo]}
-
-        Returns:
-            dict {cui: (snomed_code, snomed_term)} — also mutates RepresentativeInfo in place
-        """
-        rep_cuis = set()
-        for reps in all_reps.values():
-            for r in reps:
-                rep_cuis.add(r.cui)
-
-        if not rep_cuis:
-            return {}
-
-        snomed_map = {}
-        cui_list = list(rep_cuis)
-        for i in range(0, len(cui_list), 500):
-            batch = cui_list[i:i + 500]
-            query = f"""
-            SELECT CUI, CODE, STR
-            FROM `{project_id}.{dataset_id}.MRCONSO`
-            WHERE CUI IN UNNEST(@cuis)
-              AND SAB = 'SNOMEDCT_US'
-              AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
-              AND LAT = 'ENG'
-            """
-            jc = bigquery.QueryJobConfig(query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-            for row in bq_client.query(query, job_config=jc).result():
-                if row.CUI not in snomed_map:
-                    snomed_map[row.CUI] = (row.CODE, row.STR)
-
-        # mutate in place
-        for reps in all_reps.values():
-            for r in reps:
-                if r.cui in snomed_map:
-                    r.snomed_code, r.snomed_term = snomed_map[r.cui]
-
-        resolved = sum(1 for c in rep_cuis if c in snomed_map)
-        log(f"    SNOMED resolution: {resolved}/{len(rep_cuis)} representatives mapped")
-        return snomed_map
 
 
 class TopicAnchorAssigner:
