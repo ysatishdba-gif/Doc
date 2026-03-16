@@ -23,14 +23,14 @@ from google.cloud import bigquery
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
+    LLM_PROJECT_ID, LLM_LOCATION, LLM_MODEL, LLM_MAX_TOKENS,
     hierarchy, ic_precomputed
 )
 from cui_reduction_system import CUIReductionSystem, CUIExtractor, fetch_preferred_terms
 from topic_matcher import ChunkStore, ChunkMatcher, compute_centroid
 
-_LLM_MODEL = "claude-sonnet-4-20250514"
-_LLM_MAX_TOKENS = 1500
-_LLM_TOP_K = 3
+_LLM_TOP_K = 3  # top chunks sent for reasoning
+
 
 # ── Setup (runs once) ────────────────────────────────────────────────────────
 
@@ -260,54 +260,47 @@ Provide your analysis in clear, structured prose."""
     return prompt
 
 
-def llm_reason(query_text, results, chunks, terms,
-               api_key=None, model=_LLM_MODEL, top_k=_LLM_TOP_K):
-    """Call LLM to reason about match quality.
+def llm_reason(query_text, results, chunks, terms, top_k=_LLM_TOP_K):
+    """Call Vertex AI LLM to reason about match quality.
+
+    Uses your GCP project — same credentials as BigQuery.
+    Set LLM_PROJECT_ID, LLM_LOCATION, LLM_MODEL in config.py.
 
     Args:
         query_text: original clinical query
         results: list of ChunkMatch
         chunks: dict from ChunkStore.get_all()
         terms: dict {cui: preferred_term}
-        api_key: Anthropic API key (or set ANTHROPIC_API_KEY env var)
-        model: model to use
         top_k: how many top results to reason about
 
     Returns:
-        str — LLM reasoning text, or None if API unavailable
+        str — LLM reasoning text, or prompt string if API fails
     """
     if not results:
         return "No chunks matched the query. Cannot reason about matches."
 
     prompt = build_reasoning_prompt(query_text, results, chunks, terms, top_k)
 
-    # try Anthropic API
-    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        print("\n  LLM reasoning skipped (set ANTHROPIC_API_KEY to enable)")
+    try:
+        from google.cloud import aiplatform
+        from vertexai.generative_models import GenerativeModel
+
+        aiplatform.init(project=LLM_PROJECT_ID, location=LLM_LOCATION)
+        model = GenerativeModel(LLM_MODEL)
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "max_output_tokens": LLM_MAX_TOKENS,
+                "temperature": 0.2,
+            }
+        )
+        reasoning = response.text
+        return reasoning
+
+    except ImportError:
+        print("\n  LLM reasoning skipped (install: pip install google-cloud-aiplatform)")
         print(f"\n  Prompt ({len(prompt)} chars) saved for manual use.")
         return prompt
-
-    try:
-        import requests as req
-        resp = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": model,
-                "max_tokens": _LLM_MAX_TOKENS,
-                "messages": [{"role": "user", "content": prompt}]
-            },
-            timeout=60
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        reasoning = data["content"][0]["text"]
-        return reasoning
     except Exception as e:
         print(f"\n  LLM reasoning failed: {e}")
         return prompt
