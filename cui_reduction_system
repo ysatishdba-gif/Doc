@@ -1,4 +1,4 @@
-_VERSION = "2026-03-11-v7.3"  # verify with: from cui_reduction_system import _VERSION; print(_VERSION)
+_VERSION = "2026-03-11-v7.3"
 import os
 import time
 import logging
@@ -16,54 +16,24 @@ from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
-# ── Tunable constants (override via config or env) ───────────────────────────
-_BQ_BATCH = 5000                     # BigQuery batch size for inserts/reads
-_BQ_TIMEOUT = 300                    # BQ query timeout seconds
-_API_TIMEOUT = 200                   # CUI extraction API timeout seconds
-_GCLOUD_TIMEOUT = 30                 # gcloud auth subprocess timeout seconds
-_EMB_FETCH_WORKERS = 4               # parallel embedding fetch threads
-_KNN_BLOCK_SIZE = 2000               # cosine kNN block size for memory control
-_RANDOM_SEED = 42                    # reproducible community detection
-
-_CACHE_METADATA = 50_000             # LRU size for metadata cache
-_CACHE_IC = 100_000                  # LRU size for IC cache
-_CACHE_EMBEDDING = 50_000            # LRU size for embedding cache
-_CACHE_EXTRACTION = 10_000           # LRU size for extraction API cache
-_ANCESTOR_CACHE_MAX = 200_000        # max _ancestor_cache entries before evict
-_TIMING_MAX_PER_KEY = 10_000         # max timing samples per operation name
-
-_FAST_PATH_THRESHOLD = 200           # EmbeddingReducer: below this, skip components/louvain
-_CROSS_TOPIC_DEDUP_MIN = 200         # only run cross-topic dedup above this CUI count
-_ANCESTOR_TARGET = 20                # target ancestor count for depth derivation
-_ANCESTOR_DEPTH_CLAMP = (1, 5)       # min/max for computed ancestor depth
-_COMPONENT_DEPTH_RATIO = 0.4         # component depth as fraction of ancestor depth
-_HT_MAX_COVERAGE = 0.6              # HierarchicalTopicBuilder: exclude ancestors covering >60%
-
-_EVAL_AGGRESSIVE_RATIO = 0.95        # reduction ratio above this = WARNING
-_EVAL_MINIMAL_RATIO = 0.10           # reduction ratio below this = WARNING
-_EVAL_COMPRESSED_SPREAD = 0.1        # confidence spread below this = WARNING
-_EVAL_SEPARATION_MIN = 0.05          # topic separation below this = WARNING
-_EVAL_SUSPECT_DIST = 0.3             # embedding distance above this in recon = SUSPECT
-_XTD_KNN_K = 10                      # k-NN neighbors for cross-topic dedup
-_LOUVAIN_SPLIT_RESOLUTION = 2.0      # Louvain resolution for oversized community sub-splits
-_COSINE_FALLBACK_THRESHOLD = 0.5     # TopicBuilder: fallback if no valid kNN distances
-_EVAL_RECON_DEPTH = 3                # ancestor depth for reconstruction checks
-_RETRY_TOTAL = 3                     # HTTP retry attempts
-_RETRY_BACKOFF = 1                   # HTTP retry backoff factor (seconds)
-_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)  # HTTP status codes to retry
-_COMP_DEPTH_MEAN_THRESHOLD = 1.5     # min mean in-degree for component depth > 1
-_DEFAULT_ANCESTOR_DEPTH = 3          # fallback ancestor depth when graph too sparse
-
-# ── TopicRepresentativeSelector constants ─────────────────────────────────────
-_REP_HAC_THRESHOLD = 0.5             # cosine distance threshold for sub-clustering within sem-type groups
-
-# ── TopicBuilder singleton merge ──────────────────────────────────────────────
-_SINGLETON_MERGE_MIN_SIM = 0.3       # minimum cosine similarity to merge singleton into a group
-
-# ── TopicAnchorAssigner constants ─────────────────────────────────────────────
-_ANCHOR_IC_MIN = 4.0                 # minimum IC for an anchor CUI to be meaningful
-_ANCHOR_BFS_DEPTH = 4                # max BFS depth when searching for LCA
-_ANCHOR_IC_MAX_BROAD = 3.0           # below this IC, ancestor is too broad to be an anchor
+# ── Private implementation constants (not user-configurable) ─────────────────
+_BQ_BATCH, _BQ_TIMEOUT, _API_TIMEOUT, _GCLOUD_TIMEOUT = 5000, 300, 200, 30
+_EMB_FETCH_WORKERS, _KNN_BLOCK_SIZE, _RANDOM_SEED = 4, 2000, 42
+_CACHE_METADATA, _CACHE_IC, _CACHE_EMBEDDING = 50_000, 100_000, 50_000
+_CACHE_EXTRACTION, _ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 10_000, 200_000, 10_000
+_FAST_PATH_THRESHOLD, _CROSS_TOPIC_DEDUP_MIN = 200, 200
+_ANCESTOR_TARGET, _ANCESTOR_DEPTH_CLAMP = 20, (1, 5)
+_COMPONENT_DEPTH_RATIO, _COMP_DEPTH_MEAN_THRESHOLD = 0.4, 1.5
+_DEFAULT_ANCESTOR_DEPTH, _HT_MAX_COVERAGE = 3, 0.6
+_XTD_KNN_K, _LOUVAIN_SPLIT_RESOLUTION = 10, 2.0
+_COSINE_FALLBACK_THRESHOLD, _SINGLETON_MERGE_MIN_SIM = 0.5, 0.3
+_REP_HAC_THRESHOLD = 0.5
+_ANCHOR_IC_MIN, _ANCHOR_BFS_DEPTH, _ANCHOR_IC_MAX_BROAD = 4.0, 4, 3.0
+_EVAL_AGGRESSIVE_RATIO, _EVAL_MINIMAL_RATIO = 0.95, 0.10
+_EVAL_COMPRESSED_SPREAD, _EVAL_SEPARATION_MIN = 0.1, 0.05
+_EVAL_SUSPECT_DIST, _EVAL_RECON_DEPTH = 0.3, 3
+_RETRY_TOTAL, _RETRY_BACKOFF = 3, 1
+_RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
 logger = logging.getLogger("cui_reduction")
 logger.setLevel(logging.DEBUG)
@@ -1488,42 +1458,25 @@ class CUIReductionSystem:
 # ── Semantic type → coarse category mapping ──────────────────────────────────
 # Based on UMLS Semantic Network (McCray 2003). Maps TUI prefixes and common
 # semantic types to 6 coarse categories for representative grouping.
-_STY_TO_CATEGORY = {
-    # Disorders
-    "Disease or Syndrome": "Disease", "Neoplastic Process": "Disease",
-    "Mental or Behavioral Dysfunction": "Disease", "Pathologic Function": "Disease",
-    "Congenital Abnormality": "Disease", "Acquired Abnormality": "Disease",
-    "Injury or Poisoning": "Disease", "Cell or Molecular Dysfunction": "Disease",
-    "Anatomical Abnormality": "Disease",
-    # Chemicals & Drugs
-    "Pharmacologic Substance": "Drug", "Clinical Drug": "Drug",
-    "Antibiotic": "Drug", "Organic Chemical": "Drug",
-    "Amino Acid, Peptide, or Protein": "Drug", "Hormone": "Drug",
-    "Immunologic Factor": "Drug", "Biomedical or Dental Material": "Drug",
-    "Vitamin": "Drug", "Enzyme": "Drug", "Receptor": "Drug",
-    "Biologically Active Substance": "Drug", "Indicator, Reagent, or Diagnostic Aid": "Drug",
-    "Inorganic Chemical": "Drug", "Element, Ion, or Isotope": "Drug",
-    "Nucleic Acid, Nucleotide, or Nucleoside": "Drug",
-    # Procedures
-    "Therapeutic or Preventive Procedure": "Procedure",
-    "Diagnostic Procedure": "Procedure", "Laboratory Procedure": "Procedure",
-    "Research Activity": "Procedure", "Health Care Activity": "Procedure",
-    "Molecular Biology Research Technique": "Procedure",
-    "Medical Device": "Procedure", "Manufactured Object": "Procedure",
-    "Laboratory or Test Result": "Lab",
-    # Findings & Observations
-    "Finding": "Finding", "Sign or Symptom": "Finding",
-    "Clinical Attribute": "Finding", "Organism Attribute": "Finding",
-    "Gene or Genome": "Finding",
-    # Anatomy
-    "Body Part, Organ, or Organ Component": "Anatomy",
-    "Tissue": "Anatomy", "Cell": "Anatomy", "Body Location or Region": "Anatomy",
-    "Body Space or Junction": "Anatomy", "Body System": "Anatomy",
-    "Body Substance": "Anatomy", "Embryonic Structure": "Anatomy",
-    "Fully Formed Anatomical Structure": "Anatomy",
-}
+def _load_sty_categories():
+    """Load semantic type → category mapping from sty_categories.json."""
+    import json
+    paths = [
+        os.path.join(os.path.dirname(__file__), "sty_categories.json"),
+        "sty_categories.json",
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                groups = json.load(f)
+            mapping = {}
+            for category, sty_list in groups.items():
+                for sty in sty_list:
+                    mapping[sty] = category
+            return mapping, list(groups.keys())
+    raise FileNotFoundError("sty_categories.json not found. Ship it alongside the code.")
 
-_STY_CATEGORY_PRIORITY = ["Disease", "Drug", "Lab", "Procedure", "Finding", "Anatomy"]
+_STY_TO_CATEGORY, _STY_CATEGORY_PRIORITY = _load_sty_categories()
 
 def _sty_to_category(semantic_types):
     """Map a list of semantic type strings to a single coarse category.
@@ -2004,6 +1957,41 @@ class Evaluator:
     def reconstruction_headers():
         return ["case", "entity", "removed_cui", "removed_term", "kept_cui", "kept_term",
                 "reason", "cosine_dist", "same_parent", "shared_ancestors", "shared_semtypes", "verdict"]
+
+def fetch_preferred_terms(bq_client, project_id, dataset_id, cuis):
+    """Fetch preferred English terms for CUIs from MRCONSO.
+
+    Args:
+        bq_client: BigQuery client
+        project_id: GCP project ID
+        dataset_id: UMLS dataset ID
+        cuis: collection of CUI strings
+
+    Returns:
+        dict {cui: preferred_term_string}
+    """
+    cuis = list(cuis)
+    if not cuis:
+        return {}
+    terms = {}
+    for i in range(0, len(cuis), _BQ_BATCH):
+        batch = cuis[i:i + _BQ_BATCH]
+        query = f"""
+        SELECT CUI, STR
+        FROM `{project_id}.{dataset_id}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+          AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+        for row in bq_client.query(query, job_config=jc).result():
+            if row.CUI not in terms:
+                terms[row.CUI] = row.STR
+    for c in cuis:
+        if c not in terms:
+            terms[c] = c
+    return terms
+
 
 class CUIExtractor:
     def __init__(self, api_url, top_k=3, top_p=5000,
