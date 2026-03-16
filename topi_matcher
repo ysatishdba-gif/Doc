@@ -274,6 +274,7 @@ class ChunkMatcher:
                     self._get_ancestors(cui)
 
         results = []
+        scored_chunk_ids = set()
 
         for chunk_id, chunk_data in chunks.items():
             chunk_cuis = chunk_data["cuis"]
@@ -306,6 +307,8 @@ class ChunkMatcher:
             all_matched_chunk_cuis = exact_overlap | hierarchy_chunk_hits
             if not (exact_overlap or hierarchy_query_hits):
                 continue
+
+            scored_chunk_ids.add(chunk_id)
 
             # ── Signal 1: CUI overlap ratio (W=0.40) ─────────────────────
             matched_query_count = len(exact_overlap)
@@ -403,6 +406,40 @@ class ChunkMatcher:
             ))
 
         results.sort(key=lambda r: (-r.score, -r.cui_overlap, r.chunk_id))
+
+        # ── Pass 2: Vector fallback for remaining slots ──────────────
+        # If CUI filter found fewer than top_k, fill with vector-similar chunks.
+        # These have no CUI match but high embedding similarity.
+        if query_embedding is not None and len(results) < top_k:
+            vector_candidates = []
+            for chunk_id, chunk_data in chunks.items():
+                if chunk_id in scored_chunk_ids:
+                    continue
+                chunk_emb = chunk_data.get("embedding")
+                if chunk_emb is None:
+                    continue
+                vsim = float(np.dot(query_embedding, chunk_emb))
+                vsim = max(0.0, min(1.0, vsim))
+                if vsim >= 0.4:   # minimum vector similarity for fallback
+                    vector_candidates.append((chunk_id, chunk_data, vsim))
+            vector_candidates.sort(key=lambda x: -x[2])
+
+            for chunk_id, chunk_data, vsim in vector_candidates[:top_k - len(results)]:
+                results.append(ChunkMatch(
+                    chunk_id=chunk_id,
+                    document_id=chunk_data["doc_id"],
+                    score=round(0.30 * vsim, 4),  # vector weight only
+                    cui_overlap=0,
+                    cui_overlap_ratio=0.0,
+                    vector_sim=round(vsim, 4),
+                    lin_score=0.0,
+                    total_chunk_cuis=len(chunk_data.get("cuis", set())),
+                    total_query_cuis=len(query_cuis),
+                    overlapping_cuis=[],
+                    topics_matched={},
+                    lin_details=[]
+                ))
+
         elapsed = (time.perf_counter() - t0) * 1000
         logger.debug(f"    ChunkMatcher: {len(chunks)} chunks → "
                      f"{len(results)} matches ({elapsed:.1f}ms)")
