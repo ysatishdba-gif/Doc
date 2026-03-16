@@ -18,11 +18,11 @@ from google.cloud import storage, bigquery
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR,
     ALLOWED_SABS, GCS_BUCKET, PICKLE_PREFIX, OUTPUT_DIR,
-    hierarchy, ic_precomputed
+    INCLUDE_SUBTOPICS, hierarchy, ic_precomputed
 )
 from cui_reduction_system import (
     CUIReductionSystem, HierarchicalTopicBuilder, Evaluator,
-    TopicRepresentativeSelector, TopicAnchorAssigner
+    TopicRepresentativeSelector, TopicAnchorAssigner, fetch_preferred_terms
 )
 from topic_matcher import ChunkStore, compute_centroid
 
@@ -77,26 +77,8 @@ def parse_pickle(data):
     return text, entities
 
 
-def fetch_preferred_terms(cuis):
-    if not cuis:
-        return {}
-    terms, cuis = {}, list(cuis)
-    for i in range(0, len(cuis), 500):
-        batch = cuis[i:i+500]
-        query = f"""
-        SELECT CUI, STR
-        FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG' AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
-        """
-        jc = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-        for row in bq.query(query, job_config=jc).result():
-            if row.CUI not in terms:
-                terms[row.CUI] = row.STR
-    for c in cuis:
-        if c not in terms:
-            terms[c] = c
-    return terms
+# bind fetch_preferred_terms to this runner's BQ client
+_fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
 
 
 def save_csv(path, headers, rows):
@@ -160,7 +142,7 @@ def process_one_pickle(fname, data):
     print(f"  → Topics: {len(h_topics)}", flush=True)
 
     print(f"  → Fetching terms...", flush=True)
-    terms = fetch_preferred_terms(all_cuis)
+    terms = _fetch_terms(all_cuis)
     print(f"  → Terms: {len(terms)}", flush=True)
 
     # embeddings — all tracked CUIs (surviving + removed, needed for eval)
@@ -184,7 +166,7 @@ def process_one_pickle(fname, data):
     label_cuis = {t["topic_cui"] for t in h_topics.values() if t.get("topic_cui")}
     missing_label_terms = label_cuis - set(terms.keys())
     if missing_label_terms:
-        terms.update(fetch_preferred_terms(missing_label_terms))
+        terms.update(_fetch_terms(missing_label_terms))
 
     # anchors
     print(f"  → Assigning anchors...", flush=True)
@@ -193,7 +175,7 @@ def process_one_pickle(fname, data):
 
     anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
     anchor_cuis_for_terms.update(c for a in anchors for c in a.ancestor_cuis or [])
-    extra_terms = fetch_preferred_terms(anchor_cuis_for_terms - set(terms.keys()))
+    extra_terms = _fetch_terms(anchor_cuis_for_terms - set(terms.keys()))
     terms.update(extra_terms)
 
     # print summary
@@ -232,7 +214,6 @@ def process_one_pickle(fname, data):
 
 # ── CSV writers ──────────────────────────────────────────────────────────────
 
-INCLUDE_SUBTOPICS = False   # set True to include subtopic columns in topics CSV
 
 def write_case_csvs(result):
     """Write all CSVs for one processed pickle."""
