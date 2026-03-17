@@ -221,7 +221,7 @@ class ChunkMatcher:
         denom = ic1 + ic2
         if denom < 1e-9:
             return 0.0, None, "no_match"
-        # subsumption
+        # subsumption (one IS the ancestor of the other)
         if c1 in c2_anc:
             mica_ic = ic1
             if mica_ic >= _IC_MIN:
@@ -234,7 +234,14 @@ class ChunkMatcher:
         shared = c1_anc & c2_anc
         if not shared:
             return 0.0, None, "no_match"
-        mica = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
+        # A real shared ancestor must be LESS specific (lower IC) than both CUIs.
+        # "Terminal bronchus" (high IC) cannot be ancestor of "Seizure" — that's
+        # a cross-domain UMLS artifact from walking to root through coding systems.
+        min_ic = min(ic1, ic2)
+        valid = [c for c in shared if self.ic_map.get(c, 0.0) < min_ic]
+        if not valid:
+            return 0.0, None, "no_match"
+        mica = max(valid, key=lambda c: self.ic_map.get(c, 0.0))
         mica_ic = self.ic_map.get(mica, 0.0)
         if mica_ic < _IC_MIN:
             return 0.0, None, "no_match"
@@ -308,17 +315,24 @@ class ChunkMatcher:
                     if not matched:
                         best_mica_ic = 0.0
                         best_pair = None
+                        q_ic = self.ic_map.get(q_cui, 0.0)
                         for d_cui in chunk_cuis:
                             if d_cui in exact_overlap:
                                 continue
                             d_anc = self._ancestor_cache.get(d_cui, frozenset())
                             shared = q_anc & d_anc
                             if shared:
-                                mica = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
-                                mica_ic = self.ic_map.get(mica, 0.0)
-                                if mica_ic > best_mica_ic:
-                                    best_mica_ic = mica_ic
-                                    best_pair = (d_cui, mica, mica_ic)
+                                d_ic = self.ic_map.get(d_cui, 0.0)
+                                min_ic = min(q_ic, d_ic)
+                                # shared ancestor must be LESS specific than both CUIs
+                                valid = [c for c in shared
+                                         if self.ic_map.get(c, 0.0) < min_ic]
+                                if valid:
+                                    mica = max(valid, key=lambda c: self.ic_map.get(c, 0.0))
+                                    mica_ic = self.ic_map.get(mica, 0.0)
+                                    if mica_ic > best_mica_ic:
+                                        best_mica_ic = mica_ic
+                                        best_pair = (d_cui, mica, mica_ic)
                         # only accept if shared ancestor is specific enough (IC > 4.0)
                         if best_pair and best_mica_ic >= _IC_MIN_SIBLING:
                             hierarchy_query_hits.add(q_cui)
