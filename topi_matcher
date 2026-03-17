@@ -50,6 +50,7 @@ _W_CUI   = 0.40
 _W_VEC   = 0.30
 _W_LIN   = 0.30
 _IC_MIN    = 2.0
+_ANC_DEPTH = 8    # BFS hops — clinical paths are 5-10 deep, admin paths limited by hop count
 _MIN_OVERLAP = 1
 _SCORE_MIN = 0.01
 _IC_MIN_SIBLING = 4.0   # shared ancestor must have IC >= 4.0 to count as sibling match
@@ -194,22 +195,18 @@ class ChunkMatcher:
         self._ancestor_cache = {}
 
     def _get_ancestors(self, cui):
-        """BFS ancestors, stop when ancestors become too broad (IC < 2.0).
+        """BFS ancestors up to _ANC_DEPTH hops, cached.
 
-        Walks UP the hierarchy. At each hop, only follows parents whose
-        IC >= _IC_MIN (2.0). This naturally stops before reaching
-        UMLS administrative nodes like 'Knowledge Bases', 'research',
-        'Patient Problem' which have very low IC but connect everything.
-
-        No fixed hop limit. Depth adapts to each CUI's position in hierarchy.
-        Deep clinical branches walk further. Shallow ones stop sooner.
+        Uses fixed hop limit (8) to prevent following long admin chains.
+        Also stops following parents with IC < _IC_MIN (too broad).
+        Combined: covers deep clinical branches, blocks admin paths.
         """
         if cui in self._ancestor_cache:
             return self._ancestor_cache[cui]
         result = {cui}
         if self.graph is not None and self.graph.has_node(cui):
             frontier = {cui}
-            while frontier:
+            for _ in range(_ANC_DEPTH):
                 nxt = set()
                 for n in frontier:
                     for parent in self.graph.predecessors(n):
@@ -219,6 +216,8 @@ class ChunkMatcher:
                                 result.add(parent)
                                 nxt.add(parent)
                 frontier = nxt
+                if not frontier:
+                    break
         result = frozenset(result)
         self._ancestor_cache[cui] = result
         return result
@@ -261,6 +260,10 @@ class ChunkMatcher:
     def match(self, query_cuis, query_embedding, chunks, top_k=10):
         """Match query against stored chunks using three signals.
 
+        CUI matches are weighted by IDF (inverse document frequency).
+        A CUI appearing in every chunk has IDF=0 — no discriminative power.
+        A CUI appearing in 1 chunk has high IDF — strong signal.
+
         Args:
             query_cuis: list/set of query CUI strings (after reduction)
             query_embedding: numpy array (centroid) or None
@@ -276,6 +279,24 @@ class ChunkMatcher:
             return []
 
         has_graph = self.graph is not None and len(self.ic_map) > 0
+        n_chunks = len(chunks)
+
+        # ── Compute IDF for each CUI across all chunks ───────────────────
+        # IDF = log(N / df) where df = number of chunks containing the CUI
+        # CUI in all chunks → IDF = 0 (useless). CUI in 1 chunk → IDF high.
+        import math
+        cui_doc_freq = {}
+        for chunk_data in chunks.values():
+            for cui in chunk_data.get("cuis", set()):
+                cui_doc_freq[cui] = cui_doc_freq.get(cui, 0) + 1
+
+        def idf(cui):
+            df = cui_doc_freq.get(cui, 0)
+            if df >= n_chunks:
+                return 0.0   # in every chunk → no discriminative power
+            if df == 0:
+                return math.log(n_chunks + 1)  # not in any chunk → max weight (rare match)
+            return math.log(n_chunks / df)
 
         # precompute query ancestors
         query_ancestors = {}
@@ -356,8 +377,9 @@ class ChunkMatcher:
 
             scored_chunk_ids.add(chunk_id)
 
-            # ── Signal 1: CUI overlap ratio (W=0.40) ─────────────────────
-            matched_query_count = len(exact_overlap)
+            # ── Signal 1: IDF-weighted CUI overlap (W=0.40) ────────────────
+            # CUIs appearing in every chunk have IDF=0 — no discriminative power.
+            # CUIs appearing in 1 chunk have high IDF — strong signal.
             matched_query_cuis = set(exact_overlap)
             if has_graph:
                 for q_cui in query_cuis - exact_overlap:
@@ -366,15 +388,21 @@ class ChunkMatcher:
                     for d_cui in chunk_cuis:
                         d_anc = self._ancestor_cache.get(d_cui, frozenset())
                         if q_cui in d_anc or d_cui in q_anc:
-                            matched_query_count += 1
                             matched_query_cuis.add(q_cui)
                             found = True
                             break
                     # count sibling matches (shared ancestor) if parent-child didn't fire
                     if not found and q_cui in shared_ancestor_hits:
-                        matched_query_count += 1
                         matched_query_cuis.add(q_cui)
-            cui_ratio = matched_query_count / len(query_cuis)
+
+            idf_matched = sum(idf(q) for q in matched_query_cuis)
+            idf_total = sum(idf(q) for q in query_cuis)
+            if idf_total > 0:
+                cui_ratio = min(idf_matched / idf_total, 1.0)
+            else:
+                # all query CUIs in every chunk → simple count fallback
+                cui_ratio = len(matched_query_cuis) / len(query_cuis)
+            matched_query_count = len(matched_query_cuis)
 
             # ── Signal 2: Vector similarity (W=0.30) ─────────────────────
             vector_sim = 0.0
@@ -383,10 +411,14 @@ class ChunkMatcher:
             if has_vectors:
                 vector_sim = float(np.dot(query_embedding, chunk_emb))
                 vector_sim = max(0.0, min(1.0, vector_sim))
+                # sharpen: cube to increase spread between similar scores
+                # 0.78 → 0.47, 0.69 → 0.33. Difference grows from 0.09 to 0.14
+                vector_sim = vector_sim ** 3
 
-            # ── Signal 3: Lin similarity — BMA (W=0.30) ──────────────────
+            # ── Signal 3: Lin similarity — IDF-weighted BMA (W=0.30) ──────
             lin_details = []
-            lin_sum = 0.0
+            lin_weighted_sum = 0.0
+            lin_weight_total = 0.0
             if has_graph:
                 for q_cui in query_cuis:
                     q_anc = query_ancestors.get(q_cui, frozenset())
@@ -405,9 +437,11 @@ class ChunkMatcher:
                                     q_cui, d_cui, mica, round(lin, 4), mtype)
                                 if lin >= 1.0:
                                     break
-                    lin_sum += best_lin
+                    w = idf(q_cui)
+                    lin_weighted_sum += best_lin * w
+                    lin_weight_total += w
                     lin_details.append(best_detail)
-                lin_avg = lin_sum / len(query_cuis)
+                lin_avg = (lin_weighted_sum / lin_weight_total) if lin_weight_total > 0 else 0.0
             else:
                 lin_avg = len(exact_overlap) / len(query_cuis)
 
