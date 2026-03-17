@@ -49,10 +49,10 @@ logger = logging.getLogger("cui_reduction")
 _W_CUI   = 0.40
 _W_VEC   = 0.30
 _W_LIN   = 0.30
-_ANC_DEPTH = 4
 _IC_MIN    = 2.0
 _MIN_OVERLAP = 1
 _SCORE_MIN = 0.01
+_IC_MIN_SIBLING = 4.0   # shared ancestor must have IC >= 4.0 to count as sibling match
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -194,13 +194,13 @@ class ChunkMatcher:
         self._ancestor_cache = {}
 
     def _get_ancestors(self, cui):
-        """BFS ancestors including self, cached."""
+        """BFS ancestors to root, cached. IC filters quality downstream."""
         if cui in self._ancestor_cache:
             return self._ancestor_cache[cui]
         result = {cui}
         if self.graph is not None and self.graph.has_node(cui):
             frontier = {cui}
-            for _ in range(_ANC_DEPTH):
+            while frontier:
                 nxt = set()
                 for n in frontier:
                     for parent in self.graph.predecessors(n):
@@ -208,8 +208,6 @@ class ChunkMatcher:
                             result.add(parent)
                             nxt.add(parent)
                 frontier = nxt
-                if not frontier:
-                    break
         result = frozenset(result)
         self._ancestor_cache[cui] = result
         return result
@@ -287,22 +285,45 @@ class ChunkMatcher:
 
             hierarchy_query_hits = set()  # query CUIs matched via hierarchy
             hierarchy_chunk_hits = set()  # chunk CUIs matched via hierarchy
+            shared_ancestor_hits = {}     # {query_cui: (chunk_cui, mica, mica_ic)}
             if has_graph and len(exact_overlap) < len(query_cuis):
                 unmatched_query = query_cuis - exact_overlap
                 for q_cui in unmatched_query:
                     q_anc = query_ancestors.get(q_cui, frozenset())
+                    matched = False
                     for d_cui in chunk_cuis:
                         if d_cui in exact_overlap:
                             continue
                         d_anc = self._ancestor_cache.get(d_cui, frozenset())
                         # Direction 1: query CUI is ancestor of chunk CUI
-                        #   e.g., query "Arthritis" matches chunk "RA"
                         # Direction 2: chunk CUI is ancestor of query CUI
-                        #   e.g., query "Seizure" matches chunk "Epilepsy"
                         if q_cui in d_anc or d_cui in q_anc:
                             hierarchy_query_hits.add(q_cui)
                             hierarchy_chunk_hits.add(d_cui)
+                            matched = True
                             break
+                    # Direction 3: shared ancestor (sibling match)
+                    #   e.g., query "Medical-seizure" and chunk "Focal epilepsy"
+                    #   both have "Seizure" as ancestor but neither is parent of other
+                    if not matched:
+                        best_mica_ic = 0.0
+                        best_pair = None
+                        for d_cui in chunk_cuis:
+                            if d_cui in exact_overlap:
+                                continue
+                            d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                            shared = q_anc & d_anc
+                            if shared:
+                                mica = max(shared, key=lambda c: self.ic_map.get(c, 0.0))
+                                mica_ic = self.ic_map.get(mica, 0.0)
+                                if mica_ic > best_mica_ic:
+                                    best_mica_ic = mica_ic
+                                    best_pair = (d_cui, mica, mica_ic)
+                        # only accept if shared ancestor is specific enough (IC > 4.0)
+                        if best_pair and best_mica_ic >= _IC_MIN_SIBLING:
+                            hierarchy_query_hits.add(q_cui)
+                            hierarchy_chunk_hits.add(best_pair[0])
+                            shared_ancestor_hits[q_cui] = best_pair
 
             all_matched_chunk_cuis = exact_overlap | hierarchy_chunk_hits
             if not (exact_overlap or hierarchy_query_hits):
@@ -316,12 +337,18 @@ class ChunkMatcher:
             if has_graph:
                 for q_cui in query_cuis - exact_overlap:
                     q_anc = query_ancestors.get(q_cui, frozenset())
+                    found = False
                     for d_cui in chunk_cuis:
                         d_anc = self._ancestor_cache.get(d_cui, frozenset())
                         if q_cui in d_anc or d_cui in q_anc:
                             matched_query_count += 1
                             matched_query_cuis.add(q_cui)
+                            found = True
                             break
+                    # count sibling matches (shared ancestor) if parent-child didn't fire
+                    if not found and q_cui in shared_ancestor_hits:
+                        matched_query_count += 1
+                        matched_query_cuis.add(q_cui)
             cui_ratio = matched_query_count / len(query_cuis)
 
             # ── Signal 2: Vector similarity (W=0.30) ─────────────────────
