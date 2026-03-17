@@ -445,7 +445,7 @@ class ChunkMatcher:
             else:
                 lin_avg = len(exact_overlap) / len(query_cuis)
 
-            # ── Combined score ────────────────────────────────────────────
+            # ── Raw scores (combined later with adaptive weights) ─────────
             if has_vectors and has_graph:
                 score = (_W_CUI * cui_ratio +
                          _W_VEC * vector_sim +
@@ -490,6 +490,32 @@ class ChunkMatcher:
                 topics_matched=topics_matched,
                 lin_details=lin_details
             ))
+
+        # ── Adaptive reranking: flat signals get zero weight ─────────
+        # If CUI ratio is the same for all candidates, it can't discriminate.
+        # Redistribute its weight to signals that CAN discriminate.
+        if len(results) >= 2:
+            cui_vals = [r.cui_overlap_ratio for r in results]
+            vec_vals = [r.vector_sim for r in results]
+            lin_vals = [r.lin_score for r in results]
+
+            cui_std = np.std(cui_vals) if len(cui_vals) > 1 else 0.0
+            vec_std = np.std(vec_vals) if len(vec_vals) > 1 else 0.0
+            lin_std = np.std(lin_vals) if len(lin_vals) > 1 else 0.0
+
+            total_std = cui_std + vec_std + lin_std
+            if total_std > 0:
+                # weight each signal by its variance (ability to discriminate)
+                w_cui = cui_std / total_std
+                w_vec = vec_std / total_std
+                w_lin = lin_std / total_std
+
+                for r in results:
+                    new_score = (w_cui * r.cui_overlap_ratio +
+                                 w_vec * r.vector_sim +
+                                 w_lin * r.lin_score)
+                    # replace score in the dataclass
+                    object.__setattr__(r, 'score', round(new_score, 4))
 
         results.sort(key=lambda r: (-r.score, -r.cui_overlap, r.chunk_id))
 
