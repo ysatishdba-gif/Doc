@@ -1,0 +1,416 @@
+"""
+Mock Test — exercises the full pipeline logic without BigQuery.
+
+Tests:
+  1. Topic formation (HierarchicalTopicBuilder)
+  2. Representative selection (TopicRepresentativeSelector)
+  3. Anchor assignment (TopicAnchorAssigner)
+  4. Chunk storage (ChunkStore)
+  5. CUI Filter + Vector + Lin Similarity (ChunkMatcher)
+"""
+
+import numpy as np
+import networkx as nx
+from collections import defaultdict
+
+# ── Build mock UMLS hierarchy ────────────────────────────────────────────────
+
+G = nx.DiGraph()
+
+# Arthritis branch
+G.add_edge("C0012634", "C0003864")   # Disease → Arthritis
+G.add_edge("C0003864", "C0003873")   # Arthritis → RA
+G.add_edge("C0003864", "C0029408")   # Arthritis → Osteoarthritis
+G.add_edge("C0003873", "C0481906")   # RA → RA of knee
+G.add_edge("C0029408", "C0409959")   # OA → OA of left knee
+G.add_edge("C0029408", "C0409958")   # OA → OA of right knee
+G.add_edge("C0029408", "C0029410")   # OA → OA of hip
+
+# Drug branch
+G.add_edge("C0013227", "C0003392")   # Drug → Antimetabolites
+G.add_edge("C0003392", "C0025598")   # Antimetabolites → Methotrexate
+G.add_edge("C0013227", "C0020740")   # Drug → Hydroxychloroquine
+
+# Lab branch
+G.add_edge("C0022885", "C0418840")   # Lab test → CRP
+G.add_edge("C0022885", "C1534290")   # Lab test → ESR
+
+# Finding branch
+G.add_edge("C0037088", "C0582801")   # Sign/Symptom → Left knee pain
+G.add_edge("C0037088", "C0582802")   # Sign/Symptom → Right knee pain
+G.add_edge("C0037088", "C0018681")   # Sign/Symptom → Headache
+
+# Cardiovascular (unrelated)
+G.add_edge("C0012634", "C0007222")   # Disease → Cardiovascular
+G.add_edge("C0007222", "C0020538")   # Cardiovascular → Hypertension
+
+# Neurological branch (for bidirectional hierarchy test)
+G.add_edge("C0012634", "C0027765")   # Disease → Neurological disease
+G.add_edge("C0027765", "C0014544")   # Neurological → Epilepsy
+G.add_edge("C0014544", "C0036572")   # Epilepsy → Seizure
+
+print(f"Mock hierarchy: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+
+# ── Mock IC scores (higher = more specific) ──────────────────────────────────
+
+ic_map = {
+    "C0012634": 1.5,   # Disease (very broad)
+    "C0003864": 5.1,   # Arthritis
+    "C0003873": 7.1,   # RA
+    "C0029408": 6.3,   # Osteoarthritis
+    "C0481906": 8.5,   # RA of knee
+    "C0409959": 8.2,   # OA of left knee
+    "C0409958": 8.2,   # OA of right knee
+    "C0029410": 7.8,   # OA of hip
+    "C0013227": 2.0,   # Drug (very broad)
+    "C0003392": 5.5,   # Antimetabolites
+    "C0025598": 9.4,   # Methotrexate
+    "C0020740": 8.8,   # Hydroxychloroquine
+    "C0022885": 4.2,   # Lab test
+    "C0418840": 6.8,   # CRP
+    "C1534290": 6.5,   # ESR
+    "C0037088": 2.5,   # Sign/Symptom (broad)
+    "C0582801": 9.0,   # Left knee pain
+    "C0582802": 9.0,   # Right knee pain
+    "C0018681": 7.2,   # Headache
+    "C0007222": 4.0,   # Cardiovascular disease
+    "C0020538": 6.9,   # Hypertension
+    "C0027765": 3.5,   # Neurological disease
+    "C0014544": 6.0,   # Epilepsy
+    "C0036572": 8.5,   # Seizure
+}
+
+# ── Mock metadata ────────────────────────────────────────────────────────────
+
+from cui_reduction_system import CUIMetadata
+
+metadata = {
+    "C0003873": CUIMetadata("C0003873", ["Disease or Syndrome"], ["T047"], 7.1, ["SNOMEDCT_US"]),
+    "C0481906": CUIMetadata("C0481906", ["Disease or Syndrome"], ["T047"], 8.5, ["SNOMEDCT_US"]),
+    "C0409959": CUIMetadata("C0409959", ["Disease or Syndrome"], ["T047"], 8.2, ["SNOMEDCT_US"]),
+    "C0409958": CUIMetadata("C0409958", ["Disease or Syndrome"], ["T047"], 8.2, ["SNOMEDCT_US"]),
+    "C0029410": CUIMetadata("C0029410", ["Disease or Syndrome"], ["T047"], 7.8, ["SNOMEDCT_US"]),
+    "C0025598": CUIMetadata("C0025598", ["Pharmacologic Substance"], ["T121"], 9.4, ["SNOMEDCT_US"]),
+    "C0020740": CUIMetadata("C0020740", ["Pharmacologic Substance"], ["T121"], 8.8, ["SNOMEDCT_US"]),
+    "C0418840": CUIMetadata("C0418840", ["Laboratory Procedure"], ["T059"], 6.8, ["SNOMEDCT_US"]),
+    "C1534290": CUIMetadata("C1534290", ["Laboratory or Test Result"], ["T034"], 6.5, ["SNOMEDCT_US"]),
+    "C0582801": CUIMetadata("C0582801", ["Sign or Symptom"], ["T184"], 9.0, ["SNOMEDCT_US"]),
+    "C0582802": CUIMetadata("C0582802", ["Sign or Symptom"], ["T184"], 9.0, ["SNOMEDCT_US"]),
+    "C0020538": CUIMetadata("C0020538", ["Disease or Syndrome"], ["T047"], 6.9, ["SNOMEDCT_US"]),
+    "C0018681": CUIMetadata("C0018681", ["Sign or Symptom"], ["T184"], 7.2, ["SNOMEDCT_US"]),
+    "C0014544": CUIMetadata("C0014544", ["Disease or Syndrome"], ["T047"], 6.0, ["SNOMEDCT_US"]),
+    "C0036572": CUIMetadata("C0036572", ["Sign or Symptom"], ["T184"], 8.5, ["SNOMEDCT_US"]),
+}
+
+# ── Mock embeddings (random but consistent) ──────────────────────────────────
+
+np.random.seed(42)
+embeddings = {}
+# make related concepts have similar embeddings
+base_arthritis = np.random.randn(768).astype(np.float32)
+base_drug = np.random.randn(768).astype(np.float32)
+base_lab = np.random.randn(768).astype(np.float32)
+base_finding = np.random.randn(768).astype(np.float32)
+
+def make_emb(base, noise=0.1):
+    v = base + np.random.randn(768).astype(np.float32) * noise
+    return v / np.linalg.norm(v)
+
+for cui in ["C0003873", "C0481906", "C0409959", "C0409958", "C0029410"]:
+    embeddings[cui] = make_emb(base_arthritis, 0.15)
+for cui in ["C0025598", "C0020740"]:
+    embeddings[cui] = make_emb(base_drug, 0.1)
+for cui in ["C0418840", "C1534290"]:
+    embeddings[cui] = make_emb(base_lab, 0.1)
+for cui in ["C0582801", "C0582802", "C0018681"]:
+    embeddings[cui] = make_emb(base_finding, 0.15)
+embeddings["C0020538"] = make_emb(np.random.randn(768).astype(np.float32), 0.1)
+base_neuro = np.random.randn(768).astype(np.float32)
+embeddings["C0014544"] = make_emb(base_neuro, 0.1)   # Epilepsy
+embeddings["C0036572"] = make_emb(base_neuro, 0.15)   # Seizure (similar to Epilepsy)
+
+print(f"Mock embeddings: {len(embeddings)} CUIs")
+
+# ── Terms ────────────────────────────────────────────────────────────────────
+
+terms = {
+    "C0012634": "Disease", "C0003864": "Arthritis", "C0003873": "Rheumatoid arthritis",
+    "C0029408": "Osteoarthritis", "C0481906": "RA of knee", "C0409959": "OA of left knee",
+    "C0409958": "OA of right knee", "C0029410": "OA of hip", "C0013227": "Drug",
+    "C0003392": "Antimetabolites", "C0025598": "Methotrexate",
+    "C0020740": "Hydroxychloroquine", "C0022885": "Laboratory test",
+    "C0418840": "CRP measurement", "C1534290": "ESR elevated",
+    "C0037088": "Sign or Symptom", "C0582801": "Left knee pain",
+    "C0582802": "Right knee pain", "C0018681": "Headache",
+    "C0007222": "Cardiovascular disease", "C0020538": "Hypertension",
+    "C0027765": "Neurological disease", "C0014544": "Epilepsy", "C0036572": "Seizure",
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 1: Topic formation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from cui_reduction_system import HierarchicalTopicBuilder
+
+print(f"\n{'='*80}")
+print("TEST 1: HierarchicalTopicBuilder")
+print(f"{'='*80}")
+
+# simulate chunk 1: left knee RA + methotrexate + CRP
+chunk1_cuis = ["C0003873", "C0481906", "C0409959", "C0582801", "C0025598", "C0418840"]
+
+h_topics = HierarchicalTopicBuilder.build(chunk1_cuis, G, ic_map)
+print(f"\nChunk 1 ({len(chunk1_cuis)} CUIs) → {len(h_topics)} topics:")
+for tid, t in sorted(h_topics.items()):
+    t_cui = t["topic_cui"] or "(none)"
+    t_name = terms.get(t_cui, t_cui)
+    print(f"  Topic {tid}: {t_name} ({len(t['members'])} members)")
+    for c in t["members"]:
+        print(f"    {c} | {terms.get(c, c)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 2: Representative selection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from cui_reduction_system import TopicRepresentativeSelector
+
+print(f"\n{'='*80}")
+print("TEST 2: TopicRepresentativeSelector")
+print(f"{'='*80}")
+
+reps = TopicRepresentativeSelector.select(h_topics, metadata, embeddings, ic_map, G)
+HierarchicalTopicBuilder.label_topics(h_topics, reps)
+for tid, rep_list in sorted(reps.items()):
+    t_label = terms.get(h_topics[tid]["topic_cui"], "(none)") if h_topics[tid]["topic_cui"] else "(none)"
+    print(f"\n  Topic {tid} [label={t_label}]:")
+    for r in rep_list:
+        print(f"    [{r.category}] {r.cui} | {terms.get(r.cui, r.cui)} "
+              f"(method={r.method}, covers={r.member_count})")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 3: Anchor assignment
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from cui_reduction_system import TopicAnchorAssigner
+
+print(f"\n{'='*80}")
+print("TEST 3: TopicAnchorAssigner")
+print(f"{'='*80}")
+
+anchors = TopicAnchorAssigner.assign(reps, ic_map, G)
+for a in anchors:
+    rep_names = [terms.get(rc, rc) for rc in a.rep_cuis]
+    print(f"  Anchor: {terms.get(a.anchor_cui, a.anchor_cui)} (IC={a.anchor_ic:.1f})")
+    print(f"    Reps: {rep_names}")
+    print(f"    Topics: {a.topic_ids}")
+    print(f"    Ancestors: {len(a.ancestor_cuis)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 4: Store chunks
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from topic_matcher import ChunkStore, ChunkMatcher, compute_centroid
+
+SEP = "=" * 80
+print(f"\n{SEP}")
+print("TEST 4: ChunkStore")
+print(SEP)
+
+store = ChunkStore()
+chunk1_topics = h_topics
+
+c1 = {"C0003873", "C0481906", "C0409959", "C0582801", "C0025598", "C0418840"}
+store.add("doc1_chunk3", "doc1", c1,
+          embedding=compute_centroid(c1, embeddings), topics=chunk1_topics,
+          embeddings=embeddings)
+
+c2 = {"C0409958", "C0582802", "C0020740"}
+store.add("doc2_chunk1", "doc2", c2,
+          embedding=compute_centroid(c2, embeddings), embeddings=embeddings)
+
+c3 = {"C0020538", "C0018681"}
+store.add("doc3_chunk2", "doc3", c3,
+          embedding=compute_centroid(c3, embeddings), embeddings=embeddings)
+
+c4 = {"C0029410", "C0025598", "C1534290"}
+store.add("doc4_chunk1", "doc4", c4,
+          embedding=compute_centroid(c4, embeddings), embeddings=embeddings)
+
+# Chunk with Epilepsy (parent of Seizure — tests bidirectional matching)
+c5 = {"C0014544", "C0018681"}  # Epilepsy + Headache
+store.add("doc5_chunk1", "doc5", c5,
+          embedding=compute_centroid(c5, embeddings), embeddings=embeddings)
+
+stats = store.stats()
+print(f"  Stored: {stats['chunks']} chunks, {stats['total_cuis']} CUIs, "
+      f"{stats['chunks_with_embeddings']} with embeddings")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TEST 5: CUI Filter + IC-Weighted Scoring
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n{SEP}")
+print("TEST 5: Query -> CUI Filter + Vector + Lin")
+print(SEP)
+
+matcher = ChunkMatcher(G, ic_map)
+all_chunks = store.get_all()
+
+print("\n--- Query A: left knee osteoarthritis treatment ---")
+query_a_cuis = ["C0409959", "C0025598"]
+query_a_emb = compute_centroid(query_a_cuis, embeddings)
+print(f"  Query CUIs: {[terms.get(c, c) for c in query_a_cuis]}")
+results_a = matcher.match(query_a_cuis, query_a_emb, all_chunks)
+print("\n  Results:")
+for r in results_a:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+print("\n--- Query B: rheumatoid arthritis ---")
+query_b_cuis = ["C0003873"]
+query_b_emb = compute_centroid(query_b_cuis, embeddings)
+print(f"  Query CUIs: {[terms.get(c, c) for c in query_b_cuis]}")
+results_b = matcher.match(query_b_cuis, query_b_emb, all_chunks)
+print("\n  Results:")
+for r in results_b:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+print("\n--- Query C: right knee pain ---")
+query_c_cuis = ["C0582802"]
+query_c_emb = compute_centroid(query_c_cuis, embeddings)
+print(f"  Query CUIs: {[terms.get(c, c) for c in query_c_cuis]}")
+results_c = matcher.match(query_c_cuis, query_c_emb, all_chunks)
+print("\n  Results:")
+for r in results_c:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+print("\n--- Query D: methotrexate ---")
+query_d_cuis = ["C0025598"]
+query_d_emb = compute_centroid(query_d_cuis, embeddings)
+results_d = matcher.match(query_d_cuis, query_d_emb, all_chunks)
+print("\n  Results:")
+for r in results_d:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+print("\n--- Query E: hypertension ---")
+query_e_cuis = ["C0020538"]
+query_e_emb = compute_centroid(query_e_cuis, embeddings)
+results_e = matcher.match(query_e_cuis, query_e_emb, all_chunks)
+print("\n  Results:")
+for r in results_e:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+print("\n--- Query F: seizure (query MORE SPECIFIC than stored Epilepsy) ---")
+query_f_cuis = ["C0036572"]  # Seizure — child of Epilepsy
+query_f_emb = compute_centroid(query_f_cuis, embeddings)
+results_f = matcher.match(query_f_cuis, query_f_emb, all_chunks)
+print("  Query CUI: C0036572 (Seizure)")
+print("  Chunk has:  C0014544 (Epilepsy)")
+print("  Hierarchy:  Epilepsy → Seizure (Epilepsy is PARENT)")
+print("  Direction:  chunk CUI is ancestor of query CUI (reverse)")
+print("\n  Results:")
+for r in results_f:
+    print(ChunkMatcher.explain(r, terms))
+    print()
+
+
+
+# ACCURACY CHECKS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+print(f"\n{'='*80}")
+print("ACCURACY CHECKS")
+print(f"{'='*80}")
+
+errors = 0
+
+# Query A: should rank doc1_chunk3 first (has OA left knee + MTX)
+if results_a and results_a[0].chunk_id == "doc1_chunk3":
+    print("  ✓ Query A: doc1_chunk3 ranked first (left knee OA + MTX)")
+else:
+    print(f"  ✗ Query A: expected doc1_chunk3, got {results_a[0].chunk_id if results_a else 'nothing'}")
+    errors += 1
+
+# Query B: should rank doc1_chunk3 first (has RA)
+if results_b and results_b[0].chunk_id == "doc1_chunk3":
+    print("  ✓ Query B: doc1_chunk3 ranked first (has RA)")
+else:
+    print(f"  ✗ Query B: expected doc1_chunk3, got {results_b[0].chunk_id if results_b else 'nothing'}")
+    errors += 1
+
+# Query C: should rank doc2_chunk1 first (has right knee pain)
+if results_c and results_c[0].chunk_id == "doc2_chunk1":
+    print("  ✓ Query C: doc2_chunk1 ranked first (right knee pain)")
+else:
+    print(f"  ✗ Query C: expected doc2_chunk1, got {results_c[0].chunk_id if results_c else 'nothing'}")
+    errors += 1
+
+# Query C: should NOT rank doc1_chunk3 above doc2_chunk1 (left vs right)
+if len(results_c) >= 2:
+    c_ids = [r.chunk_id for r in results_c]
+    if "doc1_chunk3" in c_ids:
+        doc1_rank = c_ids.index("doc1_chunk3")
+        doc2_rank = c_ids.index("doc2_chunk1") if "doc2_chunk1" in c_ids else 999
+        if doc2_rank < doc1_rank:
+            print("  ✓ Query C: right knee chunk ranked above left knee chunk")
+        else:
+            print("  ✗ Query C: left knee chunk ranked equal/above right knee chunk")
+            errors += 1
+
+# Query D: should match both MTX chunks
+if results_d:
+    mtx_chunks = {r.chunk_id for r in results_d}
+    if "doc1_chunk3" in mtx_chunks and "doc4_chunk1" in mtx_chunks:
+        print("  ✓ Query D: both MTX chunks matched")
+    else:
+        print(f"  ✗ Query D: expected both MTX chunks, got {mtx_chunks}")
+        errors += 1
+
+# Query E: should only match doc3_chunk2 (hypertension)
+if results_e and results_e[0].chunk_id == "doc3_chunk2":
+    print("  ✓ Query E: doc3_chunk2 ranked first (hypertension)")
+else:
+    print(f"  ✗ Query E: expected doc3_chunk2, got {results_e[0].chunk_id if results_e else 'nothing'}")
+    errors += 1
+
+# Query E: should NOT match arthritis chunks
+if results_e:
+    arthritis_match = any(r.chunk_id in ("doc1_chunk3", "doc2_chunk1") for r in results_e)
+    if not arthritis_match:
+        print("  ✓ Query E: no arthritis chunks matched for hypertension query")
+    else:
+        print("  ✗ Query E: arthritis chunk incorrectly matched hypertension query")
+        errors += 1
+
+# Query F: Seizure (child) should match chunk with Epilepsy (parent)
+# This tests bidirectional hierarchy: query is MORE SPECIFIC than stored
+if results_f and results_f[0].chunk_id == "doc5_chunk1":
+    print("  ✓ Query F: doc5_chunk1 matched (Seizure found Epilepsy via reverse hierarchy)")
+else:
+    print(f"  ✗ Query F: expected doc5_chunk1, got {results_f[0].chunk_id if results_f else 'NOTHING'}")
+    errors += 1
+
+# Query F: should NOT match arthritis chunks
+if results_f:
+    arthritis_match = any(r.chunk_id in ("doc1_chunk3", "doc2_chunk1") for r in results_f)
+    if not arthritis_match:
+        print("  ✓ Query F: no arthritis chunks leaked into seizure query")
+    else:
+        print("  ✗ Query F: arthritis chunk incorrectly matched seizure query")
+        errors += 1
+
+print(f"\n{'='*80}")
+if errors == 0:
+    print("ALL CHECKS PASSED ✓")
+else:
+    print(f"{errors} CHECK(S) FAILED ✗")
+print(f"{'='*80}")
