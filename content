@@ -865,6 +865,14 @@ class ContextualIntentPipeline:
                 response = self.client.models.generate_content(
                     model=self.model_name, contents=prompt, config=config)
                 data = self._extract_json(response)
+                # If the model returned a bare list instead of a wrapped dict,
+                # coerce it using the schema's first list field name.
+                if isinstance(data, list):
+                    fields = schema.model_fields
+                    list_field = next(
+                        (k for k, v in fields.items()
+                         if "List" in str(v.annotation)), None)
+                    data = {list_field: data} if list_field else data
                 return schema.model_validate(data)
             except Exception as e:
                 if attempt == 0:
@@ -938,12 +946,7 @@ class ContextualIntentPipeline:
         if not concepts:
             return None
 
-        # Token budget: each concept needs ~600 tokens for 2-3 temporal phases
-        # with all fields populated. 500 base overhead + 600 per concept.
-        # Minimum 4096, cap at 32768 (handles up to ~50 concepts cleanly).
-        max_tokens = max(4096, min(500 + 600 * len(concepts), 32768))
-
-        result = self._call_model(
+        return self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=query,
                 expanded_query=expanded_query,
@@ -951,20 +954,7 @@ class ContextualIntentPipeline:
                 concept_count=len(concepts)),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=max_tokens)
-
-        # Warn if concepts came back empty — indicates truncation or LLM miss
-        if result:
-            covered = {
-                cc.atomic_concept.strip().lower()
-                for cc in result.concepts_with_context
-                if cc.temporal_phases}
-            missing_count = len(concepts) - len(covered)
-            if missing_count > 0:
-                print(f"  ⚠ {missing_count}/{len(concepts)} concepts returned "
-                      f"no temporal phases (possible truncation at {max_tokens} tokens)")
-
-        return result
+            max_tokens=32768)
 
 
     # ── main entry points ────────────────────────────────────────────────────
