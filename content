@@ -374,6 +374,9 @@ class FlatRetrievalSignals(BaseModel):
 
     Every dimension is a comma-separated string so downstream applications
     can consume the entire context in one read — no nested traversal needed.
+    context_sentences are pre-assembled narrative sentences that describe
+    the full documentation footprint — ready for direct embedding or prompt
+    injection without any further assembly.
 
     Shape:
         {
@@ -381,14 +384,19 @@ class FlatRetrievalSignals(BaseModel):
           "author_roles":     "primary care physician, urologist, oncology nurse",
           "temporal_signals": "initial presentation, active monitoring, follow-up visit",
           "content_signals":  "assessment and plan documentation, referral documentation",
-          "clinical_setting": "outpatient primary care clinic, urology specialty clinic"
+          "clinical_setting": "outpatient primary care clinic, urology specialty clinic",
+          "context_sentences": [
+            "PSA level, documented in primary care progress note by primary care physician ...",
+            "PSA level, documented in urology consultation note by urologist ..."
+          ]
         }
     """
-    document_types:   str = ""
-    author_roles:     str = ""
-    temporal_signals: str = ""   # renamed from temporal_scope for clarity
-    content_signals:  str = ""
-    clinical_setting: str = ""
+    document_types:    str = ""
+    author_roles:      str = ""
+    temporal_signals:  str = ""   # renamed from temporal_scope for clarity
+    content_signals:   str = ""
+    clinical_setting:  str = ""
+    context_sentences: List[str] = Field(default_factory=list)
 
     @classmethod
     def from_retrieval_context(cls, ctx: "RetrievalContext") -> "FlatRetrievalSignals":
@@ -401,11 +409,12 @@ class FlatRetrievalSignals(BaseModel):
             return ", ".join(dict.fromkeys(cleaned))  # dedup, preserve order
 
         return cls(
-            document_types   = _join(ctx.document_types),
-            author_roles     = _join(ctx.author_roles),
-            temporal_signals = _join(ctx.temporal_scope),
-            content_signals  = _join(ctx.content_signals),
-            clinical_setting = _join(ctx.clinical_setting),
+            document_types    = _join(ctx.document_types),
+            author_roles      = _join(ctx.author_roles),
+            temporal_signals  = _join(ctx.temporal_scope),
+            content_signals   = _join(ctx.content_signals),
+            clinical_setting  = _join(ctx.clinical_setting),
+            context_sentences = ctx.context_sentences or [],
         )
 
 
@@ -422,11 +431,19 @@ class IntentWithoutQueries(BaseModel):
 
 
 class IntentWithContext(BaseModel):
-    intent_title: str
-    description: str
-    nature: str
-    sub_natures: List[SubNature]
-    final_candidates: List[str]
+    """
+    Intent block used in full_pipeline output.
+    final_candidates now holds fully-resolved FinalCandidateItem objects
+    (same structure as in final_queries output) so both outputs are consistent
+    and downstream consumers only need to understand one candidate shape.
+    retrieval_context is the aggregated intent-level context (all concepts
+    under this intent merged), kept for intent-level retrieval use cases.
+    """
+    intent_title:      str
+    description:       str
+    nature:            str
+    sub_natures:       List[SubNature]
+    final_candidates:  List["FinalCandidateItem"] = Field(default_factory=list)
     retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
 
 
@@ -448,7 +465,11 @@ class FinalCandidateItem(BaseModel):
             "author_roles":     "primary care physician, urologist, laboratory technician",
             "temporal_signals": "initial presentation, active monitoring, follow-up visit",
             "content_signals":  "diagnostic workup documentation, referral documentation",
-            "clinical_setting": "outpatient primary care clinic, urology specialty clinic"
+            "clinical_setting": "outpatient primary care clinic, urology specialty clinic",
+            "context_sentences": [
+              "PSA level, documented in primary care progress note by primary care physician, at outpatient primary care clinic, capturing diagnostic workup documentation.",
+              "PSA level, documented in urology consultation note by urologist, at urology specialty clinic, capturing referral documentation."
+            ]
           }
         }
     """
@@ -697,6 +718,30 @@ class ExtractionResult:
         return result.model_dump()
 
     def to_full_pipeline(self) -> Dict[str, Any]:
+        # Track seen concepts globally so candidate_ids are stable and unique
+        # across intents — same numbering logic as to_final_queries().
+        seen: set = set()
+        idx = 0
+
+        def _make_candidates(intent) -> List[FinalCandidateItem]:
+            nonlocal idx
+            items = []
+            for sn in intent.sub_natures:
+                for c in sn.atomic_concepts:
+                    key = c.strip().lower()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    idx += 1
+                    rich_ctx = self._build_ctx(c.strip())
+                    items.append(FinalCandidateItem(
+                        candidate_id=f"fc_{idx:03d}",
+                        intent_title=intent.intent_title,
+                        atomic_concept=c.strip(),
+                        candidate=c.strip(),
+                        retrieval_signals=FlatRetrievalSignals.from_retrieval_context(rich_ctx)))
+            return items
+
         result = Format_FullPipeline(
             is_clinical=self.intents.is_clinical,
             reason=self.intents.reason,
@@ -709,9 +754,7 @@ class ExtractionResult:
                     description=i.description,
                     nature=i.nature,
                     sub_natures=i.sub_natures,
-                    final_candidates=[
-                        c for sn in i.sub_natures
-                        for c in sn.atomic_concepts],
+                    final_candidates=_make_candidates(i),
                     retrieval_context=self._build_intent_ctx(i.intent_title))
                 for i in self.intents.intents
             ],
