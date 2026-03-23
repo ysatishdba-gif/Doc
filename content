@@ -1,5 +1,6 @@
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Literal, Tuple
 from google import genai
@@ -355,12 +356,57 @@ class ContextualEnvironmentOutput(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RetrievalContext(BaseModel):
-    document_types: List[str] = Field(default_factory=list)
-    author_roles: List[str] = Field(default_factory=list)
-    temporal_scope: List[str] = Field(default_factory=list)
-    content_signals: List[str] = Field(default_factory=list)
-    clinical_setting: List[str] = Field(default_factory=list)
+    """
+    Used internally and by full_pipeline / nature_breakdown outputs.
+    Keeps each dimension as a separate list for structured access.
+    """
+    document_types:    List[str] = Field(default_factory=list)
+    author_roles:      List[str] = Field(default_factory=list)
+    temporal_scope:    List[str] = Field(default_factory=list)
+    content_signals:   List[str] = Field(default_factory=list)
+    clinical_setting:  List[str] = Field(default_factory=list)
     context_sentences: List[str] = Field(default_factory=list)
+
+
+class FlatRetrievalSignals(BaseModel):
+    """
+    Flat, single-level retrieval context used by FinalCandidateItem.
+
+    Every dimension is a comma-separated string so downstream applications
+    can consume the entire context in one read — no nested traversal needed.
+
+    Shape:
+        {
+          "document_types":   "primary care progress note, lab order, urology consultation note",
+          "author_roles":     "primary care physician, urologist, oncology nurse",
+          "temporal_signals": "initial presentation, active monitoring, follow-up visit",
+          "content_signals":  "assessment and plan documentation, referral documentation",
+          "clinical_setting": "outpatient primary care clinic, urology specialty clinic"
+        }
+    """
+    document_types:   str = ""
+    author_roles:     str = ""
+    temporal_signals: str = ""   # renamed from temporal_scope for clarity
+    content_signals:  str = ""
+    clinical_setting: str = ""
+
+    @classmethod
+    def from_retrieval_context(cls, ctx: "RetrievalContext") -> "FlatRetrievalSignals":
+        """Convert a structured RetrievalContext into a flat, comma-joined form."""
+        def _strip(v: str) -> str:
+            return v.split(" - ", 1)[0].replace("_", " ").strip() if v else ""
+
+        def _join(lst: List[str]) -> str:
+            cleaned = [_strip(v) for v in lst if v]
+            return ", ".join(dict.fromkeys(cleaned))  # dedup, preserve order
+
+        return cls(
+            document_types   = _join(ctx.document_types),
+            author_roles     = _join(ctx.author_roles),
+            temporal_signals = _join(ctx.temporal_scope),
+            content_signals  = _join(ctx.content_signals),
+            clinical_setting = _join(ctx.clinical_setting),
+        )
 
 
 class IntentSummaryItem(BaseModel):
@@ -385,11 +431,32 @@ class IntentWithContext(BaseModel):
 
 
 class FinalCandidateItem(BaseModel):
-    candidate_id: str
-    intent_title: str
-    atomic_concept: str
-    candidate: str
-    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
+    """
+    One atomic retrieval unit.
+
+    retrieval_signals is a flat object — every dimension is a single
+    comma-separated string. No nesting, no extra traversal needed.
+
+    Example:
+        {
+          "candidate_id":   "fc_001",
+          "intent_title":   "Elevated PSA",
+          "atomic_concept": "PSA level",
+          "candidate":      "PSA level",
+          "retrieval_signals": {
+            "document_types":   "primary care progress note, lab report, urology consultation note",
+            "author_roles":     "primary care physician, urologist, laboratory technician",
+            "temporal_signals": "initial presentation, active monitoring, follow-up visit",
+            "content_signals":  "diagnostic workup documentation, referral documentation",
+            "clinical_setting": "outpatient primary care clinic, urology specialty clinic"
+          }
+        }
+    """
+    candidate_id:      str
+    intent_title:      str
+    atomic_concept:    str
+    candidate:         str
+    retrieval_signals: FlatRetrievalSignals = Field(default_factory=FlatRetrievalSignals)
 
 
 class Format_IntentExtraction(BaseModel):
@@ -592,12 +659,16 @@ class ExtractionResult:
                         continue
                     seen.add(key)
                     idx += 1
+                    # Build the rich RetrievalContext first, then flatten it
+                    # into a single-level FlatRetrievalSignals object so
+                    # downstream consumers get everything in one read.
+                    rich_ctx = self._build_ctx(c.strip())
                     candidates.append(FinalCandidateItem(
                         candidate_id=f"fc_{idx:03d}",
                         intent_title=i.intent_title,
                         atomic_concept=c.strip(),
                         candidate=c.strip(),
-                        retrieval_context=self._build_ctx(c.strip())))
+                        retrieval_signals=FlatRetrievalSignals.from_retrieval_context(rich_ctx)))
         result = Format_FinalQueries(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
@@ -903,20 +974,79 @@ def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]
         return False, str(e)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OUTPUT CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class OutputConfig:
+    """
+    Control which output files are generated.
+    Set any flag to False to skip that output entirely.
+
+    Outputs:
+        intent_extraction  – summary of intents (title + description only)
+        final_queries      – atomic candidate list with retrieval context
+        nature_breakdown   – intents with sub_natures, no context sentences
+        full_pipeline      – complete output including expanded query + context
+    """
+    intent_extraction : bool = True
+    final_queries     : bool = True
+    nature_breakdown  : bool = True
+    full_pipeline     : bool = True
+
+    def enabled(self) -> List[str]:
+        """Return list of format names that are turned on."""
+        return [
+            name for name in
+            ["intent_extraction", "final_queries", "nature_breakdown", "full_pipeline"]
+            if getattr(self, name)
+        ]
+
+
 def run_single_query(pipeline: ContextualIntentPipeline,
-                     query: str, idx: int) -> Dict[str, Any]:
-    """Run the pipeline for a single query, save all four outputs."""
-    result  = pipeline.extract(query, verbose=True)
-    formats = result.to_all_formats()
-    prefix  = f"query{idx}"
-    files   = []
-    for name, data in formats.items():
+                     query: str,
+                     idx: int,
+                     config: OutputConfig = None) -> Dict[str, Any]:
+    """
+    Run the pipeline for a single query.
+    Only saves the output files whose flag is True in `config`.
+    Defaults to all outputs enabled if config is not provided.
+    """
+    if config is None:
+        config = OutputConfig()
+
+    enabled = config.enabled()
+    if not enabled:
+        print(f"  ⚠  No outputs enabled for query {idx} — skipping.")
+        return {"query": query, "status": "skipped", "files": []}
+
+    result = pipeline.extract(query, verbose=True)
+
+    # Build only the formats that are switched on
+    format_dispatch = {
+        "intent_extraction": result.to_intent_extraction,
+        "final_queries":     result.to_final_queries,
+        "nature_breakdown":  result.to_nature_breakdown,
+        "full_pipeline":     result.to_full_pipeline,
+    }
+
+    prefix = f"query{idx}"
+    files  = []
+
+    for name in enabled:
+        data     = format_dispatch[name]()
         filename = f"{prefix}_{name}.json"
         save_json(data, filename)
         valid, err = validate_schema(data, name)
         if not valid:
             print(f"  ⚠ Schema validation failed for {filename}: {err}")
         files.append(filename)
+
+    skipped = [n for n in format_dispatch if n not in enabled]
+    if skipped:
+        print(f"  Skipped outputs: {', '.join(skipped)}")
+
     print("-" * 60)
     return {"query": query, "status": "completed", "files": files}
 
@@ -926,10 +1056,18 @@ def run_single_query(pipeline: ContextualIntentPipeline,
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ── configure these three values ──────────────────────────────────────────
+    # ── 1. Infrastructure config ───────────────────────────────────────────────
     PROJECT_ID    = "YOUR_PROJECT_ID"
     LOCATION      = "us-central1"
     MODEL_VERSION = "gemini-2.5-flash"
+
+    # ── 2. Choose which outputs to generate (True = yes, False = no) ───────────
+    output_config = OutputConfig(
+        intent_extraction = True,   # summary: intent titles + descriptions
+        final_queries     = True,   # atomic candidates with retrieval context
+        nature_breakdown  = True,   # intents + sub_natures (no context sentences)
+        full_pipeline     = True,   # full output: expanded query + all context
+    )
     # ──────────────────────────────────────────────────────────────────────────
 
     pipeline = ContextualIntentPipeline(
@@ -944,7 +1082,7 @@ if __name__ == "__main__":
     results = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(run_single_query, pipeline, query, idx): query
+            executor.submit(run_single_query, pipeline, query, idx, output_config): query
             for idx, query in enumerate(test_queries, 1)
         }
         for future in as_completed(futures):
