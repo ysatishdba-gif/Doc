@@ -938,10 +938,12 @@ class ContextualIntentPipeline:
         if not concepts:
             return None
 
-        # Scale token budget to concept count; cap at 16384
-        max_tokens = min(1024 + 512 * len(concepts), 16384)
+        # Token budget: each concept needs ~600 tokens for 2-3 temporal phases
+        # with all fields populated. 500 base overhead + 600 per concept.
+        # Minimum 4096, cap at 32768 (handles up to ~50 concepts cleanly).
+        max_tokens = max(4096, min(500 + 600 * len(concepts), 32768))
 
-        return self._call_model(
+        result = self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=query,
                 expanded_query=expanded_query,
@@ -950,6 +952,19 @@ class ContextualIntentPipeline:
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
             max_tokens=max_tokens)
+
+        # Warn if concepts came back empty — indicates truncation or LLM miss
+        if result:
+            covered = {
+                cc.atomic_concept.strip().lower()
+                for cc in result.concepts_with_context
+                if cc.temporal_phases}
+            missing_count = len(concepts) - len(covered)
+            if missing_count > 0:
+                print(f"  ⚠ {missing_count}/{len(concepts)} concepts returned "
+                      f"no temporal phases (possible truncation at {max_tokens} tokens)")
+
+        return result
 
 
     # ── main entry points ────────────────────────────────────────────────────
