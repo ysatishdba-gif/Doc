@@ -466,18 +466,21 @@ class FinalCandidateItem(BaseModel):
 class IntentWithContext(BaseModel):
     """
     Intent block used in full_pipeline output.
-    final_candidates holds fully-resolved FinalCandidateItem objects
-    (same structure as in final_queries output) so both outputs are consistent
-    and downstream consumers only need to understand one candidate shape.
-    retrieval_context is the aggregated intent-level context (all concepts
-    under this intent merged), kept for intent-level retrieval use cases.
+
+    final_candidates holds fully-resolved FinalCandidateItem objects —
+    identical structure to final_queries output, so both outputs are
+    consistent and downstream consumers only need one candidate shape.
+
+    retrieval_signals is the union of all candidate-level signals under
+    this intent, flattened to the same shape as FinalCandidateItem so
+    the full_pipeline output is uniformly flat — no nested objects anywhere.
     """
     intent_title:      str
     description:       str
     nature:            str
     sub_natures:       List[SubNature]
     final_candidates:  List[FinalCandidateItem] = Field(default_factory=list)
-    retrieval_context: RetrievalContext = Field(default_factory=RetrievalContext)
+    retrieval_signals: FlatRetrievalSignals = Field(default_factory=FlatRetrievalSignals)
 
 
 class Format_IntentExtraction(BaseModel):
@@ -717,9 +720,40 @@ class ExtractionResult:
             timestamp=self.timestamp)
         return result.model_dump()
 
+    @staticmethod
+    def _merge_signals(candidates: List[FinalCandidateItem]) -> FlatRetrievalSignals:
+        """
+        Merge FlatRetrievalSignals across all candidates under one intent.
+        Each field is the union of values from all candidates — deduped,
+        order-preserved, comma-joined. This guarantees the intent-level
+        signals are a strict superset of what any individual candidate holds,
+        with no inflation from _build_intent_ctx's cross-concept aggregation.
+        """
+        def _union(getter) -> str:
+            seen_vals: dict = {}
+            for fc in candidates:
+                for val in getter(fc.retrieval_signals).split(", "):
+                    val = val.strip()
+                    if val and val.lower() not in seen_vals:
+                        seen_vals[val.lower()] = val
+            return ", ".join(seen_vals.values())
+
+        return FlatRetrievalSignals(
+            document_types   = _union(lambda s: s.document_types),
+            author_roles     = _union(lambda s: s.author_roles),
+            temporal_signals = _union(lambda s: s.temporal_signals),
+            content_signals  = _union(lambda s: s.content_signals),
+            clinical_setting = _union(lambda s: s.clinical_setting),
+            context_sentences= [
+                sent
+                for fc in candidates
+                for sent in fc.retrieval_signals.context_sentences
+            ],
+        )
+
     def to_full_pipeline(self) -> Dict[str, Any]:
-        # Track seen concepts globally so candidate_ids are stable and unique
-        # across intents — same numbering logic as to_final_queries().
+        # Shared seen-set and counter so candidate_ids are identical to
+        # those produced by to_final_queries() on the same ExtractionResult.
         seen: set = set()
         idx = 0
 
@@ -742,22 +776,27 @@ class ExtractionResult:
                         retrieval_signals=FlatRetrievalSignals.from_retrieval_context(rich_ctx)))
             return items
 
+        intent_blocks = []
+        for i in self.intents.intents:
+            candidates = _make_candidates(i)
+            # Intent-level signals = union of its own candidates' signals.
+            # Consistent with and never wider than the candidate-level data.
+            intent_signals = self._merge_signals(candidates)
+            intent_blocks.append(IntentWithContext(
+                intent_title=i.intent_title,
+                description=i.description,
+                nature=i.nature,
+                sub_natures=i.sub_natures,
+                final_candidates=candidates,
+                retrieval_signals=intent_signals))
+
         result = Format_FullPipeline(
             is_clinical=self.intents.is_clinical,
             reason=self.intents.reason,
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
-            intents=[
-                IntentWithContext(
-                    intent_title=i.intent_title,
-                    description=i.description,
-                    nature=i.nature,
-                    sub_natures=i.sub_natures,
-                    final_candidates=_make_candidates(i),
-                    retrieval_context=self._build_intent_ctx(i.intent_title))
-                for i in self.intents.intents
-            ],
+            intents=intent_blocks,
             timestamp=self.timestamp)
         return result.model_dump()
 
@@ -867,14 +906,25 @@ class ContextualIntentPipeline:
             total_intents_detected=len(raw.intents),
             intents=raw.intents)
 
+    # ── Step 3 ──────────────────────────────────────────────────────────────
+
     def build_context(self, query: str, expanded_query: str,
-                      intent_out: IntentExtractionOutput
+                      intent_out: IntentExtractionOutput,
                       ) -> Optional[ContextualEnvironmentOutput]:
-        """Step 3 — build contextual environment for every atomic concept."""
+        """
+        Step 3 — ONE call for all atomic concepts.
+
+        All concepts are sent in a single prompt. max_tokens is sized
+        proportionally to concept count so the model has room to respond
+        without over-allocating. No chunking, no parallel calls, no retry
+        loops — keeps cost and latency predictable.
+
+        Token budget: 1024 base + 512 per concept, capped at 16384.
+        """
         if not intent_out.is_clinical or not intent_out.intents:
             return None
 
-        # Collect unique atomic concepts
+        # ── collect unique atomic concepts ───────────────────────────────────
         concepts: List[Dict[str, str]] = []
         seen: set = set()
         for i in intent_out.intents:
@@ -888,7 +938,10 @@ class ContextualIntentPipeline:
         if not concepts:
             return None
 
-        context = self._call_model(
+        # Scale token budget to concept count; cap at 16384
+        max_tokens = min(1024 + 512 * len(concepts), 16384)
+
+        return self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=query,
                 expanded_query=expanded_query,
@@ -896,29 +949,8 @@ class ContextualIntentPipeline:
                 concept_count=len(concepts)),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=32768)
+            max_tokens=max_tokens)
 
-        # Retry any concepts that came back without temporal phases
-        covered = {
-            cc.atomic_concept.strip().lower()
-            for cc in context.concepts_with_context
-            if cc.temporal_phases}
-        missing = [c for c in concepts
-                   if c["atomic_concept"].strip().lower() not in covered]
-        if missing:
-            print(f"  Retrying {len(missing)} missing concepts...")
-            retry = self._call_model(
-                CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                    original_query=query,
-                    expanded_query=expanded_query,
-                    concepts_json=json.dumps(missing, indent=2),
-                    concept_count=len(missing)),
-                ContextualEnvironmentOutput,
-                fallback=ContextualEnvironmentOutput(),
-                max_tokens=32768)
-            context.concepts_with_context.extend(retry.concepts_with_context)
-
-        return context
 
     # ── main entry points ────────────────────────────────────────────────────
 
@@ -926,33 +958,47 @@ class ContextualIntentPipeline:
         if not query or not query.strip():
             raise ValueError("Empty query provided")
 
-        start = datetime.utcnow()
+        t0 = datetime.utcnow()
 
-        # Step 1
+        # Step 1 — query expansion (fast, ~2–3 s)
+        t1 = datetime.utcnow()
         expansion = self.expand_query(query)
+        t1e = (datetime.utcnow() - t1).total_seconds()
 
-        # Step 2
+        # Step 2 — intent extraction (sequential dependency on step 1)
+        t2 = datetime.utcnow()
         intent_out = self.extract_intents(query, expansion.expanded_query)
+        t2e = (datetime.utcnow() - t2).total_seconds()
 
-        # Step 3
-        context = self.build_context(query, expansion.expanded_query, intent_out)
+        # Step 3 — contextual environment (parallel chunks, the heavy step)
+        t3 = datetime.utcnow()
+        context = self.build_context(
+            query, expansion.expanded_query, intent_out)
+        t3e = (datetime.utcnow() - t3).total_seconds()
 
-        processing_time = (datetime.utcnow() - start).total_seconds()
+        processing_time = (datetime.utcnow() - t0).total_seconds()
 
         if verbose:
             nc = len(context.concepts_with_context) if context else 0
-            print(f"Original  : {query}")
-            print(f"Expanded  : {expansion.expanded_query}")
+            total_concepts = sum(
+                len(sn.atomic_concepts)
+                for i in intent_out.intents
+                for sn in i.sub_natures)
+            print(f"Query     : {query[:80]}")
+            print(f"Expanded  : {expansion.expanded_query[:80]}")
             if intent_out.is_clinical:
-                tq = sum(len(i.final_queries) for i in intent_out.intents)
-                ts = sum(len(i.sub_natures)   for i in intent_out.intents)
+                ts = sum(len(i.sub_natures) for i in intent_out.intents)
                 print(f"Status    : Clinical")
                 print(f"Intents   : {intent_out.total_intents_detected} | "
-                      f"Sub-natures: {ts} | Queries: {tq} | Contexts: {nc}")
+                      f"Sub-natures: {ts} | "
+                      f"Concepts: {total_concepts} | "
+                      f"Contexts: {nc}")
+                print(f"Timing    : expand={t1e:.1f}s  "
+                      f"intents={t2e:.1f}s  "
+                      f"context={t3e:.1f}s  "
+                      f"total={processing_time:.1f}s")
             else:
-                print(f"Status    : Non-clinical")
-                print(f"Reason    : {intent_out.reason}")
-            print(f"Time      : {processing_time:.2f}s")
+                print(f"Status    : Non-clinical — {intent_out.reason}")
             print()
 
         return ExtractionResult(query, expansion, intent_out,
@@ -1024,14 +1070,14 @@ def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]
 @dataclass
 class OutputConfig:
     """
-    Control which output files are generated.
-    Set any flag to False to skip that output entirely.
+    Control which output files are generated and parallelism tuning.
 
-    Outputs:
+    Output flags (True = generate, False = skip):
         intent_extraction  – summary of intents (title + description only)
         final_queries      – atomic candidate list with retrieval context
         nature_breakdown   – intents with sub_natures, no context sentences
         full_pipeline      – complete output including expanded query + context
+
     """
     intent_extraction : bool = True
     final_queries     : bool = True
@@ -1104,12 +1150,14 @@ if __name__ == "__main__":
     LOCATION      = "us-central1"
     MODEL_VERSION = "gemini-2.5-flash"
 
-    # ── 2. Choose which outputs to generate (True = yes, False = no) ───────────
+    # ── 2. Output selection + parallelism tuning ─────────────────────────────
     output_config = OutputConfig(
+        # Which files to write (True = yes, False = skip)
         intent_extraction = True,   # summary: intent titles + descriptions
         final_queries     = True,   # atomic candidates with retrieval context
         nature_breakdown  = True,   # intents + sub_natures (no context sentences)
         full_pipeline     = True,   # full output: expanded query + all context
+        # Step 3 parallelism — tune to your API rate limit
     )
     # ──────────────────────────────────────────────────────────────────────────
 
