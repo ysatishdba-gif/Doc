@@ -240,29 +240,55 @@ def run_query(
     query_text: str,
     store_path: Optional[str] = None,
     top_k: int = 10,
+    _prebuilt_chunks: Optional[dict] = None,
+    _prebuilt_index: Optional[TopicIndex] = None,
 ) -> Optional[Tuple[list, dict, dict]]:
     """Run a clinical query against stored chunks.
+
+    Args:
+        query_text:        clinical question in free text
+        store_path:        path to chunk_store.pkl
+        top_k:             max results
+        _prebuilt_chunks:  pass pre-loaded chunks to avoid reloading per query
+        _prebuilt_index:   pass pre-built TopicIndex to avoid rebuilding per query
 
     Returns:
         (results, terms, chunks) or None
     """
     t0 = time.perf_counter()
 
-    store_path = store_path or os.path.join(OUTPUT_DIR, "chunk_store.pkl")
-    if not os.path.exists(store_path):
-        print(f"ERROR: chunk store not found at {store_path}")
-        print("  → Run run_cui_reduction_api.py first to build the store")
-        return None
+    # ── Load store (skip if caller pre-loaded) ────────────────────────────────
+    if _prebuilt_chunks is not None:
+        chunks = _prebuilt_chunks
+        topic_index = _prebuilt_index
+    else:
+        store_path = store_path or os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+        if not os.path.exists(store_path):
+            print(f"ERROR: chunk store not found at {store_path}")
+            print("  → Run run_cui_reduction_api.py first to build the store")
+            return None
 
-    store  = ChunkStore.load(store_path)
-    chunks = store.get_all()
-    if not chunks:
-        print("ERROR: no chunks in store")
-        return None
+        store  = ChunkStore.load(store_path)
+        chunks = store.get_all()
+        if not chunks:
+            print("ERROR: no chunks in store")
+            return None
 
-    stats = store.stats()
-    print(f"\nStore: {stats['chunks']} chunks, {stats['total_cuis']} stored CUIs, "
-          f"{stats['chunks_with_embeddings']} with embeddings")
+        stats = store.stats()
+        print(f"\nStore: {stats['chunks']} chunks, {stats['total_cuis']} stored CUIs, "
+              f"{stats['chunks_with_embeddings']} with embeddings")
+
+        # Build TopicIndex once — expensive (~30s for large stores)
+        has_topic_centroids = any(
+            any(t.get("centroid") is not None
+                for t in cd.get("topics", {}).values())
+            for cd in chunks.values()
+        )
+        topic_index = None
+        if has_topic_centroids:
+            topic_index = TopicIndex()
+            topic_index.build(chunks, graph=hierarchy)
+            print(f"  → TopicIndex built: {len(topic_index.groups)} groups")
 
     query_result = process_query(query_text)
     if not query_result:
@@ -277,23 +303,9 @@ def run_query(
     print(f"\n  → Matching against {len(chunks)} chunks...", flush=True)
 
     # ── Two-pass matching ─────────────────────────────────────────────────────
-    # TopicIndex = production path:
-    #   Pass 1 — topic centroid gate (hard exclusion, gap_split)
-    #   Pass 2 — CUI scoring within matched topics only
-    #   Pass 3 — z-score normalisation (no manual weights)
-    #   Pass 4 — confidence gap filter
-    #
-    # ChunkMatcher = legacy path for stores without per-topic centroids.
-    has_topic_centroids = any(
-        any(t.get("centroid") is not None
-            for t in cd.get("topics", {}).values())
-        for cd in chunks.values()
-    )
-
-    if has_topic_centroids and query_topics:
+    # TopicIndex was built at store load time — reused here (no rebuild).
+    if topic_index is not None and query_topics:
         print("  → Path: TopicIndex (topic gate → CUI scoring within matched topics)")
-        topic_index = TopicIndex()
-        topic_index.build(chunks, graph=hierarchy)
         results = topic_index.match(
             query_topics, query_cuis, query_embedding,
             matcher, top_k=top_k,
@@ -330,7 +342,7 @@ def run_query(
             print(f"  {_display_result(rank, r, terms)}")
             print()
 
-    return results, terms, chunks
+    return results, terms, chunks, topic_index
 
 
 # ── LLM Reasoning ────────────────────────────────────────────────────────────
@@ -437,11 +449,38 @@ if __name__ == "__main__":
         "methotrexate side effects",
     ]
 
+    # ── Load store and build TopicIndex ONCE for all queries ─────────────────
+    if not os.path.exists(STORE_PATH):
+        print(f"ERROR: chunk store not found at {STORE_PATH}")
+        print("  → Run run_cui_reduction_api.py first to build the store")
+        raise SystemExit(1)
+
+    _store  = ChunkStore.load(STORE_PATH)
+    _chunks = _store.get_all()
+    _stats  = _store.stats()
+    print(f"\nStore: {_stats['chunks']} chunks, {_stats['total_cuis']} stored CUIs, "
+          f"{_stats['chunks_with_embeddings']} with embeddings")
+
+    _has_centroids = any(
+        any(t.get("centroid") is not None for t in cd.get("topics", {}).values())
+        for cd in _chunks.values()
+    )
+    _topic_index: Optional[TopicIndex] = None
+    if _has_centroids:
+        _topic_index = TopicIndex()
+        _topic_index.build(_chunks, graph=hierarchy)
+        print(f"  → TopicIndex built once: {len(_topic_index.groups)} groups "
+              f"(reused for all {len(QUERIES)} queries)")
+
     all_rows: List[list] = []
     all_reasoning: Dict[str, str] = {}
 
     for query_text in QUERIES:
-        result = run_query(query_text, STORE_PATH, top_k=5)
+        result = run_query(
+            query_text, top_k=5,
+            _prebuilt_chunks=_chunks,
+            _prebuilt_index=_topic_index,
+        )
         if not result:
             continue
         results, terms, chunks = result
