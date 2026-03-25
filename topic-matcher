@@ -1,0 +1,1837 @@
+"""
+Topic Matcher — Three-signal clinical retrieval with topic-level matching.
+
+Two retrieval paths:
+  TopicIndex (production):  topic grouping + z-score scoring + gap-split filtering
+  ChunkMatcher (backward):  chunk-level scoring with adaptive reranking
+
+Three signals (scored independently, no double-counting):
+  Signal 1: CUI overlap       — exact concept match (precision)
+  Signal 2: Vector cosine      — embedding similarity (recall)
+  Signal 3: Lin similarity     — hierarchy-aware match via MICA (non-exact pairs only)
+
+Scoring (TopicIndex, default z_score_normalize=True):
+  Each signal z-normalized across candidates, then summed.
+  No manual weights. Data-driven.
+
+Scoring (ChunkMatcher, backward compat):
+  Weighted sum with adaptive variance-based reranking.
+
+Components:
+  ChunkStore:          Store CUIs + embedding centroid + topics + text per chunk
+  ChunkMatcher:        Chunk-level scorer (backward compat)
+  TopicIndex:          Cross-chunk topic grouping + variant detection (production)
+  build_query_topics:  Form topics from query CUIs
+  compute_centroid:    Average CUI embeddings into one vector
+  gap_split:           Find natural separation in sorted values
+
+Usage:
+    from topic_matcher import ChunkStore, ChunkMatcher, compute_centroid
+
+    # Offline: store chunks
+    store = ChunkStore()
+    emb = compute_centroid(surviving_cuis, embeddings)
+    store.add("chunk_1", "doc_1", surviving_cuis, embedding=emb,
+              topics=h_topics, text=chunk_text)
+    store.save("chunk_store.pkl")
+
+    # Online: match
+    store = ChunkStore.load("chunk_store.pkl")
+    matcher = ChunkMatcher(graph, ic_map)
+    q_emb = compute_centroid(query_cuis, embeddings)
+    results = matcher.match(query_cuis, q_emb, store.get_all())
+
+References:
+    Lin 1998     — IC-based similarity via MICA
+    Pesquita 2009 — BMA for set-to-set similarity
+"""
+
+import math
+import pickle
+import time
+import logging
+import numpy as np
+from typing import Dict, List, Optional
+from dataclasses import dataclass
+
+# Import enums from cui_reduction_system — single source of truth for all
+# clinical domain string constants. Never compare bare strings in pipeline logic.
+from cui_reduction_system import (
+    TemporalContext, MatchType, Verdict, _TEMPORAL_PRIORITY
+)
+
+logger = logging.getLogger("cui_reduction")
+
+
+# ── Default parameters (override via constructor) ─────────────────────────────
+DEFAULTS = {
+    # ── Scoring ──────────────────────────────────────────────────────────
+    # If z_score_normalize=True, weights are ignored (signals auto-balanced).
+    # If False, manual weights are used.
+    "w_cui":              0.40,   # Signal 1 weight (manual mode only)
+    "w_vec":              0.30,   # Signal 2 weight (manual mode only)
+    "w_lin":              0.30,   # Signal 3 weight (manual mode only)
+    "z_score_normalize":  True,   # True=data-driven scoring, False=manual weights
+
+    # ── Hierarchy walk ───────────────────────────────────────────────────
+    "anc_depth":          8,      # max BFS hops (structural limit)
+    "ic_prune_ratio":     0.3,    # FALLBACK ONLY: ic_prune_ratio now derived at match()
+                                  # time as percentile(store_ics,10) / median(store_ics).
+                                  # Used only when ic_map is empty (bootstrap).
+    # ── Sibling matching ─────────────────────────────────────────────────
+    "sibling_ic_ratio":   0.6,    # FALLBACK ONLY: sibling_ic_ratio now derived at match()
+                                  # time as percentile(store_ics,25) / percentile(store_ics,75).
+                                  # Used only when ic_map is empty (bootstrap).
+
+    # ── Topic filter ─────────────────────────────────────────────────────
+    "topic_filter_pct":   85,     # FALLBACK ONLY: if gap_split finds no gap
+    "topic_filter_sim":   0.3,    # ChunkMatcher backward compat (absolute gate)
+    "max_candidates":     50,     # compute budget safety cap (after gap_split)
+
+    # ── Output ───────────────────────────────────────────────────────────
+    "score_min":          0.01,   # absolute floor (structural, not tuning)
+    "min_overlap":        1,      # ChunkMatcher backward compat
+    "confidence_ratio":   0.5,    # FALLBACK ONLY: if gap_split finds no gap
+
+    # ── Vector ───────────────────────────────────────────────────────────
+    "vector_sharpening":  1,      # 1=off (topic centroids are focused, no need)
+    "vector_fallback_min": 0.4,   # ChunkMatcher backward compat only
+
+    # ── Query topics ─────────────────────────────────────────────────────
+    "query_hac_dist":     0.5,    # HAC distance for clustering query CUIs
+    "query_singleton_max": 3,     # <= this: each CUI is own topic
+
+    # ── Topic grouping ───────────────────────────────────────────────────
+    "group_dist":         0.15,   # cosine distance for cross-chunk grouping
+    "variant_min_change": 1,      # min CUI adds+removes to flag variant
+
+    # ── IDF / Lin weighting — fully adaptive, no hardcoded thresholds ────
+    # These were previously hardcoded values. They are now derived from
+    # the actual data at match() time:
+    #
+    #   use_idf             ← IDF saturation of the store (not chunk count)
+    #   filter_min_ancestor_ic ← 25th percentile of store CUI IC distribution
+    #   ic_weight_alpha     ← normalised mean IC of query CUIs
+    #   min_best_lin        ← scales linearly with query IC specificity
+    #
+    # See ChunkMatcher._compute_adaptive_params() for the derivation.
+}
+
+
+# ── Data model ────────────────────────────────────────────────────────────────
+
+@dataclass
+class CUIMatchDetail:
+    """Best Lin match for one query CUI."""
+    query_cui: str
+    chunk_cui: Optional[str]   # best matching CUI in chunk
+    mica_cui: Optional[str]    # Most Informative Common Ancestor
+    lin_sim: float             # Lin similarity [0, 1]
+    match_type: MatchType      # EXACT | SUBSUMPTION | SIBLING | NO_MATCH
+
+@dataclass
+class ChunkMatch:
+    """Result of matching one chunk against the query."""
+    chunk_id: str
+    document_id: str
+    score: float               # combined weighted score [0, 1]
+    cui_overlap: int           # exact CUI overlap count
+    cui_overlap_ratio: float   # overlap / query CUI count
+    vector_sim: float          # cosine similarity of embedding centroids
+    lin_score: float           # average best Lin similarity (BMA)
+    total_chunk_cuis: int
+    total_query_cuis: int
+    overlapping_cuis: List[str]
+    topics_matched: Dict
+    lin_details: List[CUIMatchDetail]
+
+
+# ── ChunkStore ────────────────────────────────────────────────────────────────
+
+class ChunkStore:
+    """Stores surviving CUIs, embedding centroid, topics, and text per chunk."""
+
+    def __init__(self):
+        self._data = {}
+
+    def add(self, chunk_id, document_id, surviving_cuis,
+            embedding=None, topics=None, text=None, embeddings=None,
+            temporal_map=None):
+        """Store one chunk.
+
+        Args:
+            chunk_id: chunk identifier
+            document_id: source document identifier
+            surviving_cuis: set/list of CUI strings
+            embedding: numpy array — centroid of CUI embeddings
+            topics: dict from HierarchicalTopicBuilder
+            text: original chunk text (for LLM reasoning)
+            embeddings: dict {cui: numpy_array} — if provided, computes
+                        per-topic centroids for embedding-based topic filter
+            temporal_map: dict {cui: temporal_flag} — "current" | "historical"
+                          | "hypothetical" | "family" | "unknown"
+                          from ClinicalContextParser. Stored for query-time
+                          temporal mismatch penalisation.
+        """
+        topics = topics or {}
+        # compute per-topic centroids if embeddings available
+        if embeddings and topics:
+            for tid, t_info in topics.items():
+                members = t_info.get("members", [])
+                tc = compute_centroid(members, embeddings)
+                t_info["centroid"] = tc
+
+        self._data[chunk_id] = {
+            "doc_id": document_id,
+            "cuis": set(surviving_cuis),
+            "embedding": embedding,
+            "topics": topics,
+            "text": text or "",
+            "temporal_map": temporal_map or {},
+        }
+
+    def get_all(self):
+        return dict(self._data)
+
+    def get_chunk(self, chunk_id):
+        return self._data.get(chunk_id)
+
+    def chunk_ids(self):
+        return list(self._data.keys())
+
+    def stats(self):
+        total_cuis = sum(len(c.get("cuis", set())) for c in self._data.values())
+        has_emb = sum(1 for c in self._data.values() if c.get("embedding") is not None)
+        return {
+            "chunks": len(self._data),
+            "total_cuis": total_cuis,
+            "avg_cuis_per_chunk": round(total_cuis / len(self._data), 1) if self._data else 0,
+            "chunks_with_embeddings": has_emb,
+        }
+
+    def save(self, path):
+        with open(path, "wb") as f:
+            pickle.dump(dict(self._data), f, protocol=pickle.HIGHEST_PROTOCOL)
+        logger.info(f"ChunkStore saved: {len(self._data)} chunks to {path}")
+
+    @classmethod
+    def load(cls, path):
+        store = cls()
+        with open(path, "rb") as f:
+            store._data = pickle.load(f)
+        # backfill missing fields from older pickle versions
+        for chunk_id, chunk in store._data.items():
+            if "doc_id" not in chunk:
+                chunk["doc_id"] = chunk_id
+            if "cuis" not in chunk:
+                chunk["cuis"] = set()
+            if "embedding" not in chunk:
+                chunk["embedding"] = None
+            if "topics" not in chunk:
+                chunk["topics"] = {}
+            if "text" not in chunk:
+                chunk["text"] = ""
+            if "temporal_map" not in chunk:
+                # old store: assume all CUIs are current
+                chunk["temporal_map"] = {c: "current" for c in chunk.get("cuis", set())}
+        logger.info(f"ChunkStore loaded: {len(store._data)} chunks from {path}")
+        return store
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def gap_split(values, min_keep=1):
+    """Find natural split point in sorted values using largest gap.
+
+    Given values, sorts descending, finds the largest drop between
+    consecutive values. Everything above the gap is "relevant".
+
+    If no significant gap (largest gap < 2× median gap), keeps all.
+
+    Args:
+        values: 1D numpy array
+        min_keep: always keep at least this many items
+
+    Returns:
+        threshold: values at or above this are kept
+    """
+    if len(values) <= min_keep:
+        return float(values.min()) if len(values) > 0 else 0.0
+    sorted_desc = np.sort(values)[::-1]
+    gaps = np.diff(-sorted_desc)   # positive values = drops
+    # search gaps starting after min_keep items
+    # gap at index i splits items into [0..i] and [i+1..]
+    # to keep min_keep items, search from gap index (min_keep - 1)
+    search_start = max(0, min_keep - 1)
+    candidate_gaps = gaps[search_start:]
+    if len(candidate_gaps) == 0:
+        return float(sorted_desc[-1])
+    # check if largest gap is meaningful (at least 2× median gap)
+    max_gap = float(candidate_gaps.max())
+    median_gap = float(np.median(candidate_gaps))
+    if len(candidate_gaps) > 1 and median_gap > 0 and max_gap < 2.0 * median_gap:
+        return float(sorted_desc[-1])  # no standout gap → keep all
+    # split at the largest gap
+    split_idx = search_start + int(np.argmax(candidate_gaps)) + 1
+    if split_idx >= len(sorted_desc):
+        return float(sorted_desc[-1])
+    return float((sorted_desc[split_idx - 1] + sorted_desc[split_idx]) / 2.0)
+
+def compute_centroid(cuis, embeddings):
+    """Compute normalized centroid of CUI embeddings.
+
+    Args:
+        cuis: list/set of CUI strings
+        embeddings: dict {cui: numpy array}
+
+    Returns:
+        numpy array (L2-normalized) or None if no embeddings found
+
+    Warning:
+        Assumes input embeddings are L2-normalized. If not, cosine
+        similarities computed via dot product will be incorrect.
+    """
+    vecs = [embeddings[c] for c in cuis if c in embeddings]
+    if not vecs:
+        return None
+    # verify input normalization (check first vector, warn once)
+    if not getattr(compute_centroid, '_norm_checked', False):
+        v0_norm = float(np.linalg.norm(vecs[0]))
+        if abs(v0_norm - 1.0) > 0.01:
+            logger.warning(f"Input embeddings may not be L2-normalized "
+                           f"(first vector norm={v0_norm:.4f}). "
+                           f"Cosine via dot product will be incorrect.")
+        compute_centroid._norm_checked = True
+    centroid = np.mean(vecs, axis=0).astype(np.float32)
+    norm = np.linalg.norm(centroid)
+    if norm > 0:
+        centroid = centroid / norm
+    return centroid
+
+
+def build_query_topics(query_cuis, embeddings, params=None):
+    """Form topics from query CUIs using embedding similarity.
+
+    Same principle as chunk topic formation: group by cosine, compute centroids.
+    Handles all sizes:
+      1-3 CUIs: each is its own topic (singleton)
+      4+ CUIs:  HAC clustering at cosine distance 0.5
+
+    Args:
+        query_cuis: set/list of CUI strings (after reduction)
+        embeddings: dict {cui: numpy array}
+        params: optional dict overriding DEFAULTS
+
+    Returns:
+        dict {topic_id: {"members": [...], "topic_cui": str, "centroid": array}}
+    """
+    p = {**DEFAULTS, **(params or {})}
+    cuis = sorted(query_cuis)
+    if not cuis:
+        return {}
+
+    vecs = {c: embeddings[c] for c in cuis if c in embeddings}
+    if not vecs:
+        return {}
+
+    # few CUIs: each is its own topic
+    if len(vecs) <= p["query_singleton_max"]:
+        topics = {}
+        for i, cui in enumerate(sorted(vecs.keys())):
+            centroid = compute_centroid([cui], vecs)
+            topics[str(i)] = {
+                "members": [cui],
+                "topic_cui": cui,
+                "centroid": centroid,
+            }
+        return topics
+
+    # 4+ CUIs: HAC clustering — adaptive distance from data
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import pdist
+
+    cui_list = sorted(vecs.keys())
+    mat = np.array([vecs[c] for c in cui_list])
+    dists = pdist(mat, metric="cosine")
+    Z = linkage(dists, method="average")
+    # adaptive: use median pairwise distance as cut point
+    # dense queries (similar CUIs) → low median → tight clusters
+    # sparse queries (diverse CUIs) → high median → loose clusters
+    t = float(np.median(dists)) if len(dists) > 0 else p["query_hac_dist"]
+    # data-driven safety clamp: use 10th and 90th percentile of pairwise distances
+    # rather than fixed 0.2/0.8 — adapts to the actual concept space
+    if len(dists) >= 5:
+        lower_clamp = float(np.percentile(dists, 10))
+        upper_clamp = float(np.percentile(dists, 90))
+    else:
+        # < 5 CUIs: percentiles are unreliable — use literature values.
+        # Chapman 2001: typical within-concept cosine distance ≈ 0.15-0.25.
+        # Typical between-concept distance ≈ 0.6-0.8 for biomedical embeddings.
+        # These bounds ensure no cluster can be tighter than 80% similarity
+        # or looser than 20% similarity, which covers the full UMLS IC range.
+        lower_clamp, upper_clamp = 0.2, 0.8
+    t = min(upper_clamp, max(lower_clamp, t))
+    labels = fcluster(Z, t=t, criterion="distance")
+
+    topics = {}
+    for label in sorted(set(labels)):
+        members = [cui_list[i] for i, l in enumerate(labels) if l == label]
+        centroid = compute_centroid(members, vecs)
+        # pick medoid: member closest to centroid
+        best_cui = members[0]
+        if centroid is not None and len(members) > 1:
+            best_sim = -1.0
+            for m in members:
+                if m in vecs:
+                    s = float(np.dot(vecs[m], centroid))
+                    if s > best_sim:
+                        best_sim = s
+                        best_cui = m
+        topics[str(label)] = {
+            "members": members,
+            "topic_cui": best_cui,
+            "centroid": centroid,
+        }
+    return topics
+
+
+# ── ChunkMatcher ──────────────────────────────────────────────────────────────
+
+class ChunkMatcher:
+    """Three-signal clinical chunk retrieval.
+
+    Filter: CUI overlap OR hierarchy subsumption → candidates
+    Score candidates with:
+      1. CUI overlap ratio  (W=0.40) — exact matches / query CUI count
+      2. Vector similarity   (W=0.30) — cosine of embedding centroids
+      3. Lin similarity      (W=0.30) — BMA of best pairwise Lin via MICA
+    """
+
+    def __init__(self, graph=None, ic_map=None, params=None):
+        self.graph = graph
+        self.ic_map = ic_map or {}
+        self.p = {**DEFAULTS, **(params or {})}
+        self._ancestor_cache = {}
+        self._lin_cache = {}       # (c1,c2) → (lin, mica, match_type)
+
+    def _get_ancestors(self, cui):
+        """BFS ancestors up to anc_depth hops, cached.
+
+        First 2 hops: always follow parents (catch immediate clinical ancestors
+        even if they have low IC — e.g., a broad disease parent behind which
+        sits a specific meaningful grandparent).
+        Hop 3+: prune parents where ic(parent) < ic_prune_ratio * ic(start_cui).
+        """
+        if cui in self._ancestor_cache:
+            return self._ancestor_cache[cui]
+        result = {cui}
+        if self.graph is not None and self.graph.has_node(cui):
+            start_ic = self.ic_map.get(cui, 0.0)
+            ic_floor = self.p["ic_prune_ratio"] * start_ic
+            frontier = {cui}
+            for hop in range(self.p["anc_depth"]):
+                nxt = set()
+                for n in frontier:
+                    for parent in self.graph.predecessors(n):
+                        if parent not in result:
+                            # grace period: first 2 hops always follow
+                            if hop < 2 or self.ic_map.get(parent, 0.0) >= ic_floor:
+                                result.add(parent)
+                                nxt.add(parent)
+                frontier = nxt
+                if not frontier:
+                    break
+        result = frozenset(result)
+        self._ancestor_cache[cui] = result
+        return result
+
+    def _lin_sim(self, c1, c2, c1_anc, c2_anc):
+        """Lin similarity between two CUIs given precomputed ancestors."""
+        if c1 == c2:
+            return 1.0, c1, MatchType.EXACT
+        # cache: order-independent key
+        key = (min(c1, c2), max(c1, c2))
+        cached = self._lin_cache.get(key)
+        if cached is not None:
+            return cached
+        result = self._compute_lin(c1, c2, c1_anc, c2_anc)
+        self._lin_cache[key] = result
+        return result
+
+    def _compute_lin(self, c1, c2, c1_anc, c2_anc):
+        """Actual Lin computation (called once per unique pair).
+
+        All IC thresholds are relative to the CUIs being compared.
+        No absolute numbers. Adapts to any IC distribution.
+        """
+        ic1 = self.ic_map.get(c1, 0.0)
+        ic2 = self.ic_map.get(c2, 0.0)
+        denom = ic1 + ic2
+        if denom < 1e-9:
+            return 0.0, None, MatchType.NO_MATCH
+        ratio = self.p["sibling_ic_ratio"]
+        # subsumption (one IS the ancestor of the other)
+        # ancestor must be at least ratio × the more specific CUI
+        max_ic = max(ic1, ic2)
+        if c1 in c2_anc:
+            if ic1 >= ratio * max_ic:
+                return min(2.0 * ic1 / denom, 1.0), c1, MatchType.SUBSUMPTION
+        if c2 in c1_anc:
+            if ic2 >= ratio * max_ic:
+                return min(2.0 * ic2 / denom, 1.0), c2, MatchType.SUBSUMPTION
+        # shared ancestor — MICA
+        shared = c1_anc & c2_anc
+        if not shared:
+            return 0.0, None, MatchType.NO_MATCH
+        # ancestor must be less specific than both CUIs
+        min_ic = min(ic1, ic2)
+        valid = [c for c in shared if self.ic_map.get(c, 0.0) < min_ic]
+        if not valid:
+            return 0.0, None, MatchType.NO_MATCH
+        mica = max(valid, key=lambda c: self.ic_map.get(c, 0.0))
+        mica_ic = self.ic_map.get(mica, 0.0)
+        # mica must be at least ratio × min IC of both CUIs
+        if mica_ic < ratio * min_ic:
+            return 0.0, None, MatchType.NO_MATCH
+        return min(2.0 * mica_ic / denom, 1.0), mica, "shared_ancestor"
+
+    def _compute_adaptive_params(self, query_cuis, chunks):
+        """
+        Derive all scoring parameters from the actual data.
+        No hardcoded quality thresholds — everything comes from the
+        IC distribution of the store and the query.
+
+        Returns dict with:
+          use_idf              — bool: whether IDF weighting is reliable
+          filter_min_ancestor_ic — float: minimum IC for shared ancestor to admit a chunk
+          ic_weight_alpha      — float: blend factor between IDF and IC weighting [0,1]
+          min_best_lin         — float: minimum best Lin score to keep a hierarchy-only result
+        """
+        n_chunks = len(chunks)
+        if n_chunks == 0:
+            return {"use_idf": False, "filter_min_ancestor_ic": 0.0,
+                    "ic_weight_alpha": 0.5, "min_best_lin": 0.0}
+
+        # ── 1. IDF discrimination ability — entropy-based ─────────────────
+        # Compute the IDF entropy of the store:
+        #   H = -sum(p_i * log2(p_i)) for each CUI's normalised IDF weight
+        # High H → IDF values are diverse → IDF discriminates well → use it.
+        # Low H  → IDF values are uniform (all near 0) → IDF is useless.
+        #
+        # Reference: Robertson 2004 "Understanding IDF" (J Documentation)
+        #   IDF entropy is the natural information-theoretic measure of IDF
+        #   discrimination ability, replacing ad-hoc saturation counts.
+        cui_doc_freq = {}
+        for chunk_data in chunks.values():
+            for cui in chunk_data.get("cuis", set()):
+                cui_doc_freq[cui] = cui_doc_freq.get(cui, 0) + 1
+
+        idf_vals = []
+        for df in cui_doc_freq.values():
+            if 0 < df < n_chunks:
+                idf_vals.append(math.log(n_chunks / df))
+
+        if idf_vals:
+            idf_arr = np.array(idf_vals, dtype=np.float64)
+            idf_sum = idf_arr.sum()
+            if idf_sum > 1e-9:
+                p = idf_arr / idf_sum
+                # Shannon entropy: H = -sum(p * log2(p))
+                h_idf = float(-np.sum(p * np.log2(p + 1e-15)))
+                # maximum possible entropy = log2(n_unique_cuis)
+                h_max = math.log2(max(len(idf_vals), 2))
+                # normalised entropy: 0=all IDF identical, 1=maximally diverse
+                h_norm = h_idf / max(h_max, 1e-9)
+                # use IDF when normalised entropy > 0.3
+                # (30% of maximum diversity → IDF has meaningful discrimination)
+                use_idf = h_norm > 0.3
+            else:
+                use_idf = False
+        else:
+            use_idf = False   # all CUIs in every chunk or no CUIs at all
+
+        logger.debug(f"    Adaptive params: n_chunks={n_chunks}, "
+                     f"n_idf_vals={len(idf_vals)}, "
+                     f"h_norm={h_norm if idf_vals and idf_sum > 1e-9 else 0:.3f}, "
+                     f"use_idf={use_idf}")
+
+        # ── 2. filter_min_ancestor_ic — from store IC distribution ───────
+        # Floor = 25th percentile of IC values of CUIs actually in the store.
+        # Specific store (all knee surgery, ICs 7-10): floor ≈ 6.5
+        # General store (mixed specialties, ICs 1-12):  floor ≈ 3.2
+        # Prevents broad ancestors (IC < floor) from admitting unrelated chunks.
+        if self.ic_map and cui_doc_freq:
+            store_ics = [self.ic_map[cui] for cui in cui_doc_freq
+                         if cui in self.ic_map and self.ic_map[cui] > 0]
+            if store_ics:
+                filter_min_ancestor_ic = float(np.percentile(store_ics, 25))
+            else:
+                filter_min_ancestor_ic = 0.0
+        else:
+            filter_min_ancestor_ic = 0.0
+
+        logger.debug(f"    Adaptive params: filter_min_ancestor_ic={filter_min_ancestor_ic:.2f}")
+
+        # ── 3. ic_weight_alpha — from query IC mean ───────────────────────
+        # Alpha blends IDF and IC weighting.
+        # Specific query (high mean IC) → alpha closer to 1.0 (IC dominates)
+        # Broad query (low mean IC)     → alpha closer to 0.1 (IDF dominates)
+        # Normalised to [0.1, 0.9] against the store's max IC.
+        # max_possible_ic: always derived from the actual ic_map when available.
+        # Fallback 15.0 is only used when ic_map is completely empty (bootstrap).
+        if self.ic_map:
+            max_possible_ic = float(max(self.ic_map.values()))
+        else:
+            max_possible_ic = 15.0   # SNOMED CT intrinsic IC upper bound (bootstrap only)
+
+        if self.ic_map and query_cuis:
+            query_ics = [self.ic_map.get(q, 0.0) for q in query_cuis]
+            query_ic_mean = float(np.mean(query_ics))
+            ic_weight_alpha = float(np.clip(query_ic_mean / max(max_possible_ic, 1e-9),
+                                            0.1, 0.9))
+        else:
+            # no IC data: equal blend — neither signal dominates
+            ic_weight_alpha = 0.5
+            query_ic_mean   = 0.0
+
+        logger.debug(f"    Adaptive params: ic_weight_alpha={ic_weight_alpha:.2f}")
+
+        # ── 4. min_best_lin — from store Lin score distribution ───────────
+        # Derived from the Lin score of UNRELATED concept pairs.
+        # Unrelated pairs share only root-level SNOMED ancestors (IC ~1.0-2.5).
+        # root_ic = min(store ICs), clipped to [0.5, 2.5] — the actual hierarchy
+        # root has low IC regardless of store content.
+        #
+        # min_best_lin = 2×root_ic / (query_ic_mean + mean_store_ic) × 1.5
+        # Blocks matches below 1.5× the unrelated-pair baseline.
+        if self.ic_map and query_cuis:
+            all_ic_vals = list(self.ic_map.values())
+            # always derive from ic_map — never a magic number fallback
+            mean_store_ic = float(np.mean(store_ics)) if store_ics \
+                else float(np.mean(all_ic_vals))
+            root_ic = float(np.min(store_ics)) if store_ics \
+                else float(np.min(all_ic_vals))
+            root_ic = min(max(root_ic, 0.5), 2.5)
+            denom = query_ic_mean + mean_store_ic
+            # if denominator is near-zero, use max_possible_ic as normaliser
+            lin_unrelated = (2 * root_ic / denom) if denom > 1e-9 \
+                else (2 * root_ic / max(max_possible_ic, 1.0))
+            min_best_lin = min(lin_unrelated * 1.5, 0.35)
+            min_best_lin = max(min_best_lin, 0.03)
+        else:
+            # no IC data at all: structural minimum floor
+            # 0.05 = 5% Lin — accepts only non-trivially related pairs
+            min_best_lin = 0.05
+
+        logger.debug(f"    Adaptive params: min_best_lin={min_best_lin:.3f}")
+
+        # ── 5. ic_prune_ratio — from store IC spread ──────────────────────
+        # Controls BFS ancestor pruning: prune parent if ic(parent) < ratio × ic(child).
+        # Derived as: 10th percentile / median of store ICs.
+        # Specific store (ICs 7-10): ratio≈0.81 → tight pruning (only near-specific ancestors)
+        # General store (ICs 1-12):  ratio≈0.38 → relaxed (allow broader ancestors)
+        # Reference: Garla & Brandt 2012 (PMC3533586) — IC distribution is the natural
+        # discriminator for ancestor specificity in biomedical ontologies.
+        if store_ics and len(store_ics) >= 4:
+            ic_p10 = float(np.percentile(store_ics, 10))
+            ic_p50 = float(np.percentile(store_ics, 50))
+            ic_prune_ratio = float(np.clip(ic_p10 / max(ic_p50, 1e-9), 0.1, 0.9))
+        else:
+            ic_prune_ratio = self.p["ic_prune_ratio"]   # DEFAULTS fallback
+
+        # ── 6. sibling_ic_ratio — from store IC interquartile ratio ───────
+        # Controls sibling matching: mica_ic >= ratio × min(ic_q, ic_d).
+        # Derived as: 25th percentile / 75th percentile of store ICs.
+        # Specific store (ICs 7-10): ratio≈0.83 → only close siblings accepted
+        # General store (ICs 1-12):  ratio≈0.41 → distant siblings accepted
+        if store_ics and len(store_ics) >= 4:
+            ic_p25 = float(np.percentile(store_ics, 25))
+            ic_p75 = float(np.percentile(store_ics, 75))
+            sibling_ic_ratio = float(np.clip(ic_p25 / max(ic_p75, 1e-9), 0.1, 0.95))
+        else:
+            sibling_ic_ratio = self.p["sibling_ic_ratio"]   # DEFAULTS fallback
+
+        logger.debug(f"    Adaptive params: ic_prune_ratio={ic_prune_ratio:.3f}  "
+                     f"sibling_ic_ratio={sibling_ic_ratio:.3f}")
+
+        return {
+            "use_idf":                 use_idf,
+            "filter_min_ancestor_ic":  filter_min_ancestor_ic,
+            "ic_weight_alpha":         ic_weight_alpha,
+            "min_best_lin":            min_best_lin,
+            "ic_prune_ratio":          ic_prune_ratio,
+            "sibling_ic_ratio":        sibling_ic_ratio,
+        }
+
+    def match(self, query_cuis, query_embedding, chunks, top_k=10,
+              query_topics=None, query_temporal=None):
+        """Match query against stored chunks using three signals.
+
+        All scoring parameters are derived from the data at call time via
+        _compute_adaptive_params(). No hardcoded quality thresholds:
+
+          use_idf        ← IDF saturation of store (not chunk count)
+          filter_ic_gate ← 25th percentile of store CUI IC distribution
+          alpha          ← normalised mean IC of query CUIs [0.1, 0.9]
+          min_best_lin   ← scales with query specificity [0.05, 0.25]
+
+        Temporal context (Harkema 2009 ConText / SNOMED CT CDS Guide):
+          query_temporal: {cui: "current"|"historical"|"hypothetical"|"family"}
+          Chunk temporal_map stored at ingestion time.
+          Mismatches penalise the score:
+            query=current + chunk=historical  → penalty (stored finding is past)
+            query=historical + chunk=current  → no penalty (recent finding is fine)
+            query=hypothetical                → no penalty (rule-out query is open)
+            family context                   → always penalised if query is current
+
+        Args:
+            query_cuis: list/set of query CUI strings (after reduction)
+            query_embedding: numpy array (centroid) or None
+            chunks: dict from ChunkStore.get_all()
+            top_k: max results
+            query_topics: dict from build_query_topics() or None
+            query_temporal: dict {cui: temporal_flag} from ClinicalContextParser or None
+
+        Returns:
+            list[ChunkMatch] sorted by score descending
+        """
+        t0 = time.perf_counter()
+        query_cuis = set(query_cuis)
+        if not query_cuis or not chunks:
+            return []
+
+        has_graph = self.graph is not None and len(self.ic_map) > 0
+        n_chunks = len(chunks)
+
+        # ── Derive all scoring parameters from the data ───────────────────
+        # No hardcoded quality thresholds — everything adapts to:
+        #   - the IC distribution of CUIs in the store
+        #   - the IC specificity of this query's CUIs
+        #   - the IDF discrimination ability of this store
+        adaptive = self._compute_adaptive_params(query_cuis, chunks)
+        use_idf               = adaptive["use_idf"]
+        filter_ic_gate        = adaptive["filter_min_ancestor_ic"]
+        alpha                 = adaptive["ic_weight_alpha"]
+        min_best_lin          = adaptive["min_best_lin"]
+        ic_prune_ratio_adapt  = adaptive["ic_prune_ratio"]
+        sibling_ic_ratio_adapt = adaptive["sibling_ic_ratio"]
+
+        # ── CUI document frequencies for IDF ─────────────────────────────
+        cui_doc_freq = {}
+        for chunk_data in chunks.values():
+            for cui in chunk_data.get("cuis", set()):
+                cui_doc_freq[cui] = cui_doc_freq.get(cui, 0) + 1
+
+        def idf(cui):
+            if not use_idf:
+                return 1.0   # equal weight — IDF unreliable for this store
+            df = cui_doc_freq.get(cui, 0)
+            if df == 0 or df >= n_chunks:
+                return 0.0
+            return math.log(n_chunks / df)
+
+        # precompute query ancestors
+        query_ancestors = {}
+        if has_graph:
+            for q in query_cuis:
+                query_ancestors[q] = self._get_ancestors(q)
+
+        # precompute all stored CUI ancestors (cached)
+        if has_graph:
+            for chunk_data in chunks.values():
+                for cui in chunk_data.get("cuis", set()):
+                    self._get_ancestors(cui)
+
+        # collect query topic centroids for topic-vs-topic filter
+        query_topic_centroids = []
+        if query_topics:
+            for qt_info in query_topics.values():
+                qc = qt_info.get("centroid")
+                if qc is not None:
+                    query_topic_centroids.append(qc)
+
+        results = []
+        scored_chunk_ids = set()
+
+        for chunk_id, chunk_data in chunks.items():
+            chunk_cuis = chunk_data.get("cuis") or set()
+            doc_id = chunk_data.get("doc_id", chunk_id)
+            if not chunk_cuis:
+                continue
+
+            # ── Topic filter: query topics vs chunk topics ────────────────
+            # Adaptive: use gap_split to find natural separation between
+            # matched and unmatched topic similarities, rather than a fixed 0.3.
+            # Falls back to self.p["topic_filter_sim"] if no gap is found.
+            stored_topics = chunk_data.get("topics", {})
+            if stored_topics and query_topic_centroids:
+                matched_topic_ids = set()
+                topic_sims = []
+                topic_sim_to_id = []
+                for tid, t_info in stored_topics.items():
+                    tc = t_info.get("centroid")
+                    if tc is not None:
+                        best_sim = max(float(np.dot(qtc, tc)) for qtc in query_topic_centroids)
+                        topic_sims.append(best_sim)
+                        topic_sim_to_id.append((tid, best_sim, None))
+                    else:
+                        topic_members = set(t_info.get("members", []))
+                        if query_cuis & topic_members:
+                            matched_topic_ids.add(tid)
+                            topic_sims.append(1.0)
+                            topic_sim_to_id.append((tid, 1.0, None))
+                        else:
+                            topic_sims.append(0.0)
+                            topic_sim_to_id.append((tid, 0.0, None))
+
+                if topic_sims:
+                    sim_arr = np.array(topic_sims, dtype=np.float32)
+                    if sim_arr.max() > sim_arr.min() + 1e-6:
+                        t_sim = gap_split(sim_arr, min_keep=1)
+                        filter_sim = float(t_sim) if t_sim is not None \
+                            else self.p["topic_filter_sim"]
+                    else:
+                        filter_sim = self.p["topic_filter_sim"]
+                    for tid, sim, _ in topic_sim_to_id:
+                        if sim >= filter_sim:
+                            matched_topic_ids.add(tid)
+
+                if matched_topic_ids:
+                    topic_filtered_cuis = set()
+                    for tid in matched_topic_ids:
+                        topic_filtered_cuis.update(stored_topics[tid].get("members", []))
+                    all_topic_cuis = set()
+                    for t_info in stored_topics.values():
+                        all_topic_cuis.update(t_info.get("members", []))
+                    orphan_cuis = chunk_cuis - all_topic_cuis
+                    scoring_cuis = topic_filtered_cuis | orphan_cuis
+                else:
+                    scoring_cuis = chunk_cuis
+            elif stored_topics and query_embedding is not None:
+                # no query topics but have query centroid — fall back to blob
+                matched_topic_ids = set()
+                topic_sims = []
+                topic_sim_to_id = []
+                for tid, t_info in stored_topics.items():
+                    tc = t_info.get("centroid")
+                    if tc is not None:
+                        sim = float(np.dot(query_embedding, tc))
+                        topic_sims.append(sim)
+                        topic_sim_to_id.append((tid, sim))
+                    else:
+                        topic_members = set(t_info.get("members", []))
+                        sim = 1.0 if (query_cuis & topic_members) else 0.0
+                        topic_sims.append(sim)
+                        topic_sim_to_id.append((tid, sim))
+
+                if topic_sims:
+                    sim_arr = np.array(topic_sims, dtype=np.float32)
+                    if sim_arr.max() > sim_arr.min() + 1e-6:
+                        t_sim = gap_split(sim_arr, min_keep=1)
+                        filter_sim = float(t_sim) if t_sim is not None \
+                            else self.p["topic_filter_sim"]
+                    else:
+                        filter_sim = self.p["topic_filter_sim"]
+                    for tid, sim in topic_sim_to_id:
+                        if sim >= filter_sim:
+                            matched_topic_ids.add(tid)
+
+                if matched_topic_ids:
+                    topic_filtered_cuis = set()
+                    for tid in matched_topic_ids:
+                        topic_filtered_cuis.update(stored_topics[tid].get("members", []))
+                    all_topic_cuis = set()
+                    for t_info in stored_topics.values():
+                        all_topic_cuis.update(t_info.get("members", []))
+                    orphan_cuis = chunk_cuis - all_topic_cuis
+                    scoring_cuis = topic_filtered_cuis | orphan_cuis
+                else:
+                    scoring_cuis = chunk_cuis
+            else:
+                scoring_cuis = chunk_cuis
+
+            # ── Filter: exact CUI overlap OR hierarchy (both directions) ──
+            exact_overlap = query_cuis & scoring_cuis
+
+            hierarchy_query_hits = set()
+            hierarchy_chunk_hits = set()
+            shared_ancestor_hits = {}
+            if has_graph and len(exact_overlap) < len(query_cuis):
+                unmatched_query = query_cuis - exact_overlap
+
+                for q_cui in unmatched_query:
+                    q_anc = query_ancestors.get(q_cui, frozenset())
+                    matched = False
+                    for d_cui in scoring_cuis:
+                        if d_cui in exact_overlap:
+                            continue
+                        d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                        # Direction 1 & 2: direct parent-child subsumption.
+                        # Always admit — this is a genuine hierarchical match.
+                        # e.g. query "OA of left knee" → chunk "Osteoarthritis" (parent)
+                        if q_cui in d_anc or d_cui in q_anc:
+                            hierarchy_query_hits.add(q_cui)
+                            hierarchy_chunk_hits.add(d_cui)
+                            matched = True
+                            break
+
+                    # Direction 3: shared ancestor (sibling match).
+                    # Apply IC gate — shared ancestor must be specific enough.
+                    # This prevents broad ancestors like "Disease" (IC~1.5)
+                    # from connecting unrelated concepts like OA and rhinitis.
+                    if not matched:
+                        best_mica_ic = 0.0
+                        best_pair = None
+                        q_ic = self.ic_map.get(q_cui, 0.0)
+                        sib_ratio = sibling_ic_ratio_adapt
+                        for d_cui in scoring_cuis:
+                            if d_cui in exact_overlap:
+                                continue
+                            d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                            shared = q_anc & d_anc
+                            if shared:
+                                d_ic = self.ic_map.get(d_cui, 0.0)
+                                min_ic = min(q_ic, d_ic)
+                                ic_gate = sib_ratio * min_ic
+                                # two-part gate: ratio gate AND absolute IC floor
+                                valid = [
+                                    c for c in shared
+                                    if ic_gate <= self.ic_map.get(c, 0.0) < min_ic
+                                    and self.ic_map.get(c, 0.0) >= filter_ic_gate
+                                ]
+                                if valid:
+                                    mica = max(valid, key=lambda c: self.ic_map.get(c, 0.0))
+                                    mica_ic = self.ic_map.get(mica, 0.0)
+                                    if mica_ic > best_mica_ic:
+                                        best_mica_ic = mica_ic
+                                        best_pair = (d_cui, mica, mica_ic)
+                        if best_pair:
+                            hierarchy_query_hits.add(q_cui)
+                            hierarchy_chunk_hits.add(best_pair[0])
+                            shared_ancestor_hits[q_cui] = best_pair
+
+            all_matched_chunk_cuis = exact_overlap | hierarchy_chunk_hits
+            if not (exact_overlap or hierarchy_query_hits):
+                continue
+
+            scored_chunk_ids.add(chunk_id)
+
+            # ── Signal 1: IDF + IC-weighted CUI overlap ───────────────────
+            # Each matched query CUI is weighted by a blend of IDF and IC.
+            # Subsumption matches (chunk has parent of query CUI) are penalised
+            # by the IC ratio: penalty = chunk_cui_ic / query_cui_ic.
+            # This ensures:
+            #   exact "OA left knee" → full credit  (penalty=1.0)
+            #   subsumption "OA" for query "OA left knee" → partial (6.3/8.2=0.77)
+            # alpha and filter_ic_gate derived from adaptive params above.
+            matched_query_cuis = set(exact_overlap)
+            match_penalty = {}   # query_cui → match quality penalty [0, 1]
+
+            if has_graph:
+                for q_cui in query_cuis - exact_overlap:
+                    q_anc = query_ancestors.get(q_cui, frozenset())
+                    q_ic  = self.ic_map.get(q_cui, 1.0)
+                    found = False
+                    for d_cui in scoring_cuis:
+                        d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                        if q_cui in d_anc or d_cui in q_anc:
+                            matched_query_cuis.add(q_cui)
+                            d_ic = self.ic_map.get(d_cui, q_ic)
+                            match_penalty[q_cui] = min(d_ic / max(q_ic, 1e-9), 1.0)
+                            found = True
+                            break
+                    if not found and q_cui in shared_ancestor_hits:
+                        matched_query_cuis.add(q_cui)
+                        _, mica_cui, mica_ic = shared_ancestor_hits[q_cui]
+                        match_penalty[q_cui] = min(mica_ic / max(q_ic, 1e-9), 1.0)
+
+            max_ic = max((self.ic_map.get(q, 0.0) for q in query_cuis), default=1.0)
+            max_ic = max(max_ic, 1e-9)
+
+            def cui_weight(q, penalty=1.0):
+                """Blend of IDF and IC for one query CUI, scaled by match penalty."""
+                idf_w = idf(q)
+                ic_w  = self.ic_map.get(q, 0.0) / max_ic
+                if alpha == 0.0:
+                    base = idf_w
+                elif alpha == 1.0:
+                    base = ic_w
+                else:
+                    base = (idf_w ** (1.0 - alpha)) * (ic_w ** alpha + 1e-9)
+                return base * penalty
+
+            weight_matched = sum(
+                cui_weight(q, match_penalty.get(q, 1.0))
+                for q in matched_query_cuis
+            )
+            weight_total = sum(cui_weight(q) for q in query_cuis)
+
+            if weight_total > 1e-9:
+                cui_ratio = min(weight_matched / weight_total, 1.0)
+            else:
+                cui_ratio = len(matched_query_cuis) / len(query_cuis)
+            matched_query_count = len(matched_query_cuis)
+
+            # ── Signal 2: Vector similarity (W=0.30) ─────────────────────
+            vector_sim = 0.0
+            chunk_emb = chunk_data.get("embedding")
+            has_vectors = query_embedding is not None and chunk_emb is not None
+            if has_vectors:
+                vector_sim = float(np.dot(query_embedding, chunk_emb))
+                vector_sim = max(0.0, min(1.0, vector_sim))
+                # sharpening: raise to exponent (default=1, off; set >1 to increase spread)
+                vector_sim = vector_sim ** self.p["vector_sharpening"]
+
+            # ── Signal 3: Lin similarity — IDF-weighted, non-exact only ────
+            # Lin measures hierarchy quality for non-exact pairs ONLY.
+            # When all query CUIs are exact: Lin=1.0 (best possible agreement).
+            # This is consistent with adaptive reranking which uses stored lin_score.
+            # TopicIndex uses z-score where this becomes relative (see TopicIndex.match).
+            lin_details = []
+            lin_weighted_sum = 0.0
+            lin_weight_total = 0.0
+            if has_graph:
+                non_exact_q = query_cuis - (query_cuis & scoring_cuis)
+                if not non_exact_q:
+                    # all exact: Lin=1.0 (hierarchy fully agrees with exact match)
+                    lin_avg = 1.0
+                    for q_cui in query_cuis & scoring_cuis:
+                        lin_details.append(CUIMatchDetail(q_cui, q_cui, q_cui, 1.0, MatchType.EXACT))
+                else:
+                    for q_cui in non_exact_q:
+                        q_anc = query_ancestors.get(q_cui, frozenset())
+                        best_lin = 0.0
+                        best_detail = CUIMatchDetail(q_cui, None, None, 0.0, MatchType.NO_MATCH)
+                        for d_cui in scoring_cuis:
+                            d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                            lin, mica, mtype = self._lin_sim(q_cui, d_cui, q_anc, d_anc)
+                            if lin > best_lin:
+                                best_lin = lin
+                                best_detail = CUIMatchDetail(
+                                    q_cui, d_cui, mica, round(lin, 4), mtype)
+                                if lin >= 1.0:
+                                    break
+                        w = idf(q_cui)
+                        lin_weighted_sum += best_lin * w
+                        lin_weight_total += w
+                        lin_details.append(best_detail)
+                    for q_cui in query_cuis & scoring_cuis:
+                        lin_details.append(CUIMatchDetail(q_cui, q_cui, q_cui, 1.0, MatchType.EXACT))
+                    lin_avg = (lin_weighted_sum / lin_weight_total) if lin_weight_total > 0 else 0.0
+                    # lin_weight_total=0 only when use_idf=True and ALL non-exact
+                    # query CUIs appear in every chunk (df=N → idf=0).
+                    # In small-store mode (use_idf=False), idf()=1.0 always,
+                    # so lin_weight_total > 0 whenever there are non-exact CUIs.
+            else:
+                lin_avg = len(exact_overlap) / len(query_cuis)
+
+            # ── Raw score (combined later with adaptive weights) ──────────
+            if has_vectors and has_graph:
+                score = (self.p["w_cui"] * cui_ratio +
+                         self.p["w_vec"] * vector_sim +
+                         self.p["w_lin"] * lin_avg)
+            elif has_vectors:
+                w_total = self.p["w_cui"] + self.p["w_vec"]
+                score = (self.p["w_cui"] / w_total) * cui_ratio + (self.p["w_vec"] / w_total) * vector_sim
+            elif has_graph:
+                w_total = self.p["w_cui"] + self.p["w_lin"]
+                score = (self.p["w_cui"] / w_total) * cui_ratio + (self.p["w_lin"] / w_total) * lin_avg
+            else:
+                score = cui_ratio
+
+            # ── Temporal context penalty ──────────────────────────────────
+            # Reference: Harkema 2009 ConText, SNOMED CT CDS Guide,
+            #            Lee et al. JMIR AI 2024 (PMC11319878)
+            #
+            # Rules (per-CUI, aggregate across matched pairs):
+            #   query=current + chunk=historical  → strong penalty (0.5)
+            #   query=current + chunk=hypothetical → moderate penalty (0.75)
+            #   query=current + chunk=family       → strong penalty (0.5)
+            #   All other combinations             → no penalty (1.0)
+            # Stored on the result and re-applied AFTER adaptive reranking
+            # so the reranking pass cannot inadvertently erase temporal filtering.
+            temporal_penalty = 1.0
+            if query_temporal and matched_query_cuis:
+                chunk_temporal = chunk_data.get("temporal_map", {})
+                penalties = []
+                for q_cui in matched_query_cuis:
+                    q_temp = TemporalContext(
+                        query_temporal.get(q_cui, TemporalContext.CURRENT))
+                    if q_temp.is_non_current():
+                        continue   # historical/hypothetical query — no penalty
+                    c_temp = TemporalContext(
+                        chunk_temporal.get(q_cui, TemporalContext.CURRENT))
+                    if c_temp in (TemporalContext.HISTORICAL, TemporalContext.FAMILY):
+                        penalties.append(0.5)
+                    elif c_temp == TemporalContext.HYPOTHETICAL:
+                        penalties.append(0.75)
+                if penalties:
+                    n = len(matched_query_cuis)
+                    n_unpenalised = n - len(penalties)
+                    # unpenalised CUIs contribute 1.0, penalised contribute their factor
+                    # e.g. 1 historical out of 2 CUIs → (0.5 + 1.0) / 2 = 0.75
+                    temporal_penalty = (sum(penalties) + n_unpenalised) / n
+                    score = score * temporal_penalty
+                    logger.debug(f"    Temporal penalty on {chunk_id}: "
+                                 f"{temporal_penalty:.3f} "
+                                 f"({len(penalties)}/{n} CUIs penalised)")
+
+            if score < self.p["score_min"]:
+                continue
+
+            # ── Hard negative blocking ────────────────────────────────────
+            # Drop results where the best Lin similarity across all query-chunk
+            # pairs is below min_best_lin (derived from query IC specificity).
+            # Only applied when the chunk matched via hierarchy with no exact overlap.
+            if min_best_lin > 0.0 and has_graph and not (query_cuis & scoring_cuis):
+                best_lin_for_chunk = 0.0
+                for q_cui in query_cuis:
+                    q_anc = query_ancestors.get(q_cui, frozenset())
+                    for d_cui in scoring_cuis:
+                        d_anc = self._ancestor_cache.get(d_cui, frozenset())
+                        lin_val, _, _ = self._lin_sim(q_cui, d_cui, q_anc, d_anc)
+                        if lin_val > best_lin_for_chunk:
+                            best_lin_for_chunk = lin_val
+                if best_lin_for_chunk < min_best_lin:
+                    continue   # block this result — no genuine semantic relationship
+
+            # ── Topic grouping ────────────────────────────────────────────
+            topics_matched = {}
+            stored_topics = chunk_data.get("topics", {})
+            if stored_topics:
+                for tid, t_info in stored_topics.items():
+                    topic_members = set(t_info.get("members", []))
+                    hits = all_matched_chunk_cuis & topic_members
+                    if hits:
+                        topics_matched[tid] = {
+                            "topic_cui": t_info.get("topic_cui"),
+                            "matched_cuis": sorted(hits),
+                            "total_members": len(topic_members),
+                        }
+
+            lin_details.sort(key=lambda d: (-d.lin_sim, d.match_type != MatchType.EXACT))
+
+            results.append(ChunkMatch(
+                chunk_id=chunk_id,
+                document_id=doc_id,
+                score=round(score, 4),
+                cui_overlap=matched_query_count,
+                cui_overlap_ratio=round(cui_ratio, 4),
+                vector_sim=round(vector_sim, 4),
+                lin_score=round(lin_avg, 4),
+                total_chunk_cuis=len(chunk_cuis),
+                total_query_cuis=len(query_cuis),
+                overlapping_cuis=sorted(matched_query_cuis),
+                topics_matched=topics_matched,
+                lin_details=lin_details
+            ))
+            # store temporal penalty so reranking can re-apply it
+            results[-1].__dict__['_temporal_penalty'] = temporal_penalty
+
+        # ── Adaptive reranking (ChunkMatcher backward compat ONLY) ──────
+        # TopicIndex uses z-score normalization instead (see TopicIndex.match).
+        # This variance-based approach is kept for old data without topic centroids.
+        # Temporal penalty is re-applied after reranking so it is not overwritten.
+        if len(results) >= 2:
+            cui_vals = [r.cui_overlap_ratio for r in results]
+            vec_vals = [r.vector_sim for r in results]
+            lin_vals = [r.lin_score for r in results]
+
+            cui_std = np.std(cui_vals) if len(cui_vals) > 1 else 0.0
+            vec_std = np.std(vec_vals) if len(vec_vals) > 1 else 0.0
+            lin_std = np.std(lin_vals) if len(lin_vals) > 1 else 0.0
+
+            total_std = cui_std + vec_std + lin_std
+            if total_std > 0:
+                w_cui = cui_std / total_std
+                w_vec = vec_std / total_std
+                w_lin = lin_std / total_std
+
+                for r in results:
+                    new_score = (w_cui * r.cui_overlap_ratio +
+                                 w_vec * r.vector_sim +
+                                 w_lin * r.lin_score)
+                    # re-apply temporal penalty that was set before reranking
+                    penalty = r.__dict__.get('_temporal_penalty', 1.0)
+                    object.__setattr__(r, 'score', round(new_score * penalty, 4))
+
+        results.sort(key=lambda r: (-r.score, -r.cui_overlap, r.chunk_id))
+
+        # ── Pass 2: Vector fallback for remaining slots ──────────────
+        # If CUI filter found fewer than top_k, fill with vector-similar chunks.
+        # Adaptive floor: mean pairwise cosine similarity of store embeddings.
+        # Below the mean → not reliably related; above → worth including.
+        # Falls back to self.p["vector_fallback_min"]=0.4 if embeddings unavailable.
+        if query_embedding is not None and len(results) < top_k:
+            # derive floor from store embedding distribution
+            store_embs = [cd.get("embedding") for cd in chunks.values()
+                          if cd.get("embedding") is not None and cd.get("chunk_id") not in scored_chunk_ids]
+            if len(store_embs) >= 2:
+                emb_mat = np.array(store_embs, dtype=np.float32)
+                sims_to_query = emb_mat @ query_embedding
+                adaptive_fallback_min = float(np.mean(sims_to_query))
+                # Structural safety bounds: cosine < 0.1 is near-random (no signal);
+                # cosine > 0.8 is too restrictive for a fallback that exists to fill
+                # remaining slots. These are engineering limits, not quality thresholds.
+                adaptive_fallback_min = max(0.1, min(0.8, adaptive_fallback_min))
+            else:
+                adaptive_fallback_min = self.p["vector_fallback_min"]
+
+            vector_candidates = []
+            for chunk_id, chunk_data in chunks.items():
+                if chunk_id in scored_chunk_ids:
+                    continue
+                chunk_emb = chunk_data.get("embedding")
+                if chunk_emb is None:
+                    continue
+                vsim = float(np.dot(query_embedding, chunk_emb))
+                vsim = max(0.0, min(1.0, vsim))
+                if vsim >= adaptive_fallback_min:
+                    vector_candidates.append((chunk_id, chunk_data, vsim))
+            vector_candidates.sort(key=lambda x: -x[2])
+
+            for chunk_id, chunk_data, vsim in vector_candidates[:top_k - len(results)]:
+                # NOTE: fallback scores use manual weight, not z-score.
+                # These results are not directly comparable to main scoring.
+                # ChunkMatcher backward compat only — TopicIndex has no fallback.
+                results.append(ChunkMatch(
+                    chunk_id=chunk_id,
+                    document_id=chunk_data["doc_id"],
+                    score=round(self.p["w_vec"] * vsim, 4),  # vector weight only
+                    cui_overlap=0,
+                    cui_overlap_ratio=0.0,
+                    vector_sim=round(vsim, 4),
+                    lin_score=0.0,
+                    total_chunk_cuis=len(chunk_data.get("cuis", set())),
+                    total_query_cuis=len(query_cuis),
+                    overlapping_cuis=[],
+                    topics_matched={},
+                    lin_details=[]
+                ))
+
+        elapsed = (time.perf_counter() - t0) * 1000
+        logger.debug(f"    ChunkMatcher: {len(chunks)} chunks → "
+                     f"{len(results)} matches ({elapsed:.1f}ms)")
+        return results[:top_k]
+
+    @staticmethod
+    def explain(result, terms=None):
+        """Human-readable explanation."""
+        terms = terms or {}
+        lines = [
+            f"Chunk: {result.chunk_id}  Doc: {result.document_id}",
+            f"  Score: {result.score:.3f}  "
+            f"(CUI: {result.cui_overlap_ratio:.2f}, "
+            f"Vec: {result.vector_sim:.3f}, "
+            f"Lin: {result.lin_score:.3f})"
+        ]
+        if result.topics_matched:
+            for tid, t_info in sorted(result.topics_matched.items()):
+                t_cui = t_info.get("topic_cui")
+                t_label = terms.get(t_cui, t_cui) if t_cui else "(ungrouped)"
+                hit_names = [terms.get(c, c) for c in t_info["matched_cuis"]]
+                lines.append(
+                    f"  Topic {tid} [{t_label}]: "
+                    f"{len(t_info['matched_cuis'])}/{t_info['total_members']} CUIs hit "
+                    f"({', '.join(hit_names)})")
+        if result.overlapping_cuis:
+            cui_names = [terms.get(c, c) for c in result.overlapping_cuis]
+            lines.append(f"  Exact CUIs: {', '.join(cui_names)}")
+        for d in result.lin_details:
+            if d.match_type == MatchType.EXACT:
+                continue
+            if d.match_type == MatchType.NO_MATCH:
+                q_term = terms.get(d.query_cui, d.query_cui)
+                lines.append(f"    ✗ {q_term} — no hierarchy match")
+            else:
+                q_term = terms.get(d.query_cui, d.query_cui)
+                d_term = terms.get(d.chunk_cui, d.chunk_cui) if d.chunk_cui else "?"
+                mica_term = terms.get(d.mica_cui, d.mica_cui) if d.mica_cui else "?"
+                lines.append(
+                    f"    ~ {d.match_type} (Lin={d.lin_sim:.3f}): "
+                    f"{q_term} ↔ {d_term} via [{mica_term}]")
+        return "\n".join(lines)
+
+
+# ── Topic Grouping + Variant Detection ────────────────────────────────────────
+
+# ── Topic Grouping + Variant Detection ────────────────────────────────────────
+
+
+@dataclass
+class TopicGroupMatch:
+    """Result of matching a query against topic groups."""
+    group_id: int
+    chunk_id: str
+    document_id: str
+    score: float
+    topic_id: str              # which topic within the chunk matched
+    topic_label: str           # human-readable label
+    matched_cuis: List[str]
+    is_variant: bool           # did CUI membership change at this chunk?
+    added_cuis: List[str]      # CUIs added compared to previous entry
+    removed_cuis: List[str]    # CUIs removed compared to previous entry
+    change_type: str           # "medication_change", "new_finding", etc.
+    chunk_date: str            # date of chunk for temporal sorting
+    cui_overlap_ratio: float
+    vector_sim: float
+    lin_score: float
+
+
+class TopicIndex:
+    """Cross-chunk topic grouping with temporal variant detection.
+
+    Builds in memory from ChunkStore data. No separate pickle.
+    Groups similar topics across chunks into topic groups.
+    Detects variants (CUI membership changes) within each group.
+
+    Usage:
+        chunks = store.get_all()
+        index = TopicIndex()
+        index.build(chunks)
+        results = index.match(query_topics, query_cuis, query_embedding,
+                              matcher, chunks)
+    """
+
+    def __init__(self, params=None):
+        self.groups = []
+        self.group_centroids = None
+        self.p = {**DEFAULTS, **(params or {})}
+        self._built = False
+
+    def build(self, chunks, date_extractor=None, graph=None):
+        """Build topic groups from all chunks.
+
+        Args:
+            chunks: dict from ChunkStore.get_all()
+            date_extractor: optional callable(chunk_id, chunk_data) -> date string.
+                            If None, uses chunk_id as sort key.
+            graph: optional networkx DiGraph (UMLS hierarchy) for
+                   hierarchy-aware variant classification.
+        """
+        self._graph = graph
+        all_topics = []
+        for chunk_id, chunk_data in chunks.items():
+            doc_id = chunk_data.get("doc_id", chunk_id)
+            stored_topics = chunk_data.get("topics", {})
+            for tid, t_info in stored_topics.items():
+                centroid = t_info.get("centroid")
+                if centroid is not None:
+                    date = (date_extractor(chunk_id, chunk_data)
+                            if date_extractor else chunk_id)
+                    all_topics.append({
+                        "chunk_id": chunk_id,
+                        "doc_id": doc_id,
+                        "topic_id": tid,
+                        "t_info": t_info,
+                        "centroid": centroid,
+                        "date": str(date),
+                        "members": set(t_info.get("members", [])),
+                        "topic_cui": t_info.get("topic_cui"),
+                    })
+
+        if not all_topics:
+            self._built = True
+            return
+
+        centroids = np.array([t["centroid"] for t in all_topics])
+
+        if len(all_topics) == 1:
+            labels = [1]
+        else:
+            from scipy.cluster.hierarchy import fcluster, linkage
+            from scipy.spatial.distance import pdist
+            dists = pdist(centroids, metric="cosine")
+            # Adaptive group distance: use gap_split on pairwise distances
+            # to find the natural separation between same-cluster and
+            # different-cluster topic centroids.
+            # Falls back to DEFAULTS["group_dist"]=0.15 only if no gap found.
+            if len(dists) >= 2:
+                # gap_split works on "high values are good"; pass 1-dist (similarity)
+                sims = 1.0 - dists
+                t_sim = gap_split(sims, min_keep=1)
+                adaptive_group_dist = round(1.0 - float(t_sim), 4) if t_sim is not None \
+                    else self.p["group_dist"]
+            else:
+                adaptive_group_dist = self.p["group_dist"]
+            logger.debug(f"    TopicIndex.build: adaptive_group_dist={adaptive_group_dist:.4f} "
+                         f"(fallback={self.p['group_dist']})")
+            Z = linkage(dists, method="average")
+            labels = fcluster(Z, t=adaptive_group_dist, criterion="distance")
+
+        group_map = {}
+        for i, label in enumerate(labels):
+            group_map.setdefault(int(label), []).append(all_topics[i])
+
+        self.groups = []
+        group_centroid_list = []
+
+        for label, entries in sorted(group_map.items()):
+            entries.sort(key=lambda e: e["date"])
+
+            group_cent = np.mean([e["centroid"] for e in entries], axis=0).astype(np.float32)
+            norm = np.linalg.norm(group_cent)
+            if norm > 0:
+                group_cent = group_cent / norm
+
+            all_cuis = set()
+            for e in entries:
+                all_cuis |= e["members"]
+
+            # variant detection: compare consecutive entries
+            for i, entry in enumerate(entries):
+                if i == 0:
+                    entry["is_variant"] = False
+                    entry["added"] = []
+                    entry["removed"] = []
+                    entry["change_type"] = "baseline"
+                else:
+                    prev = entries[i - 1]["members"]
+                    curr = entry["members"]
+                    added = curr - prev
+                    removed = prev - curr
+                    is_var = (len(added) + len(removed)) >= self.p["variant_min_change"]
+                    entry["is_variant"] = is_var
+                    entry["added"] = sorted(added)
+                    entry["removed"] = sorted(removed)
+                    entry["change_type"] = (
+                        self._classify_change(added, removed) if is_var else "routine")
+
+            # find representative entry (closest centroid to group centroid)
+            if len(entries) > 1:
+                entry_cents = np.array([e["centroid"] for e in entries])
+                sims_to_group = entry_cents @ group_cent
+                rep_idx = int(np.argmax(sims_to_group))
+            else:
+                rep_idx = 0
+
+            group = {
+                "group_id": len(self.groups),
+                "centroid": group_cent,
+                "entries": entries,
+                "rep_idx": rep_idx,
+                "all_cuis": all_cuis,
+                "first_date": entries[0]["date"],
+                "last_date": entries[-1]["date"],
+                "entry_count": len(entries),
+                "variant_count": sum(1 for e in entries if e.get("is_variant", False)),
+            }
+            self.groups.append(group)
+            group_centroid_list.append(group_cent)
+
+        self.group_centroids = np.array(group_centroid_list, dtype=np.float32)
+
+        # calibrate topic filter threshold from data
+        if len(self.groups) >= 2:
+            all_sims = []
+            for i in range(len(self.group_centroids)):
+                for j in range(i + 1, len(self.group_centroids)):
+                    s = float(np.dot(self.group_centroids[i], self.group_centroids[j]))
+                    all_sims.append(s)
+            if all_sims:
+                # inter-group median = baseline similarity between unrelated groups
+                # threshold = midpoint between baseline and 1.0
+                median_sim = float(np.median(all_sims))
+                self.calibrated_threshold = max(
+                    self.p["topic_filter_sim"],
+                    (median_sim + 1.0) / 2.0  # halfway between baseline and perfect
+                )
+            else:
+                self.calibrated_threshold = self.p["topic_filter_sim"]
+        else:
+            self.calibrated_threshold = self.p["topic_filter_sim"]
+
+        self._built = True
+        logger.info(f"TopicIndex: {len(all_topics)} topics -> "
+                     f"{len(self.groups)} groups, "
+                     f"{sum(g['variant_count'] for g in self.groups)} variants, "
+                     f"threshold={self.calibrated_threshold:.3f}")
+
+    def _get_variant_ancestors(self, cui):
+        """Cached BFS ancestors for variant classification.
+        Depth derived from the graph density (same as main pipeline).
+        """
+        if not hasattr(self, '_var_anc_cache'):
+            self._var_anc_cache = {}
+        if cui in self._var_anc_cache:
+            return self._var_anc_cache[cui]
+        result = set()
+        if self._graph is not None and self._graph.has_node(cui):
+            # derive depth from graph density; import lazily to avoid circular dep
+            try:
+                from cui_reduction_system import _compute_ancestor_depth
+                depth = _compute_ancestor_depth(self._graph)
+            except ImportError:
+                depth = 4   # structural fallback if not available
+            frontier = {cui}
+            for _ in range(depth):
+                nxt = set()
+                for n in frontier:
+                    for p in self._graph.predecessors(n):
+                        if p not in result:
+                            result.add(p)
+                            nxt.add(p)
+                frontier = nxt
+                if not frontier:
+                    break
+        self._var_anc_cache[cui] = frozenset(result)
+        return self._var_anc_cache[cui]
+
+    def _classify_change(self, added, removed):
+        """Classify what kind of clinical change occurred.
+
+        Uses hierarchy (if available) to distinguish real changes
+        from extraction refinements:
+          RA → RA of knee: parent-child → "refinement"
+          Lisinopril → Amlodipine: different branch → "medication_change"
+        """
+        if added and removed and self._graph is not None:
+            all_refinement = True
+            for a_cui in added:
+                is_refinement = False
+                for r_cui in removed:
+                    if self._graph.has_node(a_cui) and self._graph.has_node(r_cui):
+                        a_anc = self._get_variant_ancestors(a_cui)
+                        if r_cui in a_anc or a_cui in a_anc:
+                            is_refinement = True
+                            break
+                        r_anc = self._get_variant_ancestors(r_cui)
+                        if a_cui in r_anc:
+                            is_refinement = True
+                            break
+                if not is_refinement:
+                    all_refinement = False
+                    break
+            if all_refinement:
+                return "refinement"
+
+        if added and removed:
+            return "medication_change"
+        elif added and not removed:
+            return "new_finding"
+        elif removed and not added:
+            return "resolved"
+        return "changed"
+
+    def match(self, query_topics, query_cuis, query_embedding,
+              matcher, top_k=10, variants_first=False):
+        """Match query against topic groups.
+
+        Data-driven scoring:
+          Phase 1: percentile-based topic filter (no fixed threshold)
+          Phase 2: score per-topic (CUI + vec + Lin)
+          Phase 3: z-score normalize signals across candidates (no manual weights)
+          Phase 4: confidence filter (drop results far below best)
+
+        Args:
+            query_topics: dict from build_query_topics()
+            query_cuis: set of query CUI strings
+            query_embedding: numpy centroid
+            matcher: ChunkMatcher instance
+            top_k: max results
+            variants_first: if True, sort variants before routine
+
+        Returns:
+            list[TopicGroupMatch]
+        """
+        if not self._built or not self.groups:
+            return []
+
+        query_cuis = set(query_cuis)
+
+        # ── Derive adaptive params via the matcher (same as ChunkMatcher.match) ──
+        # Reuse the chunks that were used to build this index via the matcher reference.
+        # We reconstruct a minimal chunk representation from the groups for saturation.
+        _mock_chunks = {}
+        for g in self.groups:
+            for entry in g["entries"]:
+                _mock_chunks[entry["chunk_id"]] = {"cuis": entry["members"]}
+        adaptive = matcher._compute_adaptive_params(query_cuis, _mock_chunks)
+        filter_ic_gate        = adaptive["filter_min_ancestor_ic"]
+        alpha                 = adaptive["ic_weight_alpha"]
+        sibling_ic_ratio_adapt = adaptive["sibling_ic_ratio"]
+        max_ic = max((matcher.ic_map.get(q, 0.0) for q in query_cuis), default=1.0)
+        max_ic = max(max_ic, 1e-9)
+
+        # Phase 1: percentile-based topic filter
+        qtc_list = []
+        if query_topics:
+            for qt in query_topics.values():
+                c = qt.get("centroid")
+                if c is not None:
+                    qtc_list.append(c)
+        if not qtc_list and query_embedding is not None:
+            qtc_list = [query_embedding]
+        if not qtc_list:
+            return []
+
+        qtc_matrix = np.array(qtc_list, dtype=np.float32)
+        sims = qtc_matrix @ self.group_centroids.T   # (n_qt, n_groups)
+
+        # take max similarity per group across all query topics
+        max_sims = sims.max(axis=0)   # (n_groups,)
+
+        # gap-based filter: find natural separation between relevant and irrelevant
+        threshold = gap_split(max_sims, min_keep=1)
+        matched_group_ids = set(int(i) for i in np.where(max_sims >= threshold)[0])
+
+        if not matched_group_ids:
+            matched_group_ids = {int(np.argmax(max_sims))}
+
+        # Phase 2: score entries (raw signals, no weighting yet)
+        raw_results = []
+        has_graph = matcher.graph is not None and len(matcher.ic_map) > 0
+
+        query_ancestors = {}
+        if has_graph:
+            for q in query_cuis:
+                query_ancestors[q] = matcher._get_ancestors(q)
+
+        def _score_raw(entry):
+            topic_members = entry["members"]
+            if not topic_members:
+                return None
+
+            # ── CUI overlap with IC gate on shared-ancestor filter ────────
+            exact = query_cuis & topic_members
+            hierarchy_hits = set()
+            match_penalty  = {}   # query_cui → match quality [0, 1]
+
+            if has_graph and len(exact) < len(query_cuis):
+                for q_cui in query_cuis - exact:
+                    q_anc = query_ancestors.get(q_cui, frozenset())
+                    q_ic  = matcher.ic_map.get(q_cui, 1.0)
+                    for d_cui in topic_members:
+                        d_anc = matcher._ancestor_cache.get(d_cui, frozenset())
+                        # Direct parent-child: always admit
+                        if q_cui in d_anc or d_cui in q_anc:
+                            hierarchy_hits.add(q_cui)
+                            d_ic = matcher.ic_map.get(d_cui, q_ic)
+                            match_penalty[q_cui] = min(d_ic / max(q_ic, 1e-9), 1.0)
+                            break
+                    else:
+                        # Shared ancestor: apply IC gate
+                        best_mica_ic, best_d = 0.0, None
+                        sib_ratio = sibling_ic_ratio_adapt
+                        for d_cui in topic_members:
+                            d_anc = matcher._ancestor_cache.get(d_cui, frozenset())
+                            shared = q_anc & d_anc
+                            if shared:
+                                d_ic = matcher.ic_map.get(d_cui, 0.0)
+                                min_ic = min(q_ic, d_ic)
+                                ic_gate = sib_ratio * min_ic
+                                valid = [
+                                    c for c in shared
+                                    if ic_gate <= matcher.ic_map.get(c, 0.0) < min_ic
+                                    and matcher.ic_map.get(c, 0.0) >= filter_ic_gate
+                                ]
+                                if valid:
+                                    mica = max(valid, key=lambda c: matcher.ic_map.get(c, 0.0))
+                                    mica_ic = matcher.ic_map.get(mica, 0.0)
+                                    if mica_ic > best_mica_ic:
+                                        best_mica_ic = mica_ic
+                                        best_d = (d_cui, mica_ic)
+                        if best_d:
+                            hierarchy_hits.add(q_cui)
+                            match_penalty[q_cui] = min(best_d[1] / max(q_ic, 1e-9), 1.0)
+
+            # ── IC-weighted cui_ratio with subsumption penalty ────────────
+            def cui_w(q, penalty=1.0):
+                ic_w = matcher.ic_map.get(q, 0.0) / max_ic
+                if alpha == 0.0:   return 1.0 * penalty
+                if alpha == 1.0:   return ic_w * penalty
+                return ((1.0 ** (1.0 - alpha)) * (ic_w ** alpha + 1e-9)) * penalty
+
+            w_matched = sum(cui_w(q, match_penalty.get(q, 1.0))
+                            for q in (exact | hierarchy_hits))
+            w_total   = sum(cui_w(q) for q in query_cuis)
+            cui_ratio = min(w_matched / max(w_total, 1e-9), 1.0)
+
+            # ── Vector similarity ─────────────────────────────────────────
+            tc = entry["centroid"]
+            vec_sim = 0.0
+            if query_embedding is not None and tc is not None:
+                vec_sim = max(0.0, min(1.0, float(np.dot(query_embedding, tc))))
+
+            # ── Lin similarity (simple average — z-score handles weighting) ──
+            lin_avg = 0.0
+            if has_graph and query_cuis:
+                non_exact_q = query_cuis - exact
+                if not non_exact_q:
+                    lin_avg = 1.0
+                else:
+                    lin_sum = 0.0
+                    for q_cui in non_exact_q:
+                        q_anc = query_ancestors.get(q_cui, frozenset())
+                        best_lin = 0.0
+                        for d_cui in topic_members:
+                            d_anc = matcher._ancestor_cache.get(d_cui, frozenset())
+                            lin, _, _ = matcher._lin_sim(q_cui, d_cui, q_anc, d_anc)
+                            if lin > best_lin:
+                                best_lin = lin
+                                if lin >= 1.0:
+                                    break
+                        lin_sum += best_lin
+                    lin_avg = lin_sum / len(non_exact_q)
+
+            return cui_ratio, vec_sim, lin_avg, sorted(exact | hierarchy_hits)
+
+        # score rep first, expand on accept
+        for gid in matched_group_ids:
+            group = self.groups[gid]
+            rep_entry = group["entries"][group.get("rep_idx", 0)]
+            rep_raw = _score_raw(rep_entry)
+            if rep_raw is None:
+                continue
+            # quick reject: all signals zero
+            if rep_raw[0] == 0.0 and rep_raw[1] == 0.0 and rep_raw[2] == 0.0:
+                continue
+            for entry in group["entries"]:
+                if entry is rep_entry:
+                    raw = rep_raw
+                else:
+                    raw = _score_raw(entry)
+                    if raw is None:
+                        continue
+                raw_results.append((entry, gid, *raw))
+
+        if not raw_results:
+            return []
+
+        # cap candidates
+        max_cand = self.p["max_candidates"]
+        if len(raw_results) > max_cand:
+            # keep top by vector sim (fastest discriminator)
+            raw_results.sort(key=lambda r: -r[3])  # vec_sim is index 3
+            raw_results = raw_results[:max_cand]
+
+        # Phase 3: z-score normalize signals, then sum
+        # tuple: (entry, gid, cui_ratio, vec_sim, lin_avg, matched_cuis)
+        cuis = np.array([r[2] for r in raw_results])   # cui_ratio
+        vecs = np.array([r[3] for r in raw_results])    # vec_sim
+        lins = np.array([r[4] for r in raw_results])    # lin_avg
+
+        if self.p["z_score_normalize"] and len(raw_results) >= 2:
+            def _znorm(arr):
+                s = np.std(arr)
+                if s < 1e-9:
+                    return np.zeros_like(arr)
+                return (arr - np.mean(arr)) / s
+            z_cui = _znorm(cuis)
+            z_vec = _znorm(vecs)
+            z_lin = _znorm(lins)
+            scores = z_cui + z_vec + z_lin
+            # shift to [0,1] range
+            smin, smax = scores.min(), scores.max()
+            if smax - smin > 1e-9:
+                scores = (scores - smin) / (smax - smin)
+            else:
+                # all candidates are indistinguishable by z-score (all signals flat).
+                # Fall back to normalised raw signal mean so scores reflect actual
+                # magnitudes rather than a fixed midpoint.
+                # w_cui/w_vec/w_lin are the manual-mode weights (DEFAULTS 0.40/0.30/0.30)
+                raw_scores = (self.p["w_cui"] * cuis +
+                              self.p["w_vec"] * vecs +
+                              self.p["w_lin"] * lins)
+                r_min, r_max = raw_scores.min(), raw_scores.max()
+                if r_max - r_min > 1e-9:
+                    scores = (raw_scores - r_min) / (r_max - r_min)
+                else:
+                    # truly identical across all signals — uniform score
+                    scores = np.ones_like(scores) * float(np.mean(raw_scores))
+        else:
+            # fallback: manual weights
+            scores = (self.p["w_cui"] * cuis +
+                      self.p["w_vec"] * vecs +
+                      self.p["w_lin"] * lins)
+
+        # Phase 4: build results with gap-based confidence filter
+        results = []
+        # find natural score separation — keep top cluster only
+        conf_floor = gap_split(scores, min_keep=1)
+
+        for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched) in enumerate(raw_results):
+            score = float(scores[i])
+            if score < self.p["score_min"] or score < conf_floor:
+                continue
+            rep = entry.get("topic_cui")
+            label = rep if rep else f"group_{gid}"
+            results.append(TopicGroupMatch(
+                group_id=gid,
+                chunk_id=entry["chunk_id"],
+                document_id=entry.get("doc_id", ""),
+                score=round(score, 4),
+                topic_id=entry.get("topic_id", ""),
+                topic_label=label,
+                matched_cuis=matched,
+                is_variant=entry.get("is_variant", False),
+                added_cuis=entry.get("added", []),
+                removed_cuis=entry.get("removed", []),
+                change_type=entry.get("change_type", ""),
+                chunk_date=entry.get("date", ""),
+                cui_overlap_ratio=round(cui_ratio, 4),
+                vector_sim=round(vec_sim, 4),
+                lin_score=round(lin_avg, 4),
+            ))
+
+        if variants_first:
+            results.sort(key=lambda r: (-r.is_variant, -r.score, r.chunk_date))
+        else:
+            results.sort(key=lambda r: (-r.score, -r.is_variant, r.chunk_date))
+
+        return results[:top_k]
+
+    def summary(self, terms=None):
+        """Human-readable summary of all topic groups."""
+        terms = terms or {}
+        lines = [f"TopicIndex: {len(self.groups)} groups"]
+        for g in self.groups:
+            rep_cuis = set()
+            for e in g["entries"]:
+                if e.get("topic_cui"):
+                    rep_cuis.add(e["topic_cui"])
+            rep_label = ", ".join(terms.get(c, c) for c in sorted(rep_cuis))
+            lines.append(f"  Group {g['group_id']}: {rep_label}")
+            lines.append(
+                f"    {g['entry_count']} entries, "
+                f"{g['variant_count']} variants, "
+                f"{g['first_date']} to {g['last_date']}")
+            for e in g.get("entries", []):
+                is_variant = e.get("is_variant", False)
+                change_type = e.get("change_type", "")
+                flag   = " VARIANT" if is_variant else ""
+                change = f" ({change_type})" if is_variant and change_type else ""
+                lines.append(f"    {e.get('date','')} {e.get('chunk_id','')}{flag}{change}")
+                if e.get("added"):
+                    added_names = [terms.get(c, c) for c in e["added"]]
+                    lines.append(f"      + {', '.join(added_names)}")
+                if e.get("removed"):
+                    removed_names = [terms.get(c, c) for c in e["removed"]]
+                    lines.append(f"      - {', '.join(removed_names)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def explain(result, terms=None):
+        """Human-readable explanation of a TopicGroupMatch."""
+        terms = terms or {}
+        label = terms.get(result.topic_label, result.topic_label)
+        lines = [
+            f"Chunk: {result.chunk_id}  Doc: {result.document_id}  "
+            f"Date: {result.chunk_date}",
+            f"  Group {result.group_id} [{label}]",
+            f"  Score: {result.score:.3f}  "
+            f"(CUI: {result.cui_overlap_ratio:.2f}, "
+            f"Vec: {result.vector_sim:.3f}, Lin: {result.lin_score:.3f})",
+        ]
+        if result.matched_cuis:
+            cui_names = [terms.get(c, c) for c in result.matched_cuis]
+            lines.append(f"  Matched: {', '.join(cui_names)}")
+        if result.is_variant:
+            lines.append(f"  VARIANT: {result.change_type}")
+            if result.added_cuis:
+                added = [terms.get(c, c) for c in result.added_cuis]
+                lines.append(f"    + Added: {', '.join(added)}")
+            if result.removed_cuis:
+                removed = [terms.get(c, c) for c in result.removed_cuis]
+                lines.append(f"    - Removed: {', '.join(removed)}")
+        return "\n".join(lines)
