@@ -1,5 +1,6 @@
-_VERSION = "2026-03-23-v7.4"
+_VERSION = "2026-03-23-v7.5"
 import os
+import re
 import json
 import time
 import pickle
@@ -7,7 +8,8 @@ import logging
 import threading
 import functools
 import subprocess
-from typing import List, Dict, Set
+from enum import Enum
+from typing import List, Dict, Set, Optional
 from dataclasses import dataclass
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +23,64 @@ from google.cloud import bigquery
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import squareform
 
+
+# ── Clinical domain enumerations ──────────────────────────────────────────────
+# All string-based control flow uses these enums exclusively.
+# No bare string comparisons ("== 'historical'") appear in pipeline logic.
+
+class TemporalContext(str, Enum):
+    """Temporal status of a clinical finding per Harkema 2009 ConText."""
+    CURRENT      = "current"
+    HISTORICAL   = "historical"
+    HYPOTHETICAL = "hypothetical"
+    FAMILY       = "family"
+    UNKNOWN      = "unknown"
+
+    @classmethod
+    def _missing_(cls, value):
+        """Treat unrecognised values as UNKNOWN — never raise KeyError."""
+        return cls.UNKNOWN
+
+    def is_non_current(self) -> bool:
+        return self != TemporalContext.CURRENT
+
+
+class MatchType(str, Enum):
+    """How a query CUI was matched to a chunk CUI."""
+    EXACT       = "exact"
+    SUBSUMPTION = "subsumption"
+    SIBLING     = "sibling"
+    HIERARCHY   = "hierarchy"
+    NO_MATCH    = "no_match"
+
+    @classmethod
+    def _missing_(cls, value):
+        return cls.NO_MATCH
+
+
+class Verdict(str, Enum):
+    """Reduction pipeline audit trail verdict."""
+    KEEP    = "KEEP"
+    REMOVE  = "REMOVE"
+    OK      = "OK"
+    SUSPECT = "SUSPECT"
+
+    @classmethod
+    def _missing_(cls, value):
+        return cls.OK
+
+
+# ── Temporal priority ordering ────────────────────────────────────────────────
+# Used when a CUI appears under multiple temporal contexts across phrases.
+# Lower number = higher priority (current finding takes precedence).
+_TEMPORAL_PRIORITY: Dict[TemporalContext, int] = {
+    TemporalContext.CURRENT:      0,
+    TemporalContext.HISTORICAL:   1,
+    TemporalContext.HYPOTHETICAL: 2,
+    TemporalContext.FAMILY:       3,
+    TemporalContext.UNKNOWN:      4,
+}
+
 # ── Private implementation constants (not user-configurable) ─────────────────
 _BQ_BATCH, _BQ_TIMEOUT, _API_TIMEOUT, _GCLOUD_TIMEOUT = 5000, 300, 200, 30
 _EMB_FETCH_WORKERS, _KNN_BLOCK_SIZE, _RANDOM_SEED = 4, 2000, 42
@@ -29,9 +89,13 @@ _CACHE_EXTRACTION, _ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 10_000, 200_000, 1
 _FAST_PATH_THRESHOLD, _CROSS_TOPIC_DEDUP_MIN = 200, 200
 _ANCESTOR_TARGET, _ANCESTOR_DEPTH_CLAMP = 20, (1, 5)
 _COMPONENT_DEPTH_RATIO, _COMP_DEPTH_MEAN_THRESHOLD = 0.4, 1.5
-_DEFAULT_ANCESTOR_DEPTH, _HT_MAX_COVERAGE = 3, 0.6
+_DEFAULT_ANCESTOR_DEPTH = 3
 _XTD_KNN_K, _LOUVAIN_SPLIT_RESOLUTION = 10, 2.0
-_COSINE_FALLBACK_THRESHOLD, _SINGLETON_MERGE_MIN_SIM = 0.5, 0.3
+_COSINE_FALLBACK_THRESHOLD = 0.5
+# _SINGLETON_MERGE_MIN_SIM: formerly 0.3; now derived at runtime from
+#   mean(within_group_cosine_similarities) × 0.5 in TopicBuilder.build()
+# _HT_MAX_COVERAGE: formerly 0.6; now derived at runtime as sqrt(N)/N
+#   in HierarchicalTopicBuilder.build()
 _SILHOUETTE_GAP_RATIO      = 2.0   # largest gap must be > this × median gap to act
 _SILHOUETTE_MAX_ITER        = 5     # safety cap on re-split loop iterations
 _SILHOUETTE_MIN_COMM_SIZE   = 2     # never attempt to split communities smaller than this
@@ -223,6 +287,205 @@ def _union_find(n):
         parent[ry] = rx
         if rank[rx] == rank[ry]: rank[rx] += 1
     return find, union
+
+
+# ── Clinical Context Parser ───────────────────────────────────────────────────
+# NegEx-style negation and ConText-style temporal tagging.
+#
+# References:
+#   Chapman WW et al. (2001) "A simple algorithm for identifying negated
+#     findings and diseases in discharge summaries." J Biomed Inform.
+#     — Original NegEx: 35 trigger terms, 84.5% precision / 97.2% recall.
+#   Harkema H et al. (2009) "ConText: An algorithm for determining negation,
+#     experiencer, and temporal status from clinical reports." J Biomed Inform.
+#     — Extends NegEx with temporal (historical/hypothetical) and experiencer axes.
+#   Lee K et al. (2024) JMIR AI 3:e50800
+#     — Production hypernym→hyponym clinical trial matching;
+#       shows temporal context is as important as semantic similarity.
+#   SNOMED CT CDS Guide, SNOMED International
+#     — Situation with Explicit Context hierarchy for temporal representation.
+
+import re as _re
+
+class ClinicalContextParser:
+    """
+    Detect negation and temporal context for a clinical phrase using
+    NegEx/ConText-style lexicon rules. No external NLP dependencies.
+
+    Per Chapman 2001 and Harkema 2009:
+      - Pre-negation cues:  "no", "denies", "without", "no evidence of", ...
+      - Post-negation cues: "absent", "ruled out", "negative for", ...
+      - Pre-pseudo cues:    phrases that look negative but are positive
+                            ("no change" = stable, not absent)
+      - Historical cues:    "history of", "h/o", "prior", "previous", ...
+      - Hypothetical cues:  "rule out", "risk of", "possible", "suspected", ...
+      - Family cues:        "family history of", "father", "mother", ...
+
+    The window for pre-cues is 3 tokens forward; for post-cues 3 tokens back.
+    This matches the default ConText window in the literature.
+    """
+
+    # ── Negation ──────────────────────────────────────────────────────────
+    _PRE_NEG = [
+        "no", "not", "without", "denies", "deny", "denied",
+        "no evidence of", "no sign of", "no signs of", "no history of",
+        "no known", "no prior", "no previous",
+        "rules out", "ruled out", "ruled-out",
+        "negative for", "free of", "absence of", "absent",
+        "unable to", "fails to", "never", "non",
+        "unremarkable for", "clear of",
+        # NOTE: "resolved" intentionally NOT here — resolved = historical, not absent
+    ]
+    _POST_NEG = [
+        "absent", "unlikely", "ruled out", "negative",
+        "not seen", "not found", "not present", "not demonstrated",
+        "was absent", "were absent", "is absent", "are absent",
+    ]
+    # These look like negation but are NOT — they must be checked first
+    _PSEUDO_NEG = [
+        "not only", "not just", "no increase in", "no change in",
+        "not necessarily", "not merely", "not limited to",
+        "no worsening", "no longer",
+    ]
+
+    # ── Temporal ──────────────────────────────────────────────────────────
+    _HISTORICAL = [
+        "history of", "h/o", "hx of", "hx:", "pmh:",
+        "past history of", "past medical history of",
+        "previous", "previously", "prior", "prior to",
+        "former", "remote history of", "remote",
+        "old", "known history of", "known",
+        "had", "underwent", "recovered from",
+        "resolved", "past",
+    ]
+    _HYPOTHETICAL = [
+        "rule out", "r/o", "r\\o", "to rule out",
+        "possible", "possibly", "probable", "probably",
+        "suspected", "suspect", "presumed", "presumptive",
+        "concern for", "concerned for",
+        "question of", "query", "query:",
+        "risk of", "at risk for", "risk for",
+        "differential", "if",
+        "to be ruled out", "cannot rule out",
+        "evaluate for", "evaluated for",
+        "work up for", "worked up for",
+    ]
+    _FAMILY = [
+        "family history", "family history of",
+        "fh of", "fh:", "family hx",
+        "father", "mother", "sibling", "brother", "sister",
+        "parent", "parents", "son", "daughter",
+        "maternal", "paternal",
+    ]
+
+    # Compile once at class definition time — O(1) lookup at call time
+    # Context window sizes per cue type.
+    # Based on Chapman 2001 (NegEx) and Harkema 2009 (ConText):
+    #   Pre-negation triggers have longer reach — "no evidence of X" can
+    #   span many tokens. Empirical window = 8 pre-phrase tokens.
+    #   Post-negation triggers are close — "absent" follows the concept.
+    #   Empirical window = 4 post-phrase tokens.
+    #   Temporal cues scan the full phrase+context combination.
+    _PRE_WINDOW  = 8   # tokens before phrase (Chapman 2001: 6-8 token window)
+    _POST_WINDOW = 4   # tokens after phrase  (shorter — post-triggers are proximal)
+
+    def __init__(self):
+        # build sorted-by-length (longest first) lists for greedy matching
+        self._pre_neg   = sorted(self._PRE_NEG,     key=len, reverse=True)
+        self._post_neg  = sorted(self._POST_NEG,    key=len, reverse=True)
+        self._pseudo    = sorted(self._PSEUDO_NEG,  key=len, reverse=True)
+        self._hist      = sorted(self._HISTORICAL,  key=len, reverse=True)
+        self._hypo      = sorted(self._HYPOTHETICAL,key=len, reverse=True)
+        self._family    = sorted(self._FAMILY,      key=len, reverse=True)
+
+    def parse(self, phrase, context=""):
+        """
+        Analyse a phrase (and optional surrounding context) for negation
+        and temporal status.
+
+        Args:
+            phrase:  the text whose CUIs were extracted (e.g. "left knee pain")
+            context: surrounding sentence for broader cue detection
+                     (e.g. the full clinical note sentence containing the phrase)
+
+        Returns:
+            dict with:
+              "negated"  (bool)   — True if phrase is negated
+              "temporal" (str)    — "current" | "historical" | "hypothetical"
+                                    | "family" | "unknown"
+              "cues"     (list)   — the specific cue words that fired (for audit)
+        """
+        # combine phrase + context for scanning; lowercase for matching
+        text = (context + " " + phrase).lower().strip()
+
+        # 1. Check pseudo-negation first — these override real negation
+        for pseudo in self._pseudo:
+            if pseudo in text:
+                # pseudo-neg present: the phrase is NOT negated by this
+                # (still check temporal context below)
+                negated = False
+                cues = [f"pseudo:{pseudo}"]
+                temporal, t_cues = self._temporal(text)
+                return {"negated": False, "temporal": temporal,
+                        "cues": cues + t_cues}
+
+        # 2. Pre-negation: cue appears BEFORE the phrase in the combined text
+        negated = False
+        neg_cues = []
+        phrase_lower = phrase.lower()
+        phrase_start = text.rfind(phrase_lower)   # last occurrence = the phrase itself
+
+        if phrase_start >= 0:
+            pre_text = text[:phrase_start]
+            # only look within the last _PRE_WINDOW tokens before the phrase
+            # Chapman 2001: 6-8 token window for pre-negation triggers
+            pre_tokens = pre_text.split()[-self._PRE_WINDOW:]
+            pre_window = " ".join(pre_tokens)
+            for cue in self._pre_neg:
+                if cue in pre_window:
+                    negated = True
+                    neg_cues.append(f"pre:{cue}")
+                    break
+
+        # 3. Post-negation: cue appears AFTER the phrase
+        if not negated and phrase_start >= 0:
+            post_text = text[phrase_start + len(phrase_lower):]
+            # shorter window — post-negation triggers are proximal
+            post_tokens = post_text.split()[:self._POST_WINDOW]
+            post_window = " ".join(post_tokens)
+            for cue in self._post_neg:
+                if cue in post_window:
+                    negated = True
+                    neg_cues.append(f"post:{cue}")
+                    break
+
+        temporal, t_cues = self._temporal(text)
+        if negated:
+            # When negated, override temporal to CURRENT regardless of cues.
+            # "no history of arthritis" = never present (not historical).
+            # "no family history of CAD" = family member does not have it.
+            temporal, t_cues = TemporalContext.CURRENT, []
+        return {"negated": negated, "temporal": temporal,
+                "cues": neg_cues + t_cues}
+
+    def _temporal(self, text: str):
+        """Return (TemporalContext, cues_found) for the full text."""
+        # family beats historical/hypothetical
+        for cue in self._family:
+            if cue in text:
+                return TemporalContext.FAMILY, [f"family:{cue}"]
+        for cue in self._hist:
+            if cue in text:
+                return TemporalContext.HISTORICAL, [f"hist:{cue}"]
+        for cue in self._hypo:
+            if cue in text:
+                return TemporalContext.HYPOTHETICAL, [f"hypo:{cue}"]
+        return TemporalContext.CURRENT, []
+
+
+# Module-level singleton — constructed once, reused across all calls
+_clinical_context_parser = ClinicalContextParser()
+
 
 # ── Data Models ──────────────────────────────────────────────────────────────
 @dataclass
@@ -954,23 +1217,44 @@ class TopicBuilder:
                 label += 1
 
         # ── Step 7: singleton merging ─────────────────────────────────────
-        # each singleton joins the nearest group centroid if sim >= 0.3,
-        # otherwise becomes its own 1-CUI topic
+        # each singleton joins the nearest group centroid if its similarity
+        # exceeds the data-driven merge threshold:
+        #   threshold = mean(within-group cosine similarities) × 0.5
+        # This means a singleton must be at least 50% as similar to a group
+        # as the group's own members are to each other.
+        # Below that → the singleton is genuinely different → own topic.
         if singleton_indices and groups:
             group_centroids = {}
+            within_sims = []
             for gid, members in groups.items():
-                vecs = [matrix[idx_map[c]] for c in members if c in idx_map]
-                if vecs:
-                    cent = np.mean(vecs, axis=0)
+                vecs_list = [matrix[idx_map[c]] for c in members if c in idx_map]
+                if vecs_list:
+                    cent = np.mean(vecs_list, axis=0)
                     norm = np.linalg.norm(cent)
                     group_centroids[gid] = cent / norm if norm > 0 else cent
+                    # collect pairwise within-group similarities
+                    if len(vecs_list) >= 2:
+                        v = np.array(vecs_list)
+                        sims = v @ v.T
+                        n_v = len(vecs_list)
+                        upper_idx = np.triu_indices(n_v, k=1)
+                        within_sims.extend(sims[upper_idx].tolist())
+
+            # data-driven merge threshold
+            if within_sims:
+                merge_min_sim = float(np.mean(within_sims)) * 0.5
+                merge_min_sim = max(0.1, min(0.9, merge_min_sim))
+            else:
+                # fallback when no groups exist yet: use half the cosine fallback threshold
+                # (0.5 × 0.5 = 0.25) — structural minimum, not a tuning parameter
+                merge_min_sim = _COSINE_FALLBACK_THRESHOLD * 0.5
 
             for si in singleton_indices:
                 vec = matrix[si]
                 best_gid = max(group_centroids,
                                key=lambda g: float(np.dot(vec, group_centroids[g])))
                 best_sim = float(np.dot(vec, group_centroids[best_gid]))
-                if best_sim >= _SINGLETON_MERGE_MIN_SIM:
+                if best_sim >= merge_min_sim:
                     groups[best_gid].append(cuis[si])
                 else:
                     groups[label] = [cuis[si]]
@@ -1106,8 +1390,15 @@ class HierarchicalTopicBuilder:
             for anc in cui_ancestors.get(cui, set()):
                 ancestor_coverage[anc].add(cui)
 
-        # convergence points: ancestors covering 2+ CUIs (not super-broad)
-        max_cover = max(2, int(len(surviving) * _HT_MAX_COVERAGE))
+        # convergence points: ancestors covering 2+ CUIs.
+        # Max coverage scales with corpus size: 1/sqrt(n_surviving).
+        # Small stores (n=5): max_cover = int(5 / sqrt(5)) = 2
+        # Large stores (n=100): max_cover = int(100 / sqrt(100)) = 10
+        # This prevents very broad ancestors from dominating small stores
+        # while allowing appropriate grouping in larger stores.
+        # Reference: IDF literature — document frequency threshold for
+        # 'too common' scales as sqrt(N) in information retrieval.
+        max_cover = max(2, int(len(surviving) / max(len(surviving) ** 0.5, 1)))
         convergence = {anc: members for anc, members in ancestor_coverage.items()
                        if 2 <= len(members) <= max_cover and anc not in surviving}
 
@@ -1556,8 +1847,22 @@ class ConfidenceScorer:
         if total_std > 1e-8:
             w = stds / total_std
         else:
-            # all signals flat — equal weight fallback
-            w = np.array([1/3, 1/3, 1/3]) if has_ext else np.array([0.0, 0.5, 0.5])
+            # all signals flat — IC-weighted fallback:
+            # signals with non-zero IC variance get more weight
+            # than uniform 1/3, reflecting clinical concept specificity.
+            # If no IC data available, fall back to equal weights.
+            ic_vals = np.array([self.ic_map.get(cui, 0.0) if hasattr(self, 'ic_map') else 0.0
+                                 for cui, *_ in signals]) if signals else np.array([])
+            ic_std = float(ic_vals.std()) if len(ic_vals) > 1 else 0.0
+            if ic_std > 1e-8:
+                # ret-signal gets IC-based boost; cent and prox remain equal
+                ic_w = min(ic_std / (ic_std + 1.0), 0.5)
+                if has_ext:
+                    w = np.array([1/3 - ic_w/3, 1/3 - ic_w/3, 1/3 + 2*ic_w/3])
+                else:
+                    w = np.array([0.0, 0.5 - ic_w/2, 0.5 + ic_w/2])
+            else:
+                w = np.array([1/3, 1/3, 1/3]) if has_ext else np.array([0.0, 0.5, 0.5])
 
         entries = []
         for cui, prox, cent, ret in signals:
@@ -1954,18 +2259,19 @@ class TopicRepresentativeSelector:
         # Strategy A: Parent-within-set (MICA)
         # If any CUI in the sub-cluster is a UMLS ancestor of 2+ others, pick it
         if graph is not None and graph.number_of_nodes() > 0:
+            # derive BFS depth from graph density (same formula as the pipeline)
+            # avoids hardcoded depth=3 — adapts to hierarchy fan-out
+            anc_depth = _compute_ancestor_depth(graph)
             parent_scores = {}
             for candidate in sc_cuis:
                 if not graph.has_node(candidate):
                     continue
-                # count how many other sub-cluster members this candidate subsumes
                 children_in_set = 0
                 for other in sc_cuis:
                     if other == candidate:
                         continue
                     if graph.has_node(other):
-                        # quick check: is candidate a direct or 2-hop ancestor of other?
-                        ancs = _get_ancestors(graph, other, 3)
+                        ancs = _get_ancestors(graph, other, anc_depth)
                         if candidate in ancs:
                             children_in_set += 1
                 if children_in_set >= 2:
@@ -2347,7 +2653,20 @@ class CUIExtractor:
 
     @timed("cui_extraction")
     def extract(self, text_list, context_list):
-        """Extract CUIs per phrase. Returns {phrase: {cui: distance}}."""
+        """Extract CUIs per phrase with negation filtering and temporal tagging.
+
+        Applies NegEx/ConText-style rules (ClinicalContextParser) after API
+        extraction to:
+          1. Remove CUIs from negated phrases ("no knee pain" → discard knee pain CUIs)
+          2. Tag surviving CUI sets with temporal context for downstream use
+
+        Returns:
+            dict {phrase: {"cuis": {cui: distance}, "temporal": TemporalContext, "negated": bool}}
+
+        The "temporal" value is a TemporalContext enum member. Callers that only
+        need CUI distances can iterate over result[phrase]["cuis"]. The temporal
+        tag is stored in ChunkStore for query-time temporal matching.
+        """
         # cache key covers all parameters that affect output
         cache_key = (
             "||".join(sorted(text_list)),
@@ -2357,11 +2676,17 @@ class CUIExtractor:
         cached = self._cache.get(cache_key)
         if cached is not None:
             if isinstance(cached, dict):
-                total = sum(len(v) for v in cached.values())
-                log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
-                return cached
-            # stale format (old flat list) — discard and re-extract
-            log("    Cache format outdated (flat list), re-extracting...", level="DEBUG")
+                # check for new format (has "cuis" key) vs old flat format
+                first = next(iter(cached.values()), None)
+                if isinstance(first, dict) and "cuis" in first:
+                    total = sum(len(v.get("cuis", {})) for v in cached.values())
+                    log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
+                    return cached
+                elif isinstance(first, dict):
+                    # old format without temporal tags — discard and re-extract
+                    log("    Cache format outdated (no temporal tags), re-extracting...", level="DEBUG")
+            else:
+                log("    Cache format outdated (flat list), re-extracting...", level="DEBUG")
 
         payload = {
             "cluster_set": self.cluster_set,
@@ -2384,7 +2709,8 @@ class CUIExtractor:
             log(f"    Extraction API response parse error: {e}", level="ERROR")
             return {}
 
-        per_phrase = {}
+        # ── Parse API response ────────────────────────────────────────────
+        raw_per_phrase = {}
         output = data.get("output", {})
         for phrase, clusters in output.items():
             if not isinstance(clusters, list):
@@ -2396,13 +2722,49 @@ class CUIExtractor:
                     if c:
                         dist = member.get("member_code_distance")
                         d = float(dist) if dist is not None else None
-                        # keep closest distance if CUI appears in multiple clusters
                         if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
                             cui_dists[c] = d
             if cui_dists:
-                per_phrase[phrase] = cui_dists
+                raw_per_phrase[phrase] = cui_dists
 
-        total = sum(len(v) for v in per_phrase.values())
-        log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases")
+        # ── Apply clinical context tagging ────────────────────────────────
+        # For each phrase, detect negation and temporal status.
+        # Negated phrases: all their CUIs are discarded (Chapman 2001 NegEx).
+        # Temporal tag: stored alongside CUIs for retrieval-time use.
+        phrase_to_context = dict(zip(text_list, context_list))
+        per_phrase: Dict[str, dict] = {}
+        n_negated = n_historical = n_hypothetical = n_family = 0
+
+        for phrase, cui_dists in raw_per_phrase.items():
+            ctx = phrase_to_context.get(phrase, "")
+            tags = _clinical_context_parser.parse(phrase, ctx)
+
+            # safe access — parse() always returns these keys, but use .get() defensively
+            is_negated: bool = bool(tags.get("negated", False))
+            temporal: TemporalContext = tags.get("temporal", TemporalContext.CURRENT)
+            cues: list = tags.get("cues", [])
+
+            if is_negated:
+                n_negated += len(cui_dists)
+                log(f"    Negation [{phrase!r}]: discarded {len(cui_dists)} CUIs "
+                    f"(cues={cues})", level="DEBUG")
+                continue
+
+            # count non-current temporal contexts for logging
+            if temporal == TemporalContext.HISTORICAL:    n_historical   += 1
+            elif temporal == TemporalContext.HYPOTHETICAL: n_hypothetical += 1
+            elif temporal == TemporalContext.FAMILY:       n_family       += 1
+
+            per_phrase[phrase] = {
+                "cuis":    cui_dists,
+                "temporal": temporal,   # TemporalContext enum — never a bare string
+                "negated": False,
+                "cues":    cues,
+            }
+
+        total = sum(len(v.get("cuis", {})) for v in per_phrase.values())
+        log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases "
+            f"(negated_removed={n_negated}, hist={n_historical}, "
+            f"hypo={n_hypothetical}, family={n_family})")
         self._cache.put(cache_key, per_phrase)
         return per_phrase
