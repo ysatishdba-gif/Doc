@@ -1515,24 +1515,36 @@ class TopicIndex:
 
     def match(self, query_topics, query_cuis, query_embedding,
               matcher, top_k=10, variants_first=False):
-        """Match query against topic groups.
+        """Match query against topic groups — strict two-pass architecture.
 
-        Data-driven scoring:
-          Phase 1: percentile-based topic filter (no fixed threshold)
-          Phase 2: score per-topic (CUI + vec + Lin)
-          Phase 3: z-score normalize signals across candidates (no manual weights)
-          Phase 4: confidence filter (drop results far below best)
+        Pass 1 — TOPIC GATE (coarse, fast, hard exclusion):
+            Compare query topic centroids against all stored group centroids.
+            gap_split finds the natural similarity threshold.
+            Groups below the threshold are EXCLUDED — no fallback.
+            Only groups that clear the gate proceed to Pass 2.
+
+        Pass 2 — CUI SCORING (fine, within matched topics only):
+            For each entry in every matched group, score using only the
+            CUIs belonging to that topic — never the full chunk CUI set.
+            Three signals: IC-weighted CUI overlap, vector cosine, Lin similarity.
+
+        Pass 3 — Z-SCORE NORMALISATION:
+            Signals are z-normalised across all Pass 2 candidates so their
+            relative discrimination power drives final ranking — no manual weights.
+
+        Pass 4 — CONFIDENCE FILTER:
+            gap_split on final scores keeps the natural top cluster only.
 
         Args:
-            query_topics: dict from build_query_topics()
-            query_cuis: set of query CUI strings
-            query_embedding: numpy centroid
-            matcher: ChunkMatcher instance
-            top_k: max results
-            variants_first: if True, sort variants before routine
+            query_topics:    dict from build_query_topics()
+            query_cuis:      set of query CUI strings (after reduction)
+            query_embedding: numpy centroid of query CUIs
+            matcher:         ChunkMatcher instance (provides IC map + hierarchy)
+            top_k:           max results
+            variants_first:  if True, sort variants before routine entries
 
         Returns:
-            list[TopicGroupMatch]
+            list[TopicGroupMatch], empty if no groups cleared the topic gate.
         """
         if not self._built or not self.groups:
             return []
@@ -1553,7 +1565,11 @@ class TopicIndex:
         max_ic = max((matcher.ic_map.get(q, 0.0) for q in query_cuis), default=1.0)
         max_ic = max(max_ic, 1e-9)
 
-        # Phase 1: percentile-based topic filter
+        # Phase 1: hard topic gate — gap_split finds the natural separation
+        # between clinically-related and unrelated topic groups.
+        # Chunks that don't clear the threshold are EXCLUDED entirely.
+        # No fallback to "at least return the closest group" — a chunk
+        # with no topically relevant content should not appear in results.
         qtc_list = []
         if query_topics:
             for qt in query_topics.values():
@@ -1568,17 +1584,26 @@ class TopicIndex:
         qtc_matrix = np.array(qtc_list, dtype=np.float32)
         sims = qtc_matrix @ self.group_centroids.T   # (n_qt, n_groups)
 
-        # take max similarity per group across all query topics
+        # max similarity per group across all query topics
         max_sims = sims.max(axis=0)   # (n_groups,)
 
-        # gap-based filter: find natural separation between relevant and irrelevant
+        # gap-based hard gate: groups below the natural gap are excluded
         threshold = gap_split(max_sims, min_keep=1)
         matched_group_ids = set(int(i) for i in np.where(max_sims >= threshold)[0])
 
+        # Hard exit: no groups cleared the topic gate → no results.
+        # This is intentional — do not fall through to CUI scoring on
+        # unrelated content. The caller should widen the query or lower
+        # the specificity of the search, not silently return poor matches.
         if not matched_group_ids:
-            matched_group_ids = {int(np.argmax(max_sims))}
+            logger.debug("TopicIndex.match: no groups cleared topic gate — "
+                         f"best_sim={float(max_sims.max()):.3f} threshold={threshold:.3f}")
+            return []
 
-        # Phase 2: score entries (raw signals, no weighting yet)
+        # Pass 2: CUI scoring within matched topics only.
+        # _score_raw operates on entry["members"] — the CUIs of that specific
+        # topic, never the full chunk CUI set. This is the key property:
+        # CUI matching is scoped to topics that cleared the gate in Pass 1.
         raw_results = []
         has_graph = matcher.graph is not None and len(matcher.ic_map) > 0
 
@@ -1705,8 +1730,7 @@ class TopicIndex:
             raw_results.sort(key=lambda r: -r[3])  # vec_sim is index 3
             raw_results = raw_results[:max_cand]
 
-        # Phase 3: z-score normalize signals, then sum
-        # tuple: (entry, gid, cui_ratio, vec_sim, lin_avg, matched_cuis)
+        # Pass 3: z-score normalise signals across all Pass 2 candidates.
         cuis = np.array([r[2] for r in raw_results])   # cui_ratio
         vecs = np.array([r[3] for r in raw_results])    # vec_sim
         lins = np.array([r[4] for r in raw_results])    # lin_avg
@@ -1745,9 +1769,7 @@ class TopicIndex:
                       self.p["w_vec"] * vecs +
                       self.p["w_lin"] * lins)
 
-        # Phase 4: build results with gap-based confidence filter
-        results = []
-        # find natural score separation — keep top cluster only
+        # Pass 4: confidence filter — drop results below natural score gap.
         conf_floor = gap_split(scores, min_keep=1)
 
         for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched) in enumerate(raw_results):
