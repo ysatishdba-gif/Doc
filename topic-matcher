@@ -1672,8 +1672,11 @@ class TopicIndex:
             w_total   = sum(cui_w(q) for q in query_cuis)
             cui_ratio = min(w_matched / max(w_total, 1e-9), 1.0)
 
-            # ── Vector similarity ─────────────────────────────────────────
-            tc = entry["centroid"]
+            # ── Vector similarity — topic centroid cosine ─────────────────
+            # The topic centroid (mean of member CUI embeddings) was computed
+            # at ingestion time. Used here as a secondary signal alongside
+            # CUI overlap and Lin — confirms semantic proximity of the match.
+            tc = entry.get("centroid")
             vec_sim = 0.0
             if query_embedding is not None and tc is not None:
                 vec_sim = max(0.0, min(1.0, float(np.dot(query_embedding, tc))))
@@ -1699,7 +1702,7 @@ class TopicIndex:
                         lin_sum += best_lin
                     lin_avg = lin_sum / len(non_exact_q)
 
-            return cui_ratio, vec_sim, lin_avg, sorted(exact | hierarchy_hits)
+            return cui_ratio, vec_sim, lin_avg, sorted(exact | hierarchy_hits), topic_members
 
         # score rep first, expand on accept
         for gid in matched_group_ids:
@@ -1773,31 +1776,34 @@ class TopicIndex:
         conf_floor = gap_split(scores, min_keep=1)
         results = []
 
-        for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched) in enumerate(raw_results):
+        for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched, topic_members) in enumerate(raw_results):
             score = float(scores[i])
             if score < self.p["score_min"] or score < conf_floor:
                 continue
 
             # Zero-signal guard: require at least one of CUI overlap or Lin > 0.
-            # A result with both zero matched only through embedding similarity via
-            # the topic gate. That is not a reliable clinical match — the topic
-            # gate passed it, but no actual concept-level evidence supports it.
-            # Single-candidate z-score always produces score=1.0 which is misleading.
             if cui_ratio == 0.0 and lin_avg == 0.0:
                 logger.debug(f"  Zero-signal result suppressed: {entry.get('chunk_id')} "
                              f"topic={entry.get('topic_cui')} score={score:.3f}")
                 continue
 
+            # matched_cuis: exact/hierarchy hits when available, otherwise
+            # fall back to the topic members that drove the Lin similarity.
+            # This ensures the CSV always shows which concepts were relevant
+            # rather than an empty list for pure-Lin matches.
+            display_matched = matched if matched else sorted(topic_members)
+
             rep = entry.get("topic_cui")
-            label = rep if rep else f"group_{gid}"
+            topic_num = entry.get("topic_id", "")
+            label = f"topic_{topic_num}" if topic_num != "" else f"group_{gid}"
             results.append(TopicGroupMatch(
                 group_id=gid,
                 chunk_id=entry.get("chunk_id", ""),
                 document_id=entry.get("doc_id", ""),
                 score=round(score, 4),
-                topic_id=entry.get("topic_id", ""),
+                topic_id=topic_num,
                 topic_label=label,
-                matched_cuis=matched,
+                matched_cuis=display_matched,
                 is_variant=entry.get("is_variant", False),
                 added_cuis=entry.get("added", []),
                 removed_cuis=entry.get("removed", []),
