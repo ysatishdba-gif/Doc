@@ -9,8 +9,11 @@ Usage:
 Flow:
     Query text → CUI extraction → Stages 1-4 reduction (fast)
     → Fetch embeddings for surviving CUIs → Compute centroid
-    → CUI filter + hierarchy subsumption → candidates
-    → Three-signal scoring → Ranked chunks
+    → Pass 1: Topic gate  (TopicIndex — hard exclusion on centroid similarity)
+    → Pass 2: CUI scoring (within matched topics only)
+    → Pass 3: Z-score normalisation
+    → Pass 4: Confidence gap filter
+    → Ranked results
     → LLM reasoning (optional)
 """
 
@@ -36,7 +39,7 @@ from topic_matcher import (
     compute_centroid, build_query_topics,
 )
 
-_LLM_TOP_K = 3   # top chunks sent for LLM reasoning
+_LLM_TOP_K = 3
 
 
 # ── Setup (runs once) ────────────────────────────────────────────────────────
@@ -52,28 +55,93 @@ system = CUIReductionSystem(
 
 extractor = CUIExtractor(
     api_url=API_URL,
-    top_k=10,            # wider than ingestion top_k for query recall
+    top_k=10,
     top_p=TOP_P,
     cluster_set=CLUSTER_SET, combined=COMBINED,
     cache_dir=CACHE_DIR)
 
 matcher = ChunkMatcher(hierarchy, ic_precomputed)
 
-
-# ── Term lookup ──────────────────────────────────────────────────────────────
-
 _fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
+
+
+# ── Helpers — work with both TopicGroupMatch and ChunkMatch ──────────────────
+
+def _is_topic_result(r) -> bool:
+    """True if r is a TopicGroupMatch (TopicIndex path)."""
+    return hasattr(r, 'group_id')
+
+
+def _matched_cuis(r) -> List[str]:
+    """CUIs matched in this result, regardless of result type."""
+    if _is_topic_result(r):
+        return list(r.matched_cuis)
+    return list(getattr(r, 'overlapping_cuis', []))
+
+
+def _display_result(rank: int, r, terms: dict) -> str:
+    """Single-line display for either result type."""
+    if _is_topic_result(r):
+        variant_flag = " [VARIANT]" if r.is_variant else ""
+        matched_terms = ", ".join(terms.get(c, c) for c in r.matched_cuis)
+        return (f"#{rank}  chunk={r.chunk_id}  topic={r.topic_label}  "
+                f"score={r.score:.3f}  CUI={r.cui_overlap_ratio:.2f}  "
+                f"Lin={r.lin_score:.3f}{variant_flag}\n"
+                f"       matched: {matched_terms}")
+    # ChunkMatch (legacy)
+    return f"#{rank}  {ChunkMatcher.explain(r, terms)}"
+
+
+def _collect_term_cuis(results: list) -> set:
+    """All CUIs that need term resolution across results of either type."""
+    cuis = set()
+    for r in results:
+        cuis.update(_matched_cuis(r))
+        if not _is_topic_result(r):
+            for t_info in getattr(r, 'topics_matched', {}).values():
+                tc = t_info.get("topic_cui")
+                if tc:
+                    cuis.add(tc)
+                cuis.update(t_info.get("matched_cuis", []))
+            for d in getattr(r, 'lin_details', []):
+                if d.chunk_cui:  cuis.add(d.chunk_cui)
+                if d.mica_cui:   cuis.add(d.mica_cui)
+                cuis.add(d.query_cui)
+    return cuis
+
+
+def _csv_row(query_text: str, rank: int, r, terms: dict) -> list:
+    """Build a CSV row for either result type."""
+    matched_names = " | ".join(terms.get(c, c) for c in _matched_cuis(r))
+
+    if _is_topic_result(r):
+        return [
+            query_text, rank, r.chunk_id, r.document_id,
+            r.score, len(r.matched_cuis), r.cui_overlap_ratio,
+            r.lin_score, "",          # total_chunk_cuis — not on TopicGroupMatch
+            r.topic_label,
+            matched_names,
+        ]
+    # ChunkMatch
+    topic_parts = []
+    for tid, t_info in sorted(getattr(r, 'topics_matched', {}).items()):
+        t_cui   = t_info.get("topic_cui")
+        t_label = terms.get(t_cui, t_cui) if t_cui else ""
+        hits    = [terms.get(c, c) for c in t_info.get("matched_cuis", [])]
+        topic_parts.append(f"{t_label}({', '.join(hits)})")
+    return [
+        query_text, rank, r.chunk_id, r.document_id,
+        r.score, r.cui_overlap, r.cui_overlap_ratio,
+        r.lin_score, r.total_chunk_cuis,
+        " | ".join(topic_parts),
+        matched_names,
+    ]
 
 
 # ── Query processing ─────────────────────────────────────────────────────────
 
 def process_query(query_text: str) -> Optional[Dict]:
-    """Extract CUIs, reduce, compute embedding for query.
-
-    Returns:
-        dict with: surviving_cuis, embedding, query_topics, terms, temporal_map
-        None if nothing extracted or survived reduction.
-    """
+    """Extract CUIs, reduce, compute embedding for query."""
     print(f"\n{'='*80}")
     print(f"QUERY: {query_text}")
     print(f"{'='*80}")
@@ -86,8 +154,6 @@ def process_query(query_text: str) -> Optional[Dict]:
         print("  → No CUIs extracted (all negated or empty)")
         return None
 
-    # Unpack new format: {phrase: {"cuis": {cui: dist}, "temporal": TemporalContext}}
-    # Use .get() with typed defaults — never assume dict keys exist.
     per_phrase_cuis: Dict[str, Dict] = {}
     query_temporal:  Dict[str, TemporalContext] = {}
 
@@ -106,21 +172,17 @@ def process_query(query_text: str) -> Optional[Dict]:
                 query_temporal[cui] = temporal
 
     if not per_phrase_cuis:
-        print("  → No CUIs after unpacking (all phrases empty)")
+        print("  → No CUIs after unpacking")
         return None
 
     total_cuis = sum(len(cd) for cd in per_phrase_cuis.values())
     print(f"  → Extracted: {total_cuis} CUIs", flush=True)
 
-    # Print non-current temporal tags (useful for clinical debugging)
-    non_current = {
-        c: t.value for c, t in query_temporal.items()
-        if t != TemporalContext.CURRENT
-    }
+    non_current = {c: t.value for c, t in query_temporal.items()
+                   if t != TemporalContext.CURRENT}
     if non_current:
         print(f"  → Temporal tags: {non_current}")
 
-    # Dump all raw CUIs before reduction
     print("\n  ── Raw CUIs from API (before reduction) ──")
     all_raw_cuis: List[str] = []
     for phrase, cd in per_phrase_cuis.items():
@@ -138,7 +200,6 @@ def process_query(query_text: str) -> Optional[Dict]:
 
     print("  → Reducing (stages 1-4)...", flush=True)
     surviving = system.reduce_query(all_raw_cuis)
-
     if not surviving:
         print("  → No CUIs survived reduction")
         return None
@@ -173,7 +234,7 @@ def process_query(query_text: str) -> Optional[Dict]:
     }
 
 
-# ── Full query → ranked chunks ───────────────────────────────────────────────
+# ── Full query → ranked results ───────────────────────────────────────────────
 
 def run_query(
     query_text: str,
@@ -181,11 +242,6 @@ def run_query(
     top_k: int = 10,
 ) -> Optional[Tuple[list, dict, dict]]:
     """Run a clinical query against stored chunks.
-
-    Args:
-        query_text: clinical question in free text
-        store_path: path to chunk_store.pkl (defaults to OUTPUT_DIR)
-        top_k:      max results
 
     Returns:
         (results, terms, chunks) or None
@@ -220,20 +276,14 @@ def run_query(
 
     print(f"\n  → Matching against {len(chunks)} chunks...", flush=True)
 
-    # ── Two-pass matching: TopicIndex first, ChunkMatcher as legacy fallback ──
-    #
-    # TopicIndex is the production path:
-    #   Pass 1 — topic centroid gate (hard exclusion, gap_split threshold)
+    # ── Two-pass matching ─────────────────────────────────────────────────────
+    # TopicIndex = production path:
+    #   Pass 1 — topic centroid gate (hard exclusion, gap_split)
     #   Pass 2 — CUI scoring within matched topics only
     #   Pass 3 — z-score normalisation (no manual weights)
     #   Pass 4 — confidence gap filter
     #
-    # ChunkMatcher is the legacy fallback used only when the store was built
-    # without per-topic centroids (old pickles).  It is not equivalent —
-    # its topic filter is soft and CUI scoring covers all chunk CUIs.
-    #
-    # Detection: if any chunk has at least one topic with a centroid, use TopicIndex.
-
+    # ChunkMatcher = legacy path for stores without per-topic centroids.
     has_topic_centroids = any(
         any(t.get("centroid") is not None
             for t in cd.get("topics", {}).values())
@@ -244,26 +294,16 @@ def run_query(
         print("  → Path: TopicIndex (topic gate → CUI scoring within matched topics)")
         topic_index = TopicIndex()
         topic_index.build(chunks, graph=hierarchy)
-        ti_results = topic_index.match(
+        results = topic_index.match(
             query_topics, query_cuis, query_embedding,
             matcher, top_k=top_k,
         )
-
-        if ti_results:
-            # Convert TopicGroupMatch → ChunkMatch-compatible display
-            # TopicGroupMatch has the same fields used by explain() and CSV writers
-            results = ti_results
-            print(f"  → TopicIndex: {len(results)} results "
-                  f"({topic_index._built and len(topic_index.groups)} groups built)")
+        if results:
+            print(f"  → TopicIndex: {len(results)} results")
         else:
-            # Topic gate excluded everything — no results, do not fall back.
-            # Falling back to ChunkMatcher here would silently return low-quality
-            # results for a query that genuinely has no matching content.
             print("  → TopicIndex: no groups cleared the topic gate — 0 results")
             print("     (query concepts may not be represented in the store)")
-            results = []
     else:
-        # Legacy path: store built without per-topic centroids
         print("  → Path: ChunkMatcher (legacy — store has no topic centroids)")
         results = matcher.match(
             query_cuis, query_embedding, chunks,
@@ -272,30 +312,8 @@ def run_query(
             query_temporal=query_temporal,
         )
 
-    # Resolve terms for all matched CUIs.
-    # Handles both TopicGroupMatch (TopicIndex path) and ChunkMatch (legacy path).
-    all_cuis_to_resolve: set = set()
-    for r in results:
-        # TopicGroupMatch uses matched_cuis; ChunkMatch uses overlapping_cuis
-        if hasattr(r, 'matched_cuis'):
-            all_cuis_to_resolve.update(r.matched_cuis)
-        if hasattr(r, 'overlapping_cuis'):
-            all_cuis_to_resolve.update(r.overlapping_cuis)
-        # ChunkMatch topic details
-        if hasattr(r, 'topics_matched'):
-            for t_info in r.topics_matched.values():
-                tc = t_info.get("topic_cui")
-                if tc:
-                    all_cuis_to_resolve.add(tc)
-                all_cuis_to_resolve.update(t_info.get("matched_cuis", []))
-        # ChunkMatch Lin details
-        if hasattr(r, 'lin_details'):
-            for d in r.lin_details:
-                if d.chunk_cui:  all_cuis_to_resolve.add(d.chunk_cui)
-                if d.mica_cui:   all_cuis_to_resolve.add(d.mica_cui)
-                all_cuis_to_resolve.add(d.query_cui)
-
-    missing = all_cuis_to_resolve - set(terms.keys())
+    # Resolve terms for all matched CUIs (both result types)
+    missing = _collect_term_cuis(results) - set(terms.keys())
     if missing:
         terms.update(_fetch_terms(missing))
 
@@ -309,17 +327,7 @@ def run_query(
         print("  No matching chunks found.")
     else:
         for rank, r in enumerate(results, 1):
-            # TopicGroupMatch (TopicIndex path) — display topic-level detail
-            if hasattr(r, 'group_id'):
-                variant_flag = " [VARIANT]" if r.is_variant else ""
-                print(f"  #{rank}  chunk={r.chunk_id}  topic={r.topic_label}  "
-                      f"score={r.score:.3f}  CUI={r.cui_overlap_ratio:.2f}  "
-                      f"Lin={r.lin_score:.3f}{variant_flag}")
-                matched_terms = [terms.get(c, c) for c in r.matched_cuis]
-                print(f"       matched: {', '.join(matched_terms)}")
-            else:
-                # ChunkMatch (legacy ChunkMatcher path)
-                print(f"  #{rank}  {ChunkMatcher.explain(r, terms)}")
+            print(f"  {_display_result(rank, r, terms)}")
             print()
 
     return results, terms, chunks
@@ -336,11 +344,17 @@ def build_reasoning_prompt(
 ) -> str:
     sections = []
     for rank, r in enumerate(results[:top_k], 1):
-        chunk_data  = chunks.get(r.chunk_id, {})
-        chunk_text  = chunk_data.get("text", "(text not available)")
-        match_explain = ChunkMatcher.explain(r, terms)
+        chunk_data = chunks.get(r.chunk_id, {})
+        chunk_text = chunk_data.get("text", "(text not available)")
         chunk_cui_list = ", ".join(
             f"{c} ({terms.get(c, c)})" for c in sorted(chunk_data.get("cuis", set()))
+        )
+        # Match analysis — both types have score, cui_overlap_ratio, lin_score
+        match_explain = (
+            f"Topic: {r.topic_label}  score={r.score:.3f}  "
+            f"CUI overlap={r.cui_overlap_ratio:.2f}  Lin={r.lin_score:.3f}"
+            if _is_topic_result(r)
+            else ChunkMatcher.explain(r, terms)
         )
         sections.append(
             f"--- CHUNK #{rank} ---\n"
@@ -353,10 +367,10 @@ def build_reasoning_prompt(
             f"Match Analysis:\n{match_explain}"
         )
 
+    # Query CUIs — use matched_cuis from results (works for both types)
+    all_matched = set(c for r in results[:top_k] for c in _matched_cuis(r))
     query_cuis_str = ", ".join(
-        f"{c} ({terms.get(c, c)})" for c in sorted(
-            set(d.query_cui for r in results[:top_k] for d in r.lin_details)
-        )
+        f"{c} ({terms.get(c, c)})" for c in sorted(all_matched)
     )
 
     return (
@@ -385,7 +399,6 @@ def llm_reason(
     terms: dict,
     top_k: int = _LLM_TOP_K,
 ) -> str:
-    """Call Vertex AI LLM to reason about match quality."""
     if not results:
         return "No chunks matched the query. Cannot reason about matches."
 
@@ -405,7 +418,6 @@ def llm_reason(
 
     except ImportError:
         print("\n  LLM reasoning skipped (install: pip install google-cloud-aiplatform)")
-        print(f"\n  Prompt ({len(prompt)} chars) saved for manual use.")
         return prompt
     except Exception as e:
         print(f"\n  LLM reasoning failed: {e}")
@@ -445,33 +457,7 @@ if __name__ == "__main__":
                 print()
 
         for rank, r in enumerate(results, 1):
-            # Build a unified row regardless of result type
-            if hasattr(r, 'group_id'):
-                # TopicGroupMatch (TopicIndex path)
-                matched_names = [terms.get(c, c) for c in r.matched_cuis]
-                all_rows.append([
-                    query_text, rank, r.chunk_id, r.document_id,
-                    r.score, len(r.matched_cuis), r.cui_overlap_ratio,
-                    r.lin_score, "",  # total_chunk_cuis not available on TopicGroupMatch
-                    r.topic_label,
-                    " | ".join(matched_names),
-                ])
-            else:
-                # ChunkMatch (legacy ChunkMatcher path)
-                topic_parts = []
-                for tid, t_info in sorted(r.topics_matched.items()):
-                    t_cui   = t_info.get("topic_cui")
-                    t_label = terms.get(t_cui, t_cui) if t_cui else ""
-                    hit_names = [terms.get(c, c) for c in t_info.get("matched_cuis", [])]
-                    topic_parts.append(f"{t_label}({', '.join(hit_names)})")
-                matched_names = [terms.get(c, c) for c in r.overlapping_cuis]
-                all_rows.append([
-                    query_text, rank, r.chunk_id, r.document_id,
-                    r.score, r.cui_overlap, r.cui_overlap_ratio,
-                    r.lin_score, r.total_chunk_cuis,
-                    " | ".join(topic_parts),
-                    " | ".join(matched_names),
-                ])
+            all_rows.append(_csv_row(query_text, rank, r, terms))
 
     if all_rows:
         csv_path = os.path.join(OUTPUT_DIR, "query_results.csv")
