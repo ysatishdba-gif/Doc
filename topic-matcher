@@ -1771,16 +1771,28 @@ class TopicIndex:
 
         # Pass 4: confidence filter — drop results below natural score gap.
         conf_floor = gap_split(scores, min_keep=1)
+        results = []
 
         for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched) in enumerate(raw_results):
             score = float(scores[i])
             if score < self.p["score_min"] or score < conf_floor:
                 continue
+
+            # Zero-signal guard: require at least one of CUI overlap or Lin > 0.
+            # A result with both zero matched only through embedding similarity via
+            # the topic gate. That is not a reliable clinical match — the topic
+            # gate passed it, but no actual concept-level evidence supports it.
+            # Single-candidate z-score always produces score=1.0 which is misleading.
+            if cui_ratio == 0.0 and lin_avg == 0.0:
+                logger.debug(f"  Zero-signal result suppressed: {entry.get('chunk_id')} "
+                             f"topic={entry.get('topic_cui')} score={score:.3f}")
+                continue
+
             rep = entry.get("topic_cui")
             label = rep if rep else f"group_{gid}"
             results.append(TopicGroupMatch(
                 group_id=gid,
-                chunk_id=entry["chunk_id"],
+                chunk_id=entry.get("chunk_id", ""),
                 document_id=entry.get("doc_id", ""),
                 score=round(score, 4),
                 topic_id=entry.get("topic_id", ""),
@@ -1795,6 +1807,16 @@ class TopicIndex:
                 vector_sim=round(vec_sim, 4),
                 lin_score=round(lin_avg, 4),
             ))
+
+        # Dedup by chunk_id: keep the highest-scoring result per chunk.
+        # Multiple topic groups can point to the same chunk — returning the
+        # same chunk 5 times under different topic labels is unhelpful and
+        # inflates the apparent result count.
+        seen_chunks: dict = {}
+        for r in results:
+            if r.chunk_id not in seen_chunks or r.score > seen_chunks[r.chunk_id].score:
+                seen_chunks[r.chunk_id] = r
+        results = list(seen_chunks.values())
 
         if variants_first:
             results.sort(key=lambda r: (-r.is_variant, -r.score, r.chunk_date))
