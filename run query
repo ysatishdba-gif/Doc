@@ -1,0 +1,416 @@
+"""
+Query Runner — CUI Filter + Vector + Lin Scoring.
+
+Takes clinical query text, reduces, matches against stored chunks.
+
+Usage:
+    python run_query.py
+
+Flow:
+    Query text → CUI extraction → Stages 1-4 reduction (fast)
+    → Fetch embeddings for surviving CUIs → Compute centroid
+    → CUI filter + hierarchy subsumption → candidates
+    → Three-signal scoring → Ranked chunks
+    → LLM reasoning (optional)
+"""
+
+import os
+import csv
+import time
+from typing import Dict, List, Optional, Tuple
+
+from google.cloud import bigquery
+
+from config import (
+    PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
+    LLM_PROJECT_ID, LLM_LOCATION, LLM_MODEL, LLM_MAX_TOKENS,
+    hierarchy, ic_precomputed
+)
+from cui_reduction_system import (
+    CUIReductionSystem, CUIExtractor, fetch_preferred_terms,
+    TemporalContext, _TEMPORAL_PRIORITY,
+)
+from topic_matcher import ChunkStore, ChunkMatcher, compute_centroid, build_query_topics
+
+_LLM_TOP_K = 3   # top chunks sent for LLM reasoning
+
+
+# ── Setup (runs once) ────────────────────────────────────────────────────────
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+bq = bigquery.Client(project=PROJECT_ID)
+
+system = CUIReductionSystem(
+    project_id=PROJECT_ID, dataset_id=DATASET_ID,
+    full_network=hierarchy, allowed_sabs=ALLOWED_SABS,
+    embedding_table=EMBEDDING_TABLE, ic_scores=ic_precomputed,
+    cache_dir=CACHE_DIR)
+
+extractor = CUIExtractor(
+    api_url=API_URL,
+    top_k=10,            # wider than ingestion top_k for query recall
+    top_p=TOP_P,
+    cluster_set=CLUSTER_SET, combined=COMBINED,
+    cache_dir=CACHE_DIR)
+
+matcher = ChunkMatcher(hierarchy, ic_precomputed)
+
+
+# ── Term lookup ──────────────────────────────────────────────────────────────
+
+_fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
+
+
+# ── Query processing ─────────────────────────────────────────────────────────
+
+def process_query(query_text: str) -> Optional[Dict]:
+    """Extract CUIs, reduce, compute embedding for query.
+
+    Returns:
+        dict with: surviving_cuis, embedding, query_topics, terms, temporal_map
+        None if nothing extracted or survived reduction.
+    """
+    print(f"\n{'='*80}")
+    print(f"QUERY: {query_text}")
+    print(f"{'='*80}")
+
+    print("  → Extracting CUIs...", flush=True)
+    per_phrase = extractor.extract([query_text], [query_text])
+    extractor._cache.flush()
+
+    if not per_phrase:
+        print("  → No CUIs extracted (all negated or empty)")
+        return None
+
+    # Unpack new format: {phrase: {"cuis": {cui: dist}, "temporal": TemporalContext}}
+    # Use .get() with typed defaults — never assume dict keys exist.
+    per_phrase_cuis: Dict[str, Dict] = {}
+    query_temporal:  Dict[str, TemporalContext] = {}
+
+    for ph, tagged in per_phrase.items():
+        cui_dists = tagged.get("cuis") or {}
+        if not cui_dists:
+            continue
+        temporal = TemporalContext(tagged.get("temporal", TemporalContext.CURRENT))
+        per_phrase_cuis[ph] = cui_dists
+        for cui in cui_dists:
+            existing = query_temporal.get(cui)
+            if existing is None or (
+                _TEMPORAL_PRIORITY.get(temporal, 99)
+                < _TEMPORAL_PRIORITY.get(existing, 99)
+            ):
+                query_temporal[cui] = temporal
+
+    if not per_phrase_cuis:
+        print("  → No CUIs after unpacking (all phrases empty)")
+        return None
+
+    total_cuis = sum(len(cd) for cd in per_phrase_cuis.values())
+    print(f"  → Extracted: {total_cuis} CUIs", flush=True)
+
+    # Print non-current temporal tags (useful for clinical debugging)
+    non_current = {
+        c: t.value for c, t in query_temporal.items()
+        if t != TemporalContext.CURRENT
+    }
+    if non_current:
+        print(f"  → Temporal tags: {non_current}")
+
+    # Dump all raw CUIs before reduction
+    print("\n  ── Raw CUIs from API (before reduction) ──")
+    all_raw_cuis: List[str] = []
+    for phrase, cd in per_phrase_cuis.items():
+        print(f"    Phrase: '{phrase}'")
+        for cui, dist in sorted(cd.items(), key=lambda x: (x[1] is None, x[1])):
+            dist_str = f"{dist:.4f}" if dist is not None else "?"
+            print(f"      {cui}  dist={dist_str}")
+            all_raw_cuis.append(cui)
+
+    raw_terms = _fetch_terms(set(all_raw_cuis))
+    print("\n  ── Raw CUIs with names ──")
+    for cui in sorted(set(all_raw_cuis)):
+        print(f"    {cui} | {raw_terms.get(cui, '?')}")
+    print()
+
+    print("  → Reducing (stages 1-4)...", flush=True)
+    surviving = system.reduce_query(all_raw_cuis)
+
+    if not surviving:
+        print("  → No CUIs survived reduction")
+        return None
+
+    print(f"  → Surviving: {len(surviving)} CUIs (from {total_cuis} raw)", flush=True)
+
+    print(f"  → Fetching embeddings for {len(surviving)} surviving CUIs...", flush=True)
+    query_embeddings = system.emb_fetcher.fetch(list(surviving))
+    query_embedding  = compute_centroid(surviving, query_embeddings)
+    query_topics     = build_query_topics(surviving, query_embeddings)
+
+    print(f"  → Query topics: {len(query_topics)}")
+    for tid, qt in query_topics.items():
+        print(f"      Topic {tid}: {len(qt.get('members', []))} CUIs")
+
+    terms = _fetch_terms(surviving)
+    for cui in surviving:
+        t = query_temporal.get(cui, TemporalContext.CURRENT)
+        t_suffix = f" [{t.value}]" if t != TemporalContext.CURRENT else ""
+        print(f"      {cui} | {terms.get(cui, cui)}{t_suffix}")
+
+    surviving_temporal: Dict[str, TemporalContext] = {
+        c: query_temporal.get(c, TemporalContext.CURRENT) for c in surviving
+    }
+
+    return {
+        "surviving_cuis": surviving,
+        "embedding":      query_embedding,
+        "query_topics":   query_topics,
+        "terms":          terms,
+        "temporal_map":   surviving_temporal,
+    }
+
+
+# ── Full query → ranked chunks ───────────────────────────────────────────────
+
+def run_query(
+    query_text: str,
+    store_path: Optional[str] = None,
+    top_k: int = 10,
+) -> Optional[Tuple[list, dict, dict]]:
+    """Run a clinical query against stored chunks.
+
+    Args:
+        query_text: clinical question in free text
+        store_path: path to chunk_store.pkl (defaults to OUTPUT_DIR)
+        top_k:      max results
+
+    Returns:
+        (results, terms, chunks) or None
+    """
+    t0 = time.perf_counter()
+
+    store_path = store_path or os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+    if not os.path.exists(store_path):
+        print(f"ERROR: chunk store not found at {store_path}")
+        print("  → Run run_cui_reduction_api.py first to build the store")
+        return None
+
+    store  = ChunkStore.load(store_path)
+    chunks = store.get_all()
+    if not chunks:
+        print("ERROR: no chunks in store")
+        return None
+
+    stats = store.stats()
+    print(f"\nStore: {stats['chunks']} chunks, {stats['total_cuis']} stored CUIs, "
+          f"{stats['chunks_with_embeddings']} with embeddings")
+
+    query_result = process_query(query_text)
+    if not query_result:
+        return None
+
+    query_cuis      = query_result["surviving_cuis"]
+    query_embedding = query_result["embedding"]
+    query_topics    = query_result.get("query_topics")
+    query_temporal  = query_result.get("temporal_map", {})
+    terms           = query_result["terms"]
+
+    print(f"\n  → Matching against {len(chunks)} chunks...", flush=True)
+    results = matcher.match(
+        query_cuis, query_embedding, chunks,
+        top_k=top_k,
+        query_topics=query_topics,
+        query_temporal=query_temporal,
+    )
+
+    # Resolve terms for all matched CUIs
+    all_cuis_to_resolve: set = set()
+    for r in results:
+        all_cuis_to_resolve.update(r.overlapping_cuis)
+        for t_info in r.topics_matched.values():
+            tc = t_info.get("topic_cui")
+            if tc:
+                all_cuis_to_resolve.add(tc)
+            all_cuis_to_resolve.update(t_info.get("matched_cuis", []))
+        for d in r.lin_details:
+            if d.chunk_cui:
+                all_cuis_to_resolve.add(d.chunk_cui)
+            if d.mica_cui:
+                all_cuis_to_resolve.add(d.mica_cui)
+            all_cuis_to_resolve.add(d.query_cui)
+
+    missing = all_cuis_to_resolve - set(terms.keys())
+    if missing:
+        terms.update(_fetch_terms(missing))
+
+    elapsed = (time.perf_counter() - t0) * 1000
+
+    print(f"\n{'='*80}")
+    print(f"RESULTS: {len(results)} chunks matched ({elapsed:.0f}ms total)")
+    print(f"{'='*80}\n")
+
+    if not results:
+        print("  No matching chunks found.")
+    else:
+        for rank, r in enumerate(results, 1):
+            print(f"  #{rank}  {ChunkMatcher.explain(r, terms)}")
+            print()
+
+    return results, terms, chunks
+
+
+# ── LLM Reasoning ────────────────────────────────────────────────────────────
+
+def build_reasoning_prompt(
+    query_text: str,
+    results: list,
+    chunks: dict,
+    terms: dict,
+    top_k: int = _LLM_TOP_K,
+) -> str:
+    sections = []
+    for rank, r in enumerate(results[:top_k], 1):
+        chunk_data  = chunks.get(r.chunk_id, {})
+        chunk_text  = chunk_data.get("text", "(text not available)")
+        match_explain = ChunkMatcher.explain(r, terms)
+        chunk_cui_list = ", ".join(
+            f"{c} ({terms.get(c, c)})" for c in sorted(chunk_data.get("cuis", set()))
+        )
+        sections.append(
+            f"--- CHUNK #{rank} ---\n"
+            f"Chunk ID: {r.chunk_id}\n"
+            f"Document: {r.document_id}\n"
+            f"Score: {r.score:.3f} (CUI overlap={r.cui_overlap_ratio:.2f}, "
+            f"Lin={r.lin_score:.3f})\n\n"
+            f"Clinical Text:\n{chunk_text}\n\n"
+            f"Medical Concepts (after CUI reduction):\n{chunk_cui_list}\n\n"
+            f"Match Analysis:\n{match_explain}"
+        )
+
+    query_cuis_str = ", ".join(
+        f"{c} ({terms.get(c, c)})" for c in sorted(
+            set(d.query_cui for r in results[:top_k] for d in r.lin_details)
+        )
+    )
+
+    return (
+        "You are a clinical information retrieval expert. "
+        "Analyze the following query and retrieved document chunks.\n\n"
+        f"CLINICAL QUERY: {query_text}\n\n"
+        f"QUERY CONCEPTS (after CUI extraction and reduction):\n{query_cuis_str}\n\n"
+        f"RETRIEVED CHUNKS (ranked by relevance):\n\n"
+        + "\n\n".join(sections)
+        + "\n\nINSTRUCTIONS:\n"
+        "1. For each retrieved chunk, explain WHY it matches the query from a "
+        "clinical perspective. Reference specific medical concepts, not just CUI codes.\n"
+        "2. Identify which chunk BEST answers the query and explain your clinical reasoning.\n"
+        "3. Note any important clinical concepts from the query that are NOT covered by "
+        "any retrieved chunk.\n"
+        "4. Rate the overall retrieval quality: Excellent / Good / Fair / Poor, "
+        "with justification.\n\n"
+        "Provide your analysis in clear, structured prose."
+    )
+
+
+def llm_reason(
+    query_text: str,
+    results: list,
+    chunks: dict,
+    terms: dict,
+    top_k: int = _LLM_TOP_K,
+) -> str:
+    """Call Vertex AI LLM to reason about match quality."""
+    if not results:
+        return "No chunks matched the query. Cannot reason about matches."
+
+    prompt = build_reasoning_prompt(query_text, results, chunks, terms, top_k)
+
+    try:
+        from google.cloud import aiplatform
+        from vertexai.generative_models import GenerativeModel
+
+        aiplatform.init(project=LLM_PROJECT_ID, location=LLM_LOCATION)
+        model = GenerativeModel(LLM_MODEL)
+        response = model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": LLM_MAX_TOKENS, "temperature": 0.2},
+        )
+        return response.text
+
+    except ImportError:
+        print("\n  LLM reasoning skipped (install: pip install google-cloud-aiplatform)")
+        print(f"\n  Prompt ({len(prompt)} chars) saved for manual use.")
+        return prompt
+    except Exception as e:
+        print(f"\n  LLM reasoning failed: {e}")
+        return prompt
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")
+
+    QUERIES = [
+        "left knee osteoarthritis treatment with methotrexate",
+        "rheumatoid arthritis of knee",
+        "elevated CRP and ESR",
+        "methotrexate side effects",
+    ]
+
+    all_rows: List[list] = []
+    all_reasoning: Dict[str, str] = {}
+
+    for query_text in QUERIES:
+        result = run_query(query_text, STORE_PATH, top_k=5)
+        if not result:
+            continue
+        results, terms, chunks = result
+
+        print(f"\n{'='*80}")
+        print("LLM REASONING")
+        print(f"{'='*80}")
+        reasoning = llm_reason(query_text, results, chunks, terms)
+        if reasoning:
+            all_reasoning[query_text] = reasoning
+            if not reasoning.startswith("You are a clinical"):
+                print(reasoning)
+                print()
+
+        for rank, r in enumerate(results, 1):
+            topic_parts = []
+            for tid, t_info in sorted(r.topics_matched.items()):
+                t_cui   = t_info.get("topic_cui")
+                t_label = terms.get(t_cui, t_cui) if t_cui else ""
+                hit_names = [terms.get(c, c) for c in t_info.get("matched_cuis", [])]
+                topic_parts.append(f"{t_label}({', '.join(hit_names)})")
+            matched_names = [terms.get(c, c) for c in r.overlapping_cuis]
+            all_rows.append([
+                query_text, rank, r.chunk_id, r.document_id,
+                r.score, r.cui_overlap, r.cui_overlap_ratio,
+                r.lin_score, r.total_chunk_cuis,
+                " | ".join(topic_parts),
+                " | ".join(matched_names),
+            ])
+
+    if all_rows:
+        csv_path = os.path.join(OUTPUT_DIR, "query_results.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["query", "rank", "chunk_id", "document_id",
+                        "score", "cui_overlap", "cui_overlap_ratio",
+                        "lin_score", "total_chunk_cuis",
+                        "topics_hit", "matched_cuis"])
+            w.writerows(all_rows)
+        print(f"\n{'='*80}")
+        print(f"Results saved to {csv_path}")
+
+    if all_reasoning:
+        reasoning_path = os.path.join(OUTPUT_DIR, "query_reasoning.txt")
+        with open(reasoning_path, "w") as f:
+            for qt, reasoning in all_reasoning.items():
+                f.write(f"{'='*80}\nQUERY: {qt}\n{'='*80}\n\n{reasoning}\n\n")
+        print(f"Reasoning saved to {reasoning_path}")
+
+    print(f"\nDONE — {len(QUERIES)} queries processed")
