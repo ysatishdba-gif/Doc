@@ -1,572 +1,344 @@
 """
-Query Runner — CUI Filter + Vector + Lin Scoring.
-
-Takes clinical query text, reduces, matches against stored chunks.
-
-Usage:
-    python run_query.py
-
-Flow:
-    Query text → CUI extraction → Full reduce_batch() pipeline (stages 1-4 + Louvain)
-    → HierarchicalTopicBuilder topic formation (same as document ingestion)
-    → Fetch embeddings → Compute topic centroids
-    → Pass 1: Topic gate  (TopicIndex — hard exclusion on centroid similarity)
-    → Pass 2: CUI scoring (within matched topics only)
-    → Pass 3: Z-score normalisation
-    → Pass 4: Confidence gap filter
-    → Ranked results
-    → LLM reasoning (optional)
-
-Design principle:
-    Query and document pipelines are identical up to ChunkStore persistence.
-    reduce_batch() is used for both. HierarchicalTopicBuilder is used for both.
-    This ensures query topic centroids and document topic centroids are built
-    by the same grouping logic — Pass 1 is a true like-for-like comparison.
+CUI Reduction Runner — API
+Extracts CUIs via API, reduction, topics, representatives, anchors, CSVs.
 """
 
 import os
 import csv
-import time
-from typing import Dict, List, Optional, Tuple
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Set
 
+import numpy as np
 from google.cloud import bigquery
 
 from config import (
     PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, CACHE_DIR, ALLOWED_SABS,
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED, OUTPUT_DIR,
-    LLM_PROJECT_ID, LLM_LOCATION, LLM_MODEL, LLM_MAX_TOKENS,
-    hierarchy, ic_precomputed
+    INCLUDE_SUBTOPICS, hierarchy, ic_precomputed
 )
 from cui_reduction_system import (
-    CUIReductionSystem, CUIExtractor, fetch_preferred_terms,
-    ClinicalContext,
-    HierarchicalTopicBuilder, TopicRepresentativeSelector, TopicAnchorAssigner,
+    CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
+    TopicRepresentativeSelector, TopicAnchorAssigner, fetch_preferred_terms,
+    ClinicalContext, Verdict,
 )
-from topic_matcher import (
-    ChunkStore, ChunkMatcher, TopicIndex,
-    compute_centroid,
-)
-
-_LLM_TOP_K = 3
+from topic_matcher import ChunkStore, compute_centroid
 
 
-# ── Setup (runs once) ────────────────────────────────────────────────────────
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-bq = bigquery.Client(project=PROJECT_ID)
+# ── shared instances ──────────────────────────────────────────────────────────
 
 system = CUIReductionSystem(
-    project_id=PROJECT_ID, dataset_id=DATASET_ID,
-    full_network=hierarchy, allowed_sabs=ALLOWED_SABS,
-    embedding_table=EMBEDDING_TABLE, ic_scores=ic_precomputed,
-    cache_dir=CACHE_DIR)
+    project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
+    allowed_sabs=ALLOWED_SABS, embedding_table=EMBEDDING_TABLE,
+    ic_scores=ic_precomputed, cache_dir=CACHE_DIR)
 
 extractor = CUIExtractor(
-    api_url=API_URL,
-    top_k=10,
-    top_p=TOP_P,
-    cluster_set=CLUSTER_SET, combined=COMBINED,
-    cache_dir=CACHE_DIR)
+    api_url=API_URL, top_k=TOP_K, top_p=TOP_P,
+    cluster_set=CLUSTER_SET, combined=COMBINED, cache_dir=CACHE_DIR)
 
-matcher = ChunkMatcher(hierarchy, ic_precomputed)
+evaluator = Evaluator(hierarchy)
+bq = bigquery.Client(project=PROJECT_ID)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 _fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
 
 
-# ── Helpers — work with both TopicGroupMatch and ChunkMatch ──────────────────
-
-def _is_topic_result(r) -> bool:
-    """True if r is a TopicGroupMatch (TopicIndex path)."""
-    return hasattr(r, 'group_id')
-
-
-def _matched_cuis(r) -> List[str]:
-    """CUIs matched in this result, regardless of result type."""
-    if _is_topic_result(r):
-        return list(r.matched_cuis)
-    return list(getattr(r, 'overlapping_cuis', []))
+def save_csv(path: str, headers: List[str], rows: List[list]) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        w.writerows(rows)
 
 
-def _display_result(rank: int, r, terms: dict) -> str:
-    """Single-line display for either result type."""
-    if _is_topic_result(r):
-        variant_flag = " [VARIANT]" if r.is_variant else ""
-        matched_terms = ", ".join(terms.get(c, c) for c in r.matched_cuis)
-        return (f"#{rank}  chunk={r.chunk_id}  topic={r.topic_label}  "
-                f"score={r.score:.3f}  CUI={r.cui_overlap_ratio:.2f}  "
-                f"Lin={r.lin_score:.3f}{variant_flag}\n"
-                f"       matched: {matched_terms}")
-    # ChunkMatch (legacy)
-    return f"#{rank}  {ChunkMatcher.explain(r, terms)}"
+# ── Typed pipeline result ─────────────────────────────────────────────────────
+
+@dataclass
+class PipelineResult:
+    """Typed container for process_text() output."""
+    surviving_cuis:  Set[str]                        = field(default_factory=set)
+    text:            str                             = ""
+    anchors:         list                            = field(default_factory=list)
+    ic_map:          Dict[str, float]                = field(default_factory=dict)
+    terms:           Dict[str, str]                  = field(default_factory=dict)
+    h_topics:        Dict                            = field(default_factory=dict)
+    topic_reps:      Dict                            = field(default_factory=dict)
+    entity_results:  List                            = field(default_factory=list)
+    all_embeddings:  Dict[str, np.ndarray]           = field(default_factory=dict)
+    metadata:        Dict                            = field(default_factory=dict)
+    # temporal_map: CUI → ClinicalContext (booleans from ConText)
+    temporal_map:    Dict[str, ClinicalContext]      = field(default_factory=dict)
 
 
-def _collect_term_cuis(results: list) -> set:
-    """All CUIs that need term resolution across results of either type."""
-    cuis = set()
-    for r in results:
-        cuis.update(_matched_cuis(r))
-        if not _is_topic_result(r):
-            for t_info in getattr(r, 'topics_matched', {}).values():
-                tc = t_info.get("topic_cui")
-                if tc:
-                    cuis.add(tc)
-                cuis.update(t_info.get("matched_cuis", []))
-            for d in getattr(r, 'lin_details', []):
-                if d.chunk_cui:  cuis.add(d.chunk_cui)
-                if d.mica_cui:   cuis.add(d.mica_cui)
-                cuis.add(d.query_cui)
-    return cuis
+# ── core pipeline ─────────────────────────────────────────────────────────────
 
+def _resolve_context(existing: Optional[ClinicalContext],
+                     new: ClinicalContext) -> ClinicalContext:
+    """When a CUI appears in multiple phrases, keep the highest-priority context.
 
-def _csv_row(query_text: str, rank: int, r, terms: dict) -> list:
-    """Build a CSV row for either result type."""
-    matched_names = " | ".join(terms.get(c, c) for c in _matched_cuis(r))
-
-    if _is_topic_result(r):
-        return [
-            query_text, rank, r.chunk_id, r.document_id,
-            r.score, len(r.matched_cuis), r.cui_overlap_ratio,
-            r.lin_score, "",          # total_chunk_cuis — not on TopicGroupMatch
-            r.topic_label,
-            matched_names,
-        ]
-    # ChunkMatch
-    topic_parts = []
-    for tid, t_info in sorted(getattr(r, 'topics_matched', {}).items()):
-        t_cui   = t_info.get("topic_cui")
-        t_label = terms.get(t_cui, t_cui) if t_cui else ""
-        hits    = [terms.get(c, c) for c in t_info.get("matched_cuis", [])]
-        topic_parts.append(f"{t_label}({', '.join(hits)})")
-    return [
-        query_text, rank, r.chunk_id, r.document_id,
-        r.score, r.cui_overlap, r.cui_overlap_ratio,
-        r.lin_score, r.total_chunk_cuis,
-        " | ".join(topic_parts),
-        matched_names,
-    ]
-
-
-# ── Query processing ─────────────────────────────────────────────────────────
-
-def process_query(query_text: str) -> Optional[Dict]:
-    """Extract and reduce query CUIs using the same pipeline as document ingestion.
-
-    In production, CUI reduction and topic formation is a shared API applied
-    identically to both documents and runtime queries. This function runs the
-    full pipeline — same extraction, same four-stage reduction, same
-    HierarchicalTopicBuilder topic formation — so query topics and document
-    topics are directly comparable in Pass 1.
-
-    The only difference from document ingestion: results are not persisted
-    to ChunkStore. Everything else is identical.
+    Priority via ClinicalContext.temporal_priority():
+      negated(0) > current(1) > historical(2) > hypothetical(3) > family(4)
     """
-    print(f"\n{'='*80}")
-    print(f"QUERY: {query_text}")
-    print(f"{'='*80}")
+    if existing is None:
+        return new
+    return new if new.temporal_priority() < existing.temporal_priority() else existing
 
-    # ── Step 1: Extract CUIs (same as document ingestion) ────────────────────
-    print("  → Extracting CUIs...", flush=True)
-    per_phrase = extractor.extract([query_text], [query_text])
-    extractor._cache.flush()
 
-    if not per_phrase:
-        print("  → No CUIs extracted (all negated or empty)")
+def process_text(
+    text_list: List[str],
+    context: str,
+    label: str = "doc",
+) -> Optional[PipelineResult]:
+    """Full pipeline: text → extract → reduce → topics → reps → anchors."""
+    if not text_list:
+        print(f"[{label}] No phrases supplied")
         return None
 
-    per_phrase_cuis: Dict[str, Dict] = {}
-    query_temporal:  Dict[str, ClinicalContext] = {}
+    context_list = [context] * len(text_list)
+    per_phrase = extractor.extract(text_list, context_list)
+    extractor._cache.flush()
 
-    for ph, tagged in per_phrase.items():
+    # per_phrase: {phrase: {"cuis": {cui: dist}, "context": ClinicalContext}}
+    per_phrase_cuis: Dict[str, Dict] = {}
+    temporal_map:    Dict[str, ClinicalContext] = {}
+
+    for phrase, tagged in per_phrase.items():
         cui_dists = tagged.get("cuis") or {}
         if not cui_dists:
             continue
         cc: ClinicalContext = tagged.get("context", ClinicalContext())
-        per_phrase_cuis[ph] = cui_dists
+        per_phrase_cuis[phrase] = cui_dists
         for cui in cui_dists:
-            existing = query_temporal.get(cui)
-            if existing is None or cc.temporal_priority() < existing.temporal_priority():
-                query_temporal[cui] = cc
+            temporal_map[cui] = _resolve_context(temporal_map.get(cui), cc)
 
-    if not per_phrase_cuis:
-        print("  → No CUIs after unpacking")
-        return None
-
-    total_cuis = sum(len(cd) for cd in per_phrase_cuis.values())
-    print(f"  → Extracted: {total_cuis} CUIs", flush=True)
-
-    non_current = {c: cc for c, cc in query_temporal.items() if not cc.is_current()}
-    if non_current:
-        flags = {c: ("historical" if cc.historical else
-                     "hypothetical" if cc.hypothetical else "family")
-                 for c, cc in non_current.items()}
-        print(f"  → Temporal tags: {flags}")
-
-    print("\n  ── Raw CUIs from API (before reduction) ──")
-    all_raw_cuis: List[str] = []
-    for phrase, cd in per_phrase_cuis.items():
-        print(f"    Phrase: '{phrase}'")
-        for cui, dist in sorted(cd.items(), key=lambda x: (x[1] is None, x[1])):
-            all_raw_cuis.append(cui)
-
-    raw_terms = _fetch_terms(set(all_raw_cuis))
-    for phrase, cd in per_phrase_cuis.items():
-        for cui, dist in sorted(cd.items(), key=lambda x: (x[1] is None, x[1])):
-            dist_str = f"{dist:.4f}" if dist is not None else "?"
-            name = raw_terms.get(cui, "?")
-            print(f"      {cui}  dist={dist_str}  {name}")
-    print()
-
-    # ── Step 2: Full four-stage reduction (same as document ingestion) ────────
-    # Uses reduce_batch() — the identical reduction path used for documents.
-    # reduce_query() is intentionally not used here: it skips Louvain and
-    # several other stages. One pipeline for both queries and documents.
-    print("  → Reducing (stages 1-4)...", flush=True)
-    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase_cuis.items()]
-    reduction_results = system.reduce_batch(batch_inputs)
-
-    all_surviving: set = set()
-    for r in reduction_results:
-        all_surviving.update(r.all_reduced_cuis)
-
-    if not all_surviving:
-        print("  → No CUIs survived reduction")
-        return None
-
-    print(f"  → Surviving: {len(all_surviving)} CUIs (from {total_cuis} raw)", flush=True)
-
-    # ── Step 3: Embeddings (same as document ingestion) ───────────────────────
-    print(f"  → Fetching embeddings for {len(all_surviving)} surviving CUIs...", flush=True)
-    query_embeddings = system.emb_fetcher.fetch(list(all_surviving))
-    query_embedding  = compute_centroid(all_surviving, query_embeddings)
-
-    # ── Step 4: Topic formation — HierarchicalTopicBuilder (same as document) ─
-    # Documents use HierarchicalTopicBuilder. Queries now use the same method.
-    # This ensures query topic centroids and document topic centroids are built
-    # by the same grouping logic — Pass 1 is a true like-for-like comparison.
-    print("  → Building query topics (HierarchicalTopicBuilder)...", flush=True)
-    ic_map      = system.ic_computer.compute(list(all_surviving), {})
-    query_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
-
-    metadata    = system.fetcher.fetch(list(all_surviving))
-    topic_reps  = TopicRepresentativeSelector.select(
-        query_topics, metadata, query_embeddings, ic_map, hierarchy)
-    HierarchicalTopicBuilder.label_topics(query_topics, topic_reps)
-
-    # Compute centroid per query topic — same as document path
-    for t_info in query_topics.values():
-        t_info["centroid"] = compute_centroid(t_info.get("members", []), query_embeddings)
-
-    print(f"  → Query topics: {len(query_topics)}")
-    for tid, qt in query_topics.items():
-        members = qt.get("members", [])
-        label   = qt.get("topic_cui", tid)
-        print(f"      Topic {tid}: {len(members)} CUIs  [{label}]")
-
-    # ── Step 5: Fetch terms and build output ──────────────────────────────────
-    terms = _fetch_terms(all_surviving)
-    for cui in all_surviving:
-        cc = query_temporal.get(cui, ClinicalContext())
+    print(f"\n[{label}] Extracted CUIs for {len(per_phrase_cuis)} phrases")
+    for phrase, cui_dists in per_phrase_cuis.items():
+        cc = per_phrase[phrase].get("context", ClinicalContext())
         flags = []
         if cc.historical:   flags.append("historical")
         if cc.hypothetical: flags.append("hypothetical")
         if cc.family:       flags.append("family")
-        t_suffix = f" [{', '.join(flags)}]" if flags else ""
-        print(f"      {cui} | {terms.get(cui, cui)}{t_suffix}")
+        tag = f" [{', '.join(flags)}]" if flags else ""
+        print(f"  \"{phrase}\"{tag}: {len(cui_dists)} CUIs")
 
-    surviving_temporal: Dict[str, ClinicalContext] = {
-        c: query_temporal.get(c, ClinicalContext()) for c in all_surviving
-    }
-
-    return {
-        "surviving_cuis": all_surviving,
-        "embedding":      query_embedding,
-        "query_topics":   query_topics,
-        "terms":          terms,
-        "temporal_map":   surviving_temporal,
-    }
-
-
-# ── Full query → ranked results ───────────────────────────────────────────────
-
-def run_query(
-    query_text: str,
-    store_path: Optional[str] = None,
-    top_k: int = 10,
-    _prebuilt_chunks: Optional[dict] = None,
-    _prebuilt_index: Optional[TopicIndex] = None,
-) -> Optional[Tuple[list, dict, dict]]:
-    """Run a clinical query against stored chunks.
-
-    Args:
-        query_text:        clinical question in free text
-        store_path:        path to chunk_store.pkl
-        top_k:             max results
-        _prebuilt_chunks:  pass pre-loaded chunks to avoid reloading per query
-        _prebuilt_index:   pass pre-built TopicIndex to avoid rebuilding per query
-
-    Returns:
-        (results, terms, chunks) or None
-    """
-    t0 = time.perf_counter()
-
-    # ── Load store (skip if caller pre-loaded) ────────────────────────────────
-    if _prebuilt_chunks is not None:
-        chunks = _prebuilt_chunks
-        topic_index = _prebuilt_index
-    else:
-        store_path = store_path or os.path.join(OUTPUT_DIR, "chunk_store.pkl")
-        if not os.path.exists(store_path):
-            print(f"ERROR: chunk store not found at {store_path}")
-            print("  → Run run_cui_reduction_api.py first to build the store")
-            return None
-
-        store  = ChunkStore.load(store_path)
-        chunks = store.get_all()
-        if not chunks:
-            print("ERROR: no chunks in store")
-            return None
-
-        stats = store.stats()
-        print(f"\nStore: {stats['chunks']} chunks, {stats['total_cuis']} stored CUIs, "
-              f"{stats['chunks_with_embeddings']} with embeddings")
-
-        # Build TopicIndex once — expensive (~30s for large stores)
-        has_topic_centroids = any(
-            any(t.get("centroid") is not None
-                for t in cd.get("topics", {}).values())
-            for cd in chunks.values()
-        )
-        topic_index = None
-        if has_topic_centroids:
-            topic_index = TopicIndex()
-            topic_index.build(chunks, graph=hierarchy)
-            print(f"  → TopicIndex built: {len(topic_index.groups)} groups")
-
-    query_result = process_query(query_text)
-    if not query_result:
+    if not per_phrase_cuis:
+        print(f"[{label}] No CUIs extracted (all negated or empty)")
         return None
 
-    query_cuis      = query_result["surviving_cuis"]
-    query_embedding = query_result["embedding"]
-    query_topics    = query_result.get("query_topics")
-    query_temporal  = query_result.get("temporal_map", {})
-    terms           = query_result["terms"]
+    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase_cuis.items()]
+    results = system.reduce_batch(batch_inputs)
+    entity_results = [(batch_inputs[i][1], results[i]) for i in range(len(results))]
 
-    print(f"\n  → Matching against {len(chunks)} chunks...", flush=True)
+    all_surviving: Set[str] = set()
+    all_cuis:      Set[str] = set()
+    for _entity_text, result in entity_results:
+        all_surviving.update(result.all_reduced_cuis)
+        for e in result.confidence:
+            all_cuis.update(e.explains_cuis)
+        for a in result.audit_trail:
+            all_cuis.add(a.removed_cui)
+            if a.kept_cui:
+                all_cuis.add(a.kept_cui)
+    all_cuis.update(all_surviving)
+    for cd in per_phrase_cuis.values():
+        all_cuis.update(cd.keys())
 
-    # ── Two-pass matching ─────────────────────────────────────────────────────
-    # TopicIndex was built at store load time — reused here (no rebuild).
-    if topic_index is not None and query_topics:
-        print("  → Path: TopicIndex (topic gate → CUI scoring within matched topics)")
-        results = topic_index.match(
-            query_topics, query_cuis, query_embedding,
-            matcher, top_k=top_k,
-        )
-        if results:
-            print(f"  → TopicIndex: {len(results)} results")
-        else:
-            print("  → TopicIndex: no groups cleared the topic gate — 0 results")
-            print("     (query concepts may not be represented in the store)")
-    else:
-        print("  → Path: ChunkMatcher (legacy — store has no topic centroids)")
-        results = matcher.match(
-            query_cuis, query_embedding, chunks,
-            top_k=top_k,
-            query_topics=query_topics,
-            query_temporal=query_temporal,
-        )
+    if not all_surviving:
+        print(f"[{label}] No CUIs survived reduction")
+        return None
 
-    # Resolve terms for all matched CUIs (both result types)
-    missing = _collect_term_cuis(results) - set(terms.keys())
-    if missing:
-        terms.update(_fetch_terms(missing))
+    ic_map       = system.ic_computer.compute(list(all_surviving), {})
+    h_topics     = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
+    terms        = _fetch_terms(all_cuis)
+    embeddings   = system.emb_fetcher.fetch(list(all_surviving))
+    removed_embs = system.emb_fetcher.fetch(list(all_cuis - all_surviving))
+    all_embeddings = {**embeddings, **removed_embs}
 
-    elapsed = (time.perf_counter() - t0) * 1000
+    metadata   = system.fetcher.fetch(list(all_cuis))
+    topic_reps = TopicRepresentativeSelector.select(
+        h_topics, metadata, all_embeddings, ic_map, hierarchy)
+    HierarchicalTopicBuilder.label_topics(h_topics, topic_reps)
 
-    print(f"\n{'='*80}")
-    print(f"RESULTS: {len(results)} chunks matched ({elapsed:.0f}ms total)")
-    print(f"{'='*80}\n")
+    label_cuis = {t["topic_cui"] for t in h_topics.values() if t.get("topic_cui")}
+    missing_label_terms = label_cuis - set(terms.keys())
+    if missing_label_terms:
+        terms.update(_fetch_terms(missing_label_terms))
 
-    if not results:
-        print("  No matching chunks found.")
-    else:
-        for rank, r in enumerate(results, 1):
-            print(f"  {_display_result(rank, r, terms)}")
-            print()
+    anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
+    anchor_cuis = set(a.anchor_cui for a in anchors)
+    anchor_cuis.update(c for a in anchors for c in (a.ancestor_cuis or []))
+    terms.update(_fetch_terms(anchor_cuis - set(terms.keys())))
 
-    return results, terms, chunks
+    surviving_temporal: Dict[str, ClinicalContext] = {
+        c: temporal_map.get(c, ClinicalContext()) for c in all_surviving
+    }
 
+    raw_count = sum(len(cd) for cd in per_phrase_cuis.values())
+    print(f"[{label}] {raw_count} raw → {len(all_surviving)} surviving "
+          f"→ {len(h_topics)} topics → {len(anchors)} anchors")
 
-# ── LLM Reasoning ────────────────────────────────────────────────────────────
+    non_current = {c: cc for c, cc in surviving_temporal.items()
+                   if not cc.is_current()}
+    if non_current:
+        hist  = sum(1 for cc in non_current.values() if cc.historical)
+        hypo  = sum(1 for cc in non_current.values() if cc.hypothetical)
+        fam   = sum(1 for cc in non_current.values() if cc.family)
+        print(f"  Temporal: historical={hist} hypothetical={hypo} family={fam}")
 
-def build_reasoning_prompt(
-    query_text: str,
-    results: list,
-    chunks: dict,
-    terms: dict,
-    top_k: int = _LLM_TOP_K,
-) -> str:
-    sections = []
-    for rank, r in enumerate(results[:top_k], 1):
-        chunk_data = chunks.get(r.chunk_id, {})
-        chunk_text = chunk_data.get("text", "(text not available)")
-        chunk_cui_list = ", ".join(
-            f"{c} ({terms.get(c, c)})" for c in sorted(chunk_data.get("cuis", set()))
-        )
-        # Match analysis — both types have score, cui_overlap_ratio, lin_score
-        match_explain = (
-            f"Topic: {r.topic_label}  score={r.score:.3f}  "
-            f"CUI overlap={r.cui_overlap_ratio:.2f}  Lin={r.lin_score:.3f}"
-            if _is_topic_result(r)
-            else ChunkMatcher.explain(r, terms)
-        )
-        sections.append(
-            f"--- CHUNK #{rank} ---\n"
-            f"Chunk ID: {r.chunk_id}\n"
-            f"Document: {r.document_id}\n"
-            f"Score: {r.score:.3f} (CUI overlap={r.cui_overlap_ratio:.2f}, "
-            f"Lin={r.lin_score:.3f})\n\n"
-            f"Clinical Text:\n{chunk_text}\n\n"
-            f"Medical Concepts (after CUI reduction):\n{chunk_cui_list}\n\n"
-            f"Match Analysis:\n{match_explain}"
-        )
+    for a in anchors:
+        rep_terms_list = [terms.get(rc, rc) for rc in a.rep_cuis]
+        print(f"    {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)} "
+              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms_list)}])")
 
-    # Query CUIs — use matched_cuis from results (works for both types)
-    all_matched = set(c for r in results[:top_k] for c in _matched_cuis(r))
-    query_cuis_str = ", ".join(
-        f"{c} ({terms.get(c, c)})" for c in sorted(all_matched)
-    )
-
-    return (
-        "You are a clinical information retrieval expert. "
-        "Analyze the following query and retrieved document chunks.\n\n"
-        f"CLINICAL QUERY: {query_text}\n\n"
-        f"QUERY CONCEPTS (after CUI extraction and reduction):\n{query_cuis_str}\n\n"
-        f"RETRIEVED CHUNKS (ranked by relevance):\n\n"
-        + "\n\n".join(sections)
-        + "\n\nINSTRUCTIONS:\n"
-        "1. For each retrieved chunk, explain WHY it matches the query from a "
-        "clinical perspective. Reference specific medical concepts, not just CUI codes.\n"
-        "2. Identify which chunk BEST answers the query and explain your clinical reasoning.\n"
-        "3. Note any important clinical concepts from the query that are NOT covered by "
-        "any retrieved chunk.\n"
-        "4. Rate the overall retrieval quality: Excellent / Good / Fair / Poor, "
-        "with justification.\n\n"
-        "Provide your analysis in clear, structured prose."
+    return PipelineResult(
+        surviving_cuis = all_surviving,
+        text           = context,
+        anchors        = anchors,
+        ic_map         = ic_map,
+        terms          = terms,
+        h_topics       = h_topics,
+        topic_reps     = topic_reps,
+        entity_results = entity_results,
+        all_embeddings = all_embeddings,
+        metadata       = metadata,
+        temporal_map   = surviving_temporal,
     )
 
 
-def llm_reason(
-    query_text: str,
-    results: list,
-    chunks: dict,
-    terms: dict,
-    top_k: int = _LLM_TOP_K,
-) -> str:
-    if not results:
-        return "No chunks matched the query. Cannot reason about matches."
+# ── CSV writers ───────────────────────────────────────────────────────────────
 
-    prompt = build_reasoning_prompt(query_text, results, chunks, terms, top_k)
+def write_csvs(result: PipelineResult, label: str = "doc") -> None:
+    terms    = result.terms
+    h_topics = result.h_topics
 
-    try:
-        from google.cloud import aiplatform
-        from vertexai.generative_models import GenerativeModel
+    entity_rows = []
+    for entity_text, r in result.entity_results:
+        for e in r.confidence:
+            explains_str = " | ".join(
+                f"{ec}:{terms.get(ec, ec)}" for ec in e.explains_cuis
+            ) if e.explains_cuis else ""
+            entity_rows.append([
+                entity_text, e.cui, terms.get(e.cui, e.cui),
+                round(e.confidence, 4), round(e.extraction_proximity, 3),
+                round(e.centrality, 3), round(e.retention_power, 3),
+                len(e.explains_cuis), explains_str,
+            ])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_entities.csv"),
+             ["entity","cui","preferred_term","confidence","prox","cent","ret",
+              "explains_count","explains"], entity_rows)
 
-        aiplatform.init(project=LLM_PROJECT_ID, location=LLM_LOCATION)
-        model = GenerativeModel(LLM_MODEL)
-        response = model.generate_content(
-            prompt,
-            generation_config={"max_output_tokens": LLM_MAX_TOKENS, "temperature": 0.2},
-        )
-        return response.text
+    topic_rows = []
+    if INCLUDE_SUBTOPICS:
+        for tid, t in sorted(h_topics.items()):
+            t_label_cui = t.get("topic_cui") or ""
+            t_label = terms.get(t_label_cui, t_label_cui) if t_label_cui else ""
+            for stid, st in sorted(t.get("subtopics", {}).items()):
+                st_cui  = st.get("subtopic_cui") or ""
+                st_name = terms.get(st_cui, st_cui) if st_cui else ""
+                for c in st.get("members", []):
+                    topic_rows.append([tid, t_label, stid, st_name, c, terms.get(c, c)])
+            for c in sorted(t.get("ungrouped", [])):
+                topic_rows.append([tid, t_label, "", "", c, terms.get(c, c)])
+        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+                 ["topic_id","topic_label","subtopic_id","subtopic_name",
+                  "cui","preferred_term"], topic_rows)
+    else:
+        for tid, t in sorted(h_topics.items()):
+            t_label_cui = t.get("topic_cui") or ""
+            t_label = terms.get(t_label_cui, t_label_cui) if t_label_cui else ""
+            for c in t.get("members", []):
+                topic_rows.append([tid, t_label, c, terms.get(c, c)])
+        save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
+                 ["topic_id","topic_label","cui","preferred_term"], topic_rows)
 
-    except ImportError:
-        print("\n  LLM reasoning skipped (install: pip install google-cloud-aiplatform)")
-        return prompt
-    except Exception as e:
-        print(f"\n  LLM reasoning failed: {e}")
-        return prompt
+    rep_rows = []
+    for tid in sorted(result.topic_reps.keys()):
+        for r in result.topic_reps[tid]:
+            rep_rows.append([
+                tid, r.cui, terms.get(r.cui, r.cui), r.method,
+                r.member_count, round(r.ic_score, 2),
+                " | ".join(f"{m}:{terms.get(m,m)}" for m in r.members),
+            ])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_representatives.csv"),
+             ["topic_id","rep_cui","rep_term","method","member_count",
+              "ic_score","members"], rep_rows)
+
+    anchor_rows = []
+    for a in result.anchors:
+        rep_detail = " | ".join(f"{rc}:{terms.get(rc,rc)}" for rc in a.rep_cuis)
+        topic_parts = [
+            f"topic_{tid}({len(h_topics.get(tid, {}).get('members', []))} CUIs)"
+            for tid in a.topic_ids
+        ]
+        anchor_rows.append([
+            a.anchor_cui, terms.get(a.anchor_cui, a.anchor_cui),
+            round(a.anchor_ic, 2), rep_detail,
+            len(a.topic_ids), " | ".join(topic_parts),
+            len(a.ancestor_cuis) if a.ancestor_cuis else 0,
+        ])
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_anchors.csv"),
+             ["anchor_cui","anchor_term","anchor_ic","representatives",
+              "topics_covered","topic_details","ancestor_count"], anchor_rows)
+
+    print(f"[{label}] CSVs written to {OUTPUT_DIR}")
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+def run_evaluation(result: PipelineResult, label: str = "doc"):
+    flat_topics = {tid: t.get("members", []) for tid, t in result.h_topics.items()}
+    metric_rows = evaluator.intrinsic_metrics(
+        label, result.entity_results, flat_topics, result.all_embeddings)
+    recon_rows  = evaluator.reconstruction_check(
+        label, result.entity_results, result.all_embeddings,
+        result.metadata, result.terms)
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_metrics.csv"),
+             Evaluator.metric_headers(), metric_rows)
+    save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_reconstruction.csv"),
+             Evaluator.reconstruction_headers(), recon_rows)
+    suspect = sum(1 for r in recon_rows if Verdict.SUSPECT.value in str(r[-1]))
+    ok      = sum(1 for r in recon_rows if str(r[-1]) == Verdict.OK.value)
+    total   = len(recon_rows)
+    if total:
+        print(f"[{label}] Evaluation: {ok}/{total} OK, {suspect}/{total} SUSPECT")
+    return metric_rows, recon_rows
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
-    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")
-
-    QUERIES = [
-        "left knee osteoarthritis treatment with methotrexate",
-        "rheumatoid arthritis of knee",
-        "elevated CRP and ESR",
-        "methotrexate side effects",
+    CONTEXT = (
+        "Patient presented with left knee pain and swelling for the past three days. "
+        "Pain worsens with weight bearing and climbing stairs. No history of trauma. "
+        "Mild effusion noted on examination."
+    )
+    TEXT_LIST = [
+        "left knee pain", "swelling", "weight bearing pain",
+        "climbing stairs difficulty", "knee effusion",
     ]
 
-    # ── Load store and build TopicIndex ONCE for all queries ─────────────────
-    if not os.path.exists(STORE_PATH):
-        print(f"ERROR: chunk store not found at {STORE_PATH}")
-        print("  → Run run_cui_reduction_api.py first to build the store")
-        raise SystemExit(1)
+    CHUNK_ID   = "api_chunk_1"
+    STORE_PATH = os.path.join(OUTPUT_DIR, "chunk_store.pkl")
 
-    _store  = ChunkStore.load(STORE_PATH)
-    _chunks = _store.get_all()
-    _stats  = _store.stats()
-    print(f"\nStore: {_stats['chunks']} chunks, {_stats['total_cuis']} stored CUIs, "
-          f"{_stats['chunks_with_embeddings']} with embeddings")
+    result = process_text(TEXT_LIST, CONTEXT, label="api")
+    if result:
+        write_csvs(result, label="api")
+        run_evaluation(result, label="api")
 
-    _has_centroids = any(
-        any(t.get("centroid") is not None for t in cd.get("topics", {}).values())
-        for cd in _chunks.values()
-    )
-    _topic_index: Optional[TopicIndex] = None
-    if _has_centroids:
-        _topic_index = TopicIndex()
-        _topic_index.build(_chunks, graph=hierarchy)
-        print(f"  → TopicIndex built once: {len(_topic_index.groups)} groups "
-              f"(reused for all {len(QUERIES)} queries)")
-
-    all_rows: List[list] = []
-    all_reasoning: Dict[str, str] = {}
-
-    for query_text in QUERIES:
-        result = run_query(
-            query_text, top_k=5,
-            _prebuilt_chunks=_chunks,
-            _prebuilt_index=_topic_index,
+        store     = ChunkStore()
+        chunk_emb = compute_centroid(result.surviving_cuis, result.all_embeddings)
+        store.add(
+            CHUNK_ID, "api_doc",
+            result.surviving_cuis,
+            embedding    = chunk_emb,
+            topics       = result.h_topics,
+            text         = result.text,
+            embeddings   = result.all_embeddings,
+            temporal_map = result.temporal_map,
         )
-        if not result:
-            continue
-        results, terms, chunks = result
+        store.save(STORE_PATH)
 
-        print(f"\n{'='*80}")
-        print("LLM REASONING")
-        print(f"{'='*80}")
-        reasoning = llm_reason(query_text, results, chunks, terms)
-        if reasoning:
-            all_reasoning[query_text] = reasoning
-            if not reasoning.startswith("You are a clinical"):
-                print(reasoning)
-                print()
+        stats = store.stats()
+        print(f"\n  Stored: {stats['total_cuis']} surviving CUIs "
+              f"for {stats['chunks']} chunk(s)")
+        print(f"  Store saved to: {STORE_PATH}")
 
-        for rank, r in enumerate(results, 1):
-            all_rows.append(_csv_row(query_text, rank, r, terms))
-
-    if all_rows:
-        csv_path = os.path.join(OUTPUT_DIR, "query_results.csv")
-        with open(csv_path, "w", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["query", "rank", "chunk_id", "document_id",
-                        "score", "cui_overlap", "cui_overlap_ratio",
-                        "lin_score", "total_chunk_cuis",
-                        "topics_hit", "matched_cuis"])
-            w.writerows(all_rows)
-        print(f"\n{'='*80}")
-        print(f"Results saved to {csv_path}")
-
-    if all_reasoning:
-        reasoning_path = os.path.join(OUTPUT_DIR, "query_reasoning.txt")
-        with open(reasoning_path, "w") as f:
-            for qt, reasoning in all_reasoning.items():
-                f.write(f"{'='*80}\nQUERY: {qt}\n{'='*80}\n\n{reasoning}\n\n")
-        print(f"Reasoning saved to {reasoning_path}")
-
-    print(f"\nDONE — {len(QUERIES)} queries processed")
+    print(f"\n{'='*80}\nDONE\n{'='*80}")
