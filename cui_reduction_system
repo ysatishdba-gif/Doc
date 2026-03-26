@@ -51,17 +51,32 @@ class ClinicalContext:
                and not self.hypothetical and not self.family
 
     @classmethod
-    def from_dict(cls, d: dict) -> "ClinicalContext":
-        """Restore from a stored dict (e.g. from pickle backfill)."""
+    def from_dict(cls, d) -> "ClinicalContext":
+        """Restore from a stored dict, string, or ClinicalContext.
+
+        Handles:
+          - None → default (current)
+          - ClinicalContext instance → return as-is
+          - dict with boolean keys → read directly
+          - legacy string ("historical") → map to boolean
+        """
         if d is None:
             return cls()
         if isinstance(d, cls):
             return d
+        if isinstance(d, dict):
+            return cls(
+                negated      = bool(d.get("negated", False)),
+                historical   = bool(d.get("historical", False)),
+                hypothetical = bool(d.get("hypothetical", False)),
+                family       = bool(d.get("family", False)),
+            )
+        # Legacy: old pickles may store bare string values
         legacy = str(d).lower()
         return cls(
-            historical   = legacy in ("historical",),
-            hypothetical = legacy in ("hypothetical",),
-            family       = legacy in ("family",),
+            historical   = legacy == "historical",
+            hypothetical = legacy == "hypothetical",
+            family       = legacy == "family",
             negated      = False,
         )
 
@@ -335,8 +350,8 @@ class ClinicalContextParser:
     additions. The 102 ConText rules are published, validated clinical
     NLP (Chapman 2001, Harkema 2009) maintained by the medspacy team.
 
-    parse() finds the phrase inside the context text and lets ConText
-    evaluate it in its natural sentence position.
+    batch_parse() processes the full document once and returns context
+    for all phrases — O(1) amortized per phrase vs O(n_tokens) per call.
     """
 
     _nlp = None
@@ -350,61 +365,113 @@ class ClinicalContextParser:
         log(f"    ClinicalContextParser: medspacy loaded "
             f"({len(cls._nlp.get_pipe('medspacy_context').rules)} built-in rules)")
 
-    def parse(self, phrase: str, context: str = "") -> "ClinicalContext":
-        """Detect clinical context for a phrase. O(n_tokens) per call.
+    def batch_parse(self, phrases: List[str], context: str = "") -> Dict[str, "ClinicalContext"]:
+        """Process all phrases against the same context in a single pass.
+
+        Runs medspacy once on the context text, sets all phrase spans as
+        entities, and reads ConText results for each. This avoids
+        re-tokenizing the full document per phrase.
 
         Args:
-            phrase:  clinical phrase to evaluate
-            context: surrounding sentence/note text (or empty for queries)
+            phrases: list of clinical phrases to evaluate
+            context: surrounding text (full sentence/note, or empty)
 
         Returns:
-            ClinicalContext with booleans from ConText.
-            Default (all False) = current, present, not negated.
+            dict {phrase: ClinicalContext} for every input phrase.
+            Phrases not found in context are processed standalone.
         """
         self._ensure_loaded()
         nlp = self.__class__._nlp
+        result = {}
 
-        phrase_s = phrase.strip()
-        if not phrase_s:
-            return ClinicalContext()
+        if not phrases:
+            return result
 
-        # ── Find phrase inside context (correct sentence scope) ───────────
-        # Never append phrase to context — clinical notes ending with
-        # negation triggers ("no f/u needed") would falsely negate it.
+        # ── Group phrases by whether they appear in context ───────────────
+        in_context = []     # (phrase, start, end) — found in context
+        standalone = []     # phrases not found — process alone
+
         if context:
             ctx_s = context.strip()
-            pos = ctx_s.lower().find(phrase_s.lower())
-            if pos != -1:
-                text = ctx_s
-                start, end = pos, pos + len(phrase_s)
-            else:
-                text = phrase_s
-                start, end = 0, len(phrase_s)
+            ctx_lower = ctx_s.lower()
+            for phrase in phrases:
+                phrase_s = phrase.strip()
+                if not phrase_s:
+                    result[phrase] = ClinicalContext()
+                    continue
+                pos = ctx_lower.find(phrase_s.lower())
+                if pos != -1:
+                    in_context.append((phrase, pos, pos + len(phrase_s)))
+                else:
+                    standalone.append(phrase)
         else:
-            text = phrase_s
-            start, end = 0, len(phrase_s)
+            ctx_s = ""
+            standalone = [p for p in phrases if p.strip()]
+            for p in phrases:
+                if not p.strip():
+                    result[p] = ClinicalContext()
 
-        doc = nlp.make_doc(text)
-        # sentencizer needed for ConText scope boundaries
-        for name, proc in nlp.pipeline:
-            if name != "medspacy_context":
-                doc = proc(doc)
+        # ── Single pass over context for all found phrases ────────────────
+        if in_context and ctx_s:
+            doc = nlp.make_doc(ctx_s)
+            for name, proc in nlp.pipeline:
+                if name != "medspacy_context":
+                    doc = proc(doc)
 
-        span = doc.char_span(start, end, label="CONCEPT",
-                             alignment_mode="expand")
-        if span is None:
-            return ClinicalContext()
+            spans = []
+            span_phrases = []
+            for phrase, start, end in in_context:
+                span = doc.char_span(start, end, label="CONCEPT",
+                                     alignment_mode="expand")
+                if span is not None:
+                    spans.append(span)
+                    span_phrases.append(phrase)
+                else:
+                    standalone.append(phrase)
 
-        doc.ents = [span]
-        doc = nlp.get_pipe("medspacy_context")(doc)
-        ent = doc.ents[0]
+            if spans:
+                doc.ents = spans
+                doc = nlp.get_pipe("medspacy_context")(doc)
+                for ent, phrase in zip(doc.ents, span_phrases):
+                    result[phrase] = ClinicalContext(
+                        negated=ent._.is_negated,
+                        historical=ent._.is_historical,
+                        hypothetical=ent._.is_hypothetical,
+                        family=ent._.is_family,
+                    )
 
-        return ClinicalContext(
-            negated=ent._.is_negated,
-            historical=ent._.is_historical,
-            hypothetical=ent._.is_hypothetical,
-            family=ent._.is_family,
-        )
+        # ── Standalone phrases (not found in context) ─────────────────────
+        for phrase in standalone:
+            phrase_s = phrase.strip()
+            doc = nlp.make_doc(phrase_s)
+            for name, proc in nlp.pipeline:
+                if name != "medspacy_context":
+                    doc = proc(doc)
+            span = doc.char_span(0, len(phrase_s), label="CONCEPT",
+                                 alignment_mode="expand")
+            if span is None:
+                result[phrase] = ClinicalContext()
+                continue
+            doc.ents = [span]
+            doc = nlp.get_pipe("medspacy_context")(doc)
+            ent = doc.ents[0]
+            result[phrase] = ClinicalContext(
+                negated=ent._.is_negated,
+                historical=ent._.is_historical,
+                hypothetical=ent._.is_hypothetical,
+                family=ent._.is_family,
+            )
+
+        # ── Fill missing (shouldn't happen, but safe default) ─────────────
+        for phrase in phrases:
+            if phrase not in result:
+                result[phrase] = ClinicalContext()
+
+        return result
+
+    def parse(self, phrase: str, context: str = "") -> "ClinicalContext":
+        """Single-phrase convenience wrapper. For batch use batch_parse()."""
+        return self.batch_parse([phrase], context).get(phrase, ClinicalContext())
 
 
 # Module-level singleton — _ensure_loaded() is lazy on first parse() call.
@@ -739,6 +806,10 @@ class EmbeddingFetcher:
             f"dim={dim} | cache_hits={len(cuis)-len(missing)} | "
             f"fetched={len(result)-(len(cuis)-len(missing))}", level="DEBUG")
         return result
+
+    def close(self):
+        """Shut down the thread pool. Call when done with all fetches."""
+        self._pool.shutdown(wait=False)
 
 def _cosine_knn(matrix, k):
     """k-NN via cosine similarity. Input: L2-normalized (N,D) array. Returns (neighbors, scores)."""
@@ -2073,6 +2144,11 @@ class CUIReductionSystem:
         self.fetcher._cache.flush()
         self.emb_fetcher._cache.flush()
 
+    def close(self):
+        """Shut down resources. Call when done processing all documents."""
+        self._flush_caches()
+        self.emb_fetcher.close()
+
     def _empty(self, ctx, t0, audit=None):
         return ReductionResult(
             ctx, 0, 0, 0, 0, {}, [], [], {},
@@ -2092,7 +2168,9 @@ class CUIReductionSystem:
 # Based on UMLS Semantic Network (McCray 2003). Maps TUI prefixes and common
 # semantic types to 6 coarse categories for representative grouping.
 def _load_sty_categories():
-    """Load semantic type → category mapping from sty_categories.json."""
+    """Load semantic type → category mapping from sty_categories.json.
+    Falls back to empty mapping if file not found — everything maps to 'Other'.
+    """
     paths = [
         os.path.join(os.path.dirname(__file__), "sty_categories.json"),
         "sty_categories.json",
@@ -2106,7 +2184,9 @@ def _load_sty_categories():
                 for sty in sty_list:
                     mapping[sty] = category
             return mapping, list(groups.keys())
-    raise FileNotFoundError("sty_categories.json not found. Ship it alongside the code.")
+    log("sty_categories.json not found — all semantic types map to 'Other'",
+        level="WARNING")
+    return {}, []
 
 _STY_TO_CATEGORY, _STY_CATEGORY_PRIORITY = _load_sty_categories()
 
@@ -2649,93 +2729,117 @@ class CUIExtractor:
                       status_forcelist=list(_RETRY_STATUS_CODES))
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
+    def _refresh_token(self):
+        """Refresh gcloud identity token. Called on 401 responses."""
+        try:
+            token = subprocess.run(
+                ["gcloud", "auth", "print-identity-token"],
+                stdout=subprocess.PIPE, universal_newlines=True,
+                timeout=_GCLOUD_TIMEOUT).stdout.strip()
+            self.headers["Authorization"] = f"Bearer {token}"
+            log("    Extraction API: token refreshed", level="DEBUG")
+        except Exception as e:
+            log(f"    Extraction API: token refresh failed: {e}", level="WARNING")
+
     @timed("cui_extraction")
     def extract(self, text_list, context_list):
         """Extract CUIs per phrase with negation filtering and temporal tagging.
 
-        Applies clinical context detection (ClinicalContextParser) after API
-        extraction to:
-          1. Remove CUIs from negated phrases ("no knee pain" → discard knee pain CUIs)
-          2. Tag surviving CUI sets with ClinicalContext for downstream use
+        Two-phase design:
+          Phase 1 — CUI extraction (cacheable): API call for CUI distances.
+            Cached by (phrases, top_k, top_p, cluster_set, combined).
+            Context is NOT part of the cache key — CUI extraction depends
+            on the phrase+context embedding, but the cache is keyed on
+            phrases only for cross-document hit rates.
+
+          Phase 2 — ConText tagging (never cached): medspacy negation/temporal.
+            Always runs fresh because the same phrase ("knee pain") can be
+            negated in one document and affirmed in another.
+            Uses batch_parse() — single pass over the context document.
 
         Returns:
             dict {phrase: {"cuis": {cui: distance}, "context": ClinicalContext}}
-
-        The "context" value is a ClinicalContext dataclass (from medspacy ConText).
-        Callers that only need CUI distances can iterate over result[phrase]["cuis"].
-        The context is stored in ChunkStore for query-time temporal matching.
         """
-        # cache key covers all parameters that affect output
+        # ── Phase 1: CUI extraction (cacheable) ──────────────────────────
         cache_key = (
             "||".join(sorted(text_list)),
             self.top_k, self.top_p,
             self.cluster_set, self.combined
         )
+
+        raw_per_phrase = None
         cached = self._cache.get(cache_key)
         if cached is not None:
             if isinstance(cached, dict):
-                # check for new format (has "cuis" key) vs old flat format
                 first = next(iter(cached.values()), None)
+                # Accept both formats: raw {phrase: {cui: dist}} or
+                # tagged {phrase: {"cuis": {cui: dist}, ...}}
                 if isinstance(first, dict) and "cuis" in first:
-                    total = sum(len(v.get("cuis", {})) for v in cached.values())
-                    log(f"    Extraction: {total} CUIs across {len(cached)} phrases (cached)")
-                    return cached
+                    raw_per_phrase = {p: v["cuis"] for p, v in cached.items()
+                                     if v.get("cuis")}
                 elif isinstance(first, dict):
-                    # old format without temporal tags — discard and re-extract
-                    log("    Cache format outdated (no temporal tags), re-extracting...", level="DEBUG")
-            else:
-                log("    Cache format outdated (flat list), re-extracting...", level="DEBUG")
+                    raw_per_phrase = {p: v for p, v in cached.items() if v}
 
-        payload = {
-            "cluster_set": self.cluster_set,
-            "text_list": text_list,
-            "context_list": context_list,
-            "top_k": self.top_k,
-            "top_p": self.top_p,
-            "combined": self.combined
-        }
-        try:
-            resp = self.session.post(
-                self.url, headers=self.headers,
-                json=payload, timeout=_API_TIMEOUT)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.exceptions.RequestException as e:
-            log(f"    Extraction API error: {e}", level="ERROR")
-            return {}
-        except (ValueError, KeyError) as e:
-            log(f"    Extraction API response parse error: {e}", level="ERROR")
-            return {}
+        if raw_per_phrase is None:
+            # Cache miss — call extraction API
+            payload = {
+                "cluster_set": self.cluster_set,
+                "text_list": text_list,
+                "context_list": context_list,
+                "top_k": self.top_k,
+                "top_p": self.top_p,
+                "combined": self.combined
+            }
+            try:
+                resp = self.session.post(
+                    self.url, headers=self.headers,
+                    json=payload, timeout=_API_TIMEOUT)
+                if resp.status_code == 401:
+                    self._refresh_token()
+                    resp = self.session.post(
+                        self.url, headers=self.headers,
+                        json=payload, timeout=_API_TIMEOUT)
+                resp.raise_for_status()
+                data = resp.json()
+            except requests.exceptions.RequestException as e:
+                log(f"    Extraction API error: {e}", level="ERROR")
+                return {}
+            except (ValueError, KeyError) as e:
+                log(f"    Extraction API response parse error: {e}", level="ERROR")
+                return {}
 
-        # ── Parse API response ────────────────────────────────────────────
-        raw_per_phrase = {}
-        output = data.get("output", {})
-        for phrase, clusters in output.items():
-            if not isinstance(clusters, list):
-                continue
-            cui_dists = {}
-            for cluster in clusters:
-                for member in cluster.get("members", []):
-                    c = str(member.get("member_code", ""))
-                    if c:
-                        dist = member.get("member_code_distance")
-                        d = float(dist) if dist is not None else None
-                        if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
-                            cui_dists[c] = d
-            if cui_dists:
-                raw_per_phrase[phrase] = cui_dists
+            raw_per_phrase = {}
+            output = data.get("output", {})
+            for phrase, clusters in output.items():
+                if not isinstance(clusters, list):
+                    continue
+                cui_dists = {}
+                for cluster in clusters:
+                    for member in cluster.get("members", []):
+                        c = str(member.get("member_code", ""))
+                        if c:
+                            dist = member.get("member_code_distance")
+                            d = float(dist) if dist is not None else None
+                            if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
+                                cui_dists[c] = d
+                if cui_dists:
+                    raw_per_phrase[phrase] = cui_dists
+        else:
+            log(f"    Extraction: {sum(len(v) for v in raw_per_phrase.values())} "
+                f"CUIs across {len(raw_per_phrase)} phrases (API cached)")
 
-        # ── Apply clinical context tagging ────────────────────────────────
-        # medspacy ConText (built-in rules only, zero custom additions).
-        # Negated phrases: all their CUIs are discarded.
-        # ClinicalContext stored alongside CUIs for retrieval-time use.
-        phrase_to_context = dict(zip(text_list, context_list))
+        # ── Phase 2: ConText tagging (never cached, always fresh) ─────────
+        # batch_parse processes the full document once — O(n_tokens) total,
+        # not O(n_tokens × n_phrases).
+        full_context = max(context_list, key=len) if context_list else ""
+        phrase_contexts = _clinical_context_parser.batch_parse(
+            list(raw_per_phrase.keys()), full_context)
+
         per_phrase: Dict[str, dict] = {}
         n_negated = n_historical = n_hypothetical = n_family = 0
 
         for phrase, cui_dists in raw_per_phrase.items():
-            ctx = phrase_to_context.get(phrase, "")
-            cc: ClinicalContext = _clinical_context_parser.parse(phrase, ctx)
+            cc = phrase_contexts.get(phrase, ClinicalContext())
 
             if cc.negated:
                 n_negated += len(cui_dists)
@@ -2749,12 +2853,14 @@ class CUIExtractor:
 
             per_phrase[phrase] = {
                 "cuis":    cui_dists,
-                "context": cc,   # ClinicalContext dataclass — from medspacy ConText
+                "context": cc,
             }
 
         total = sum(len(v.get("cuis", {})) for v in per_phrase.values())
         log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases "
             f"(negated_removed={n_negated}, hist={n_historical}, "
             f"hypo={n_hypothetical}, family={n_family})")
-        self._cache.put(cache_key, per_phrase)
+
+        # Cache raw CUI extraction only (no ConText tags)
+        self._cache.put(cache_key, {p: v["cuis"] for p, v in per_phrase.items()})
         return per_phrase
