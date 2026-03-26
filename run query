@@ -32,7 +32,7 @@ from config import (
 )
 from cui_reduction_system import (
     CUIReductionSystem, CUIExtractor, fetch_preferred_terms,
-    TemporalContext, _TEMPORAL_PRIORITY,
+    ClinicalContext,
 )
 from topic_matcher import (
     ChunkStore, ChunkMatcher, TopicIndex,
@@ -155,21 +155,18 @@ def process_query(query_text: str) -> Optional[Dict]:
         return None
 
     per_phrase_cuis: Dict[str, Dict] = {}
-    query_temporal:  Dict[str, TemporalContext] = {}
+    query_temporal:  Dict[str, ClinicalContext] = {}
 
     for ph, tagged in per_phrase.items():
         cui_dists = tagged.get("cuis") or {}
         if not cui_dists:
             continue
-        temporal = TemporalContext(tagged.get("temporal", TemporalContext.CURRENT))
+        cc: ClinicalContext = tagged.get("context", ClinicalContext())
         per_phrase_cuis[ph] = cui_dists
         for cui in cui_dists:
             existing = query_temporal.get(cui)
-            if existing is None or (
-                _TEMPORAL_PRIORITY.get(temporal, 99)
-                < _TEMPORAL_PRIORITY.get(existing, 99)
-            ):
-                query_temporal[cui] = temporal
+            if existing is None or cc.temporal_priority() < existing.temporal_priority():
+                query_temporal[cui] = cc
 
     if not per_phrase_cuis:
         print("  → No CUIs after unpacking")
@@ -178,10 +175,12 @@ def process_query(query_text: str) -> Optional[Dict]:
     total_cuis = sum(len(cd) for cd in per_phrase_cuis.values())
     print(f"  → Extracted: {total_cuis} CUIs", flush=True)
 
-    non_current = {c: t.value for c, t in query_temporal.items()
-                   if t != TemporalContext.CURRENT}
+    non_current = {c: cc for c, cc in query_temporal.items() if not cc.is_current()}
     if non_current:
-        print(f"  → Temporal tags: {non_current}")
+        flags = {c: ("historical" if cc.historical else
+                     "hypothetical" if cc.hypothetical else "family")
+                 for c, cc in non_current.items()}
+        print(f"  → Temporal tags: {flags}")
 
     print("\n  ── Raw CUIs from API (before reduction) ──")
     all_raw_cuis: List[str] = []
@@ -217,12 +216,16 @@ def process_query(query_text: str) -> Optional[Dict]:
 
     terms = _fetch_terms(surviving)
     for cui in surviving:
-        t = query_temporal.get(cui, TemporalContext.CURRENT)
-        t_suffix = f" [{t.value}]" if t != TemporalContext.CURRENT else ""
+        cc = query_temporal.get(cui, ClinicalContext())
+        flags = []
+        if cc.historical:   flags.append("historical")
+        if cc.hypothetical: flags.append("hypothetical")
+        if cc.family:       flags.append("family")
+        t_suffix = f" [{', '.join(flags)}]" if flags else ""
         print(f"      {cui} | {terms.get(cui, cui)}{t_suffix}")
 
-    surviving_temporal: Dict[str, TemporalContext] = {
-        c: query_temporal.get(c, TemporalContext.CURRENT) for c in surviving
+    surviving_temporal: Dict[str, ClinicalContext] = {
+        c: query_temporal.get(c, ClinicalContext()) for c in surviving
     }
 
     return {
