@@ -7,14 +7,21 @@ Usage:
     python run_query.py
 
 Flow:
-    Query text → CUI extraction → Stages 1-4 reduction (fast)
-    → Fetch embeddings for surviving CUIs → Compute centroid
+    Query text → CUI extraction → Full reduce_batch() pipeline (stages 1-4 + Louvain)
+    → HierarchicalTopicBuilder topic formation (same as document ingestion)
+    → Fetch embeddings → Compute topic centroids
     → Pass 1: Topic gate  (TopicIndex — hard exclusion on centroid similarity)
     → Pass 2: CUI scoring (within matched topics only)
     → Pass 3: Z-score normalisation
     → Pass 4: Confidence gap filter
     → Ranked results
     → LLM reasoning (optional)
+
+Design principle:
+    Query and document pipelines are identical up to ChunkStore persistence.
+    reduce_batch() is used for both. HierarchicalTopicBuilder is used for both.
+    This ensures query topic centroids and document topic centroids are built
+    by the same grouping logic — Pass 1 is a true like-for-like comparison.
 """
 
 import os
@@ -33,10 +40,11 @@ from config import (
 from cui_reduction_system import (
     CUIReductionSystem, CUIExtractor, fetch_preferred_terms,
     ClinicalContext,
+    HierarchicalTopicBuilder, TopicRepresentativeSelector, TopicAnchorAssigner,
 )
 from topic_matcher import (
     ChunkStore, ChunkMatcher, TopicIndex,
-    compute_centroid, build_query_topics,
+    compute_centroid,
 )
 
 _LLM_TOP_K = 3
@@ -141,11 +149,22 @@ def _csv_row(query_text: str, rank: int, r, terms: dict) -> list:
 # ── Query processing ─────────────────────────────────────────────────────────
 
 def process_query(query_text: str) -> Optional[Dict]:
-    """Extract CUIs, reduce, compute embedding for query."""
+    """Extract and reduce query CUIs using the same pipeline as document ingestion.
+
+    In production, CUI reduction and topic formation is a shared API applied
+    identically to both documents and runtime queries. This function runs the
+    full pipeline — same extraction, same four-stage reduction, same
+    HierarchicalTopicBuilder topic formation — so query topics and document
+    topics are directly comparable in Pass 1.
+
+    The only difference from document ingestion: results are not persisted
+    to ChunkStore. Everything else is identical.
+    """
     print(f"\n{'='*80}")
     print(f"QUERY: {query_text}")
     print(f"{'='*80}")
 
+    # ── Step 1: Extract CUIs (same as document ingestion) ────────────────────
     print("  → Extracting CUIs...", flush=True)
     per_phrase = extractor.extract([query_text], [query_text])
     extractor._cache.flush()
@@ -197,25 +216,55 @@ def process_query(query_text: str) -> Optional[Dict]:
             print(f"      {cui}  dist={dist_str}  {name}")
     print()
 
+    # ── Step 2: Full four-stage reduction (same as document ingestion) ────────
+    # Uses reduce_batch() — the identical reduction path used for documents.
+    # reduce_query() is intentionally not used here: it skips Louvain and
+    # several other stages. One pipeline for both queries and documents.
     print("  → Reducing (stages 1-4)...", flush=True)
-    surviving = system.reduce_query(all_raw_cuis)
-    if not surviving:
+    batch_inputs = [(list(cd.keys()), ph, cd) for ph, cd in per_phrase_cuis.items()]
+    reduction_results = system.reduce_batch(batch_inputs)
+
+    all_surviving: set = set()
+    for r in reduction_results:
+        all_surviving.update(r.all_reduced_cuis)
+
+    if not all_surviving:
         print("  → No CUIs survived reduction")
         return None
 
-    print(f"  → Surviving: {len(surviving)} CUIs (from {total_cuis} raw)", flush=True)
+    print(f"  → Surviving: {len(all_surviving)} CUIs (from {total_cuis} raw)", flush=True)
 
-    print(f"  → Fetching embeddings for {len(surviving)} surviving CUIs...", flush=True)
-    query_embeddings = system.emb_fetcher.fetch(list(surviving))
-    query_embedding  = compute_centroid(surviving, query_embeddings)
-    query_topics     = build_query_topics(surviving, query_embeddings)
+    # ── Step 3: Embeddings (same as document ingestion) ───────────────────────
+    print(f"  → Fetching embeddings for {len(all_surviving)} surviving CUIs...", flush=True)
+    query_embeddings = system.emb_fetcher.fetch(list(all_surviving))
+    query_embedding  = compute_centroid(all_surviving, query_embeddings)
+
+    # ── Step 4: Topic formation — HierarchicalTopicBuilder (same as document) ─
+    # Documents use HierarchicalTopicBuilder. Queries now use the same method.
+    # This ensures query topic centroids and document topic centroids are built
+    # by the same grouping logic — Pass 1 is a true like-for-like comparison.
+    print("  → Building query topics (HierarchicalTopicBuilder)...", flush=True)
+    ic_map      = system.ic_computer.compute(list(all_surviving), {})
+    query_topics = HierarchicalTopicBuilder.build(list(all_surviving), hierarchy, ic_map)
+
+    metadata    = system.fetcher.fetch(list(all_surviving))
+    topic_reps  = TopicRepresentativeSelector.select(
+        query_topics, metadata, query_embeddings, ic_map, hierarchy)
+    HierarchicalTopicBuilder.label_topics(query_topics, topic_reps)
+
+    # Compute centroid per query topic — same as document path
+    for t_info in query_topics.values():
+        t_info["centroid"] = compute_centroid(t_info.get("members", []), query_embeddings)
 
     print(f"  → Query topics: {len(query_topics)}")
     for tid, qt in query_topics.items():
-        print(f"      Topic {tid}: {len(qt.get('members', []))} CUIs")
+        members = qt.get("members", [])
+        label   = qt.get("topic_cui", tid)
+        print(f"      Topic {tid}: {len(members)} CUIs  [{label}]")
 
-    terms = _fetch_terms(surviving)
-    for cui in surviving:
+    # ── Step 5: Fetch terms and build output ──────────────────────────────────
+    terms = _fetch_terms(all_surviving)
+    for cui in all_surviving:
         cc = query_temporal.get(cui, ClinicalContext())
         flags = []
         if cc.historical:   flags.append("historical")
@@ -225,11 +274,11 @@ def process_query(query_text: str) -> Optional[Dict]:
         print(f"      {cui} | {terms.get(cui, cui)}{t_suffix}")
 
     surviving_temporal: Dict[str, ClinicalContext] = {
-        c: query_temporal.get(c, ClinicalContext()) for c in surviving
+        c: query_temporal.get(c, ClinicalContext()) for c in all_surviving
     }
 
     return {
-        "surviving_cuis": surviving,
+        "surviving_cuis": all_surviving,
         "embedding":      query_embedding,
         "query_topics":   query_topics,
         "terms":          terms,
