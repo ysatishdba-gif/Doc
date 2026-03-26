@@ -86,7 +86,9 @@ DEFAULTS = {
     # ── Topic filter ─────────────────────────────────────────────────────
     "topic_filter_pct":   85,     # FALLBACK ONLY: if gap_split finds no gap
     "topic_filter_sim":   0.3,    # ChunkMatcher backward compat (absolute gate)
-    "max_candidates":     50,     # compute budget safety cap (after gap_split)
+    # max_candidates removed — no cap on Pass 2 candidates.
+    # All candidates that clear Pass 1 are scored. gap_split in Pass 4
+    # is the natural filter; a hard cap silently excluded valid results.
 
     # ── Output ───────────────────────────────────────────────────────────
     "score_min":          0.01,   # absolute floor (structural, not tuning)
@@ -97,9 +99,12 @@ DEFAULTS = {
     "vector_sharpening":  1,      # 1=off (topic centroids are focused, no need)
     "vector_fallback_min": 0.4,   # ChunkMatcher backward compat only
 
-    # ── Query topics ─────────────────────────────────────────────────────
-    "query_hac_dist":     0.5,    # HAC distance for clustering query CUIs
-    "query_singleton_max": 3,     # <= this: each CUI is own topic
+    # ── Query topics — HAC params no longer used ──────────────────────────
+    # build_query_topics() (HAC) is replaced by HierarchicalTopicBuilder.
+    # Query and document topic formation now use the same method.
+    # These keys are kept as dead config for backward compat only.
+    "query_hac_dist":     0.5,    # UNUSED — kept for backward compat
+    "query_singleton_max": 3,     # UNUSED — kept for backward compat
 
     # ── Topic grouping ───────────────────────────────────────────────────
     "group_dist":         0.15,   # cosine distance for cross-chunk grouping
@@ -1726,14 +1731,12 @@ class TopicIndex:
         if not raw_results:
             return []
 
-        # cap candidates
-        max_cand = self.p["max_candidates"]
-        if len(raw_results) > max_cand:
-            # keep top by vector sim (fastest discriminator)
-            raw_results.sort(key=lambda r: -r[3])  # vec_sim is index 3
-            raw_results = raw_results[:max_cand]
-
         # Pass 3: z-score normalise signals across all Pass 2 candidates.
+        # No cap applied — all candidates that cleared Pass 1 are scored.
+        # gap_split in Pass 4 is the natural filter. A hard cap silently
+        # excluded valid results that ranked low on vector similarity but
+        # high on CUI overlap. Z-score on arrays of N floats is O(N) and
+        # fast regardless of candidate count.
         cuis = np.array([r[2] for r in raw_results])   # cui_ratio
         vecs = np.array([r[3] for r in raw_results])    # vec_sim
         lins = np.array([r[4] for r in raw_results])    # lin_avg
