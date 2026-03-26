@@ -57,7 +57,7 @@ from dataclasses import dataclass
 # Import enums from cui_reduction_system — single source of truth for all
 # clinical domain string constants. Never compare bare strings in pipeline logic.
 from cui_reduction_system import (
-    ClinicalContext, MatchType, Verdict
+    ClinicalContext, MatchType
 )
 
 logger = logging.getLogger("cui_reduction")
@@ -1344,6 +1344,11 @@ class TopicIndex:
             all_cuis = set()
             for e in entries:
                 all_cuis |= e["members"]
+                # Include the grouping ancestor CUI — it's not in members
+                # but represents the topic's defining concept
+                tc = e.get("topic_cui")
+                if tc:
+                    all_cuis.add(tc)
 
             # variant detection: compare consecutive entries
             for i, entry in enumerate(entries):
@@ -1533,8 +1538,6 @@ class TopicIndex:
         # Phase 1: hard topic gate — gap_split finds the natural separation
         # between clinically-related and unrelated topic groups.
         # Chunks that don't clear the threshold are EXCLUDED entirely.
-        # No fallback to "at least return the closest group" — a chunk
-        # with no topically relevant content should not appear in results.
         qtc_list = []
         if query_topics:
             for qt in query_topics.values():
@@ -1556,19 +1559,30 @@ class TopicIndex:
         threshold = gap_split(max_sims, min_keep=1)
         matched_group_ids = set(int(i) for i in np.where(max_sims >= threshold)[0])
 
-        # Hard exit: no groups cleared the topic gate → no results.
-        # This is intentional — do not fall through to CUI scoring on
-        # unrelated content. The caller should widen the query or lower
-        # the specificity of the search, not silently return poor matches.
+        # ── CUI overlap rescue ────────────────────────────────────────────
+        # Centroid similarity is an average over all member embeddings.
+        # A group with genuine CUI overlap (exact or ancestor match) can
+        # have low centroid similarity when non-overlapping members pull
+        # the centroid away. Check actual CUI evidence before excluding.
+        if len(matched_group_ids) < len(self.groups):
+            for gid, group in enumerate(self.groups):
+                if gid in matched_group_ids:
+                    continue
+                group_cuis = group.get("all_cuis", set())
+                if query_cuis & group_cuis:
+                    matched_group_ids.add(gid)
+                    logger.debug(
+                        f"TopicIndex.match: group {gid} admitted by CUI overlap "
+                        f"(centroid_sim={float(max_sims[gid]):.3f} < "
+                        f"threshold={threshold:.3f}, "
+                        f"shared={sorted(query_cuis & group_cuis)})")
+
         if not matched_group_ids:
             logger.debug("TopicIndex.match: no groups cleared topic gate — "
                          f"best_sim={float(max_sims.max()):.3f} threshold={threshold:.3f}")
             return []
 
         # Pass 2: CUI scoring within matched topics only.
-        # _score_raw operates on entry["members"] — the CUIs of that specific
-        # topic, never the full chunk CUI set. This is the key property:
-        # CUI matching is scoped to topics that cleared the gate in Pass 1.
         raw_results = []
         has_graph = matcher.graph is not None and len(matcher.ic_map) > 0
 
@@ -1577,10 +1591,37 @@ class TopicIndex:
             for q in query_cuis:
                 query_ancestors[q] = matcher._get_ancestors(q)
 
+            # ── Precompute ancestors for ALL document CUIs in matched groups ──
+            # Without this, matcher._ancestor_cache is empty for doc CUIs
+            # and all hierarchy matching (parent-child, sibling, MICA, Lin)
+            # silently returns zero. This was the root cause of cui_ratio=0.0
+            # for topics with genuine hierarchical overlap.
+            for gid in matched_group_ids:
+                group = self.groups[gid]
+                for entry in group["entries"]:
+                    for d_cui in entry.get("members", set()):
+                        if d_cui not in matcher._ancestor_cache:
+                            matcher._get_ancestors(d_cui)
+                    # topic_cui is the grouping ancestor — also needs ancestors
+                    tc = entry.get("topic_cui")
+                    if tc and tc not in matcher._ancestor_cache:
+                        matcher._get_ancestors(tc)
+
         def _score_raw(entry):
             topic_members = entry["members"]
             if not topic_members:
                 return None
+
+            # ── Include topic_cui in matchable set ────────────────────────
+            # topic_cui is the grouping ancestor from HierarchicalTopicBuilder.
+            # It's NOT in members (by design — ancestors are grouping keys).
+            # But if the query contains this exact CUI, that's a genuine
+            # match: the query is asking for the concept that DEFINES this
+            # topic. Without this, a query CUI matching the topic's own
+            # label produces cui_ratio=0.0 and gets suppressed.
+            topic_cui = entry.get("topic_cui")
+            if topic_cui:
+                topic_members = topic_members | {topic_cui}
 
             # ── CUI overlap with IC gate on shared-ancestor filter ────────
             exact = query_cuis & topic_members
