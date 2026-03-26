@@ -509,7 +509,7 @@ class ChunkMatcher:
         # mica must be at least ratio × min IC of both CUIs
         if mica_ic < ratio * min_ic:
             return 0.0, None, MatchType.NO_MATCH
-        return min(2.0 * mica_ic / denom, 1.0), mica, "shared_ancestor"
+        return min(2.0 * mica_ic / denom, 1.0), mica, MatchType.SIBLING
 
     def _compute_adaptive_params(self, query_cuis, chunks):
         """
@@ -543,6 +543,8 @@ class ChunkMatcher:
                 cui_doc_freq[cui] = cui_doc_freq.get(cui, 0) + 1
 
         idf_vals = []
+        h_norm = 0.0
+        idf_sum = 0.0
         for df in cui_doc_freq.values():
             if 0 < df < n_chunks:
                 idf_vals.append(math.log(n_chunks / df))
@@ -691,22 +693,13 @@ class ChunkMatcher:
           alpha          ← normalised mean IC of query CUIs [0.1, 0.9]
           min_best_lin   ← scales with query specificity [0.05, 0.25]
 
-        Temporal context (Harkema 2009 ConText / SNOMED CT CDS Guide):
-          query_temporal: {cui: "current"|"historical"|"hypothetical"|"family"}
-          Chunk temporal_map stored at ingestion time.
-          Mismatches penalise the score:
-            query=current + chunk=historical  → penalty (stored finding is past)
-            query=historical + chunk=current  → no penalty (recent finding is fine)
-            query=hypothetical                → no penalty (rule-out query is open)
-            family context                   → always penalised if query is current
-
         Args:
             query_cuis: list/set of query CUI strings (after reduction)
             query_embedding: numpy array (centroid) or None
             chunks: dict from ChunkStore.get_all()
             top_k: max results
             query_topics: dict from build_query_topics() or None
-            query_temporal: dict {cui: temporal_flag} from ClinicalContextParser or None
+            query_temporal: unused — kept for backward compat
 
         Returns:
             list[ChunkMatch] sorted by score descending
@@ -1055,42 +1048,6 @@ class ChunkMatcher:
             else:
                 score = cui_ratio
 
-            # ── Temporal context penalty ──────────────────────────────────
-            # Reference: Harkema 2009 ConText, SNOMED CT CDS Guide,
-            #            Lee et al. JMIR AI 2024 (PMC11319878)
-            #
-            # Rules (per-CUI, aggregate across matched pairs):
-            #   query=current + chunk=historical  → strong penalty (0.5)
-            #   query=current + chunk=hypothetical → moderate penalty (0.75)
-            #   query=current + chunk=family       → strong penalty (0.5)
-            #   All other combinations             → no penalty (1.0)
-            # Stored on the result and re-applied AFTER adaptive reranking
-            # so the reranking pass cannot inadvertently erase temporal filtering.
-            temporal_penalty = 1.0
-            if query_temporal and matched_query_cuis:
-                chunk_temporal = chunk_data.get("temporal_map", {})
-                penalties = []
-                for q_cui in matched_query_cuis:
-                    q_ctx = query_temporal.get(q_cui, ClinicalContext())
-                    if isinstance(q_ctx, str):
-                        q_ctx = ClinicalContext.from_dict(q_ctx)
-                    if not q_ctx.is_current():
-                        continue   # historical/hypothetical query — no penalty
-                    c_ctx = chunk_temporal.get(q_cui, ClinicalContext())
-                    if isinstance(c_ctx, str):
-                        c_ctx = ClinicalContext.from_dict(c_ctx)
-                    p = c_ctx.penalty()
-                    if p < 1.0:
-                        penalties.append(p)
-                if penalties:
-                    n = len(matched_query_cuis)
-                    n_unpenalised = n - len(penalties)
-                    temporal_penalty = (sum(penalties) + n_unpenalised) / n
-                    score = score * temporal_penalty
-                    logger.debug(f"    Temporal penalty on {chunk_id}: "
-                                 f"{temporal_penalty:.3f} "
-                                 f"({len(penalties)}/{n} CUIs penalised)")
-
             if score < self.p["score_min"]:
                 continue
 
@@ -1140,13 +1097,10 @@ class ChunkMatcher:
                 topics_matched=topics_matched,
                 lin_details=lin_details
             ))
-            # store temporal penalty so reranking can re-apply it
-            results[-1].__dict__['_temporal_penalty'] = temporal_penalty
 
         # ── Adaptive reranking (ChunkMatcher backward compat ONLY) ──────
         # TopicIndex uses z-score normalization instead (see TopicIndex.match).
         # This variance-based approach is kept for old data without topic centroids.
-        # Temporal penalty is re-applied after reranking so it is not overwritten.
         if len(results) >= 2:
             cui_vals = [r.cui_overlap_ratio for r in results]
             vec_vals = [r.vector_sim for r in results]
@@ -1166,9 +1120,7 @@ class ChunkMatcher:
                     new_score = (w_cui * r.cui_overlap_ratio +
                                  w_vec * r.vector_sim +
                                  w_lin * r.lin_score)
-                    # re-apply temporal penalty that was set before reranking
-                    penalty = r.__dict__.get('_temporal_penalty', 1.0)
-                    object.__setattr__(r, 'score', round(new_score * penalty, 4))
+                    object.__setattr__(r, 'score', round(new_score, 4))
 
         results.sort(key=lambda r: (-r.score, -r.cui_overlap, r.chunk_id))
 
@@ -1507,11 +1459,9 @@ class TopicIndex:
                 for r_cui in removed:
                     if self._graph.has_node(a_cui) and self._graph.has_node(r_cui):
                         a_anc = self._get_variant_ancestors(a_cui)
-                        if r_cui in a_anc or a_cui in a_anc:
-                            is_refinement = True
-                            break
                         r_anc = self._get_variant_ancestors(r_cui)
-                        if a_cui in r_anc:
+                        # parent-child in either direction = refinement
+                        if r_cui in a_anc or a_cui in r_anc:
                             is_refinement = True
                             break
                 if not is_refinement:
