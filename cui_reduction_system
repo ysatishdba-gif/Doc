@@ -126,15 +126,12 @@ _LOUVAIN_MIN_CUIS = 20
 _ANCESTOR_TARGET, _ANCESTOR_DEPTH_CLAMP = 20, (1, 5)
 _COMPONENT_DEPTH_RATIO, _COMP_DEPTH_MEAN_THRESHOLD = 0.4, 1.5
 _DEFAULT_ANCESTOR_DEPTH = 3
-_XTD_KNN_K, _LOUVAIN_SPLIT_RESOLUTION = 10, 2.0
+_XTD_KNN_K = 10
 _COSINE_FALLBACK_THRESHOLD = 0.5
 # _SINGLETON_MERGE_MIN_SIM: formerly 0.3; now derived at runtime from
 #   mean(within_group_cosine_similarities) × 0.5 in TopicBuilder.build()
 # _HT_MAX_COVERAGE: formerly 0.6; now derived at runtime as sqrt(N)/N
 #   in HierarchicalTopicBuilder.build()
-_SILHOUETTE_GAP_RATIO      = 2.0   # largest gap must be > this × median gap to act
-_SILHOUETTE_MAX_ITER        = 5     # safety cap on re-split loop iterations
-_SILHOUETTE_MIN_COMM_SIZE   = 2     # never attempt to split communities smaller than this
 _REP_HAC_THRESHOLD = 0.5
 _ANCHOR_IC_MIN, _ANCHOR_BFS_DEPTH, _ANCHOR_IC_MAX_BROAD = 4.0, 4, 3.0
 _EVAL_AGGRESSIVE_RATIO, _EVAL_MINIMAL_RATIO = 0.95, 0.10
@@ -158,6 +155,7 @@ _RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
 logger = logging.getLogger("cui_reduction")
 logger.setLevel(logging.DEBUG)
+logger.propagate = False  # don't bubble up to root logger (prevents duplicate lines)
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter(
@@ -836,269 +834,12 @@ class TopicBuilder:
     """
     Builds CUI topics using cosine k-NN graph + Louvain community detection.
 
-    Splitting strategy (v7.4):
-      Replaces the old sqrt(N) hard size cap with fully data-driven
-      silhouette-based splitting. No hardcoded quality threshold.
-
-      After the first Louvain run, silhouette score is computed for every
-      community. The natural gap in those scores (found via the same
-      gap_split logic used in topic_matcher.py) determines which communities
-      are poorly formed and should be re-split at resolution=2.0.
-
-      The process repeats until no meaningful gap remains in the silhouette
-      distribution or communities can no longer be split.
+    Used in Stage 5 for dedup scoping only — communities are NOT the final
+    topics. HierarchicalTopicBuilder (Stage 6) forms the actual topics.
 
     References:
-      Rousseeuw 1987 (silhouette)
       Blondel 2008 (Louvain)
     """
-
-    # ── Silhouette helpers ────────────────────────────────────────────────────
-
-    @staticmethod
-    def _compute_community_silhouette(comm_indices, all_comm_index_lists, matrix):
-        """
-        Compute average silhouette score for one community.
-
-        Args:
-            comm_indices         : list of int — row indices in matrix for this community
-            all_comm_index_lists : list of lists of int — all communities (including this one)
-            matrix               : (N, D) float32 L2-normalized embedding matrix
-
-        Returns:
-            float in [-1, +1]
-            1.0 for singletons (trivially perfect, no split needed)
-            1.0 if only one community exists (nothing to compare against)
-        """
-        if len(comm_indices) < _SILHOUETTE_MIN_COMM_SIZE:
-            return 1.0
-
-        n_comms = len(all_comm_index_lists)
-        if n_comms <= 1:
-            return 1.0
-
-        # identify which index in all_comm_index_lists is THIS community
-        # use the frozenset of indices as identity key (order-independent)
-        comm_key = frozenset(comm_indices)
-        this_comm_idx = next(
-            (i for i, c in enumerate(all_comm_index_lists) if frozenset(c) == comm_key),
-            None
-        )
-
-        node_scores = []
-
-        for idx in comm_indices:
-            vec = matrix[idx]   # shape (D,), L2-normalized
-
-            # ── a(i): mean distance to all OTHER nodes in same community ──
-            same = [j for j in comm_indices if j != idx]
-            if same:
-                sims = vec @ matrix[same].T
-                a_i = float(np.mean(1.0 - sims))
-            else:
-                a_i = 0.0
-
-            # ── b(i): mean distance to nearest OTHER community ────────────
-            b_i = float('inf')
-            for ci, other in enumerate(all_comm_index_lists):
-                if ci == this_comm_idx:
-                    continue   # skip own community — O(1) index check, not set comparison
-                sims = vec @ matrix[other].T
-                mean_dist = float(np.mean(1.0 - sims))
-                if mean_dist < b_i:
-                    b_i = mean_dist
-
-            denom = max(a_i, b_i)
-            s_i = (b_i - a_i) / denom if denom > 1e-9 else 0.0
-            node_scores.append(s_i)
-
-        return float(np.mean(node_scores))
-
-    @staticmethod
-    def _find_silhouette_split_threshold(scores):
-        """
-        Find the natural gap in a list of silhouette scores.
-
-        Uses the same gap logic as gap_split() in topic_matcher.py:
-          largest gap must be > _SILHOUETTE_GAP_RATIO × median gap.
-
-        Edge cases handled:
-          - All scores identical   → gaps all 0, max_gap=0 → return None
-          - One outlier, rest same → median_gap=0, max_gap>0 → act on it
-          - No standout gap        → max_gap < ratio×median → return None
-
-        Returns:
-            float  — threshold value (communities below this get split)
-            None   — no meaningful gap found, all communities acceptable
-        """
-        if len(scores) < 2:
-            return None
-
-        arr = np.array(scores, dtype=np.float32)
-        sorted_desc = np.sort(arr)[::-1]
-        gaps = np.diff(-sorted_desc)    # positive = drop between consecutive values
-
-        if len(gaps) == 0:
-            return None
-
-        max_gap    = float(gaps.max())
-        median_gap = float(np.median(gaps))
-
-        if max_gap < 1e-9:
-            # all scores identical — no gap to act on
-            return None
-
-        if median_gap > 1e-9 and max_gap < _SILHOUETTE_GAP_RATIO * median_gap:
-            # gaps exist but none stands out clearly above the rest
-            log(f"      Silhouette: no standout gap "
-                f"(max={max_gap:.4f}, median={median_gap:.4f}, "
-                f"ratio={max_gap/median_gap:.2f} < {_SILHOUETTE_GAP_RATIO}) "
-                f"— keeping all communities", level="DEBUG")
-            return None
-
-        # threshold = midpoint between the two scores on either side of the gap
-        split_idx = int(np.argmax(gaps)) + 1
-        if split_idx >= len(sorted_desc):
-            return None
-
-        threshold = float(
-            (sorted_desc[split_idx - 1] + sorted_desc[split_idx]) / 2.0
-        )
-        return threshold
-
-    @staticmethod
-    def _split_communities_by_silhouette(communities_as_indices, matrix, G):
-        """
-        Iteratively split poorly-formed communities using data-driven
-        silhouette gap detection. No hardcoded quality threshold.
-
-        Args:
-            communities_as_indices : list of lists of int (node indices)
-            matrix                 : (N, D) L2-normalized embedding matrix
-            G                      : networkx.Graph (the full k-NN graph)
-
-        Returns:
-            list of lists of int — final community index lists
-        """
-        # ── Step 1: compute silhouette for every initial community ────────
-        scores = [
-            TopicBuilder._compute_community_silhouette(comm, communities_as_indices, matrix)
-            for comm in communities_as_indices
-        ]
-
-        log(f"    Silhouette after first Louvain "
-            f"({len(communities_as_indices)} communities): "
-            f"min={min(scores):.3f}  "
-            f"median={float(np.median(scores)):.3f}  "
-            f"max={max(scores):.3f}")
-
-        # ── Step 2: find natural gap ──────────────────────────────────────
-        threshold = TopicBuilder._find_silhouette_split_threshold(scores)
-
-        if threshold is None:
-            # no meaningful gap — all communities acceptable quality
-            log(f"    Silhouette: no gap found — keeping all "
-                f"{len(communities_as_indices)} communities as-is")
-            return communities_as_indices
-
-        log(f"    Silhouette gap threshold: {threshold:.3f} — "
-            f"{sum(1 for s in scores if s < threshold)} community/ies to split")
-
-        # ── Step 3: separate good from poor communities ───────────────────
-        final_communities = []
-        queue = []
-
-        for comm, score in zip(communities_as_indices, scores):
-            if score >= threshold:
-                final_communities.append(comm)
-            else:
-                queue.append(comm)
-
-        # ── Step 4: iteratively re-split poor communities ─────────────────
-        iteration = 0
-        while queue and iteration < _SILHOUETTE_MAX_ITER:
-            iteration += 1
-            next_queue = []
-
-            for comm in queue:
-
-                # too small to split
-                if len(comm) < _SILHOUETTE_MIN_COMM_SIZE:
-                    final_communities.append(comm)
-                    continue
-
-                # build subgraph on just this community's nodes
-                subG = G.subgraph(comm).copy()
-                if subG.number_of_edges() == 0:
-                    # no internal edges — cannot split meaningfully
-                    final_communities.append(comm)
-                    continue
-
-                # re-run Louvain at higher resolution to force finer split
-                sub_comms_raw = networkx.community.louvain_communities(
-                    subG, weight="weight", seed=_RANDOM_SEED,
-                    resolution=_LOUVAIN_SPLIT_RESOLUTION)
-
-                if len(sub_comms_raw) <= 1:
-                    # Louvain cannot find any internal split
-                    # accept this community even with low silhouette
-                    log(f"      Silhouette iter {iteration}: "
-                        f"community of {len(comm)} cannot be split further — accepting",
-                        level="DEBUG")
-                    final_communities.append(comm)
-                    continue
-
-                # convert frozensets → lists of original node indices
-                # subG nodes are the original indices from G, not re-numbered
-                sub_comms = [list(sc) for sc in sub_comms_raw]
-
-                log(f"      Silhouette iter {iteration}: "
-                    f"split community of {len(comm)} → "
-                    f"{[len(sc) for sc in sub_comms]}",
-                    level="DEBUG")
-
-                # recompute silhouette for each sub-community
-                # context = everything finalized so far + remaining queue + new subs
-                context = final_communities + next_queue + sub_comms
-                sub_scores = [
-                    TopicBuilder._compute_community_silhouette(sc, context, matrix)
-                    for sc in sub_comms
-                ]
-
-                # find gap within this new batch
-                sub_threshold = TopicBuilder._find_silhouette_split_threshold(sub_scores)
-
-                if sub_threshold is None:
-                    # all sub-communities are acceptable
-                    final_communities.extend(sub_comms)
-                else:
-                    for sc, sc_score in zip(sub_comms, sub_scores):
-                        if sc_score >= sub_threshold:
-                            final_communities.append(sc)
-                        else:
-                            next_queue.append(sc)   # needs another attempt
-
-            # if queue is not shrinking, stop (splitting is not helping)
-            if len(next_queue) >= len(queue):
-                log(f"      Silhouette: queue not shrinking after iter {iteration} "
-                    f"— accepting remaining {len(next_queue)} communities",
-                    level="DEBUG")
-                final_communities.extend(next_queue)
-                next_queue = []
-
-            queue = next_queue
-
-        # anything remaining after max iterations — accept as-is
-        if queue:
-            log(f"    Silhouette: max iterations ({_SILHOUETTE_MAX_ITER}) reached — "
-                f"accepting {len(queue)} remaining communities", level="DEBUG")
-            final_communities.extend(queue)
-
-        log(f"    Silhouette splitting complete: "
-            f"{len(communities_as_indices)} → {len(final_communities)} communities "
-            f"({iteration} iteration(s))")
-
-        return final_communities
 
     # ── Main build ────────────────────────────────────────────────────────────
 
@@ -1112,8 +853,7 @@ class TopicBuilder:
           1. Sort CUIs, build (N, D) embedding matrix
           2. Cosine k-NN (k=20) → adaptive threshold → weighted graph
           3. Louvain community detection (resolution=1.0)
-          4. Silhouette-based splitting — data-driven, no hardcoded threshold
-          5. Singleton merging
+          4. Singleton merging
 
         Args:
             cuis        : list of CUI strings (must all have entries in embeddings)
@@ -1189,23 +929,20 @@ class TopicBuilder:
             f"(sizes: {sorted([len(c) for c in communities], reverse=True)})",
             level="DEBUG")
 
-        # ── Step 5: silhouette-based splitting (data-driven, no hardcoded threshold)
-        # converts frozensets → lists for silhouette computation
-        communities_as_lists = [list(comm) for comm in communities]
-        final_index_lists = TopicBuilder._split_communities_by_silhouette(
-            communities_as_lists, matrix, G)
-
-        # ── Step 6: convert index lists → CUI lists, separate singletons ─
+        # ── Step 5: convert communities → CUI lists, separate singletons ─
+        # Silhouette-based splitting removed — Louvain communities are only
+        # used for dedup scoping, not as final topics. The 4 structural
+        # guards in _reduce_topic handle all quality control. Splitting
+        # added 200-500ms of compute for no change in dedup output.
         idx_map = {c: i for i, c in enumerate(cuis)}
         groups = {}
         label = 0
         singleton_indices = []
 
-        for comm in final_index_lists:
+        for comm in communities:
             members = [cuis[i] for i in comm]
             if len(members) == 1:
-                singleton_indices.append(comm[0] if isinstance(comm, list)
-                                         else list(comm)[0])
+                singleton_indices.append(list(comm)[0])
             else:
                 groups[label] = members
                 label += 1
