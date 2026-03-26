@@ -57,7 +57,7 @@ from dataclasses import dataclass
 # Import enums from cui_reduction_system — single source of truth for all
 # clinical domain string constants. Never compare bare strings in pipeline logic.
 from cui_reduction_system import (
-    TemporalContext, MatchType, Verdict, _TEMPORAL_PRIORITY
+    ClinicalContext, MatchType, Verdict
 )
 
 logger = logging.getLogger("cui_reduction")
@@ -232,8 +232,9 @@ class ChunkStore:
             if "text" not in chunk:
                 chunk["text"] = ""
             if "temporal_map" not in chunk:
-                # old store: assume all CUIs are current
-                chunk["temporal_map"] = {c: "current" for c in chunk.get("cuis", set())}
+                # old store: assume all CUIs are current (default ClinicalContext)
+                chunk["temporal_map"] = {c: ClinicalContext()
+                                         for c in chunk.get("cuis", set())}
         logger.info(f"ChunkStore loaded: {len(store._data)} chunks from {path}")
         return store
 
@@ -1055,21 +1056,20 @@ class ChunkMatcher:
                 chunk_temporal = chunk_data.get("temporal_map", {})
                 penalties = []
                 for q_cui in matched_query_cuis:
-                    q_temp = TemporalContext(
-                        query_temporal.get(q_cui, TemporalContext.CURRENT))
-                    if q_temp.is_non_current():
+                    q_ctx = query_temporal.get(q_cui, ClinicalContext())
+                    if isinstance(q_ctx, str):
+                        q_ctx = ClinicalContext.from_dict(q_ctx)
+                    if not q_ctx.is_current():
                         continue   # historical/hypothetical query — no penalty
-                    c_temp = TemporalContext(
-                        chunk_temporal.get(q_cui, TemporalContext.CURRENT))
-                    if c_temp in (TemporalContext.HISTORICAL, TemporalContext.FAMILY):
-                        penalties.append(0.5)
-                    elif c_temp == TemporalContext.HYPOTHETICAL:
-                        penalties.append(0.75)
+                    c_ctx = chunk_temporal.get(q_cui, ClinicalContext())
+                    if isinstance(c_ctx, str):
+                        c_ctx = ClinicalContext.from_dict(c_ctx)
+                    p = c_ctx.penalty()
+                    if p < 1.0:
+                        penalties.append(p)
                 if penalties:
                     n = len(matched_query_cuis)
                     n_unpenalised = n - len(penalties)
-                    # unpenalised CUIs contribute 1.0, penalised contribute their factor
-                    # e.g. 1 historical out of 2 CUIs → (0.5 + 1.0) / 2 = 0.75
                     temporal_penalty = (sum(penalties) + n_unpenalised) / n
                     score = score * temporal_penalty
                     logger.debug(f"    Temporal penalty on {chunk_id}: "
