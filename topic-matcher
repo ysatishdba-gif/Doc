@@ -1530,9 +1530,27 @@ class TopicIndex:
         max_ic = max((matcher.ic_map.get(q, 0.0) for q in query_cuis), default=1.0)
         max_ic = max(max_ic, 1e-9)
 
-        # Phase 1: hard topic gate — gap_split finds the natural separation
-        # between clinically-related and unrelated topic groups.
-        # Chunks that don't clear the threshold are EXCLUDED entirely.
+        # ══════════════════════════════════════════════════════════════════
+        # Pass 1: Topic gate — PERFORMANCE OPTIMIZATION, not a hard gate.
+        #
+        # Design: centroid similarity and CUI overlap are fast checks that
+        # narrow the candidate set for Pass 2. But they can miss valid
+        # matches when query and document concepts are in different UMLS
+        # branches (e.g., "worsening condition" → qualifier CUIs vs
+        # "worsening cough" → disease CUIs). These are clinically related
+        # but have no CUI overlap and low centroid similarity.
+        #
+        # Strategy:
+        #   1. Centroid gate: gap_split on centroid similarities
+        #   2. CUI overlap rescue: admit groups sharing exact CUIs
+        #   3. Fallback: if fewer than min_groups admitted, score ALL
+        #      groups in Pass 2 and let the combined score discriminate.
+        #
+        # The combined z-score (Pass 3) + gap_split (Pass 4) is where
+        # the real filtering happens. Pass 1 only skips groups when
+        # there are enough high-confidence matches to make skipping safe.
+        # ══════════════════════════════════════════════════════════════════
+
         qtc_list = []
         if query_topics:
             for qt in query_topics.values():
@@ -1546,19 +1564,13 @@ class TopicIndex:
 
         qtc_matrix = np.array(qtc_list, dtype=np.float32)
         sims = qtc_matrix @ self.group_centroids.T   # (n_qt, n_groups)
-
-        # max similarity per group across all query topics
         max_sims = sims.max(axis=0)   # (n_groups,)
 
-        # gap-based hard gate: groups below the natural gap are excluded
+        # Step 1: centroid-based gate
         threshold = gap_split(max_sims, min_keep=1)
         matched_group_ids = set(int(i) for i in np.where(max_sims >= threshold)[0])
 
-        # ── CUI overlap rescue ────────────────────────────────────────────
-        # Centroid similarity is an average over all member embeddings.
-        # A group with genuine CUI overlap (exact or ancestor match) can
-        # have low centroid similarity when non-overlapping members pull
-        # the centroid away. Check actual CUI evidence before excluding.
+        # Step 2: CUI overlap rescue for excluded groups
         if len(matched_group_ids) < len(self.groups):
             for gid, group in enumerate(self.groups):
                 if gid in matched_group_ids:
@@ -1568,14 +1580,22 @@ class TopicIndex:
                     matched_group_ids.add(gid)
                     logger.debug(
                         f"TopicIndex.match: group {gid} admitted by CUI overlap "
-                        f"(centroid_sim={float(max_sims[gid]):.3f} < "
-                        f"threshold={threshold:.3f}, "
-                        f"shared={sorted(query_cuis & group_cuis)})")
+                        f"(shared={sorted(query_cuis & group_cuis)})")
 
+        # Step 3: fallback — if gate was too aggressive, score everything.
+        # For stores with N groups, Pass 2 is O(N × |query_cuis| × |topic_members|)
+        # which is milliseconds for typical clinical stores (N < 100).
+        # Losing a valid match is worse than scoring a few extra groups.
         if not matched_group_ids:
-            logger.debug("TopicIndex.match: no groups cleared topic gate — "
-                         f"best_sim={float(max_sims.max()):.3f} threshold={threshold:.3f}")
-            return []
+            matched_group_ids = set(range(len(self.groups)))
+            logger.debug(
+                f"TopicIndex.match: no groups cleared gate — "
+                f"scoring all {len(self.groups)} groups "
+                f"(best_sim={float(max_sims.max()):.3f} "
+                f"threshold={threshold:.3f})")
+
+        logger.debug(f"TopicIndex.match: {len(matched_group_ids)}/{len(self.groups)} "
+                     f"groups admitted to Pass 2")
 
         # Pass 2: CUI scoring within matched topics only.
         raw_results = []
@@ -1705,23 +1725,16 @@ class TopicIndex:
 
             return cui_ratio, vec_sim, lin_avg, sorted(exact | hierarchy_hits), topic_members
 
-        # score rep first, expand on accept
+        # Score all entries in matched groups.
+        # Each entry has its own centroid and member set, so signals vary
+        # per entry within the same group. Scoring all is O(entries × |query_cuis|)
+        # which is fast for typical stores.
         for gid in matched_group_ids:
             group = self.groups[gid]
-            rep_entry = group["entries"][group.get("rep_idx", 0)]
-            rep_raw = _score_raw(rep_entry)
-            if rep_raw is None:
-                continue
-            # quick reject: all signals zero
-            if rep_raw[0] == 0.0 and rep_raw[1] == 0.0 and rep_raw[2] == 0.0:
-                continue
             for entry in group["entries"]:
-                if entry is rep_entry:
-                    raw = rep_raw
-                else:
-                    raw = _score_raw(entry)
-                    if raw is None:
-                        continue
+                raw = _score_raw(entry)
+                if raw is None:
+                    continue
                 raw_results.append((entry, gid, *raw))
 
         if not raw_results:
