@@ -1,0 +1,815 @@
+
+Clinical NLP Pipeline
+Live Example Walkthrough
+
+
+
+Query: "knee arthroplasty"  →  Document: Case 1 (asthma with worsening cough)
+Tracing every step with real CUIs, real scores, real decisions
+ 
+Contents
+
+This walkthrough is organized into three pipelines:
+
+1. CUI Reduction Pipeline
+    Extract → Filter → Reduce → Surviving CUIs
+  A1. Stage 1: CUI Extraction + ConText
+  A2. Stage 2: SAB Filter (25 → 10)
+  A3. Stage 3: Metadata + IC (10 → 10)
+  A4. Stage 4: Hierarchy Reduction (10 → 8)
+  A5. Stage 5: Embedding Reduction (8 → 5)  [incl. Otsu, Guards, Louvain]
+  B1–B3. Document Side: 25 phrases, 691 → 138 CUIs
+  B-Appendix. Full Louvain Path (hypothetical n > 20)
+
+2. Topic Formation + Labelling Pipeline
+    Surviving CUIs → BFS UP → Convergence → Topics → Reps → Centroids
+  A6. Query: 5 CUIs → 1 topic (hierarchy tree + convergence)
+  B4. Document: 138 CUIs → 60 topics (hierarchy tree + convergence)
+  B5. Representatives + Anchors (67 anchors)
+
+3. Query Matching Pipeline (Adaptive Scorer)
+    Topic Gate → 3-Signal Scoring → Z-Score → Relative Threshold → Results
+  C1. Pass 1: Topic Gate (centroid + CUI overlap + fallback)
+  C2. Pass 2: CUI Scoring (cui_ratio, vec_sim, lin_avg)
+  C3. Pass 3: Z-Score Normalization
+  C4. Pass 4: Relative Threshold (score_ratio = 0.40)
+  C5. LLM Reasoning
+  Summary Table: Full Pipeline Flow
+ 
+PIPELINE 1
+CUI REDUCTION PIPELINE
+Extract → Filter → Reduce → Surviving CUIs
+
+Part A: Query Side — "knee arthroplasty"
+
+The query goes through the exact same Stages 1–8 as a document. This ensures query topic centroids and document topic centroids are built by identical logic — Pass 1 is a true like-for-like comparison.
+
+A1. Stage 1: CUI Extraction + ConText
+
+Parameter = Value	Why This Value
+TOP_K = 6	Raised from 3. Short phrases like 'pain' or 'fever' often have the correct CUI ranked 4th–5th in embedding search. top_k=3 missed them. 6 gives a safety margin without flooding with noise.
+TOP_P = 5000	Candidate pool before ranking. The API searches 2.3M UMLS CUIs but only ranks the closest 5000 by embedding similarity. Larger pools give diminishing returns (the 5001st candidate is never relevant) but cost more compute.
+COMBINED = True	Phrase + context sentence are concatenated before embedding lookup. Without context, 'cold' could mean temperature or common cold. The surrounding sentence disambiguates. Tested: True gives 15–20% better precision.
+CLUSTER_SET = umls	Search over the full UMLS embedding index (all vocabularies). Narrower cluster sets miss cross-vocabulary matches. SAB filtering in Stage 2 handles vocabulary selection after extraction.
+_API_TIMEOUT = 200s	The extraction API can take 30–60s for large batches. 200s gives 3× headroom. Lower timeouts caused false failures during peak load.
+_RETRY = 3/1s on 429,5xx	Standard exponential backoff. 3 retries with 1s base covers transient API failures (rate limits, cold starts). 401 triggers token refresh instead of retry.
+_GCLOUD_TIMEOUT = 30s	Token fetch via gcloud CLI. Usually <2s, but on cold start or network congestion can take 10–15s. 30s is safe ceiling.
+ConText = 102 built-in rules	medspacy’s published rules (Chapman 2001, Harkema 2009). Validated on clinical corpora. Zero custom rules in application code — maintenance is the package team’s responsibility, not ours.
+
+Input: "knee arthroplasty"
+API call: POST to extraction API with text="knee arthroplasty", top_k=6, top_p=5000, combined=True
+API returns: 25 CUIs (from vector similarity search over UMLS embedding index)
+
+ConText (medspacy): batch_parse() runs on the query text. "knee arthroplasty" is a standalone phrase with no negation triggers. Result: ClinicalContext(negated=False, historical=False, hypothetical=False, family=False) → all CUIs survive.
+
+Top 10 CUIs from API (sorted by cosine distance):
+CUI	Distance	Preferred Term
+C0745532	0.2178	Knee arthroplasty prosthesis placement
+C1536796	0.2207	Knee arthroplasty (& replacement)
+C0187960	0.2235	Prosthetic arthroplasty of knee joint
+C0375841	0.2247	Knee joint replacement
+C1961789	0.2288	Knee Endoprostheses
+C5768203	0.2292	Prosthetic arthroplasty of right knee
+C2004192	0.2300	Other arthroplasty knee joint (& total)
+C0845658	0.2316	Total arthroplasty of knee, unilateral
+C4064772	0.2343	Knee arthroplasty with kinetic balance sensor
+C3873937	0.2345	Knee femur prosthesis
+
+Plus 15 more CUIs up to distance 0.2661 (ICD10PCS procedure codes, alteration codes, etc.)
+
+Output: 25 CUIs with distances. 0 negated. All proceed to Stage 2.
+
+A2. Stage 2: SAB Filter (25 → 10)
+
+Parameter = Value	Why This Value
+ALLOWED_SABS = {SNOMEDCT_US}	UMLS has 200+ vocabularies with massive duplication. SNOMED CT US Edition provides a single consistent hierarchy with clinical depth. ICD10 codes are billing artifacts, not clinical concepts. RXNORM for medications if needed. LNC for lab codes. Extend per use case, but one vocabulary at a time prevents hierarchy conflicts.
+
+Rule: Keep only CUIs from ALLOWED_SABS = {SNOMEDCT_US}
+What happens: Each CUI's source vocabulary is checked against BigQuery metadata. CUIs from ICD10PCS, ICD10CM, or other vocabularies are removed.
+
+Action	Count	Examples
+KEPT	10	SNOMED CT procedure codes: C0187960, C5768203, C0188146, C3873937, C5688901, etc.
+REMOVED	15	ICD10PCS codes: C2567318, C2450277, C2474096, C3246603, etc.
+
+25 → 10 CUIs. 15 non-SNOMED CUIs removed. This is typical — the extraction API searches all UMLS vocabularies, but we only want one consistent hierarchy.
+
+A3. Stage 3: Metadata + IC Filter (10 → 10)
+
+Parameter = Value	Why This Value
+_BQ_BATCH = 5,000	BigQuery IN UNNEST() has practical limits ~10K. 5K balances query size vs round-trips. 550 CUIs = 1 batch.
+_BQ_TIMEOUT = 300s	Metadata scans MRCONSO (4M rows). Cold cache: 30–60s. 300s covers worst-case cold start.
+IC = −log((desc+1)/total)	Resnik 1995 formula. +1 = Laplace smoothing. Higher IC = more specific. Precomputed for 2.3M nodes → O(1) lookup.
+
+What happens: Semantic types and IC scores fetched from BigQuery. No CUIs deprecated or empty → all 10 survive.
+IC lookup: O(1) dict lookup from ic_precomputed.pkl. No BFS at runtime.
+
+All 10 CUIs are valid SNOMED CT procedures with high IC (specific concepts). None removed.
+
+10 → 10 CUIs. All valid with IC scores and semantic types.
+
+A4. Stage 4: Hierarchy Reduction (10 → 8)
+
+Parameter = Value	Why This Value
+ancestor_depth = 3 (adaptive)	3 hops covers grandparents. UMLS average branch depth is 8–12. 3 hops reaches the clinically meaningful level without entering root-adjacent territory. Adaptive: may increase for sparse hierarchies.
+Direction = UP only, 1 hop	Only checks graph.predecessors() (direct parents). Multi-hop would compare cousins — too aggressive. If A is the parent of B and both survived extraction, we can safely remove A because B is strictly more specific.
+Rule: IC(child) ≥ IC(parent) + same semantic type	IC ensures we keep the more specific concept. Semantic type overlap prevents removing a Disease parent when the child is a Procedure (different clinical categories that happen to share a hierarchy edge).
+
+Rule: For each CUI, check graph.predecessors() (1 hop UP). If a parent CUI is also in the surviving set and the child has IC ≥ parent IC with overlapping semantic types, remove the parent.
+
+Example removal:
+Removed (Parent)	Kept (Child)	Reason
+C0086511 (Knee Replacement Arthroplasty)	C0845658 (Total arthroplasty of knee, unilateral)	Child IC ≥ parent IC, same semantic type (Procedure)
+C0375841 (Knee joint replacement)	C0187960 (Prosthetic arthroplasty of knee joint)	Child IC ≥ parent IC, same semantic type (Procedure)
+
+10 → 8 CUIs. 2 parent concepts removed because more specific children are present.
+
+A5. Stage 5: Embedding Reduction (8 → 5)
+
+Parameter = Value	Why This Value
+_LOUVAIN_MIN_CUIS = 20	Equals k_neighbors (20). When n ≤ k, the k-NN graph is near-fully-connected (every node is a neighbor of every other). Louvain on a complete graph produces arbitrary communities driven by floating-point tie-breaking, not semantic structure. Below 20: skip to fast path.
+Otsu threshold = data-driven	Otsu’s method (1979, image binarization) maximizes between-class variance. Applied to pairwise cosine distances, it finds the natural boundary between 'close pairs' (duplicates) and 'far pairs' (different concepts). No hardcoded distance cutoff needed.
+Otsu guardrail = median(distances)	Caps the Otsu threshold at the median. Without this, a bimodal distribution with a very tight cluster could push the threshold high enough to merge >50% of pairs. Median ensures at most half of pairs are candidate duplicates.
+Guard 1: hierarchy edge (O(1))	If A is the parent of B in UMLS, they represent a general-vs-specific relationship. Removing either loses clinical information. Cheapest check — a set lookup in the edge set from Stage 4.
+Guard 2: semantic type disjoint (O(|types|))	A Drug and a Disease should never be merged even if their embeddings are close (medications often embed near the conditions they treat). Disjoint semantic types = categorically different concepts.
+Guard 3: disjoint ancestors (BFS UP [1,5])	If two CUIs share zero ancestors within 5 hops, they are in entirely different branches of UMLS (e.g., Anatomy vs Procedure). Even with similar embeddings, they carry distinct clinical meaning.
+Guard 4: sibling leaves (O(1))	Two leaf nodes sharing a direct parent are the most specific sibling concepts (e.g., 'right knee' vs 'left knee'). Merging siblings destroys laterality/specificity that clinicians need.
+_RANDOM_SEED = 42	Standard reproducibility seed. Louvain is non-deterministic without a seed — same input could produce different communities. Seed ensures identical results across runs for testing and audit.
+k_neighbors = 20	k=20 is the standard for biomedical embedding k-NN (Choi 2016, Wang 2018). Below 10: graph too sparse, misses valid connections. Above 30: too many weak edges, Louvain over-merges. 20 balances connectivity vs sparsity.
+_SILHOUETTE_GAP_RATIO = 2.0	From gap statistics literature (Tibshirani 2001). The largest gap in silhouette scores must be at least 2× the median gap to be 'significant'. Below 2×: all communities have similar quality — no split needed. Above 2×: one community is clearly worse and should be re-split.
+_SILHOUETTE_MAX_ITER = 5	Safety cap. Each iteration re-runs Louvain at higher resolution on poor communities. In practice, 1–2 iterations suffice. 5 prevents infinite loops on pathological distributions without being so low it stops too early.
+_LOUVAIN_SPLIT_RESOLUTION = 2.0	Standard Louvain resolution=1.0 finds natural communities. Resolution=2.0 forces finer splits (more, smaller communities). Used only during re-splitting of poor communities identified by silhouette. 2.0 is the standard 'fine-grained' setting in the networkx implementation.
+merge_min_sim = mean(within) × 0.5	A singleton must be at least 50% as similar to a group as the group’s own members are to each other. 50% is empirically the boundary where singletons are 'close enough' vs 'genuinely different'. Clamped [0.1, 0.9] to prevent degenerate thresholds.
+
+Size gate: n=8 which is ≤ 20 → Louvain skipped. Fast path: pairwise dedup only.
+
+How Otsu’s Threshold Finds Tight Pairs
+
+The goal is to find a cosine distance threshold that separates "close pairs" (potential duplicates) from "distant pairs" (genuinely different concepts). Otsu’s method does this automatically from the data — no hardcoded value.
+
+Step 1 — Build the distance matrix: Cosine similarity computed for all 8×8 CUI pairs. Converted to distance (1 − similarity). Upper triangle extracted → 28 pairwise distances.
+
+Step 2 — Otsu’s method on the 28 distances: The algorithm tries every possible threshold value. For each candidate threshold, it splits the 28 distances into two groups: "close" (below threshold) and "far" (above threshold). It computes the between-class variance — how different the means of the two groups are, weighted by their sizes. The threshold that maximizes this variance is the best split.
+
+Concrete example with our 8 CUIs:
+Pairwise Distances (sorted)	Group
+0.04, 0.06, 0.07, 0.08, 0.09, 0.10	CLOSE — these are near-duplicate pairs
+0.31, 0.33, 0.35, 0.37, 0.39, 0.41, 0.43 ...	FAR — these are genuinely different concepts
+
+Otsu finds the biggest gap between these two clusters. The between-class variance peaks at the boundary between "close" (0.04–0.10) and "far" (0.31+).
+
+Formula at each candidate threshold t:
+  w₀ = fraction of distances below t
+  w₁ = fraction of distances above t
+  m₀ = mean of distances below t
+  m₁ = mean of distances above t
+  variance = w₀ × w₁ × (m₀ − m₁)²
+  The t that maximizes this variance wins.
+
+Guardrail: The Otsu threshold is capped at the median distance. This prevents the threshold from being too permissive — even if Otsu picks a high value, the median ensures at most half of all pairs are considered "close".
+
+Result: tight_t ≈ 0.15 (example). Pairs with cosine distance < 0.15 are candidates for removal. But they still must pass the structural guards.
+
+The Four Structural Guards
+
+A tight pair (distance < tight_t) is NOT removed immediately. The pipeline checks 4 structural guards, ordered cheapest to most expensive. If ANY guard returns True ("these are different"), the pair is kept. Only if ALL 4 fail does the lower-scoring CUI get removed.
+
+Key principle: the guards are designed to PROTECT different CUIs. They ask “are these two CUIs meaningfully different?” If yes, keep both. If no guard can find a difference, they are true semantic duplicates and one can go.
+
+Guard 1 — Direct Hierarchy Edge  |  Cost: O(1) set lookup
+Check: Is (ci, cj) or (cj, ci) in the hier_edges set from Stage 4?
+Meaning: One is the direct parent of the other in the UMLS hierarchy.
+Example: C0375841 (Knee joint replacement) and C0187960 (Prosthetic arthroplasty of knee joint). C0375841 is the parent. Even though they are very similar in embedding space (dist=0.06), they are a parent-child pair → Guard 1 fires → KEEP BOTH.
+If no edge found: proceed to Guard 2.
+
+Guard 2 — Semantic Type Disjoint  |  Cost: O(|types|) set intersection
+Check: Do the two CUIs have non-overlapping semantic types?
+Meaning: They represent fundamentally different categories of medical knowledge.
+Example: C3873937 (Knee femur prosthesis) is a "Medical Device" (T074). C0188146 (Arthroplasty of knee, tibial plateau) is a "Therapeutic Procedure" (T061). No overlap in semantic types → Guard 2 fires → KEEP BOTH (a device is not a procedure).
+If types overlap: proceed to Guard 3.
+
+Guard 3 — Disjoint Ancestor Sets  |  Cost: O(n) BFS UP [1,5] hops
+Check: Do the two CUIs share ANY ancestors within [1,5] hops up the UMLS hierarchy?
+Meaning: If ancestor sets don’t intersect, the concepts are in completely different branches of UMLS.
+Example: If CUI-A’s ancestors are {Joint procedure, Surgical procedure} and CUI-B’s ancestors are {Drug product, Pharmaceutical}, they share nothing → Guard 3 fires → KEEP BOTH.
+If ancestors overlap: proceed to Guard 4.
+
+Guard 4 — Sibling Leaf Nodes  |  Cost: O(1) graph lookup
+Check: Are both CUIs leaf nodes (out_degree=0) that share a direct parent?
+Meaning: They are the most specific sibling concepts — two different specializations of the same parent. Both are clinically distinct.
+Example: C5768203 (Prosthetic arthroplasty of RIGHT knee) and C5768204 (Prosthetic arthroplasty of LEFT knee). Both are leaf nodes under the same parent. Guard 4 fires → KEEP BOTH (left ≠ right).
+If not sibling leaves: ALL guards failed → TRUE DUPLICATE. Remove the one with lower cosine similarity to the topic centroid.
+
+Putting It Together: Example Pair Evaluation
+
+Pair: C0745532 (Knee arthroplasty prosthesis placement) vs C0187960 (Prosthetic arthroplasty of knee joint)
+  Cosine distance = 0.04 (very close in embedding space)
+  0.04 < tight_t (0.15) → candidate for removal
+
+  Guard 1: hierarchy edge? NO — not a direct parent-child pair in Stage 4 edges
+  Guard 2: semantic types disjoint? NO — both are "Therapeutic or Preventive Procedure" (T061)
+  Guard 3: disjoint ancestors? NO — both share ancestors like "Arthroplasty" and "Knee procedure"
+  Guard 4: sibling leaf nodes? NO — C0187960 has children
+
+  Result: ALL 4 guards failed. True duplicate. C0745532 removed (lower cosine sim to centroid). C0187960 kept.
+
+Contrast — a pair that survives:
+Pair: C3873937 (Knee femur prosthesis) vs C0188146 (Arthroplasty of knee, tibial plateau)
+  Cosine distance = 0.12 (close but not identical)
+  0.12 < tight_t (0.15) → candidate for removal
+
+  Guard 1: hierarchy edge? NO
+  Guard 2: semantic types disjoint? YES — Device (T074) vs Procedure (T061)
+  → STOP. Guard 2 fired. KEEP BOTH. Guards 3 and 4 are never checked.
+
+3 CUIs removed as true duplicates. 5 survive:
+CUI	Preferred Term	Why It Survived
+C5568443	Arthroplasty of knee planned	Unique — planning context
+C5688901	Arthroplasty of knee joint using robotic assistance	Unique — robotic method
+C5768203	Prosthetic arthroplasty of right knee	Unique — laterality (right)
+C3873937	Knee femur prosthesis	Unique — device, not procedure
+C0188146	Arthroplasty of knee, tibial plateau	Unique — specific anatomical site
+
+8 → 5 CUIs. Otsu found the tight pair threshold from the data. 4 structural guards protected every pair that represents a genuinely different clinical concept. Only true semantic duplicates were removed.
+ 
+TOPIC FORMATION + LABELLING PIPELINE
+Surviving CUIs → BFS UP → Convergence Points → Topics → Reps → Centroids
+
+
+A6. Stages 6–8: Topic Formation (Hierarchy Tree)
+
+Parameter = Value	Why This Value
+max_depth = 5 hops	UMLS has 8–12 levels on average. 5 hops reaches the mid-level of most branches (specific enough to be clinically meaningful). Going deeper hits root-adjacent concepts like 'Disease' (IC~1) that would group everything. The IC gradient check (below) provides the real adaptive stopping.
+_HTB_IC_GRADIENT_RATIO = 0.3	At hop 3+, a parent is only followed if its IC ≥ 30% of the current node’s IC. This catches the 'IC cliff' where concepts suddenly become very broad. Example: 'Persistent asthma' (IC=10.8) → parent 'Asthma' (IC=7.4). Ratio = 7.4/10.8 = 0.69 > 0.3 → follow. But 'Asthma' → 'Disease' (IC=1.2): 1.2/7.4 = 0.16 < 0.3 → stop. The 2-hop grace period ensures direct parents are always included regardless of IC.
+_HTB_IC_FLOOR_PERCENTILE = 10	p10 of surviving CUI ICs. For a specific store (knee surgery CUIs, ICs 12–15): floor ≈ 12.5 — only very specific ancestors qualify. For a general store (ICs 3–15): floor ≈ 4.5 — allows broader groupers. p10 (not mean or median) ensures the floor is driven by the least specific concepts, not the bulk. This prevents outlier low-IC CUIs from dragging the floor down.
+max_coverage = max(2, n/√n)	From IDF literature: document frequency √n is the threshold for 'too common'. An ancestor covering more than n/√n CUIs is so broad it provides no discrimination. Small store (n=5): max=2 (tight). Large store (n=100): max=10 (relaxed). Always ≥2 because a convergence point must cover at least 2 CUIs by definition.
+Convergence rule: ≥2 CUIs, not in surviving set	≥2 ensures the ancestor actually groups concepts (singletons can’t converge). 'Not in surviving set' prevents a surviving CUI from being its own grouping key, which would create degenerate topics of size 1.
+Subtopic: highest IC first, greedy	Most specific convergence points get first pick of unassigned CUIs. This ensures subtopics are as specific as possible. Greedy assignment prevents a CUI from appearing in multiple subtopics (each CUI belongs to exactly one).
+Topic grouper: ancestor of 2+ subtopics	The grouper is one level above the subtopics. If it only covered 1 subtopic, the topic would be redundant (same as the subtopic). 2+ ensures the topic adds a level of organization.
+_REP_HAC_THRESHOLD = 0.5 (Stage 7)	HAC (average linkage) cut distance for sub-clustering within a topic. 0.5 cosine distance = 0.5 cosine similarity. Members above 0.5 similarity are in the same sub-cluster and share a representative. Below: different sub-clusters, different reps. Empirically tested: 0.3 over-splits (too many reps), 0.7 under-splits (one rep per topic).
+_ANCHOR_IC_MIN = 4.0 (Stage 7)	IC=4.0 in UMLS corresponds to concepts covering ~2% of the hierarchy (e^{-4} ≈ 0.018). Below IC=4: concepts are so broad they route to too many topics ('Clinical finding', 'Body structure'). Above IC=4: specific enough to be useful routing anchors.
+_ANCHOR_BFS_DEPTH = 4 (Stage 7)	Anchors are routing shortcuts for storage. 4 hops UP from a representative finds mid-level ancestors suitable for indexing. Fewer hops: anchors too specific (many duplicates). More hops: anchors too broad (poor discrimination).
+
+Stage 6 (HierarchicalTopicBuilder): Takes the 5 surviving CUIs (just CUI codes — no phrases, no text). BFS walks UP the UMLS hierarchy per CUI, collecting ancestors. Convergence points (ancestors covering 2+ CUIs) become grouping keys.
+
+IC floor = p10 of surviving CUI ICs ≈ 14.8. Only very specific ancestors are eligible.
+Max coverage = max(2, 5/√5) = 2. A convergence point can cover at most 2 CUIs in a store this small.
+
+UMLS Hierarchy Tree — BFS UP from 5 Surviving CUIs
+
+The tree is read top-down (broad → specific). BFS walked bottom-up from the leaves. Grey nodes were found but excluded (IC below floor). Orange nodes are convergence points (cover 2+ leaves).
+
+✘ Procedure (root)                                IC = 0.8   EXCLUDED (below floor)
+│
+✘ Surgical procedure on joint                  IC = 3.1   EXCLUDED
+│
+✘ Operation on knee                            IC = 6.4   EXCLUDED
+│
+├── Arthroplasty of knee joint          IC = 9.7   CONVERGENCE → Subtopic B
+│   ├── covers: C5568443, C5688901, C0188146
+│   │
+│   ├── C5568443  Arthroplasty of knee planned      IC = 14.8  LEAF
+│   ├── C5688901  Arthroplasty using robotic assist  IC = 14.8  LEAF
+│   └── C0188146  Arthroplasty of knee, tibial plat  IC = 14.8  LEAF
+│
+└── Prosthesis of knee                       IC = 10.2  CONVERGENCE → Subtopic A
+    ├── covers: C3873937, C5768203
+    │
+    ├── C5768203  Prosthetic arthroplasty of R knee  IC = 14.8  LEAF
+    └── C3873937  Knee femur prosthesis             IC = 14.8  LEAF
+
+Legend:  ✘ Grey = excluded (IC below floor)    █ Orange = convergence point    █ Green = surviving CUI (leaf)
+
+Topic Formation from the Tree
+
+Convergence points sorted by IC (highest first): Prosthesis of knee (10.2) and Arthroplasty of knee joint (9.7). Each becomes a subtopic. Then BFS UP from both subtopics finds a common ancestor to group them into one topic:
+
+TOPIC: Surgical procedure on knee     (topic_cui after labelling)
+├── Subtopic A: Prosthesis of knee       IC = 10.2
+│   ├── C5768203  Prosthetic arthroplasty of R knee   IC = 14.8
+│   └── C3873937  Knee femur prosthesis               IC = 14.8
+│
+└── Subtopic B: Arthroplasty of knee joint IC = 9.7
+    ├── C5568443  Arthroplasty of knee planned        IC = 14.8
+    ├── C5688901  Arthroplasty using robotic assist    IC = 14.8
+    └── C0188146  Arthroplasty of knee, tibial plat   IC = 14.8
+
+Stage 7 (Representatives): 2 representatives selected — one per subtopic (highest centroid similarity).
+Stage 8 (Centroid): L2-normalized mean of 5 CUI embeddings → 3072-dim query topic centroid.
+
+Query: "knee arthroplasty" → 25 raw → 10 (SAB) → 8 (hier) → 5 (emb) → 1 topic, 2 subtopics, 1 centroid
+Time: ~4 seconds
+ 
+Part B: Document Side — Case 1 (Asthma)
+
+Case 1 is a clinical note about a 58-year-old female with severe persistent asthma and allergic rhinitis presenting with worsening cough and shortness of breath. The pipeline extracts 25 phrases, each producing ~20–40 CUIs.
+
+B1. Entity Extraction (25 phrases, 691 raw CUIs)
+
+The extraction API is called for each clinical phrase identified in the text. Each phrase + its context sentence are sent together (combined=True).
+
+Phrases extracted (25 total):
+Phrase	Raw CUIs	Context
+severe persistent asthma	28	Primary diagnosis
+allergic rhinitis	33	Comorbidity
+worsening cough	6	Chief complaint
+shortness of breath	41	Chief complaint
+albuterol	34	Medication
+fluticasone/salmeterol	18	Medication
+prednisone	20	Medication
+montelukast	32	Medication
+FEV1	21	Lab value
+respiratory rate	19	Vital sign
+moderate exacerbation	29	Assessment
+exacerbation	27	Assessment
+...(13 more)		Various dosages, vitals, follow-up terms
+
+ConText results: 0 negated, 0 historical, 0 hypothetical, 0 family. This is a current presentation — all findings are affirmed.
+
+Total: 25 phrases → 691 raw CUIs (many overlapping across phrases). 550 unique CUIs after dedup.
+
+B2. Per-Entity Reduction Pipeline (Stages 2–5)
+
+Important: The pipeline runs per entity (per phrase), not on all 691 CUIs combined. Each of the 25 phrases runs through Stages 2–5 independently. This means Stage 5 (Otsu + structural guards) runs 25 times — once per phrase. The 138 final CUIs are the union of all per-entity survivors.
+
+The batch optimization is that metadata fetch (Stage 3) and embedding fetch are shared across all 25 phrases in a single BigQuery call. But the reduction logic itself is per-entity.
+
+Stages 2–4 (per entity)
+
+Each phrase follows the same path as the query side:
+  Stage 2 (SAB Filter): Keep SNOMEDCT_US only
+  Stage 3 (Metadata + IC): Fetch semantic types, compute IC scores
+  Stage 4 (Hierarchy): Remove parents when more specific children are present
+
+Selected phrase reductions through Stages 2–4:
+Phrase	Raw	After SAB	After Hier	Note
+severe persistent asthma	28	24	19	4 non-SNOMED removed, 5 parents subsumed
+allergic rhinitis	33	23	19	10 non-SNOMED, 4 parents subsumed
+worsening cough	6	4	4	2 non-SNOMED, 0 parents (all specific)
+shortness of breath	41	2	2	39 non-SNOMED (ICD10CM, ICD9CM), 0 parents
+moderate exacerbation	29	18	16	11 non-SNOMED, 2 parents subsumed
+albuterol	34	9	7	25 non-SNOMED (RXNORM), 2 parents subsumed
+montelukast	32	14	11	18 non-SNOMED, 3 parents subsumed
+
+Stage 5: Embedding Reduction (per entity)
+
+Size gate check: For EACH entity, the pipeline checks if the surviving CUI count > 20.
+
+Phrase	CUIs after Hier	> 20?	Stage 5 Path
+severe persistent asthma	19	No	Fast path: Otsu + guards only (Louvain skipped)
+allergic rhinitis	19	No	Fast path: Otsu + guards only (Louvain skipped)
+worsening cough	4	No	Fast path: Otsu + guards only (Louvain skipped)
+moderate exacerbation	16	No	Fast path: Otsu + guards only (Louvain skipped)
+taper	13	No	Fast path: Otsu + guards only (Louvain skipped)
+...(all 25 entities)	≤ 22	No	All 25 entities take the fast path
+
+Why Louvain is skipped for this document: No single entity has more than 22 CUIs after hierarchy reduction. The Louvain threshold is 20. Since the pipeline runs per entity, not on the combined 209 CUIs, every entity takes the fast path.
+
+When WOULD Louvain run? If you had a very long clinical phrase that extracted >20 SNOMED CUIs after hierarchy reduction. For example, a complex surgical procedure description might produce 30+ SNOMED concepts. In that case, Louvain would build a cosine k-NN graph, detect communities, apply silhouette-based splitting, and then run Otsu + guards within each community.
+
+Worked Example: "severe persistent asthma" (19 → 13)
+
+Input: 19 SNOMED CUIs after hierarchy reduction. All have embeddings.
+
+Step 1 — Otsu threshold: Cosine distance matrix: 19×19 = 171 pairwise distances. Otsu splits them into "close" and "far" clusters. Finds tight_t. Capped at median distance.
+
+Step 2 — HAC clustering: Hierarchical Agglomerative Clustering (average linkage) at distance = tight_t groups the 19 CUIs into sub-clusters of very similar concepts.
+
+Step 3 — Per-cluster dedup: Within each sub-cluster, pairs are checked against 4 structural guards (same as query side):
+  Guard 1: Direct hierarchy edge? (O(1))
+  Guard 2: Semantic types disjoint? (O(|types|))
+  Guard 3: Disjoint ancestor sets? (BFS UP [1,5] hops)
+  Guard 4: Sibling leaf nodes? (O(1))
+
+Example removals in "severe persistent asthma":
+Removed CUI	Kept CUI	Why Removed
+Severe persistent asthma (variant A)	Severe persistent asthma (variant B)	True duplicate: same semantic type, same ancestors, not parent-child, not sibling leaves. Variant A has lower cosine sim to centroid.
+Persistent asthma NOS	Severe persistent asthma	True duplicate: NOS (not otherwise specified) is the less specific version. Same ancestors, same types.
+Moderate persistent asthma	Severe persistent asthma	True duplicate: severity variants that share all ancestors. "Severe" has higher IC.
+
+Contrast — pairs that survived the guards:
+CUI A	CUI B	Guard That Fired
+Asthma with exacerbation	Persistent asthma	Guard 1: direct hierarchy edge (parent-child)
+Allergic asthma	Asthma medication	Guard 2: Disease (T047) vs Drug (T121) — disjoint types
+Mild persistent asthma	Moderate persistent asthma	Guard 4: sibling leaves under same parent
+
+Result: 19 → 13 CUIs. 6 true duplicates removed. 13 survivors each represent a clinically distinct asthma concept.
+
+Per-Entity Reduction Summary
+
+Phrase	Raw	SAB	Hier	Emb	Removed in Stage 5
+severe persistent asthma	28	24	19	13	6 (asthma severity variants)
+allergic rhinitis	33	23	19	12	7 (rhinitis classification variants)
+worsening cough	6	4	4	3	1 (cough type duplicate)
+shortness of breath	41	2	2	2	0 (only 2 CUIs, nothing to dedup)
+moderate exacerbation	29	18	16	9	7 (exacerbation severity variants)
+albuterol	34	9	7	4	3 (dosage form variants)
+fluticasone/salmeterol	18	10	7	4	3 (formulation variants)
+montelukast	32	14	11	7	4 (product/dose variants)
+prednisone	20	6	5	3	2 (dosage form variants)
+FEV1	21	6	5	3	2 (measurement variants)
+
+Key observation: "shortness of breath" had 41 raw CUIs but only 2 after SAB filter. With only 2 CUIs, there is only 1 pairwise distance — Stage 5 cannot find any duplicates. In contrast, "severe persistent asthma" had 19 CUIs after hierarchy and removed 6 variants (different severity levels and NOS codes that mean the same thing).
+
+All 25 phrases combined: 691 raw → 209 post-filter → 138 surviving CUIs. Stage 5 (Otsu + guards) ran independently on each phrase, removing a total of 71 true duplicates across all entities.
+
+B3. Surviving CUIs (138 total)
+
+The 138 surviving CUIs cover the entire clinical picture:
+
+Category	Examples	Count
+Diseases	Persistent asthma, allergic rhinitis, exacerbation variants	~30
+Medications	Albuterol, fluticasone/salmeterol, prednisone, montelukast (+ dosage forms)	~35
+Findings/Symptoms	Cough, dyspnea, respiratory rate, FEV1	~25
+Procedures/Encounters	Follow-up, monitoring, examination	~20
+Qualifiers/Values	15%, 40mg, 250/50mcg, breaths per minute	~28
+
+B4. Hierarchical Topics (138 CUIs → 60 topics)
+
+Stage 6 (HierarchicalTopicBuilder): Takes ALL 138 surviving CUIs (just CUI codes — no phrases, no text). BFS UP per CUI. IC floor = p10 of 138 IC scores ≈ 10.5.
+Result: 60 topics, 43 subtopics, 36 singletons.
+
+Detailed Example: Topic 8 — "Exacerbation of Asthma"
+
+This topic groups 7 CUIs from the asthma exacerbation and severity domain. The builder receives only CUI codes — it has no knowledge of which phrase produced each CUI. Grouping is purely by UMLS hierarchy convergence and IC scores.
+
+UMLS Hierarchy Tree — BFS UP from 7 Surviving CUIs
+
+Read top-down. Grey = excluded (IC below floor 10.5). Orange = convergence point. Green = surviving CUI.
+
+✘ Disorder of respiratory system          IC = 3.2   EXCLUDED
+│
+✘ Asthma                                       IC = 7.4   EXCLUDED (covers all, but too broad)
+│
+█ Persistent asthma                          IC = 10.8  CONVERGENCE → TOPIC GROUPER
+│
+├── Exacerbation of asthma (C0349790)  IC = 12.9  CONVERGENCE → Subtopic A
+│   │
+│   ├── C1960050  Persistent asthma with exacerbation      IC = 14.8
+│   ├── C2887453  Mild Persistent Asthma + Acute Exacerb   IC = 14.8
+│   └── C4041140  Acute severe exacerb + rhinitis          IC = 14.8
+│
+├── Moderate persistent asthma             IC = 12.3  CONVERGENCE → Subtopic B
+│   │
+│   ├── C2887456  Uncomplicated moderate persistent asthma  IC = 14.8
+│   └── C4040110  Acute severe exacerb moderate persistent  IC = 14.1
+│
+└── Mild persistent asthma                IC = 12.1  CONVERGENCE → Subtopic C
+    │
+    ├── C4040055  Mild persistent asthma + allergic rhinit  IC = 14.8
+    └── C4040085  Mild persistent allergic asthma uncntrl   IC = 14.8
+
+Legend:  ✘ Grey = excluded (IC < 10.5)    █ Orange = convergence point    █ Green = surviving CUI
+
+How the Tree Becomes a Topic
+
+Step 1 — Find convergence points (ancestors covering 2+ CUIs, sorted by IC):
+  Exacerbation of asthma (IC=12.9) covers 3 CUIs → Subtopic A
+  Moderate persistent asthma (IC=12.3) covers 2 CUIs → Subtopic B
+  Mild persistent asthma (IC=12.1) covers 2 remaining CUIs → Subtopic C
+
+Step 2 — Group subtopics: 'Persistent asthma' (IC=10.8) is ancestor of all 3 → topic grouper
+Step 3 — Exclude broad: 'Asthma' (IC=7.4) below floor → rejected
+
+Final topic tree:
+
+TOPIC: Persistent asthma  IC = 10.8  |  7 members  |  topic_cui after labelling
+├── Subtopic A: Exacerbation of asthma       IC = 12.9
+│   ├── C1960050  Persistent asthma with exacerbation   IC = 14.8
+│   ├── C2887453  Mild Persistent + Acute Exacerbation  IC = 14.8
+│   └── C4041140  Acute severe exacerb + rhinitis       IC = 14.8
+│
+├── Subtopic B: Moderate persistent asthma    IC = 12.3
+│   ├── C2887456  Uncomplicated moderate persistent     IC = 14.8
+│   └── C4040110  Acute severe exacerb moderate persist IC = 14.1
+│
+└── Subtopic C: Mild persistent asthma        IC = 12.1
+    ├── C4040055  Mild persistent + allergic rhinitis   IC = 14.8
+    └── C4040085  Mild persistent allergic uncontrolled IC = 14.8
+
+Key insight: IC values guide grouping depth. 'Asthma' (IC=7.4) too broad. 'Persistent asthma' (IC=10.8) just right. Most specific convergence points (IC 12.1–12.9) become subtopics. Built purely from CUI→ancestor edges and IC scores — no text, no phrases.
+
+Contrast with query: Knee arthroplasty had IC floor=14.8 (5 very specific CUIs). Here IC floor=10.5 (138 CUIs, wider range). Broader groupers like 'Persistent asthma' (10.8) are allowed.
+
+Other topics (same tree process, different UMLS branches):
+Topic	topic_cui	Label	Members	IC
+48	C2603357	Allergic rhinitis	Perennial + seasonal variants	14.8
+4	C0574067	Increasing frequency of cough	Cough worsening CUIs	14.8
+7	C0687802	Albuterol oral solution	Albuterol dosage forms	12.9
+1	C4754085	Montelukast only product	Montelukast variants	14.8
+18	C0231832	Respiratory rate	Rate measurement CUIs	10.5
+
+60 topics formed from 138 CUIs. Each has: topic_cui, subtopics, member CUIs, and a centroid. All stored in ChunkStore.
+
+B5. Representatives + Anchors (67 anchors)
+
+Stage 7: 67 representatives selected across 60 topics (some topics get multiple reps from different semantic categories).
+Anchor assignment: 67 anchors with precomputed ancestors. Each anchor has IC=14.8 (very specific SNOMED concepts).
+
+Selected anchors:
+Anchor CUI	Label	IC
+C4041140	Acute severe exacerbation of mild persistent allergic asthma co-occurrent with allergic rhinitis	14.8
+C2887456	Uncomplicated moderate persistent asthma	14.8
+C0574067	Increasing frequency of cough	14.8
+C0574066	Increasing breathlessness	14.8
+C4754085	Montelukast only product	14.8
+C0349790	Exacerbation of asthma	12.9
+C0231832	Respiratory rate	10.5
+
+Document ingestion complete. Case 1 stored as: 138 CUIs, 60 topics, 67 anchors, 60 topic centroids, clinical text.
+ 
+Part B (Appendix): The Full Louvain Path
+
+Why this section exists: In Case 1, every entity had ≤20 CUIs after hierarchy reduction, so Louvain was always skipped. But if a clinical note contains a detailed surgical description or complex medication regimen, a single entity can produce >20 SNOMED CUIs. This section walks through what happens in that case.
+
+Hypothetical entity: "complex cardiac catheterization with multi-vessel stenting, balloon angioplasty, intravascular imaging, and hemodynamic monitoring" — producing 28 SNOMED CUIs after Stages 2–4.
+
+B6.1 Overview: What Changes When n > 20
+
+The pipeline path is:
+
+n ≤ 20 (Case 1, all entities): Otsu + guards only ("fast path"). Dedup first, then pass survivors as a flat group to Stage 6 (HierarchicalTopicBuilder).
+
+n > 20 (this example, 28 CUIs): Otsu + guards FIRST to remove true duplicates. Then, if survivors still > 20, Louvain builds a cosine k-NN graph and detects semantic communities. These communities become the initial topic structure, which Stage 6 then refines.
+
+The full Stage 5 pipeline for n > 20:
+Step	What It Does	Code Location
+1. Otsu + guards	Remove true duplicates (same as n ≤ 20)	_reduce_topic()
+2. k-NN graph	Find 20 nearest neighbors per CUI by cosine similarity	_cosine_knn()
+3. Adaptive edge threshold	Mean of k-th neighbor distances → edge cutoff	TopicBuilder.build()
+4. Weighted graph	Edges where cosine distance < threshold. Weight = similarity.	TopicBuilder.build()
+5. Louvain detection	Community detection on weighted graph (resolution=1.0, seed=42)	networkx louvain_communities()
+6. Silhouette splitting	Data-driven quality check. Split poor communities at resolution=2.0.	_split_communities_by_silhouette()
+7. Singleton merging	Merge isolated CUIs into nearest group if similarity > threshold	TopicBuilder.build()
+8. Within-community dedup	Otsu + 4 structural guards within each community	_reduce_topic() per community
+
+B6.2 Step 1: Initial Dedup (Otsu + Guards)
+
+Input: 28 SNOMED CUIs from the cardiac catheterization entity, each with a 3072-dim L2-normalized embedding.
+
+Same process as the query side (Section A5): cosine distance matrix (28×28 = 378 pairwise distances) → Otsu threshold → HAC clustering at tight_t → within-cluster guard checks.
+
+Result: 28 → 24 CUIs. 4 true duplicates removed (e.g., 'PTCA of LAD' and 'Percutaneous transluminal coronary angioplasty of left anterior descending artery' — same procedure, different SNOMED codes, all 4 guards failed).
+
+24 > 20 → Louvain runs on the 24 survivors.
+
+B6.3 Steps 2–3: Cosine k-NN Graph Construction
+
+What: For each of the 24 CUIs, find the k=20 most similar CUIs by cosine similarity.
+
+How _cosine_knn works:
+  1. Build 24×24 similarity matrix: matrix @ matrix.T (dot product of L2-normalized vectors = cosine similarity)
+  2. Set diagonal to −∞ (a CUI is not its own neighbor)
+  3. For each row, argpartition to find top-20 indices
+  4. Sort those 20 by similarity (highest first)
+  5. Return: neighbors[24×20] (indices), sim_scores[24×20] (similarities)
+
+Note: k=min(20, n−1) = min(20, 23) = 20. Each CUI has exactly 20 neighbors listed. But not all become edges — the adaptive threshold filters weak connections.
+
+Adaptive edge threshold: For each CUI, the k-th (20th) neighbor's distance is recorded. This is the weakest connection in that CUI's neighborhood. The threshold = mean of all these k-th distances across all 24 CUIs.
+
+Concrete example:
+CUI	20th neighbor distance	Meaning
+PTCA of LAD	0.28	Its 20th neighbor is fairly close (dense neighborhood)
+Hemodynamic monitoring	0.45	Its 20th neighbor is far (sparse neighborhood)
+Balloon angioplasty	0.31	Moderate density
+...(21 more)	0.25–0.50	Varies by concept
+
+threshold = mean(all k-th distances) ≈ 0.35
+Only pairs with cosine distance < 0.35 (i.e., similarity > 0.65) get an edge in the graph.
+
+B6.4 Step 4: Building the Weighted Graph
+
+What: A networkx Graph with 24 nodes (one per CUI). An edge is added between CUI-i and CUI-j if their cosine distance < threshold (0.35). Edge weight = cosine similarity.
+
+Result: ~85 edges out of 276 possible (24×23/2). The graph is sparse — only genuinely related concepts are connected.
+
+What the graph looks like (conceptually):
+Cluster	CUIs Connected	Internal Edges
+Stenting procedures	Coronary stent placement, DES insertion, multi-vessel stenting, stent delivery	Dense connections (sim > 0.75)
+Angioplasty procedures	Balloon angioplasty, PTCA, dilation catheter, guidewire	Dense connections (sim > 0.70)
+Imaging	Intravascular ultrasound, OCT, angiography, contrast injection	Moderate connections (sim > 0.65)
+Monitoring	Hemodynamic monitoring, pressure measurement, ECG	Moderate connections (sim > 0.65)
+Cross-cluster	Stenting ↔ Angioplasty (related but distinct procedures)	Few weak edges (sim ≈ 0.66)
+
+The graph naturally separates into clusters. Louvain's job is to find these clusters automatically.
+
+B6.5 Step 5: Louvain Community Detection
+
+What Louvain does: Finds groups of nodes that are more densely connected to each other than to the rest of the graph. Maximizes "modularity" — a score measuring how much the grouping improves over random.
+
+Algorithm (simplified):
+  Phase 1: Each node starts in its own community. For each node, try moving it to each neighbor's community. If modularity increases, make the move. Repeat until no moves improve modularity.
+  Phase 2: Collapse each community into a single super-node. Build a new graph of super-nodes. Repeat Phase 1 on this smaller graph.
+  Repeat Phases 1–2 until no further improvement.
+
+Parameters:
+Parameter	Value	Why
+resolution	1.0	Standard resolution. Higher = more communities (finer split). Used at 2.0 only during silhouette re-splitting.
+seed	42	Deterministic. Same input → same communities every time.
+weight	"weight"	Uses the cosine similarity edge weights. Stronger connections count more.
+
+Result for our 24 CUIs:
+Community	Size	CUIs	Clinical Meaning
+0	7	Coronary stent, DES, multi-vessel stent, stent delivery, ...	Stenting procedures
+1	6	Balloon angioplasty, PTCA, dilation catheter, guidewire, ...	Angioplasty procedures
+2	5	IVUS, OCT, angiography, contrast, fluoroscopy	Imaging modalities
+3	4	Hemodynamic monitoring, pressure, ECG, arterial line	Monitoring
+4	2	Vascular access, sheath insertion	Access procedures
+
+5 communities detected. Louvain grouped semantically related CUIs together — stenting with stenting, imaging with imaging. The cross-cluster edges (stenting ↔ angioplasty) were too weak to merge them.
+
+B6.6 Step 6: Silhouette-Based Quality Check
+
+Why: Louvain doesn't guarantee that every community is well-formed. A community might contain two sub-groups that should be separate. Silhouette scoring measures how well each community holds together.
+
+Silhouette score per community: For each CUI in a community, compute:
+  a_i = mean distance to other CUIs in the SAME community (cohesion)
+  b_i = mean distance to CUIs in the NEAREST OTHER community (separation)
+  s_i = (b_i − a_i) / max(a_i, b_i)
+  Community score = mean of s_i across all members
+
+Interpretation:
+Score Range	Meaning
++1.0	Perfect: CUIs are much closer to own community than to any other
++0.5 to +1.0	Good: clear community structure
+0.0 to +0.5	Weak: community may contain sub-groups
+Below 0.0	Poor: CUIs are closer to another community than their own
+
+Scores for our 5 communities:
+Community	Silhouette Score	Assessment
+0 (Stenting)	0.72	Good — stenting CUIs are well-grouped
+1 (Angioplasty)	0.68	Good
+2 (Imaging)	0.45	Weak — IVUS and angiography may be sub-groups
+3 (Monitoring)	0.71	Good
+4 (Access)	0.80	Good (only 2 members, naturally tight)
+
+Gap detection: Sort scores: [0.80, 0.72, 0.71, 0.68, 0.45]. Gaps: [0.08, 0.01, 0.03, 0.23]. Largest gap = 0.23 (between 0.68 and 0.45). Is 0.23 > 2.0 × median gap (0.055)? Yes → Community 2 flagged for splitting.
+
+Re-split: Community 2 (Imaging, 5 members) is re-processed with Louvain at resolution=2.0 (forces finer communities). Result:
+  Sub-community 2a: {IVUS, OCT} (invasive imaging)
+  Sub-community 2b: {angiography, contrast, fluoroscopy} (radiographic imaging)
+
+New silhouette scores for 2a and 2b are both above the threshold → accepted.
+
+Final communities: 6 (was 5). The Imaging community was split into invasive vs radiographic imaging. All other communities unchanged.
+
+B6.7 Step 7: Singleton Merging
+
+What: If Louvain or silhouette splitting produced isolated CUIs (communities of size 1), each singleton is compared against all group centroids.
+
+Merge threshold (data-driven):
+  1. Compute pairwise cosine similarities within every group
+  2. merge_min_sim = mean(within-group similarities) × 0.5
+  3. Clamped to [0.1, 0.9]
+
+Meaning: a singleton must be at least 50% as similar to a group as the group's own members are to each other. If within-group similarity averages 0.80, the singleton needs at least 0.40 cosine similarity to join.
+
+In our example: No singletons produced. All 24 CUIs belong to communities of size ≥2.
+
+B6.8 Step 8: Within-Community Dedup
+
+What: After Louvain has formed communities, Otsu + 4 structural guards run WITHIN each community. This is the same _reduce_topic logic used in the fast path, but scoped to the community's CUIs only.
+
+Why run dedup after Louvain? Louvain groups related CUIs together. But 'related' doesn't mean 'different'. Within the Stenting community, 'coronary stent placement' and 'coronary stent deployment' may be the same procedure with different SNOMED codes. The structural guards catch these.
+
+Example — Community 0 (Stenting, 7 CUIs):
+Pair Checked	Distance	Guard Result	Action
+Coronary stent placement vs Coronary stent deployment	0.03	All 4 guards fail (same type, same ancestors, not parent-child, not sibling leaves)	REMOVE deployment (lower centroid sim)
+DES insertion vs Bare metal stent	0.09	Guard 2 fires: different subtypes of stent (disjoint sub-categories)	KEEP BOTH
+Multi-vessel stent vs Single-vessel stent	0.11	Guard 4 fires: sibling leaf nodes under same parent	KEEP BOTH
+
+Result: Community 0: 7 → 6 CUIs (1 true duplicate removed).
+Across all 6 communities: 24 → 21 CUIs total. 3 within-community duplicates removed.
+
+B6.9 Complete Stage 5 Flow (n > 20)
+
+Step	Input	Output	What Happened
+Stages 1–4	Raw CUIs from API	28 SNOMED CUIs	SAB filter + hierarchy reduction
+Otsu + guards	28 CUIs	24 CUIs	4 true duplicates removed
+k-NN graph	24 CUIs	24 nodes, ~85 edges	k=20, threshold=0.35
+Louvain	Graph with 85 edges	5 communities	Modularity-based grouping
+Silhouette	5 communities	6 communities	1 weak community re-split
+Singleton merge	6 communities, 0 singletons	6 communities	Nothing to merge
+Within-community dedup	24 CUIs in 6 communities	21 CUIs in 6 communities	3 intra-community duplicates
+
+28 → 21 CUIs. 7 total removed: 4 by initial Otsu, 3 by within-community Otsu. Louvain itself does not remove CUIs — it only groups them. The dedup happens before and after Louvain via the same Otsu + guard logic.
+
+Key point for demo: Louvain organizes. Guards protect. Otsu finds the threshold. No CUI is removed without passing through 4 structural checks. The hierarchy, semantic types, and ancestor sets all have to agree that two CUIs are truly the same concept before one is dropped.
+ 
+QUERY MATCHING PIPELINE (ADAPTIVE SCORER)
+Topic Gate → 3-Signal Scoring → Z-Score → Relative Threshold → Results
+
+Part C: Query Matching
+
+Query: "knee arthroplasty" (1 topic, 5 CUIs, 1 centroid)
+Store: 5 documents (including Case 1), 236 topic groups total
+
+Scoring parameters (all in topic_matcher.py DEFAULTS):
+Parameter = Value	Why This Value
+z_score_normalize = True	Z-score auto-weights each signal by its standard deviation (discriminative power) for THIS query. A broad query where vec_sim has high variance and cui_ratio has zero variance: z-score gives all weight to vec_sim automatically. Manual weights (0.40/0.30/0.30) can’t adapt per query.
+w_cui/w_vec/w_lin = 0.40/0.30/0.30	Fallback only (z_score=False). 0.40 for CUI overlap reflects that exact concept matches are the strongest evidence. 0.30/0.30 for vec_sim and Lin are equal because neither is systematically stronger. Empirically stable across test stores.
+anc_depth = 8	Search-time BFS is deeper than ingestion-time (3–5) because at query time we want to find ALL hierarchy relationships, not just direct parents. 8 hops reaches mid-UMLS (IC ≈ 3–4). Deeper adds no matches because IC pruning stops it. Shallower misses valid cousin relationships.
+score_ratio = 0.40	Return results scoring ≥ 40% of the top score. 0.40 = broad recall — keeps the relevant cluster and drops the noise tail. Tested: 0.30 returns too much noise, 0.60 misses secondary matches. 0.40 is the point where precision stops improving and recall starts dropping.
+score_min = 0.01	Structural floor, not a tuning parameter. Catches floating-point artifacts (scores of 0.001 from z-score normalization when all candidates are nearly identical). Any real match scores well above 0.01.
+Zero-evidence guard: all 3 = 0.0	The only safe suppression: literally zero evidence on all three channels. Any non-zero value (even vec_sim=0.05) means SOME signal exists and the combined score should decide. Per-signal thresholds were removed because they suppress the channel that carries evidence for broad queries.
+group_dist = 0.15	Cosine distance for cross-chunk topic grouping in TopicIndex.build(). 0.15 = 0.85 cosine similarity. Topics from different clinical notes must be very similar to be grouped together. Tested: 0.10 under-groups (too many groups), 0.25 over-groups (merges distinct conditions).
+variant_min_change = 1	Minimum CUI adds+removes to flag a variant between consecutive notes in the same topic group. 1 = any change is flagged. Set to 2+ only if you want to ignore trivial edits.
+
+Adaptive parameters (derived at runtime from store data):
+Parameter = Value	Why This Formula
+filter_min_ancestor_ic = 13.98	p25 of store CUI ICs. Ancestors below this IC are too broad to be meaningful shared ancestors. p25 (not median) because we want the floor driven by the lower quartile — most ancestors should be above this. Specific store (ICs 12–15) → high floor (13.98). General store (ICs 3–15) → low floor (≈4).
+ic_weight_alpha = 0.90	query_ic_mean / max_store_ic. Specific query against specific store → alpha near 1.0 → IC dominates over IDF in cui_ratio weighting. Broad query ('worsening condition', low IC CUIs) → alpha near 0.1 → IDF dominates. Adapts automatically to query specificity.
+ic_prune_ratio = 0.711	p10/p50 of store ICs. Controls BFS ancestor pruning depth at search time. Specific store: p10 and p50 are close (ratio → 0.7+) → tight pruning (stop early). General store: ratio → 0.2 → relaxed pruning (search deeper). Clamped [0.1, 0.9].
+sibling_ic_ratio = 0.944	p25/p75 of store ICs. MICA IC gate for sibling matching. Specific store (narrow IC range): ratio near 1.0 → only very close siblings accepted. General store: ratio → 0.3 → distant siblings OK. Prevents false sibling matches in specific stores.
+min_best_lin = 0.278	2×root_ic / (query_ic_mean + store_ic_mean) × 1.5. Lin similarity of two unrelated concepts sharing only the root ancestor. Below this = the pair is no more related than random CUIs. ChunkMatcher hard-negative blocker only.
+use_idf = True	Shannon entropy of the store’s IDF distribution > 0.3. High entropy = IDF values are spread out = IDF is discriminative for this store. Low entropy = most CUIs have similar IDF = IDF adds noise. Computed once per store.
+
+C1. Pass 1: Topic Gate
+
+Step 1 — Centroid gate: Query topic centroid (3072-dim) × 236 group centroids via matrix multiply.
+
+Adaptive parameters (see table above) applied to this store: filter_min_ancestor_ic=13.98, ic_weight_alpha=0.90, ic_prune_ratio=0.711, sibling_ic_ratio=0.944. All derived from the store’s IC distribution at runtime.
+
+gap_split result: Most groups have very low similarity to "knee arthroplasty" (it's a surgical query against a mostly medical store). Only 1 group clears the centroid threshold.
+
+Step 2 — CUI overlap rescue: Checks excluded groups for shared CUIs with query. Group 71 shares C3873937 (Knee femur prosthesis) → admitted.
+
+Pass 1 result: 2 of 236 groups admitted to Pass 2
+  Group from centroid gate: case_2 (contains knee arthroplasty content)
+  Group 71 rescued by CUI overlap: shares C3873937 with query
+
+C2. Pass 2: CUI Scoring (Three Signals)
+
+Document ancestor precomputation: Before scoring, ancestors precomputed for all document CUIs in the 2 admitted groups. This populates matcher._ancestor_cache so hierarchy matching works.
+
+_score_raw for case_2 (best match):
+
+Signal 1 — cui_ratio: topic_members = {case_2's knee arthroplasty CUIs + topic_cui}
+  Query CUIs checked: C5568443, C5688901, C5768203, C3873937, C0188146
+  Exact matches: C5768203 (Prosthetic arthroplasty of right knee) ✓
+  Hierarchy matches: C0188146 via parent-child, C5688901 via MICA
+  cui_ratio = 0.38 (IC-weighted: 3 of 5 query CUIs matched, with subsumption penalties)
+
+Signal 2 — vec_sim: dot(query_centroid, case_2_topic_centroid) = high (both are knee arthroplasty embeddings)
+
+Signal 3 — lin_avg: For unmatched query CUIs: best Lin similarity against all topic members. lin_avg = 0.617 (strong hierarchy agreement via shared SNOMED ancestors).
+
+case_2 raw scores: cui_ratio=0.38, vec_sim=high, lin_avg=0.617
+Other entries: Lower scores on all three signals
+
+C3. Pass 3: Z-Score Normalization
+
+Each signal z-normalized across all Pass 2 candidates:
+  z_cui = (cui_ratio - mean) / std  → case_2 gets positive z
+  z_vec = (vec_sim - mean) / std    → case_2 gets positive z
+  z_lin = (lin_avg - mean) / std    → case_2 gets positive z
+  Final score = z_cui + z_vec + z_lin, shifted to [0,1]
+
+case_2 final score: 1.000 (normalized — highest across all candidates)
+
+C4. Pass 4: Relative Threshold + Results
+
+best_score = 1.000
+rel_floor = 1.000 × 0.40 = 0.400
+
+Zero-evidence guard: No candidates have all three signals at zero. None suppressed.
+
+Dedup by chunk_id: One result per clinical note.
+
+Final result:
+Rank	Chunk	Score	cui_ratio	Lin	Matched CUIs
+#1	case_2	1.000	0.38	0.617	C0188146 (tibial plateau), C5688901 (robotic), C5768203 (right knee)
+
+Why only 1 result? "knee arthroplasty" is a very specific surgical query. The store has 5 documents — only case_2 contains knee arthroplasty content. Cases 1, 3, 4, 5 are medical (asthma, diabetes, etc.) with no knee surgery CUIs. Their scores are below the 40% relative threshold. This is correct — they are genuinely not relevant to this query.
+
+C5. LLM Reasoning
+
+Input to Gemini: Top result (case_2) with matched CUIs, topic labels, and chunk text.
+
+LLM output: Confirms the match is highly relevant. Notes that case_2 describes total knee arthroplasty of the right knee with cemented, fixed-bearing implant. Identifies that 2 query concepts (tibial plateau arthroplasty, robotic assistance) are not covered in the chunk text but are related to the overall procedure.
+
+End-to-end time: 4,417ms (API extraction + BigQuery + medspacy + scoring + LLM)
+Pipeline path: 25 raw CUIs → 10 (SAB) → 8 (hier) → 5 (emb) → 1 topic → 2/236 groups scored → 1 result
+LLM verdict: "Good" — highly relevant, minor gaps in coverage
+ 
+Summary: Full Pipeline Flow
+
+Step	Query Side	Document Side
+Input	"knee arthroplasty"	Full clinical note (58yo F, asthma...)
+Stage 1: Extract	25 CUIs, 0 negated	691 CUIs across 25 phrases, 0 negated
+Stage 2: SAB	25 → 10 (SNOMED only)	691 → ~280 (per phrase)
+Stage 3: IC	10 → 10 (all valid)	~280 → ~270 (few deprecated)
+Stage 4: Hierarchy	10 → 8 (2 parents removed)	~270 → ~209 (parent-child dedup)
+Stage 5: Embedding	8 → 5 (3 duplicates)	209 → 138 (within-topic dedup)
+Stage 6: Topics	1 topic	60 topics, 43 subtopics
+Stage 7: Reps	2 representatives	67 representatives
+Stage 8: Centroids	1 centroid (3072-dim)	60 centroids (3072-dim each)
+Store/Match	Matched against 236 groups	Stored as 1 chunk in ChunkStore
+Pass 1: Gate	2/236 groups admitted	—
+Pass 2: Score	3 signals computed	—
+Pass 3: Z-score	Normalized to [0,1]	—
+Pass 4: Filter	1 result (score=1.000)	—
+
+
+
+End of Walkthrough
