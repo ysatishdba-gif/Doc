@@ -29,59 +29,26 @@ from scipy.spatial.distance import squareform
 # No bare string comparisons ("== 'historical'") appear in pipeline logic.
 
 # ── Clinical context — output of ClinicalContextParser ───────────────────────
-# Plain dataclass carrying the four ConText boolean attributes directly.
+# Plain dataclass carrying the four clinical context boolean attributes.
 # No hardcoded category names, no enum, no priority dict.
-# The booleans come straight from medspacy ConText (Chapman 2001, Harkema 2009).
+# The booleans are set by ClinicalContextParser using medspacy ConText.
 
 @dataclass
 class ClinicalContext:
     """Negation and temporal context for a clinical phrase.
 
-    All fields are set by ClinicalContextParser.parse() using ConText.
+    All fields are set by ClinicalContextParser via medspacy ConText.
     Default (all False) = current, present, not negated.
     """
-    negated:      bool = False  # phrase is absent / denied
-    historical:   bool = False  # past condition — "history of X"
-    hypothetical: bool = False  # uncertain / possible — "possible X", "r/o X"
-    family:       bool = False  # family history — "father had X"
+    negated:      bool = False
+    historical:   bool = False
+    hypothetical: bool = False
+    family:       bool = False
 
     def is_current(self) -> bool:
         """True if the finding is present and not negated."""
         return not self.negated and not self.historical \
                and not self.hypothetical and not self.family
-
-    def temporal_priority(self) -> int:
-        """Lower = higher priority when resolving conflicts across phrases.
-
-        When a CUI appears under multiple phrases with different contexts,
-        the context with the lowest priority number wins.
-        Current (0) always beats historical (1) beats hypothetical (2) etc.
-        """
-        if self.negated:      return 0   # negated = definitively absent
-        if not self.historical and not self.hypothetical and not self.family:
-            return 1                     # current = present
-        if self.historical:   return 2
-        if self.hypothetical: return 3
-        if self.family:       return 4
-        return 5
-
-    def penalty(self) -> float:
-        """Retrieval penalty for non-current context (used in ChunkMatcher).
-
-        Current → 1.0 (no penalty)
-        Hypothetical → 0.75 (uncertain — partial penalty)
-        Historical / Family → 0.5 (past — stronger penalty)
-        """
-        if self.historical or self.family:
-            return 0.5
-        if self.hypothetical:
-            return 0.75
-        return 1.0
-
-    @classmethod
-    def current(cls) -> "ClinicalContext":
-        """Convenience constructor for the default current/present context."""
-        return cls()
 
     @classmethod
     def from_dict(cls, d: dict) -> "ClinicalContext":
@@ -90,8 +57,6 @@ class ClinicalContext:
             return cls()
         if isinstance(d, cls):
             return d
-        # Legacy: old pickles may store TemporalContext string values
-        # Map them to ClinicalContext booleans
         legacy = str(d).lower()
         return cls(
             historical   = legacy in ("historical",),
@@ -359,177 +324,90 @@ def _union_find(n):
 
 
 # ── Clinical Context Parser ───────────────────────────────────────────────────
-# NegEx-style negation and ConText-style temporal tagging.
-#
-# References:
-#   Chapman WW et al. (2001) "A simple algorithm for identifying negated
-#     findings and diseases in discharge summaries." J Biomed Inform.
-#     — Original NegEx: 35 trigger terms, 84.5% precision / 97.2% recall.
-#   Harkema H et al. (2009) "ConText: An algorithm for determining negation,
-#     experiencer, and temporal status from clinical reports." J Biomed Inform.
-#     — Extends NegEx with temporal (historical/hypothetical) and experiencer axes.
-#   Lee K et al. (2024) JMIR AI 3:e50800
-#     — Production hypernym→hyponym clinical trial matching;
-#       shows temporal context is as important as semantic similarity.
-#   SNOMED CT CDS Guide, SNOMED International
-#     — Situation with Explicit Context hierarchy for temporal representation.
+# Negation and temporal detection via medspacy ConText (built-in rules only).
+# Zero custom rules, zero overrides, zero string matching in application code.
+# medspacy's 102 published rules are the package's responsibility, not ours.
 
 class ClinicalContextParser:
-    """
-    Detect negation and temporal context for a clinical phrase using
-    medspacy ConText — the published, validated clinical NLP algorithm
-    (Chapman 2001, Harkema 2009).
+    """Detect negation and temporal context using medspacy ConText defaults.
 
-    ConText uses spaCy token-pattern matching — word-boundary safe by
-    design. Zero hardcoded string lists. 102 built-in rules extended
-    with clinical-specific patterns. All rules are configurable via
-    the medspacy API without code changes.
+    Uses ONLY the built-in rules shipped with medspacy — zero custom
+    additions. The 102 ConText rules are published, validated clinical
+    NLP (Chapman 2001, Harkema 2009) maintained by the medspacy team.
 
-    Performance: pipeline is constructed once (lazy, on first call).
-    Per-call cost: tokenisation + ConText graph traversal — O(n_tokens),
-    typically < 1ms for a clinical phrase + context window.
-
-    References:
-        Chapman 2001 — NegEx
-        Harkema 2009 — ConText
-        medspacy 1.3 — https://github.com/medspacy/medspacy
+    parse() finds the phrase inside the context text and lets ConText
+    evaluate it in its natural sentence position.
     """
 
-    # ── Class-level singletons ────────────────────────────────────────────────
-    _nlp          = None
-    _context_pipe = None
-
-    # Tokens that ConText classifies as NEGATED_EXISTENCE but are clinically
-    # HISTORICAL — "resolved X" means past condition, not absent condition.
-    _RESOLVED_AS_HISTORICAL = frozenset([
-        "resolved", "resolving", "cleared", "recovered from",
-        "remission", "in remission",
-    ])
+    _nlp = None
 
     @classmethod
     def _ensure_loaded(cls):
-        """Lazy-load the medspacy pipeline once. Thread-safe via Python GIL."""
         if cls._nlp is not None:
             return
-
-        import medspacy      # registers medspacy_context spaCy factory
-        import spacy
-        from medspacy.context import ConTextRule
-
-        nlp     = spacy.blank("en")
-        nlp.add_pipe("sentencizer")
-        context = nlp.add_pipe("medspacy_context")
-
-        # ── Remap POSSIBLE_EXISTENCE → is_hypothetical ────────────────────────
-        # Default mapping: POSSIBLE_EXISTENCE → is_uncertain (not is_hypothetical).
-        # Clinically, "possible X" / "probable X" = hypothetical, not uncertain.
-        context.context_attributes_mapping["POSSIBLE_EXISTENCE"] = {
-            "is_hypothetical": True
-        }
-
-        # ── Add CONCERN_FOR category → hypothetical ───────────────────────────
-        # ConText default lacks "concern for", "evaluated for", etc.
-        context.context_attributes_mapping["CONCERN_FOR"] = {"is_hypothetical": True}
-
-        # ── Add RESOLVED_HISTORICAL category → historical ─────────────────────
-        # "resolved X" fires NEGATED_EXISTENCE in defaults. We add a competing
-        # HISTORICAL rule. The override logic in parse() handles the conflict.
-        context.context_attributes_mapping["RESOLVED_HISTORICAL"] = {
-            "is_historical": True
-        }
-
-        extra_rules = [
-            # Hypothetical — concern/suspicion (not in ConText defaults)
-            ConTextRule("concern for",     "CONCERN_FOR", direction="FORWARD"),
-            ConTextRule("concerns for",    "CONCERN_FOR", direction="FORWARD"),
-            ConTextRule("suspicious for",  "CONCERN_FOR", direction="FORWARD"),
-            ConTextRule("evaluated for",   "CONCERN_FOR", direction="FORWARD"),
-            ConTextRule("workup for",      "CONCERN_FOR", direction="FORWARD"),
-            ConTextRule("r/o",             "CONCERN_FOR", direction="FORWARD"),
-            # Historical — additions not in ConText defaults
-            ConTextRule("hx of",             "HISTORICAL", direction="FORWARD"),
-            ConTextRule("pmh:",              "HISTORICAL", direction="FORWARD"),
-            ConTextRule("prior history of",  "HISTORICAL", direction="FORWARD"),
-            ConTextRule("remote history of", "HISTORICAL", direction="FORWARD"),
-            ConTextRule("known history of",  "HISTORICAL", direction="FORWARD"),
-            ConTextRule("underwent",         "HISTORICAL", direction="FORWARD"),
-            ConTextRule("resolved",          "RESOLVED_HISTORICAL", direction="FORWARD"),
-            ConTextRule("resolving",         "RESOLVED_HISTORICAL", direction="FORWARD"),
-            ConTextRule("cleared",           "RESOLVED_HISTORICAL", direction="FORWARD"),
-            ConTextRule("in remission",      "RESOLVED_HISTORICAL", direction="FORWARD"),
-        ]
-        context.add(extra_rules)
-
-        cls._nlp          = nlp
-        cls._context_pipe = context
-        log(f"    ClinicalContextParser: ConText loaded "
-            f"({len(context.rules)} rules)", level="DEBUG")
-
-    # ── Public API ────────────────────────────────────────────────────────────
+        import medspacy
+        cls._nlp = medspacy.load(enable=["medspacy_context"])
+        log(f"    ClinicalContextParser: medspacy loaded "
+            f"({len(cls._nlp.get_pipe('medspacy_context').rules)} built-in rules)")
 
     def parse(self, phrase: str, context: str = "") -> "ClinicalContext":
-        """Detect negation and temporal context for a clinical phrase.
+        """Detect clinical context for a phrase. O(n_tokens) per call.
 
         Args:
-            phrase:  clinical phrase whose CUIs are being tagged
-            context: surrounding text (full sentence or note section).
-                     Pass empty string for query-time calls where no
-                     surrounding context is available.
+            phrase:  clinical phrase to evaluate
+            context: surrounding sentence/note text (or empty for queries)
 
         Returns:
-            ClinicalContext dataclass with boolean fields from ConText.
-            Default (all False) = present, current, not negated.
+            ClinicalContext with booleans from ConText.
+            Default (all False) = current, present, not negated.
         """
         self._ensure_loaded()
-        nlp          = self.__class__._nlp
-        context_pipe = self.__class__._context_pipe
+        nlp = self.__class__._nlp
 
-        combined = (context.strip() + " " + phrase.strip()).strip() \
-                   if context else phrase.strip()
-        doc = nlp(combined)
+        phrase_s = phrase.strip()
+        if not phrase_s:
+            return ClinicalContext()
 
-        phrase_lower   = phrase.lower()
-        combined_lower = doc.text.lower()
-        start_char     = combined_lower.rfind(phrase_lower)
-        if start_char == -1:
-            start_char = 0
-        end_char = start_char + len(phrase_lower)
+        # ── Find phrase inside context (correct sentence scope) ───────────
+        # Never append phrase to context — clinical notes ending with
+        # negation triggers ("no f/u needed") would falsely negate it.
+        if context:
+            ctx_s = context.strip()
+            pos = ctx_s.lower().find(phrase_s.lower())
+            if pos != -1:
+                text = ctx_s
+                start, end = pos, pos + len(phrase_s)
+            else:
+                text = phrase_s
+                start, end = 0, len(phrase_s)
+        else:
+            text = phrase_s
+            start, end = 0, len(phrase_s)
 
-        span = doc.char_span(start_char, end_char,
-                             label="CONCEPT", alignment_mode="expand")
+        doc = nlp.make_doc(text)
+        # sentencizer needed for ConText scope boundaries
+        for name, proc in nlp.pipeline:
+            if name != "medspacy_context":
+                doc = proc(doc)
+
+        span = doc.char_span(start, end, label="CONCEPT",
+                             alignment_mode="expand")
         if span is None:
             return ClinicalContext()
 
         doc.ents = [span]
-        doc = context_pipe(doc)
+        doc = nlp.get_pipe("medspacy_context")(doc)
         ent = doc.ents[0]
 
-        is_negated    = ent._.is_negated
-        is_historical = ent._.is_historical
-        is_hypo       = ent._.is_hypothetical
-        is_family     = ent._.is_family
-
-        # Override: "resolved X" → HISTORICAL not NEGATED
-        # ConText fires NEGATED_EXISTENCE on "resolved" but clinical meaning is past.
-        if is_negated and not is_historical:
-            pre_tokens = combined_lower[:combined_lower.rfind(phrase_lower)].split()[-4:]
-            if any(t in self._RESOLVED_AS_HISTORICAL for t in pre_tokens):
-                is_negated    = False
-                is_historical = True
-
-        # "family history of X" fires both FAMILY and HISTORICAL — keep only FAMILY
-        if is_family:
-            is_historical = False
-
         return ClinicalContext(
-            negated      = is_negated,
-            historical   = is_historical,
-            hypothetical = is_hypo,
-            family       = is_family,
+            negated=ent._.is_negated,
+            historical=ent._.is_historical,
+            hypothetical=ent._.is_hypothetical,
+            family=ent._.is_family,
         )
 
 
-# Module-level singleton — _ensure_loaded() is lazy.
+# Module-level singleton — _ensure_loaded() is lazy on first parse() call.
 _clinical_context_parser = ClinicalContextParser()
 
 # ── Data Models ──────────────────────────────────────────────────────────────
@@ -2775,7 +2653,7 @@ class CUIExtractor:
     def extract(self, text_list, context_list):
         """Extract CUIs per phrase with negation filtering and temporal tagging.
 
-        Applies NegEx/ConText-style rules (ClinicalContextParser) after API
+        Applies clinical context detection (ClinicalContextParser) after API
         extraction to:
           1. Remove CUIs from negated phrases ("no knee pain" → discard knee pain CUIs)
           2. Tag surviving CUI sets with ClinicalContext for downstream use
@@ -2783,7 +2661,7 @@ class CUIExtractor:
         Returns:
             dict {phrase: {"cuis": {cui: distance}, "context": ClinicalContext}}
 
-        The "context" value is a ClinicalContext dataclass (booleans from ConText).
+        The "context" value is a ClinicalContext dataclass (from medspacy ConText).
         Callers that only need CUI distances can iterate over result[phrase]["cuis"].
         The context is stored in ChunkStore for query-time temporal matching.
         """
@@ -2848,8 +2726,8 @@ class CUIExtractor:
                 raw_per_phrase[phrase] = cui_dists
 
         # ── Apply clinical context tagging ────────────────────────────────
-        # For each phrase, detect negation and temporal status via ConText.
-        # Negated phrases: all their CUIs are discarded (Chapman 2001 NegEx).
+        # medspacy ConText (built-in rules only, zero custom additions).
+        # Negated phrases: all their CUIs are discarded.
         # ClinicalContext stored alongside CUIs for retrieval-time use.
         phrase_to_context = dict(zip(text_list, context_list))
         per_phrase: Dict[str, dict] = {}
@@ -2871,7 +2749,7 @@ class CUIExtractor:
 
             per_phrase[phrase] = {
                 "cuis":    cui_dists,
-                "context": cc,   # ClinicalContext dataclass — booleans from ConText
+                "context": cc,   # ClinicalContext dataclass — from medspacy ConText
             }
 
         total = sum(len(v.get("cuis", {})) for v in per_phrase.values())
