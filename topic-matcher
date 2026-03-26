@@ -92,6 +92,16 @@ DEFAULTS = {
 
     # ── Output ───────────────────────────────────────────────────────────
     "score_min":          0.01,   # absolute floor (structural, not tuning)
+    "min_cui_ratio":      0.05,   # absolute floor on raw cui_ratio before z-score.
+                                  # Addresses the "all candidates are bad but still
+                                  # ranked" problem: even if z-score normalisation
+                                  # elevates a candidate, it must have demonstrated
+                                  # at least 5% IC-weighted concept overlap.
+                                  # Complements the zero-signal guard (which only
+                                  # catches cui_ratio=0.0 exactly). This catches
+                                  # near-zero overlap that z-score would otherwise
+                                  # amplify into a seemingly confident result.
+                                  # 0.05 = 5% of total query IC weight matched.
     "min_overlap":        1,      # ChunkMatcher backward compat
     "confidence_ratio":   0.5,    # FALLBACK ONLY: if gap_split finds no gap
 
@@ -1782,6 +1792,22 @@ class TopicIndex:
         for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched, topic_members) in enumerate(raw_results):
             score = float(scores[i])
             if score < self.p["score_min"] or score < conf_floor:
+                continue
+
+            # Absolute CUI overlap floor: require raw cui_ratio >= min_cui_ratio
+            # before z-score is applied. This prevents z-score normalisation from
+            # amplifying candidates with near-zero concept overlap into apparently
+            # confident results. Complements the zero-signal guard below:
+            #   zero-signal guard catches cui_ratio == 0.0 exactly
+            #   min_cui_ratio catches near-zero overlap (0 < cui_ratio < 0.05)
+            # Both guards operate on the raw (pre-z-score) cui_ratio so they
+            # reflect actual concept evidence rather than relative ranking.
+            if cui_ratio < self.p["min_cui_ratio"] and lin_avg < self.p["min_cui_ratio"]:
+                logger.debug(
+                    f"  Weak-signal result suppressed: {entry.get('chunk_id')} "
+                    f"topic={entry.get('topic_cui')} "
+                    f"cui_ratio={cui_ratio:.4f} lin_avg={lin_avg:.4f} score={score:.3f}"
+                )
                 continue
 
             # Zero-signal guard: require at least one of CUI overlap or Lin > 0.
