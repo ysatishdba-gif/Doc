@@ -135,6 +135,14 @@ _EMB_FETCH_WORKERS, _KNN_BLOCK_SIZE, _RANDOM_SEED = 4, 2000, 42
 _CACHE_METADATA, _CACHE_IC, _CACHE_EMBEDDING = 50_000, 100_000, 50_000
 _CACHE_EXTRACTION, _ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 10_000, 200_000, 10_000
 _FAST_PATH_THRESHOLD, _CROSS_TOPIC_DEDUP_MIN = 200, 200
+# Minimum CUI count for Louvain to produce meaningful communities.
+# Below this threshold the k-NN graph is near-fully-connected (k gets
+# capped at n-1) and Louvain produces arbitrary communities driven by
+# tie-breaking rather than semantic structure. For small sets, pass
+# surviving CUIs directly — HierarchicalTopicBuilder handles them correctly.
+# Value = k_neighbors default (20): need more concepts than neighbours
+# for the graph to have meaningful sparse structure.
+_LOUVAIN_MIN_CUIS = 20
 _ANCESTOR_TARGET, _ANCESTOR_DEPTH_CLAMP = 20, (1, 5)
 _COMPONENT_DEPTH_RATIO, _COMP_DEPTH_MEAN_THRESHOLD = 0.4, 1.5
 _DEFAULT_ANCESTOR_DEPTH = 3
@@ -1623,7 +1631,16 @@ class EmbeddingReducer:
 
     @staticmethod
     def _fast_path(cuis, metadata, embeddings, ic_map, hierarchy_edges, graph, ancestor_depth):
-        """Direct pairwise dedup for <=200 CUIs. Skips components/louvain."""
+        """Direct pairwise dedup for <=200 CUIs.
+
+        Skips graph component decomposition.
+        Also skips Louvain when len(surviving) <= _LOUVAIN_MIN_CUIS:
+          — k-NN graph becomes near-fully-connected when n <= k_neighbors (20)
+          — Louvain communities are driven by tie-breaking, not semantic structure
+          — HierarchicalTopicBuilder in Stage 6 handles small sets correctly
+          — For queries (typically 4-12 surviving CUIs) this avoids 200-500ms
+            of Louvain computation that adds no value
+        """
         with_emb = [c for c in cuis if c in embeddings]
         without_emb = [c for c in cuis if c not in embeddings]
         log(f"    Fast path: {len(cuis)} CUIs ({len(with_emb)} with embeddings)", level="DEBUG")
@@ -1633,9 +1650,22 @@ class EmbeddingReducer:
             with_emb, embeddings, metadata, ic_map, hierarchy_edges, graph, ancestor_depth)
         surviving.extend(without_emb)
         emb_surviving = [c for c in surviving if c in embeddings]
+
         if len(emb_surviving) >= 2:
-            topics = {f"topic_{i}": t for i, t in enumerate(
-                TopicBuilder.build(emb_surviving, embeddings).values())}
+            if len(emb_surviving) > _LOUVAIN_MIN_CUIS:
+                # Large enough for Louvain to find meaningful communities
+                topics = {f"topic_{i}": t for i, t in enumerate(
+                    TopicBuilder.build(emb_surviving, embeddings).values())}
+                log(f"    Fast path: Louvain ran ({len(emb_surviving)} surviving CUIs)",
+                    level="DEBUG")
+            else:
+                # Too few CUIs — Louvain would produce arbitrary tie-breaking communities.
+                # Pass all surviving CUIs as a single flat group.
+                # HierarchicalTopicBuilder (Stage 6) forms the proper topic structure.
+                topics = {"topic_0": emb_surviving}
+                log(f"    Fast path: Louvain skipped ({len(emb_surviving)} <= "
+                    f"{_LOUVAIN_MIN_CUIS} CUIs) — passing to HierarchicalTopicBuilder",
+                    level="DEBUG")
             tid = len(topics)
             for c in without_emb:
                 if c in surviving:
