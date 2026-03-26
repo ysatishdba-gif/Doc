@@ -92,11 +92,13 @@ DEFAULTS = {
 
     # ── Output ───────────────────────────────────────────────────────────
     "score_min":          0.01,   # absolute floor (structural, not tuning)
+    "score_ratio":        0.40,   # return results scoring >= 40% of the top result.
+                                  # Adapts to data: 1 result or 50, depending on how
+                                  # many are clinically relevant. No fixed cap.
+                                  # 0.40 = broad recall. Set higher (0.6) for precision.
     "min_cui_ratio":      0.05,   # UNUSED — kept for backward compat.
-                                  # Pass 4 now uses a single zero-evidence guard
-                                  # (all 3 raw signals == 0.0) instead of per-signal
-                                  # thresholds. The combined z-score + gap_split
-                                  # handles signal discrimination.
+                                  # Pass 4 now uses relative threshold (score_ratio)
+                                  # + zero-evidence guard instead of per-signal checks.
     "min_overlap":        1,      # ChunkMatcher backward compat
     "confidence_ratio":   0.5,    # FALLBACK ONLY: if gap_split finds no gap
 
@@ -1479,37 +1481,33 @@ class TopicIndex:
         return "changed"
 
     def match(self, query_topics, query_cuis, query_embedding,
-              matcher, top_k=10, variants_first=False):
-        """Match query against topic groups — strict two-pass architecture.
+              matcher, top_k=None, variants_first=False):
+        """Match query against topic groups.
 
-        Pass 1 — TOPIC GATE (coarse, fast, hard exclusion):
-            Compare query topic centroids against all stored group centroids.
-            gap_split finds the natural similarity threshold.
-            Groups below the threshold are EXCLUDED — no fallback.
-            Only groups that clear the gate proceed to Pass 2.
+        Pass 1 — TOPIC GATE (performance optimization):
+            Centroid similarity + CUI overlap narrow the candidate set.
+            Falls back to scoring all groups when gate finds no evidence.
 
-        Pass 2 — CUI SCORING (fine, within matched topics only):
-            For each entry in every matched group, score using only the
-            CUIs belonging to that topic — never the full chunk CUI set.
-            Three signals: IC-weighted CUI overlap, vector cosine, Lin similarity.
+        Pass 2 — CUI SCORING (three signals):
+            IC-weighted CUI overlap, vector cosine, Lin similarity.
 
         Pass 3 — Z-SCORE NORMALISATION:
-            Signals are z-normalised across all Pass 2 candidates so their
-            relative discrimination power drives final ranking — no manual weights.
+            Auto-weights signals by discriminative power.
 
-        Pass 4 — CONFIDENCE FILTER:
-            gap_split on final scores keeps the natural top cluster only.
+        Pass 4 — RELATIVE THRESHOLD + DEDUP:
+            Return all results scoring >= score_ratio (40%) of the top
+            result. No fixed count cap. Adapts to the data.
 
         Args:
             query_topics:    dict from build_query_topics()
             query_cuis:      set of query CUI strings (after reduction)
             query_embedding: numpy centroid of query CUIs
             matcher:         ChunkMatcher instance (provides IC map + hierarchy)
-            top_k:           max results
+            top_k:           optional safety cap (None = no cap, return all above threshold)
             variants_first:  if True, sort variants before routine entries
 
         Returns:
-            list[TopicGroupMatch], empty if no groups cleared the topic gate.
+            list[TopicGroupMatch], empty if no evidence found.
         """
         if not self._built or not self.groups:
             return []
@@ -1785,45 +1783,33 @@ class TopicIndex:
                       self.p["w_lin"] * lins)
 
         # ══════════════════════════════════════════════════════════════════
-        # Pass 4: Confidence filter + dedup
+        # Pass 4: Relative threshold + zero-evidence guard + dedup
         #
-        # Design principle: TRUST THE COMBINED SCORE from Pass 3.
+        # Return all results scoring at least score_ratio (40%) of the
+        # top result's score. The count adapts to the data — 1 result
+        # or 20, depending on how many are clinically relevant.
         #
-        # Z-score normalization (Pass 3) auto-weights the three signals
-        # by their discriminative power for THIS query. gap_split finds
-        # the natural separation between good and bad candidates.
-        # score_min is a structural floor (0.01).
-        #
-        # The only guard is zero-evidence: if all three raw signals are
-        # literally zero, the result has no clinical evidence at all and
-        # was admitted purely by centroid noise in Pass 1. This is the
-        # only case where suppression is correct regardless of score.
-        #
-        # No per-signal thresholds (min_cui_ratio, vec_sim_floor, etc.).
-        # Those create blind spots for queries whose evidence comes
-        # through a single signal channel:
-        #   - "fever and chills" → CUI overlap only (vec_sim may be low)
-        #   - "worsening condition" → vec_sim only (CUI overlap=0, Lin=0)
-        #   - "osteoarthritis of left knee" → Lin only (via parent-child)
-        # Per-signal thresholds suppress the channel that carries the
-        # evidence. The combined score already accounts for this.
+        # No gap_split. No fixed top_k cutoff. The score from Pass 3
+        # ranks everything. The relative threshold separates relevant
+        # from irrelevant. score_min is the absolute floor.
         # ══════════════════════════════════════════════════════════════════
 
-        conf_floor = gap_split(scores, min_keep=1)
+        best_score = float(scores.max()) if len(scores) > 0 else 0.0
+        rel_floor = best_score * self.p["score_ratio"]
         results = []
 
         for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched, topic_members) in enumerate(raw_results):
             score = float(scores[i])
 
-            # ── Score floor: gap_split natural threshold + absolute min ────
-            if score < self.p["score_min"] or score < conf_floor:
+            # ── Absolute floor ────────────────────────────────────────────
+            if score < self.p["score_min"]:
                 continue
 
-            # ── Zero-evidence guard: ALL three raw signals are zero ────────
-            # This means the result has literally no clinical evidence —
-            # no CUI overlap, no hierarchy relationship, no embedding
-            # similarity. It was admitted by centroid noise in Pass 1.
-            # Suppress it regardless of what z-score produced.
+            # ── Relative threshold: must be >= score_ratio × best ─────────
+            if score < rel_floor:
+                continue
+
+            # ── Zero-evidence guard ───────────────────────────────────────
             if cui_ratio == 0.0 and lin_avg == 0.0 and vec_sim == 0.0:
                 logger.debug(
                     f"  Zero-evidence result suppressed: {entry.get('chunk_id')} "
@@ -1872,7 +1858,7 @@ class TopicIndex:
         else:
             results.sort(key=lambda r: (-r.score, -r.is_variant, r.chunk_date))
 
-        return results[:top_k]
+        return results[:top_k] if top_k else results
 
     def summary(self, terms=None):
         """Human-readable summary of all topic groups."""
