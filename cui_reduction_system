@@ -160,6 +160,19 @@ _ANCHOR_IC_MIN, _ANCHOR_BFS_DEPTH, _ANCHOR_IC_MAX_BROAD = 4.0, 4, 3.0
 _EVAL_AGGRESSIVE_RATIO, _EVAL_MINIMAL_RATIO = 0.95, 0.10
 _EVAL_COMPRESSED_SPREAD, _EVAL_SEPARATION_MIN = 0.1, 0.05
 _EVAL_SUSPECT_DIST, _EVAL_RECON_DEPTH = 0.3, 3
+# HierarchicalTopicBuilder BFS controls (Stage 6)
+# _HTB_IC_GRADIENT_RATIO: at hops 3+, a parent is only followed if
+#   IC(parent) >= this ratio × IC(current node). Prevents BFS from
+#   entering very broad territory when the IC gradient drops sharply.
+#   0.3 means: stop following a parent that has less than 30% of the
+#   current node's IC. Set conservatively — 2-hop grace period already
+#   ensures direct parents are always included.
+_HTB_IC_GRADIENT_RATIO = 0.3
+# _HTB_IC_FLOOR_PERCENTILE: used to derive the absolute IC floor for
+#   convergence point candidates from the p10 of surviving CUI ICs.
+#   Ancestors with IC below this floor are never selected as grouping
+#   anchors even if the gradient check would pass.
+_HTB_IC_FLOOR_PERCENTILE = 10
 _RETRY_TOTAL, _RETRY_BACKOFF = 3, 1
 _RETRY_STATUS_CODES = (429, 500, 502, 503, 504)
 
@@ -1397,18 +1410,69 @@ class HierarchicalTopicBuilder:
                             "_grouping_cui": None}}
             return {}
 
+        # ── Adaptive depth ────────────────────────────────────────────────────
+        # Fixed max_depth=5 can be too shallow for sparse hierarchies (misses
+        # convergence points) and too deep for dense ones (picks up very broad
+        # ancestors that contaminate groupings).
+        #
+        # Strategy: walk UP from each CUI and stop when the IC gradient drops
+        # sharply — i.e. the next parent's IC is less than
+        # _HTB_IC_GRADIENT_RATIO × current node's IC.
+        # This means we follow ancestry while concepts remain meaningfully
+        # specific, and stop when we enter very broad territory.
+        #
+        # Hard bounds: [2, max_depth] hops so we always get at least 2 levels
+        # of ancestry (enough for direct grouping) and never exceed max_depth.
+        #
+        # _HTB_IC_FLOOR: absolute minimum IC for any ancestor to be admitted
+        # as a convergence point candidate. Derived from the surviving set:
+        # p10 of surviving CUI ICs. Prevents 'Disease' (IC ~1-2) and similar
+        # root-adjacent concepts from becoming grouping anchors even when the
+        # gradient check would otherwise allow them.
+        if ic_scores and surviving:
+            surv_ics = [ic_scores.get(c, 0.0) for c in surviving
+                        if ic_scores.get(c, 0.0) > 0]
+            if surv_ics:
+                ic_floor = float(np.percentile(surv_ics, 10))
+            else:
+                ic_floor = 0.0
+        else:
+            ic_floor = 0.0
+
         def _bfs_up(node):
-            """BFS ancestors up to max_depth from node."""
+            """BFS ancestors with IC floor + adaptive depth.
+
+            Stops at each hop when:
+              (a) parent IC < _HTB_IC_GRADIENT_RATIO × node IC
+                  (IC gradient too steep — entering broad territory), OR
+              (b) parent IC < ic_floor (absolute floor from surviving set p10)
+
+            Hard depth cap: max_depth hops regardless.
+            Minimum depth: 2 hops always followed unconditionally so that
+            direct parents are always included even if they have low IC.
+            """
             if not graph.has_node(node):
                 return set()
-            ancestors, frontier = set(), {node}
-            for _ in range(max_depth):
+            ancestors = set()
+            frontier = {node}
+            for hop in range(max_depth):
                 nxt = set()
                 for n in frontier:
+                    n_ic = ic_scores.get(n, 0.0)
                     for parent in graph.predecessors(n):
-                        if parent not in ancestors:
+                        if parent in ancestors:
+                            continue
+                        p_ic = ic_scores.get(parent, 0.0)
+                        # First 2 hops: always follow (unconditional grace period)
+                        if hop < 2:
                             ancestors.add(parent)
                             nxt.add(parent)
+                        else:
+                            # Hop 3+: apply IC floor AND gradient check
+                            if p_ic >= ic_floor and (
+                                    n_ic <= 0 or p_ic >= _HTB_IC_GRADIENT_RATIO * n_ic):
+                                ancestors.add(parent)
+                                nxt.add(parent)
                 frontier = nxt
                 if not frontier:
                     break
