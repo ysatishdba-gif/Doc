@@ -1,12 +1,6 @@
 """
 CUI Reduction Runner — API
 Extracts CUIs via API, reduction, topics, representatives, anchors, CSVs.
-
-Usage:
-    python run_cui_reduction_api.py
-
-    # Or import:
-    from run_cui_reduction_api import process_text
 """
 
 import os
@@ -26,12 +20,12 @@ from config import (
 from cui_reduction_system import (
     CUIReductionSystem, CUIExtractor, HierarchicalTopicBuilder, Evaluator,
     TopicRepresentativeSelector, TopicAnchorAssigner, fetch_preferred_terms,
-    TemporalContext, Verdict, _TEMPORAL_PRIORITY,
+    ClinicalContext, Verdict,
 )
 from topic_matcher import ChunkStore, compute_centroid
 
 
-# ── shared instances (initialized once) ──────────────────────────────────────
+# ── shared instances ──────────────────────────────────────────────────────────
 
 system = CUIReductionSystem(
     project_id=PROJECT_ID, dataset_id=DATASET_ID, full_network=hierarchy,
@@ -45,9 +39,6 @@ extractor = CUIExtractor(
 evaluator = Evaluator(hierarchy)
 bq = bigquery.Client(project=PROJECT_ID)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
-# ── helpers ──────────────────────────────────────────────────────────────────
 
 _fetch_terms = lambda cuis: fetch_preferred_terms(bq, PROJECT_ID, DATASET_ID, cuis)
 
@@ -63,75 +54,71 @@ def save_csv(path: str, headers: List[str], rows: List[list]) -> None:
 
 @dataclass
 class PipelineResult:
-    """Typed, validated container for process_text() output.
+    """Typed container for process_text() output."""
+    surviving_cuis:  Set[str]                        = field(default_factory=set)
+    text:            str                             = ""
+    anchors:         list                            = field(default_factory=list)
+    ic_map:          Dict[str, float]                = field(default_factory=dict)
+    terms:           Dict[str, str]                  = field(default_factory=dict)
+    h_topics:        Dict                            = field(default_factory=dict)
+    topic_reps:      Dict                            = field(default_factory=dict)
+    entity_results:  List                            = field(default_factory=list)
+    all_embeddings:  Dict[str, np.ndarray]           = field(default_factory=dict)
+    metadata:        Dict                            = field(default_factory=dict)
+    # temporal_map: CUI → ClinicalContext (booleans from ConText)
+    temporal_map:    Dict[str, ClinicalContext]      = field(default_factory=dict)
 
-    All fields have safe defaults so callers never hit KeyError.
-    Uses typed TemporalContext values throughout — no bare strings.
+
+# ── core pipeline ─────────────────────────────────────────────────────────────
+
+def _resolve_context(existing: Optional[ClinicalContext],
+                     new: ClinicalContext) -> ClinicalContext:
+    """When a CUI appears in multiple phrases, keep the highest-priority context.
+
+    Priority via ClinicalContext.temporal_priority():
+      negated(0) > current(1) > historical(2) > hypothetical(3) > family(4)
     """
-    surviving_cuis:  Set[str]                           = field(default_factory=set)
-    text:            str                                = ""
-    anchors:         list                               = field(default_factory=list)
-    ic_map:          Dict[str, float]                   = field(default_factory=dict)
-    terms:           Dict[str, str]                     = field(default_factory=dict)
-    h_topics:        Dict                               = field(default_factory=dict)
-    topic_reps:      Dict                               = field(default_factory=dict)
-    entity_results:  List                               = field(default_factory=list)
-    all_embeddings:  Dict[str, np.ndarray]              = field(default_factory=dict)
-    metadata:        Dict                               = field(default_factory=dict)
-    temporal_map:    Dict[str, TemporalContext]         = field(default_factory=dict)
+    if existing is None:
+        return new
+    return new if new.temporal_priority() < existing.temporal_priority() else existing
 
-
-# ── core pipeline: text → anchors ────────────────────────────────────────────
 
 def process_text(
     text_list: List[str],
     context: str,
     label: str = "doc",
 ) -> Optional[PipelineResult]:
-    """Full pipeline: text → extract → reduce → topics → reps → anchors.
-
-    Args:
-        text_list: list of clinical phrases to extract CUIs from
-        context:   surrounding text used as extraction context
-        label:     identifier for output files (e.g. "doc", case name)
-
-    Returns:
-        PipelineResult on success, None if nothing survived extraction/reduction.
-    """
+    """Full pipeline: text → extract → reduce → topics → reps → anchors."""
     if not text_list:
-        print(f"[{label}] No phrases supplied — nothing to process")
+        print(f"[{label}] No phrases supplied")
         return None
 
     context_list = [context] * len(text_list)
     per_phrase = extractor.extract(text_list, context_list)
     extractor._cache.flush()
 
-    # per_phrase: {phrase: {"cuis": {cui: dist}, "temporal": TemporalContext, ...}}
-    # Unpack and build typed temporal map.
-    # When a CUI appears in multiple phrases, CURRENT beats HISTORICAL etc.
-    per_phrase_cuis: Dict[str, Dict[str, Optional[float]]] = {}
-    temporal_map:    Dict[str, TemporalContext] = {}
+    # per_phrase: {phrase: {"cuis": {cui: dist}, "context": ClinicalContext}}
+    per_phrase_cuis: Dict[str, Dict] = {}
+    temporal_map:    Dict[str, ClinicalContext] = {}
 
     for phrase, tagged in per_phrase.items():
-        cui_dists: Dict[str, Optional[float]] = tagged.get("cuis") or {}
+        cui_dists = tagged.get("cuis") or {}
         if not cui_dists:
             continue
-        # TemporalContext is already an enum from the extractor; coerce defensively
-        temporal = TemporalContext(tagged.get("temporal", TemporalContext.CURRENT))
+        cc: ClinicalContext = tagged.get("context", ClinicalContext())
         per_phrase_cuis[phrase] = cui_dists
-
         for cui in cui_dists:
-            existing = temporal_map.get(cui)
-            if existing is None or (
-                _TEMPORAL_PRIORITY.get(temporal, 99)
-                < _TEMPORAL_PRIORITY.get(existing, 99)
-            ):
-                temporal_map[cui] = temporal
+            temporal_map[cui] = _resolve_context(temporal_map.get(cui), cc)
 
     print(f"\n[{label}] Extracted CUIs for {len(per_phrase_cuis)} phrases")
     for phrase, cui_dists in per_phrase_cuis.items():
-        t = per_phrase[phrase].get("temporal", TemporalContext.CURRENT)
-        print(f"  \"{phrase}\" [{t.value}]: {len(cui_dists)} CUIs")
+        cc = per_phrase[phrase].get("context", ClinicalContext())
+        flags = []
+        if cc.historical:   flags.append("historical")
+        if cc.hypothetical: flags.append("hypothetical")
+        if cc.family:       flags.append("family")
+        tag = f" [{', '.join(flags)}]" if flags else ""
+        print(f"  \"{phrase}\"{tag}: {len(cui_dists)} CUIs")
 
     if not per_phrase_cuis:
         print(f"[{label}] No CUIs extracted (all negated or empty)")
@@ -177,55 +164,52 @@ def process_text(
         terms.update(_fetch_terms(missing_label_terms))
 
     anchors = TopicAnchorAssigner.assign(topic_reps, ic_map, hierarchy)
+    anchor_cuis = set(a.anchor_cui for a in anchors)
+    anchor_cuis.update(c for a in anchors for c in (a.ancestor_cuis or []))
+    terms.update(_fetch_terms(anchor_cuis - set(terms.keys())))
 
-    anchor_cuis_for_terms = set(a.anchor_cui for a in anchors)
-    anchor_cuis_for_terms.update(c for a in anchors for c in (a.ancestor_cuis or []))
-    extra_terms = _fetch_terms(anchor_cuis_for_terms - set(terms.keys()))
-    terms.update(extra_terms)
-
-    # Narrow temporal_map to surviving CUIs; default to CURRENT for any gap
-    surviving_temporal: Dict[str, TemporalContext] = {
-        c: temporal_map.get(c, TemporalContext.CURRENT) for c in all_surviving
+    surviving_temporal: Dict[str, ClinicalContext] = {
+        c: temporal_map.get(c, ClinicalContext()) for c in all_surviving
     }
 
     raw_count = sum(len(cd) for cd in per_phrase_cuis.values())
-    print(f"[{label}] {raw_count} raw CUIs "
-          f"→ {len(all_surviving)} surviving → {len(h_topics)} topics "
-          f"→ {len(anchors)} anchors")
+    print(f"[{label}] {raw_count} raw → {len(all_surviving)} surviving "
+          f"→ {len(h_topics)} topics → {len(anchors)} anchors")
 
-    t_counts = Counter(t.value for t in surviving_temporal.values())
-    if any(k != TemporalContext.CURRENT.value for k in t_counts):
-        print(f"  Temporal: {dict(t_counts)}")
+    non_current = {c: cc for c, cc in surviving_temporal.items()
+                   if not cc.is_current()}
+    if non_current:
+        hist  = sum(1 for cc in non_current.values() if cc.historical)
+        hypo  = sum(1 for cc in non_current.values() if cc.hypothetical)
+        fam   = sum(1 for cc in non_current.values() if cc.family)
+        print(f"  Temporal: historical={hist} hypothetical={hypo} family={fam}")
 
     for a in anchors:
         rep_terms_list = [terms.get(rc, rc) for rc in a.rep_cuis]
         print(f"    {a.anchor_cui} | {terms.get(a.anchor_cui, a.anchor_cui)} "
-              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms_list)}], "
-              f"topics={a.topic_ids})")
+              f"(IC={a.anchor_ic:.1f}, reps=[{', '.join(rep_terms_list)}])")
 
     return PipelineResult(
-        surviving_cuis  = all_surviving,
-        text            = context,
-        anchors         = anchors,
-        ic_map          = ic_map,
-        terms           = terms,
-        h_topics        = h_topics,
-        topic_reps      = topic_reps,
-        entity_results  = entity_results,
-        all_embeddings  = all_embeddings,
-        metadata        = metadata,
-        temporal_map    = surviving_temporal,
+        surviving_cuis = all_surviving,
+        text           = context,
+        anchors        = anchors,
+        ic_map         = ic_map,
+        terms          = terms,
+        h_topics       = h_topics,
+        topic_reps     = topic_reps,
+        entity_results = entity_results,
+        all_embeddings = all_embeddings,
+        metadata       = metadata,
+        temporal_map   = surviving_temporal,
     )
 
 
-# ── CSV writers ──────────────────────────────────────────────────────────────
+# ── CSV writers ───────────────────────────────────────────────────────────────
 
 def write_csvs(result: PipelineResult, label: str = "doc") -> None:
-    """Write all CSVs from a PipelineResult."""
     terms    = result.terms
     h_topics = result.h_topics
 
-    # ── entities ────────────────────────────────────────────────────────
     entity_rows = []
     for entity_text, r in result.entity_results:
         for e in r.confidence:
@@ -239,10 +223,9 @@ def write_csvs(result: PipelineResult, label: str = "doc") -> None:
                 len(e.explains_cuis), explains_str,
             ])
     save_csv(os.path.join(OUTPUT_DIR, f"{label}_entities.csv"),
-             ["entity", "cui", "preferred_term", "confidence", "prox", "cent", "ret",
-              "explains_count", "explains"], entity_rows)
+             ["entity","cui","preferred_term","confidence","prox","cent","ret",
+              "explains_count","explains"], entity_rows)
 
-    # ── topics ──────────────────────────────────────────────────────────
     topic_rows = []
     if INCLUDE_SUBTOPICS:
         for tid, t in sorted(h_topics.items()):
@@ -256,8 +239,8 @@ def write_csvs(result: PipelineResult, label: str = "doc") -> None:
             for c in sorted(t.get("ungrouped", [])):
                 topic_rows.append([tid, t_label, "", "", c, terms.get(c, c)])
         save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
-                 ["topic_id", "topic_label", "subtopic_id", "subtopic_name",
-                  "cui", "preferred_term"], topic_rows)
+                 ["topic_id","topic_label","subtopic_id","subtopic_name",
+                  "cui","preferred_term"], topic_rows)
     else:
         for tid, t in sorted(h_topics.items()):
             t_label_cui = t.get("topic_cui") or ""
@@ -265,41 +248,36 @@ def write_csvs(result: PipelineResult, label: str = "doc") -> None:
             for c in t.get("members", []):
                 topic_rows.append([tid, t_label, c, terms.get(c, c)])
         save_csv(os.path.join(OUTPUT_DIR, f"{label}_topics.csv"),
-                 ["topic_id", "topic_label", "cui", "preferred_term"], topic_rows)
+                 ["topic_id","topic_label","cui","preferred_term"], topic_rows)
 
-    # ── representatives ─────────────────────────────────────────────────
     rep_rows = []
     for tid in sorted(result.topic_reps.keys()):
         for r in result.topic_reps[tid]:
             rep_rows.append([
-                tid, r.cui, terms.get(r.cui, r.cui),
-                r.method, r.member_count, round(r.ic_score, 2),
-                " | ".join(f"{m}:{terms.get(m, m)}" for m in r.members),
+                tid, r.cui, terms.get(r.cui, r.cui), r.method,
+                r.member_count, round(r.ic_score, 2),
+                " | ".join(f"{m}:{terms.get(m,m)}" for m in r.members),
             ])
     save_csv(os.path.join(OUTPUT_DIR, f"{label}_representatives.csv"),
-             ["topic_id", "rep_cui", "rep_term", "method", "member_count",
-              "ic_score", "members"], rep_rows)
+             ["topic_id","rep_cui","rep_term","method","member_count",
+              "ic_score","members"], rep_rows)
 
-    # ── anchors ─────────────────────────────────────────────────────────
     anchor_rows = []
     for a in result.anchors:
-        rep_detail = " | ".join(f"{rc}:{terms.get(rc, rc)}" for rc in a.rep_cuis)
-        topic_detail_parts = []
-        for tid in a.topic_ids:
-            t = h_topics.get(tid, {})
-            member_count = len(t.get("members", []))
-            topic_detail_parts.append(f"topic_{tid}({member_count} CUIs)")
+        rep_detail = " | ".join(f"{rc}:{terms.get(rc,rc)}" for rc in a.rep_cuis)
+        topic_parts = [
+            f"topic_{tid}({len(h_topics.get(tid, {}).get('members', []))} CUIs)"
+            for tid in a.topic_ids
+        ]
         anchor_rows.append([
             a.anchor_cui, terms.get(a.anchor_cui, a.anchor_cui),
-            round(a.anchor_ic, 2),
-            rep_detail,
-            len(a.topic_ids), " | ".join(topic_detail_parts),
+            round(a.anchor_ic, 2), rep_detail,
+            len(a.topic_ids), " | ".join(topic_parts),
             len(a.ancestor_cuis) if a.ancestor_cuis else 0,
         ])
     save_csv(os.path.join(OUTPUT_DIR, f"{label}_anchors.csv"),
-             ["anchor_cui", "anchor_term", "anchor_ic",
-              "representatives", "topics_covered", "topic_details",
-              "ancestor_count"], anchor_rows)
+             ["anchor_cui","anchor_term","anchor_ic","representatives",
+              "topics_covered","topic_details","ancestor_count"], anchor_rows)
 
     print(f"[{label}] CSVs written to {OUTPUT_DIR}")
 
@@ -308,7 +286,7 @@ def run_evaluation(result: PipelineResult, label: str = "doc"):
     flat_topics = {tid: t.get("members", []) for tid, t in result.h_topics.items()}
     metric_rows = evaluator.intrinsic_metrics(
         label, result.entity_results, flat_topics, result.all_embeddings)
-    recon_rows = evaluator.reconstruction_check(
+    recon_rows  = evaluator.reconstruction_check(
         label, result.entity_results, result.all_embeddings,
         result.metadata, result.terms)
     save_csv(os.path.join(OUTPUT_DIR, f"{label}_eval_metrics.csv"),
@@ -323,7 +301,7 @@ def run_evaluation(result: PipelineResult, label: str = "doc"):
     return metric_rows, recon_rows
 
 
-# ── main ─────────────────────────────────────────────────────────────────────
+# ── main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
@@ -333,11 +311,8 @@ if __name__ == "__main__":
         "Mild effusion noted on examination."
     )
     TEXT_LIST = [
-        "left knee pain",
-        "swelling",
-        "weight bearing pain",
-        "climbing stairs difficulty",
-        "knee effusion",
+        "left knee pain", "swelling", "weight bearing pain",
+        "climbing stairs difficulty", "knee effusion",
     ]
 
     CHUNK_ID   = "api_chunk_1"
