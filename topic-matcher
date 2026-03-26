@@ -92,16 +92,11 @@ DEFAULTS = {
 
     # ── Output ───────────────────────────────────────────────────────────
     "score_min":          0.01,   # absolute floor (structural, not tuning)
-    "min_cui_ratio":      0.05,   # absolute floor on raw cui_ratio before z-score.
-                                  # Addresses the "all candidates are bad but still
-                                  # ranked" problem: even if z-score normalisation
-                                  # elevates a candidate, it must have demonstrated
-                                  # at least 5% IC-weighted concept overlap.
-                                  # Complements the zero-signal guard (which only
-                                  # catches cui_ratio=0.0 exactly). This catches
-                                  # near-zero overlap that z-score would otherwise
-                                  # amplify into a seemingly confident result.
-                                  # 0.05 = 5% of total query IC weight matched.
+    "min_cui_ratio":      0.05,   # UNUSED — kept for backward compat.
+                                  # Pass 4 now uses a single zero-evidence guard
+                                  # (all 3 raw signals == 0.0) instead of per-signal
+                                  # thresholds. The combined z-score + gap_split
+                                  # handles signal discrimination.
     "min_overlap":        1,      # ChunkMatcher backward compat
     "confidence_ratio":   0.5,    # FALLBACK ONLY: if gap_split finds no gap
 
@@ -1776,35 +1771,50 @@ class TopicIndex:
                       self.p["w_vec"] * vecs +
                       self.p["w_lin"] * lins)
 
-        # Pass 4: confidence filter — drop results below natural score gap.
+        # ══════════════════════════════════════════════════════════════════
+        # Pass 4: Confidence filter + dedup
+        #
+        # Design principle: TRUST THE COMBINED SCORE from Pass 3.
+        #
+        # Z-score normalization (Pass 3) auto-weights the three signals
+        # by their discriminative power for THIS query. gap_split finds
+        # the natural separation between good and bad candidates.
+        # score_min is a structural floor (0.01).
+        #
+        # The only guard is zero-evidence: if all three raw signals are
+        # literally zero, the result has no clinical evidence at all and
+        # was admitted purely by centroid noise in Pass 1. This is the
+        # only case where suppression is correct regardless of score.
+        #
+        # No per-signal thresholds (min_cui_ratio, vec_sim_floor, etc.).
+        # Those create blind spots for queries whose evidence comes
+        # through a single signal channel:
+        #   - "fever and chills" → CUI overlap only (vec_sim may be low)
+        #   - "worsening condition" → vec_sim only (CUI overlap=0, Lin=0)
+        #   - "osteoarthritis of left knee" → Lin only (via parent-child)
+        # Per-signal thresholds suppress the channel that carries the
+        # evidence. The combined score already accounts for this.
+        # ══════════════════════════════════════════════════════════════════
+
         conf_floor = gap_split(scores, min_keep=1)
         results = []
 
         for i, (entry, gid, cui_ratio, vec_sim, lin_avg, matched, topic_members) in enumerate(raw_results):
             score = float(scores[i])
+
+            # ── Score floor: gap_split natural threshold + absolute min ────
             if score < self.p["score_min"] or score < conf_floor:
                 continue
 
-            # Absolute CUI overlap floor: require raw cui_ratio >= min_cui_ratio
-            # before z-score is applied. This prevents z-score normalisation from
-            # amplifying candidates with near-zero concept overlap into apparently
-            # confident results. Complements the zero-signal guard below:
-            #   zero-signal guard catches cui_ratio == 0.0 exactly
-            #   min_cui_ratio catches near-zero overlap (0 < cui_ratio < 0.05)
-            # Both guards operate on the raw (pre-z-score) cui_ratio so they
-            # reflect actual concept evidence rather than relative ranking.
-            if cui_ratio < self.p["min_cui_ratio"] and lin_avg < self.p["min_cui_ratio"]:
+            # ── Zero-evidence guard: ALL three raw signals are zero ────────
+            # This means the result has literally no clinical evidence —
+            # no CUI overlap, no hierarchy relationship, no embedding
+            # similarity. It was admitted by centroid noise in Pass 1.
+            # Suppress it regardless of what z-score produced.
+            if cui_ratio == 0.0 and lin_avg == 0.0 and vec_sim == 0.0:
                 logger.debug(
-                    f"  Weak-signal result suppressed: {entry.get('chunk_id')} "
-                    f"topic={entry.get('topic_cui')} "
-                    f"cui_ratio={cui_ratio:.4f} lin_avg={lin_avg:.4f} score={score:.3f}"
-                )
-                continue
-
-            # Zero-signal guard: require at least one of CUI overlap or Lin > 0.
-            if cui_ratio == 0.0 and lin_avg == 0.0:
-                logger.debug(f"  Zero-signal result suppressed: {entry.get('chunk_id')} "
-                             f"topic={entry.get('topic_cui')} score={score:.3f}")
+                    f"  Zero-evidence result suppressed: {entry.get('chunk_id')} "
+                    f"topic={entry.get('topic_cui')} score={score:.3f}")
                 continue
 
             # matched_cuis: exact/hierarchy hits when available, otherwise
