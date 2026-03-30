@@ -1,13 +1,22 @@
 import json
 import re
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Literal, Tuple
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field, field_validator, model_validator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+
+# Suppress Vertex AI SDK internal enum validation warning
+# ("ON_DEMAND_PRIORITY is not a valid traffic type")
+warnings.filterwarnings(
+    "ignore",
+    message=".*ON_DEMAND.*is not a valid.*",
+    category=UserWarning)
+
+from google import genai
+from google.genai import types
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -370,24 +379,8 @@ class RetrievalContext(BaseModel):
 
 
 class FlatRetrievalSignals(BaseModel):
-    """
-    Retrieval context for a candidate. Every signal dimension is a clean
-    list of strings — ready for direct use in filtering, embedding, or
-    prompt injection. context_sentences are pre-assembled narrative sentences
-    describing the full documentation footprint.
+    """Internal helper — builds clean deduplicated lists from RetrievalContext."""
 
-    Shape:
-        {
-          "document_types":   ["laboratory order", "laboratory report", "progress note"],
-          "author_roles":     ["ordering provider", "laboratory technician", "primary care physician"],
-          "temporal_signals": ["initial screening or diagnostic testing", "follow up and monitoring"],
-          "content_signals":  ["psa level numeric value", "reference range", "abnormal flag"],
-          "clinical_setting": ["outpatient clinic", "primary care office", "urology clinic"],
-          "context_sentences": [
-            "PSA level, documented in laboratory order and progress note, by ordering provider ..."
-          ]
-        }
-    """
     document_types:    List[str] = Field(default_factory=list)
     author_roles:      List[str] = Field(default_factory=list)
     temporal_signals:  List[str] = Field(default_factory=list)
@@ -397,7 +390,6 @@ class FlatRetrievalSignals(BaseModel):
 
     @classmethod
     def from_retrieval_context(cls, ctx: "RetrievalContext") -> "FlatRetrievalSignals":
-        """Convert a structured RetrievalContext into clean deduplicated lists."""
         def _strip(v: str) -> str:
             return v.split(" - ", 1)[0].replace("_", " ").strip() if v else ""
 
@@ -434,54 +426,66 @@ class IntentWithoutQueries(BaseModel):
 
 class FinalCandidateItem(BaseModel):
     """
-    One retrieval candidate — concept enriched with its intent context.
+    One retrieval candidate — all signals inlined as top-level fields.
 
-    candidate carries the full clinical label (intent + concept), e.g.
-    "Elevated PSA - PSA level" rather than a bare term.
-    retrieval_signals contains clean lists per dimension plus narrative
-    context_sentences ready for embedding or prompt injection.
-
-    Example:
+    Shape:
         {
-          "candidate_id":   "fc_001",
-          "intent_title":   "Elevated PSA",
-          "candidate":      "Elevated PSA - PSA level",
-          "retrieval_signals": {
-            "document_types":   ["laboratory order", "laboratory report", "progress note"],
-            "author_roles":     ["ordering provider", "laboratory technician", "primary care physician"],
-            "temporal_signals": ["initial screening or diagnostic testing", "follow up and monitoring"],
-            "content_signals":  ["psa level numeric value", "reference range", "abnormal flag"],
-            "clinical_setting": ["outpatient clinic", "primary care office", "urology clinic"],
-            "context_sentences": [
-              "Elevated PSA - PSA level, documented in laboratory order and progress note, ..."
-            ]
-          }
+          "candidate_id":    "fc_001",
+          "intent_title":    "Elevated PSA",
+          "candidate":       "elevated PSA",
+          "sentence":        "PSA level, documented in laboratory order and progress note,
+                              by ordering provider and primary care physician,
+                              at outpatient clinic, capturing psa level numeric value
+                              and reference range.",
+          "document_types":  ["laboratory order", "laboratory report", "progress note"],
+          "author_roles":    ["ordering provider", "laboratory technician", "primary care physician"],
+          "temporal_signals":["initial screening or diagnostic testing", "follow up and monitoring"],
+          "content_signals": ["psa level numeric value", "reference range", "abnormal flag"],
+          "clinical_setting":["outpatient clinic", "primary care office", "urology clinic"]
         }
     """
-    candidate_id:      str
-    intent_title:      str
-    candidate:         str
-    retrieval_signals: FlatRetrievalSignals = Field(default_factory=FlatRetrievalSignals)
+    candidate_id:     str
+    intent_title:     str
+    candidate:        str
+    sentence:         str = ""
+    document_types:   List[str] = Field(default_factory=list)
+    author_roles:     List[str] = Field(default_factory=list)
+    temporal_signals: List[str] = Field(default_factory=list)
+    content_signals:  List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
+
+    @classmethod
+    def from_signals(cls, candidate_id: str, intent_title: str,
+                     candidate: str, signals: FlatRetrievalSignals) -> "FinalCandidateItem":
+        return cls(
+            candidate_id     = candidate_id,
+            intent_title     = intent_title,
+            candidate        = candidate,
+            sentence         = signals.context_sentences[0] if signals.context_sentences else "",
+            document_types   = signals.document_types,
+            author_roles     = signals.author_roles,
+            temporal_signals = signals.temporal_signals,
+            content_signals  = signals.content_signals,
+            clinical_setting = signals.clinical_setting,
+        )
 
 
 class IntentWithContext(BaseModel):
     """
     Intent block used in full_pipeline output.
-
-    final_candidates holds fully-resolved FinalCandidateItem objects —
-    identical structure to final_queries output, so both outputs are
-    consistent and downstream consumers only need one candidate shape.
-
-    retrieval_signals is the union of all candidate-level signals under
-    this intent, flattened to the same shape as FinalCandidateItem so
-    the full_pipeline output is uniformly flat — no nested objects anywhere.
+    final_candidates mirrors the same flat shape as final_queries output.
+    Intent-level signal fields are the union of all candidate signals.
     """
-    intent_title:      str
-    description:       str
-    nature:            str
-    sub_natures:       List[SubNature]
-    final_candidates:  List[FinalCandidateItem] = Field(default_factory=list)
-    retrieval_signals: FlatRetrievalSignals = Field(default_factory=FlatRetrievalSignals)
+    intent_title:     str
+    description:      str
+    nature:           str
+    sub_natures:      List[SubNature]
+    final_candidates: List[FinalCandidateItem] = Field(default_factory=list)
+    document_types:   List[str] = Field(default_factory=list)
+    author_roles:     List[str] = Field(default_factory=list)
+    temporal_signals: List[str] = Field(default_factory=list)
+    content_signals:  List[str] = Field(default_factory=list)
+    clinical_setting: List[str] = Field(default_factory=list)
 
 
 class Format_IntentExtraction(BaseModel):
@@ -685,11 +689,12 @@ class ExtractionResult:
                     seen.add(key)
                     idx += 1
                     rich_ctx = self._build_ctx(c.strip())
-                    candidates.append(FinalCandidateItem(
+                    signals = FlatRetrievalSignals.from_retrieval_context(rich_ctx)
+                    candidates.append(FinalCandidateItem.from_signals(
                         candidate_id=f"fc_{idx:03d}",
                         intent_title=i.intent_title,
                         candidate=c.strip(),
-                        retrieval_signals=FlatRetrievalSignals.from_retrieval_context(rich_ctx)))
+                        signals=signals))
         result = Format_FinalQueries(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
@@ -723,23 +728,19 @@ class ExtractionResult:
         def _union(getter) -> List[str]:
             seen, out = set(), []
             for fc in candidates:
-                for val in getter(fc.retrieval_signals):
+                for val in getter(fc):
                     if val and val.lower() not in seen:
                         out.append(val)
                         seen.add(val.lower())
             return out
 
         return FlatRetrievalSignals(
-            document_types    = _union(lambda s: s.document_types),
-            author_roles      = _union(lambda s: s.author_roles),
-            temporal_signals  = _union(lambda s: s.temporal_signals),
-            content_signals   = _union(lambda s: s.content_signals),
-            clinical_setting  = _union(lambda s: s.clinical_setting),
-            context_sentences = [
-                sent
-                for fc in candidates
-                for sent in fc.retrieval_signals.context_sentences
-            ],
+            document_types    = _union(lambda fc: fc.document_types),
+            author_roles      = _union(lambda fc: fc.author_roles),
+            temporal_signals  = _union(lambda fc: fc.temporal_signals),
+            content_signals   = _union(lambda fc: fc.content_signals),
+            clinical_setting  = _union(lambda fc: fc.clinical_setting),
+            context_sentences = [fc.sentence for fc in candidates if fc.sentence],
         )
 
     def to_full_pipeline(self) -> Dict[str, Any]:
@@ -759,11 +760,12 @@ class ExtractionResult:
                     seen.add(key)
                     idx += 1
                     rich_ctx = self._build_ctx(c.strip())
-                    items.append(FinalCandidateItem(
+                    signals = FlatRetrievalSignals.from_retrieval_context(rich_ctx)
+                    items.append(FinalCandidateItem.from_signals(
                         candidate_id=f"fc_{idx:03d}",
                         intent_title=intent.intent_title,
                         candidate=c.strip(),
-                        retrieval_signals=FlatRetrievalSignals.from_retrieval_context(rich_ctx)))
+                        signals=signals))
             return items
 
         intent_blocks = []
@@ -771,14 +773,18 @@ class ExtractionResult:
             candidates = _make_candidates(i)
             # Intent-level signals = union of its own candidates' signals.
             # Consistent with and never wider than the candidate-level data.
-            intent_signals = self._merge_signals(candidates)
+            merged = self._merge_signals(candidates)
             intent_blocks.append(IntentWithContext(
                 intent_title=i.intent_title,
                 description=i.description,
                 nature=i.nature,
                 sub_natures=i.sub_natures,
                 final_candidates=candidates,
-                retrieval_signals=intent_signals))
+                document_types=merged.document_types,
+                author_roles=merged.author_roles,
+                temporal_signals=merged.temporal_signals,
+                content_signals=merged.content_signals,
+                clinical_setting=merged.clinical_setting))
 
         result = Format_FullPipeline(
             is_clinical=self.intents.is_clinical,
