@@ -1,30 +1,248 @@
-45 distances sorted:
-0.02, 0.03, 0.03, 0.04, 0.08, 0.09, 0.10, 0.11, 0.12, ... 0.25
+Rule 1: Cover ≥2 surviving CUIs
+The ancestor must be a parent/grandparent of at least 2 of your 100 surviving CUIs. That's what makes it a convergence point — multiple CUIs meet there.
+Persistent asthma
+  ├── C2887453 (Mild persistent + exacerb)     ← surviving CUI
+  ├── C2887456 (Moderate persistent)            ← surviving CUI
+  └── C4040110 (Severe exacerb moderate)        ← surviving CUI
 
-Try splitting at 0.03:
-  left:  {0.02}              mean = 0.02
-  right: {0.03, 0.03, ... 0.25}  mean = 0.13
-  difference between means = 0.11
-  but left has only 1 value → weak split
-  score = low
+Persistent asthma covers 3 surviving CUIs → YES, convergence ✓
 
-Try splitting at 0.04:
-  left:  {0.02, 0.03, 0.03}      mean = 0.027
-  right: {0.04, 0.08, ... 0.25}   mean = 0.14
-  difference = 0.113
-  left has 3 values, right has 42 → better split
-  score = medium
+Respiratory rate measurement
+  └── C0231832 (Respiratory rate)               ← surviving CUI
+      (no other surviving CUI under this parent)
 
-Try splitting at 0.08:                          ← THE GAP
-  left:  {0.02, 0.03, 0.03, 0.04}  mean = 0.03
-  right: {0.08, 0.09, ... 0.25}     mean = 0.15
-  difference = 0.12
-  left is tight (all 0.02-0.04), right is tight (all 0.08+)
-  CLEANEST separation
-  score = HIGHEST
+Respiratory rate measurement covers 1 surviving CUI → NO, not convergence ✗
+→ C0231832 becomes a singleton topic (no grouper found)
+If an ancestor covers only 1 CUI, it's not grouping anything. It's just a parent of one concept. No point making it a topic.
 
-Try splitting at 0.09:
-  left:  {0.02, 0.03, 0.03, 0.04, 0.08}  mean = 0.04
-  right: {0.09, 0.10, ... 0.25}            mean = 0.16
-  0.08 is now mixed in with the duplicates → messier left group
-  score = lower than 0.08
+Rule 2: IC ≥ floor
+The ancestor must be specific enough to be a meaningful clinical label.
+Persistent asthma    IC=10.8   ≥ 5.5?  YES → can be a topic ✓
+  (means something specific — a clinician recognizes this)
+
+Asthma               IC=7.4    ≥ 5.5?  YES → can be a topic ✓
+  (still meaningful)
+
+Disease              IC=1.2    ≥ 5.5?  NO → rejected ✗
+  (everything is a disease — useless as a topic label)
+
+Clinical finding     IC=0.5    ≥ 5.5?  NO → rejected ✗
+  (even more useless)
+Without this rule, "Disease" covers all 100 CUIs. It would become one mega-topic containing everything. The floor prevents that.
+
+Rule 3: Not in the surviving set
+The ancestor must be an ancestor, not one of the 100 CUIs itself.
+Surviving set: {C2887453, C2887456, C4040110, ...}
+
+Persistent asthma (C0581122) — is it in the surviving set? NO → can be grouper ✓
+
+C2887456 (Moderate persistent) — is it in the surviving set? YES → can't be grouper ✗
+Why? If a surviving CUI becomes its own topic, you get a topic with one member — itself. That's not grouping. It's a CUI pointing at itself. The grouper must be an ancestor that sits above the surviving CUIs in the hierarchy, not one of them.
+
+All three together:
+BFS found ancestor X.
+
+  Does X cover ≥2 survivors?     → is it worth grouping?
+  Is X's IC ≥ floor?             → is it specific enough?
+  Is X outside the surviving set? → is it actually an ancestor?
+
+  All YES → X becomes a topic grouping key
+  Any NO  → X is skippedpull alll these topic formation in one cell to copy12:23 PMConsolidated topic formation explanations for convenient copyingConsolidated topic formation explanations for convenient copyingStage 6: HierarchicalTopicBuilder
+Input: only CUI codes. No phrases, no text. The builder doesn't know which phrase produced which CUI.
+How it works: BFS walks UP the UMLS hierarchy from each surviving CUI. Where multiple CUIs converge to a shared ancestor, that ancestor becomes a grouping key.
+
+Parameters
+ParameterValueTypeWhy this valuemax_depth5FIXEDSafety cap. IC gradient does the real stopping. 5 is never the binding constraint._HTB_IC_GRADIENT_RATIO0.3FIXEDAt hop 3+, stop if IC(parent) < 30% of IC(current). Catches the "IC cliff". Hops 1-2 always followed (grace period)._HTB_IC_FLOOR_PERCENTILE10FIXEDIC floor = p10 (10th percentile) of surviving CUI ICs. The percentile number (10) is fixed. The floor VALUE it produces changes per run.max_coveragemax(2, n/√n)ADAPTIVEFrom IDF literature. Ancestor covering more than this is too broad. Small set (n=5): max=2. Large (n=100): max=10.Convergence rule≥2 CUIs, not in surviving setFIXED≥2 ensures actual grouping. "Not in surviving set" prevents a CUI from being its own topic.Subtopic selectionhighest IC first, greedyFIXEDMost specific convergence points become subtopics. Each CUI belongs to one subtopic only.
+
+How the walk works
+BFS walks UP from every surviving CUI. Three things can stop it:
+Hop 1: ALWAYS walk                           (grace period)
+Hop 2: ALWAYS walk                           (grace period)
+Hop 3: walk IF IC ratio ≥ 0.3               (gradient check starts)
+Hop 4: walk IF IC ratio ≥ 0.3
+Hop 5: walk IF IC ratio ≥ 0.3, then STOP    (max depth, hard cap)
+Example — walking UP from "Severe persistent asthma" (IC=13.8):
+Hop 1: Persistent asthma       IC=10.8   grace → walk
+                                          ratio not checked yet
+Hop 2: Asthma                  IC=7.4    grace → walk
+                                          ratio not checked yet
+Hop 3: Respiratory disorder    IC=3.2    ratio = 3.2/7.4 = 0.43 > 0.3 → walk
+Hop 4: Disease                 IC=1.2    ratio = 1.2/3.2 = 0.38 > 0.3 → walk
+Hop 5: Clinical finding        IC=0.5    MAX DEPTH → stop
+Sparse branch with cliff:
+Hop 1: Some specific procedure IC=12.0   grace → walk
+Hop 2: Procedure category      IC=8.0    grace → walk
+Hop 3: Procedure               IC=0.8    ratio = 0.8/8.0 = 0.10 < 0.3 → STOP
+→ stopped at hop 3 by gradient
+
+IC gradient ratio (0.3) — why?
+At hop 3+, check: is parent's IC at least 30% of current node's IC?
+Asthma (IC=7.4) → Respiratory disorder (IC=3.2)
+  ratio = 3.2/7.4 = 0.43 > 0.3 → keep walking (gradual decline, still useful)
+
+Disease (IC=1.2) → Clinical finding (IC=0.1)
+  ratio = 0.1/1.2 = 0.08 < 0.3 → STOP (cliff — jumped from meaningful to useless)
+0.3 means: allow a 70% drop per hop. Generous enough for gradual IC decrease. Strict enough to catch sudden cliffs. Tested: 0.2 goes too deep, 0.5 stops too early.
+Hops 1-2 are grace period because some branches have a legitimate big IC jump at hop 1 (very specific leaf under a broad parent). You don't want to cut off the first two levels.
+
+IC floor — what it is
+Not constant. Computed per run.
+_HTB_IC_FLOOR_PERCENTILE = 10  ← this is fixed (always 10th percentile)
+
+But the result depends on your data:
+  Query (5 CUIs, all IC ~14.8):     p10 → floor ≈ 14.8
+  Document (138 CUIs, IC 3-15):     p10 → floor ≈ 10.5
+  Another doc (200 CUIs, IC 5-15):  p10 → floor ≈ 6.2
+p10 = the value at position 10% in the sorted IC list. One number. Not an average of the bottom 10%.
+100 CUIs sorted by IC:
+  position 1:   IC=3.2
+  position 2:   IC=4.1
+  ...
+  position 10:  IC=5.5   ← THIS is p10. One number.
+  ...
+  position 100: IC=14.8
+
+floor = 5.5
+Why p10: 90% of your CUIs are above this floor. Only the truly broad bottom 10% set the boundary. Low enough to find valid groupers. High enough to block root-adjacent concepts.
+
+IC floor — how it's used
+BFS walks UP from ALL CUIs (not just the bottom 10%). Every ancestor found is checked against the floor. Only ancestors ABOVE the floor can become topic grouping keys.
+BFS found ancestor "Persistent asthma" (IC=10.8):
+  above floor (10.5)?  YES → eligible as grouping key
+
+BFS found ancestor "Asthma" (IC=7.4):
+  above floor (10.5)?  NO → rejected, too broad
+
+BFS found ancestor "Disease" (IC=1.2):
+  above floor (10.5)?  NO → rejected, way too broad
+Without the floor, "Asthma" (IC=7.4) becomes a grouping key. It would pull in severity variants, medications, procedures — everything asthma-related into one mega-topic. Clinically useless.
+
+Three rules for a grouping key
+BFS collects ancestors. Not every ancestor becomes a topic. Three rules filter:
+Rule 1: Cover ≥2 surviving CUIs (convergence)
+The ancestor must be parent/grandparent of at least 2 of your surviving CUIs. That's what makes it a convergence point — multiple CUIs meet there.
+Persistent asthma
+  ├── C2887453 (Mild persistent + exacerb)     ← surviving CUI
+  ├── C2887456 (Moderate persistent)            ← surviving CUI
+  └── C4040110 (Severe exacerb moderate)        ← surviving CUI
+
+Covers 3 → YES ✓ (worth grouping)
+
+Respiratory rate measurement
+  └── C0231832 (Respiratory rate)               ← surviving CUI
+      (no other surviving CUI under this)
+
+Covers 1 → NO ✗ (not grouping anything, C0231832 becomes a singleton topic)
+Rule 2: IC ≥ floor (specific enough)
+The ancestor must be specific enough to be a meaningful clinical label.
+Persistent asthma    IC=10.8   ≥ 10.5?  YES → meaningful label ✓
+Asthma               IC=7.4    ≥ 10.5?  NO  → too broad ✗
+Disease              IC=1.2    ≥ 10.5?  NO  → everything is a disease ✗
+Rule 3: Not in the surviving set (must be an ancestor)
+The grouping key must sit ABOVE the surviving CUIs, not be one of them.
+Persistent asthma (C0581122) — in surviving set? NO → can be grouper ✓
+C2887456 (Moderate persistent) — in surviving set? YES → can't be grouper ✗
+If a surviving CUI becomes its own topic, you get a topic with one member — itself. The grouper must be an ancestor that sits above.
+All three together:
+BFS found ancestor X.
+  Does X cover ≥2 survivors?       → is it worth grouping?
+  Is X's IC ≥ floor?               → is it specific enough?
+  Is X outside the surviving set?  → is it actually an ancestor?
+  All YES → X becomes a topic grouping key
+  Any NO  → X is skipped
+
+max_coverage — preventing mega-groupers
+Even if an ancestor passes all three rules, it might cover too many CUIs. max_coverage = max(2, n/√n) limits this.
+n=100: max_coverage = max(2, 100/√100) = max(2, 10) = 10
+n=25:  max_coverage = max(2, 25/√25) = max(2, 5) = 5
+n=5:   max_coverage = max(2, 5/√5) = max(2, 2.2) = 2
+An ancestor covering more than max_coverage CUIs is rejected even if it passes the three rules. From IDF literature: √n is the threshold for "too common." An ancestor covering that many concepts provides no discrimination.
+
+Convergence point selection
+Multiple ancestors can pass all rules. Sort by IC (highest first). Assign greedily.
+138 CUIs, floor=10.5
+
+Convergence points found (sorted by IC):
+  Exacerbation of asthma (IC=12.9) → covers C1960050, C2887453, C4041140 → Subtopic A
+  Moderate persistent asthma (IC=12.3) → covers C2887456, C4040110 → Subtopic B
+  Mild persistent asthma (IC=12.1) → covers C4040055, C4040085 → Subtopic C
+  Persistent asthma (IC=10.8) → covers all 7 → TOPIC GROUPER (ancestor of all 3 subtopics)
+
+Greedy: highest IC first gets first pick of unassigned CUIs.
+  Exacerbation (12.9) claims C1960050, C2887453, C4041140
+  Moderate (12.3) claims C2887456, C4040110
+  Mild (12.1) claims C4040055, C4040085
+  Persistent asthma (10.8) covers all 3 subtopics → becomes the topic grouper
+
+Worked example — query: 5 CUIs → 1 topic
+IC floor = p10([14.8, 14.8, 14.8, 14.8, 14.8]) ≈ 14.8
+max_coverage = max(2, 5/√5) = 2
+
+UMLS hierarchy tree (BFS UP from 5 surviving CUIs):
+
+✘ Procedure                                    IC=0.8   excluded (below floor)
+│
+✘ Surgical procedure on joint                  IC=3.1   excluded
+│
+✘ Operation on knee                            IC=6.4   excluded
+│
+├── █ Arthroplasty of knee joint               IC=9.7   CONVERGENCE → Subtopic B
+│   │  covers: C5568443, C5688901, C0188146
+│   ├── ✔ C5568443  Arthroplasty of knee planned            IC=14.8
+│   ├── ✔ C5688901  Arthroplasty using robotic assist       IC=14.8
+│   └── ✔ C0188146  Arthroplasty of knee, tibial plateau    IC=14.8
+│
+└── █ Prosthesis of knee                       IC=10.2  CONVERGENCE → Subtopic A
+    │  covers: C3873937, C5768203
+    ├── ✔ C5768203  Prosthetic arthroplasty of R knee       IC=14.8
+    └── ✔ C3873937  Knee femur prosthesis                   IC=14.8
+
+✘ = excluded   █ = convergence   ✔ = surviving CUI
+
+Convergence selection (highest IC first):
+  Prosthesis of knee (IC=10.2) → 2 CUIs → Subtopic A
+  Arthroplasty of knee joint (IC=9.7) → 3 CUIs → Subtopic B
+  Operation on knee (IC=6.4) → REJECTED (below floor)
+
+Topic grouper: ancestor of both subtopics
+→ 1 topic, 2 subtopics, 5 member CUIs
+
+Worked example — document: 138 CUIs → 60 topics
+Same process. IC floor = p10(138 ICs) ≈ 10.5 — lower because wider IC range.
+Topic 8: Exacerbation of Asthma (7 CUIs)
+
+✘ Disorder of respiratory system               IC=3.2   excluded
+│
+✘ Asthma                                       IC=7.4   excluded (would swallow everything)
+│
+█ Persistent asthma                            IC=10.8  TOPIC GROUPER
+│
+├── █ Exacerbation of asthma (C0349790)        IC=12.9  Subtopic A
+│   ├── ✔ C1960050  Persistent asthma with exacerbation     IC=14.8
+│   ├── ✔ C2887453  Mild Persistent + Acute Exacerbation    IC=14.8
+│   └── ✔ C4041140  Acute severe exacerb + rhinitis         IC=14.8
+│
+├── █ Moderate persistent asthma               IC=12.3  Subtopic B
+│   ├── ✔ C2887456  Uncomplicated moderate persistent       IC=14.8
+│   └── ✔ C4040110  Acute severe exacerb moderate persist   IC=14.1
+│
+└── █ Mild persistent asthma                   IC=12.1  Subtopic C
+    ├── ✔ C4040055  Mild persistent + allergic rhinitis     IC=14.8
+    └── ✔ C4040085  Mild persistent allergic uncontrolled   IC=14.8
+
+Why Asthma (IC=7.4) excluded: below IC floor (10.5).
+If used as grouper → pulls in medications, findings, everything.
+Persistent asthma (IC=10.8) is just above floor → groups severity variants only.
+
+Why hierarchy instead of Louvain for topics?
+Louvain topicsHierarchical topicsGrouping basisEmbedding similarityUMLS ancestryCategory boundariesDrugs + diseases mixedClean (ontology boundaries)LabelsNone ("cluster 3")SNOMED preferred termtopic_cuiNoneYes — matchable anchor CUISubtopicsFlatTwo-level (topic → subtopics)Document stickersNeed separate labellingReady to display
+
+Stage 7: Representatives + Anchors
+ParameterValueTypeWhy this value_REP_HAC_THRESHOLD0.5FIXEDHAC cut for sub-clustering. 0.5 = 50% cosine distance. Tested: 0.3 over-splits, 0.7 under-splits._ANCHOR_IC_MIN4.0FIXEDIC=4 ≈ 2% of hierarchy. Below: too broad ("Clinical finding" routes everywhere)._ANCHOR_BFS_DEPTH4FIXED4 hops UP from rep → mid-level ancestors for routing._ANCHOR_IC_MAX_BROAD3.0FIXEDAbsolute safety floor. Reject anchors below IC=3.0.
+Selection: per topic, group by semantic category, sub-cluster via HAC, pick one rep per sub-cluster. Preference: parent-within-set → embedding medoid → highest IC.
+Query: 2 reps (one per subtopic). Document: 67 reps.
+Anchors (documents only): routing shortcuts stored with the chunk.
+
+Stage 8: Centroids
+L2-normalized mean of member CUI embeddings (3072-dim). Same formula for queries and documents.
+Query: 1 centroid. Document: 60 centroids. These are what Pass 1 compares. Opus 4.6Extended
