@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Dict, Any, List, Optional, Literal, Tuple
 from pydantic import BaseModel, Field, field_validator, model_validator
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 
 # Suppress Vertex AI SDK internal enum validation warning
 # ("ON_DEMAND_PRIORITY is not a valid traffic type")
@@ -274,16 +273,6 @@ Concepts: {concepts_json}"""
 # LLM / EXTRACTION SCHEMAS
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PipelineInput(BaseModel):
-    query: str
-    verbose: bool = False
-
-    @field_validator('query', mode='before')
-    @classmethod
-    def ensure_string(cls, v):
-        return str(v).strip()
-
-
 class QueryExpansionOutput(BaseModel):
     expanded_query: str
     abbreviations_expanded: List[str] = Field(default_factory=list)
@@ -309,7 +298,6 @@ class Intent(BaseModel):
     description: str = ""
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
-    final_queries: List[str] = Field(default_factory=list)
 
 
 # Used as the direct LLM response schema (no original_query / expanded_query
@@ -546,75 +534,47 @@ class ExtractionResult:
     # ── private helpers ──────────────────────────────────────────────────────
 
     @staticmethod
-    def _clean(v: str) -> str:
-        if not v:
-            return ""
-        if " - " in v:
-            k, d = v.split(" - ", 1)
-            return k.replace("_", " ") + " - " + d
-        return v.replace("_", " ")
-
-    @staticmethod
-    def _pfx(v: str) -> str:
-        if not v:
-            return ""
-        return (v.split(" - ", 1)[0].replace("_", " ")
-                if " - " in v else v.replace("_", " "))
-
-    @staticmethod
-    def _join(items: List[str]) -> str:
-        parts = [ExtractionResult._pfx(v) for v in (items or []) if v]
-        if not parts:
-            return ""
-        if len(parts) == 1:
-            return parts[0]
-        if len(parts) == 2:
-            return f"{parts[0]} and {parts[1]}"
-        return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
-    @staticmethod
-    def _dedup(values: List[str]) -> List[str]:
-        seen, out = set(), []
-        for v in (values or []):
-            if not v:
-                continue
-            k = v.split(" - ", 1)[0].strip().lower()
-            if k and k not in seen:
-                out.append(v)
-                seen.add(k)
-        return out
-
-    @staticmethod
     def _flatten_and_build(concept_name: str,
                            phases: List[TemporalPhase]) -> Tuple:
+        def _s(v: str) -> str:
+            return v.split(" - ", 1)[0].replace("_", " ").strip() if v else ""
+
+        def _dd(lst: List[str]) -> List[str]:
+            seen, out = set(), []
+            for v in lst:
+                k = _s(v).lower()
+                if k and k not in seen:
+                    out.append(_s(v))
+                    seen.add(k)
+            return out
+
+        def _prose(lst: List[str]) -> str:
+            parts = [_s(v) for v in lst if v]
+            if not parts: return ""
+            if len(parts) == 1: return parts[0]
+            if len(parts) == 2: return f"{parts[0]} and {parts[1]}"
+            return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
         docs, auths, temps, sigs, setts, sentences = [], [], [], [], [], []
         for p in (phases or []):
             if not p.document_types or not p.author_roles:
                 continue
             if p.phase_name:
                 temps.append(p.phase_name)
-            docs.extend(p.document_types or [])
-            auths.extend(p.author_roles or [])
-            sigs.extend(p.content_signals or [])
-            setts.extend(p.clinical_settings or [])
-            d  = ExtractionResult._join(p.document_types)
-            a  = ExtractionResult._join(p.author_roles)
-            se = ExtractionResult._join(p.clinical_settings)
-            si = ExtractionResult._join(p.content_signals)
-            parts = [concept_name, f"documented in {d}", f"by {a}"]
-            if se:
-                parts.append(f"at {se}")
-            if si:
-                parts.append(f"capturing {si}")
+            docs.extend(p.document_types)
+            auths.extend(p.author_roles)
+            sigs.extend(p.content_signals)
+            setts.extend(p.clinical_settings)
+            parts = [concept_name,
+                     f"documented in {_prose(p.document_types)}",
+                     f"by {_prose(p.author_roles)}"]
+            se = _prose(p.clinical_settings)
+            si = _prose(p.content_signals)
+            if se: parts.append(f"at {se}")
+            if si: parts.append(f"capturing {si}")
             sentences.append(", ".join(parts) + ".")
-        cl = ExtractionResult._clean
-        dd = ExtractionResult._dedup
-        return (dd([cl(v) for v in docs]),
-                dd([cl(v) for v in auths]),
-                dd([cl(v) for v in temps]),
-                dd([cl(v) for v in sigs]),
-                dd([cl(v) for v in setts]),
-                sentences)
+        return (_dd(docs), _dd(auths), _dd(temps),
+                _dd(sigs), _dd(setts), sentences)
 
     def _get_phases(self, atomic_concept: str) -> List[TemporalPhase]:
         if not self.context or not self.context.concepts_with_context:
@@ -631,26 +591,6 @@ class ExtractionResult:
             return RetrievalContext()
         docs, auths, temps, sigs, setts, sents = (
             self._flatten_and_build(concept_name, phases))
-        return RetrievalContext(
-            document_types=docs,
-            author_roles=auths,
-            temporal_scope=temps,
-            content_signals=sigs,
-            clinical_setting=setts,
-            context_sentences=sents)
-
-    def _build_intent_ctx(self, intent_title: str) -> RetrievalContext:
-        if not self.context or not self.context.concepts_with_context:
-            return RetrievalContext()
-        all_phases: List[TemporalPhase] = []
-        key = intent_title.strip().lower()
-        for cc in self.context.concepts_with_context:
-            if cc.intent_title.strip().lower() == key:
-                all_phases.extend(cc.temporal_phases or [])
-        if not all_phases:
-            return RetrievalContext()
-        docs, auths, temps, sigs, setts, sents = (
-            self._flatten_and_build(intent_title, all_phases))
         return RetrievalContext(
             document_types=docs,
             author_roles=auths,
@@ -1037,9 +977,46 @@ class ContextualIntentPipeline:
 # UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _CompactListEncoder:
+    """Renders lists of scalars on one line; all other structures indented normally."""
+
+    def dumps(self, obj: Any) -> str:
+        return "".join(self._enc(obj, 0))
+
+    def _enc(self, obj, level):
+        indent = "  " * level
+        inner  = "  " * (level + 1)
+        if isinstance(obj, dict):
+            if not obj:
+                yield "{}"
+                return
+            yield "{\n"
+            items = list(obj.items())
+            for i, (k, v) in enumerate(items):
+                yield f"{inner}{json.dumps(k)}: "
+                yield from self._enc(v, level + 1)
+                yield ",\n" if i < len(items) - 1 else "\n"
+            yield indent + "}"
+        elif isinstance(obj, list):
+            if not obj:
+                yield "[]"
+            elif all(isinstance(v, (str, int, float, bool, type(None))) for v in obj):
+                yield "[" + ", ".join(json.dumps(v, ensure_ascii=False) for v in obj) + "]"
+            else:
+                yield "[\n"
+                for i, v in enumerate(obj):
+                    yield inner
+                    yield from self._enc(v, level + 1)
+                    yield ",\n" if i < len(obj) - 1 else "\n"
+                yield indent + "]"
+        else:
+            yield json.dumps(obj, ensure_ascii=False)
+
+
 def save_json(data: Dict, filename: str) -> None:
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=2)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(_CompactListEncoder().dumps(data))
+        f.write("\n")
     print(f"  Saved: {filename}")
 
 
