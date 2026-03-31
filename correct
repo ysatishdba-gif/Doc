@@ -106,23 +106,100 @@ async def screen_and_analyze_batch(
             comments_block += f'\n[COMMENT_{i}] (ID={item["Response_ID"]}):\n"""{item["Response"]}"""\n'
 
         prompt = f"""
-**Role:** You are an expert content analyst for a Medical Education program. You will process MULTIPLE student comments in a single pass. For each comment, you must perform TWO tasks:
+**Role:** You are an expert content moderator and data annotation expert for a Medical Education program. You will process MULTIPLE student comments in a single pass. For each comment, you must perform TWO tasks: SCREENING and THEMATIC ANALYSIS. You must perform a step-by-step reasoning process for each comment before providing the final JSON output.
 
-**TASK A — SCREENING:** Determine if the comment should be flagged.
-**What NOT to Flag:** Critiques of course structure, teaching methods, or assessment fairness are valid feedback — do NOT flag them.
-**Flagging Criteria:**
-1. **Unprofessional Comments on Personal Attributes:** Critiques/compliments on appearance, accent (not clarity), or personal life speculation.
-2. **Potentially Biased or Discriminatory Language:** Language suggesting bias against protected groups, slurs, inappropriate mentions of race/ethnicity/gender/age/orientation/disability.
-3. **Emotionally Charged or Unsubstantiated Claims:** Hostile, overly emotional language or strong personal attacks without evidence (e.g., 'worst ever,' 'needs to be fired,' 'antagonized us').
+==============================
+TASK A — SCREENING
+==============================
 
-**TASK B — THEMATIC ANALYSIS:** Extract theme and sentiment.
-- `sentiment_label`: Exactly "Positive", "Negative", or "Neutral" based on EVALUATIVE LANGUAGE, not topic.
-- `sentiment_score`: Float from -1.0 (most negative) to 1.0 (most positive), aligned with label.
-- `primary_theme`: 2-5 word summary of the main point.
-- `theme_description`: 2-3 sentence elaboration of the primary theme.
-- `potential_lcme_standard`: Most relevant LCME standard number (e.g., "6.3", "8.1"), or null.
+**Primary Goal:** Analyze each student comment. If it violates any of the flagging criteria, you must extract the specific problematic phrase and classify it. If it does not, mark it as clean.
 
-**OUTPUT FORMAT:** Return a JSON array with one object per comment, in order. Each object must have this exact schema:
+**What NOT to Flag (Important Distinctions):**
+- Critiques of course structure (e.g., "The course was disorganized," "This should be a 4-week course").
+- Feedback on teaching methods (e.g., "Lectures were too fast," "I prefer more small group work").
+- Comments on assessment fairness (e.g., "The exam questions were not representative of the lectures").
+These are considered valid, professional feedback and should **NOT** be flagged.
+
+**Flagging Criteria & Categories:**
+1.  **Unprofessional Comments on Personal Attributes:** Flag comments not relevant to teaching effectiveness. This includes critiques/compliments on physical appearance, accent (not tied to clarity), or speculation about personal life.
+2.  **Potentially Biased or Discriminatory Language:** Flag any language suggesting bias against a protected group. This includes inappropriate mentions of race, ethnicity, gender identity, age, sexual orientation, disability, or the use of slurs.
+3.  **Emotionally Charged or Unsubstantiated Claims:** Flag language that is overly emotional, hostile, or makes strong personal attacks without evidence (e.g., 'worst course ever,' 'needs to be fired,' 'antagonized us').
+
+**Your Step-by-Step Reasoning Process (Chain of Thought) for Screening:**
+1.  **Initial Assessment:** Briefly summarize the comment's main point.
+2.  **Rule Check:** Systematically check the comment against each of the three strict rules. For each rule, state "Violation" or "No Violation."
+3.  **Final Conclusion:** Based on your rule check, state your final conclusion about whether the comment should be flagged. If it is flagged, identify the category and the specific text.
+
+--- SCREENING EXAMPLES ---
+
+**EXAMPLE 1 (FLAGGED - Discriminatory Language)**
+**Student Comment to Analyze:**
+"During the AML small group, the leader referred to a cell that is laden with Auer bodies as f*ggot cells. It was mentioned upwards of 5-7 times... I understand that this is the actual name for the cells, but it is also a violent slur..."
+
+**Reasoning:**
+1.  **Initial Assessment:** The student is reporting the use of a violent slur by a group leader.
+2.  **Rule Check:**
+    - Unprofessional Comments on Personal Attributes: No Violation.
+    - Potentially Biased or Discriminatory Language: Violation. The use of a slur, regardless of historical medical context, is discriminatory and creates a hostile environment.
+    - Emotionally Charged or Unsubstantiated Claims: No Violation. The student is providing a factual report.
+3.  **Final Conclusion:** The comment reports a clear violation of Rule 2. It must be flagged for immediate review.
+
+Result: is_inappropriate=true, flagged_content="referred to a cell that is laden with Auer bodies as f*ggot cells", category_of_concern="Potentially Biased or Discriminatory Language", reviewer_notes="High Priority: Reports use of a violent slur by faculty."
+
+**EXAMPLE 2 (FLAGGED - Emotionally Charged)**
+**Student Comment to Analyze:**
+"Overall, this was the worst course I have taken at Mayo. I actually found the basic content interesting from neuro... but Dr. Hoerth's approach/presentation as the course director made the course feel like a chore... he had already antagonized us as students so much that he was not willing to listen to us."
+
+**Reasoning:**
+1.  **Initial Assessment:** The student is expressing extreme dissatisfaction with the course director, using strong personal language.
+2.  **Rule Check:**
+    - Unprofessional Comments on Personal Attributes: No Violation.
+    - Potentially Biased or Discriminatory Language: No Violation.
+    - Emotionally Charged or Unsubstantiated Claims: Violation. The phrases 'worst course' and 'antagonized us' are highly emotional and constitute personal attacks rather than constructive feedback.
+3.  **Final Conclusion:** The comment violates Rule 3. It should be flagged for its emotionally charged language.
+
+Result: is_inappropriate=true, flagged_content="worst course I have taken at Mayo... antagonized us as students", category_of_concern="Emotionally Charged or Unsubstantiated Claims", reviewer_notes="Comment contains strong, emotionally charged language and personal criticism."
+
+**EXAMPLE 3 (NOT FLAGGED)**
+**Student Comment to Analyze:**
+"The course organization needs a major re-work. It is evident that this course did not re-organize well into the compressed curriculum timeline. There is too much time dedicated to minutiae."
+
+**Reasoning:**
+1.  **Initial Assessment:** The student is providing a critique of the course's organization and pacing.
+2.  **Rule Check:**
+    - Unprofessional Comments on Personal Attributes: No Violation.
+    - Potentially Biased or Discriminatory Language: No Violation.
+    - Emotionally Charged or Unsubstantiated Claims: No Violation. This is a critique of the course, not a personal attack.
+3.  **Final Conclusion:** The comment does not violate any rules. It is professional feedback.
+
+Result: is_inappropriate=false, flagged_content=null, category_of_concern=null, reviewer_notes=null
+
+==============================
+TASK B — THEMATIC ANALYSIS
+==============================
+
+**Persona:** You are a data annotation expert for a medical school, familiar with LCME accreditation standards from the provided reference document.
+**Task:** Analyze each student comment. Your goal is to extract key information.
+
+**CRITICAL — Sentiment Classification Rules:**
+- Classify sentiment based on the EVALUATIVE LANGUAGE in the comment, not the topic.
+- **"Positive"**: Contains praise, approval, satisfaction, or appreciation.
+- **"Negative"**: Contains criticism, dissatisfaction, complaint, or frustration.
+- **"Neutral"**: Purely factual or descriptive with NO evaluative langauge.
+
+**Field Definitions:**
+- `sentiment_label`: (String) Exactly one of: "Positive", "Negative", or "Neutral".
+- `sentiment_score`: (Float) -1.0(most Negative) to 1.0(most positive). Must align with sentiment_label.
+- `primary_theme`: (String) A brief, 2-5 word summary of the main point of THIS comment (e.g., "Excellent Small Group Facilitation", "Exam Question Unfairness").
+- `theme_description`: (String) A concise, 2-3 sentence summary that elaborates on the `primary_theme`, capturing the core feedback.
+- `potential_lcme_standard`: (String) Based on the provided LCME handbook, identify the single most relevant standard number this comment might relate to (e.g., "6.3", "8.1"). If none, return null.
+
+==============================
+OUTPUT FORMAT
+==============================
+
+For each comment, perform the step-by-step reasoning for BOTH tasks, then produce the final JSON.
+Return a JSON array with one object per comment, in the same order as the comments. Each object must have this exact schema:
 ```json
 [
   {{
@@ -141,10 +218,12 @@ async def screen_and_analyze_batch(
 ]
 ```
 
-**COMMENTS TO PROCESS:**
+==============================
+COMMENTS TO PROCESS
+==============================
 {comments_block}
 
-Return ONLY the JSON array. No other text.
+Perform your step-by-step reasoning for each comment, then return the final JSON array.
 """
 
         for attempt in range(retry_count + 1):
@@ -157,7 +236,6 @@ Return ONLY the JSON array. No other text.
 
                 # Parse JSON array from response
                 text = response.text
-                # Try to find JSON array
                 match = re.search(r'\[.*\]', text, re.DOTALL)
                 if not match:
                     raise ValueError("No JSON array found in response.")
@@ -170,17 +248,60 @@ Return ONLY the JSON array. No other text.
                         f"Expected {len(batch)} results, got {len(results)}"
                     )
 
-                # Ensure response_id is set correctly from our input
-                for i, result in enumerate(results):
-                    result['response_id'] = batch[i]['Response_ID']
+                # ============================================================
+                # ALIGNMENT SAFEGUARD: Use comment_index AND response_id to
+                # guarantee each result maps to the correct input comment.
+                # Never rely on positional ordering alone.
+                # ============================================================
 
-                return results
+                # Build a lookup: expected comment_index → batch position
+                expected_ids = {i: batch[i]['Response_ID'] for i in range(len(batch))}
+
+                aligned_results = [None] * len(batch)
+                used_indices = set()
+
+                for result in results:
+                    cidx = result.get('comment_index')
+                    rid = result.get('response_id')
+
+                    # Strategy 1: Match by comment_index (primary key)
+                    if cidx is not None and 0 <= cidx < len(batch) and cidx not in used_indices:
+                        # Cross-validate: if response_id was returned, it must match
+                        if rid is not None and rid != expected_ids[cidx]:
+                            raise ValueError(
+                                f"comment_index {cidx} returned response_id {rid}, "
+                                f"expected {expected_ids[cidx]} — possible displacement"
+                            )
+                        result['response_id'] = expected_ids[cidx]
+                        aligned_results[cidx] = result
+                        used_indices.add(cidx)
+
+                    # Strategy 2: Match by response_id if comment_index is missing
+                    elif rid is not None:
+                        for pos, expected_rid in expected_ids.items():
+                            if expected_rid == rid and pos not in used_indices:
+                                result['comment_index'] = pos
+                                result['response_id'] = expected_rid
+                                aligned_results[pos] = result
+                                used_indices.add(pos)
+                                break
+
+                # Check all positions were filled
+                missing_positions = [i for i, r in enumerate(aligned_results) if r is None]
+                if missing_positions:
+                    raise ValueError(
+                        f"Could not align results for comment positions: {missing_positions}. "
+                        f"Matched {len(used_indices)}/{len(batch)} comments."
+                    )
+
+                return aligned_results
 
             except Exception as e:
                 if attempt < retry_count:
                     await asyncio.sleep(2 ** attempt)
                     continue
                 # On final failure, return error entries for each comment
+                # (same behavior as original code)
                 return [
                     {
                         "response_id": item["Response_ID"],
@@ -208,14 +329,14 @@ async def synthesize_themes_phase2(primary_themes_list: list) -> dict or None:
 
     prompt = f"""
 **Persona:** You are an expert in curriculum evaluation and meta-analysis of qualitative data.
-**Task:** Synthesize the provided primary themes into a small, distinct set of overarching dominant themes.
+**Task:** You are provided with a list of primary themes from thousands of student comments. Synthesize these into a small, distinct set of overarching, dominant themes.
 
-**Instructions:**
+**Instructions & Guidance:**
 - Merge synonyms and abstract related concepts.
-- Ensure each dominant theme is distinct and not redundant.
-- Align terminology with these examples (create new ones if data supports it):
+- Ensure each dominant theme you create is distinct and not redundant.
+- **Crucially, align the terminology and scope of your generated themes with the following examples from medical education curriculum evaluation. These examples are a guide, not an exhaustive list; you can create new themes if the data strongly supports it and they dont fit into any of the examples below.**
 
-**Example Dominant Themes:**
+**Examples of High-Quality Dominant Themes:**
 - Learning Environment & Climate
 - Teaching Quality & Instructional Effectiveness
 - Curriculum Design & Alignment
@@ -232,19 +353,19 @@ async def synthesize_themes_phase2(primary_themes_list: list) -> dict or None:
 - Preparedness for Practice
 - Meaning, Motivation & Engagement
 
-**Required Output:** Return a single valid JSON object.
+**Required Output:** Return a single, valid JSON object.
 **JSON Schema:**
 {{
   "dominant_themes": [
     {{
-      "dominant_theme": "2-5 word theme name",
-      "theme_description": "2-3 sentence summary.",
-      "potential_lcme_standard": "Standard number or null"
+      "dominant_theme": "The 2-5 word name for the overarching theme (e.g., 'Clinical Training & Experiential Learning').",
+      "theme_description": "A 2-3 sentence summary of what this dominant theme covers.",
+      "potential_lcme_standard": "The single most relevant LCME standard for this entire theme (e.g., 'Standard 9'), or null."
     }}
   ]
 }}
 ---
-**Primary themes to synthesize:**
+**Analyze this list of primary themes from student comments:**
 {formatted_themes}
 """
     generation_config = GenerationConfig(temperature=0.0, seed=42)
@@ -284,7 +405,7 @@ async def map_themes_batched_llm(
     Maps primary themes to dominant themes using batched LLM calls.
     DEDUPLICATES first so the LLM only processes each unique theme once.
     """
-    formatted_dominant = "- " + "\n- ".join(dominant_theme_names)
+    formatted_dominant_themes = "- " + "\n- ".join(dominant_theme_names)
 
     # Step 1: Deduplicate — only map unique primary themes
     unique_themes = list(set(all_primary_themes))
@@ -299,15 +420,17 @@ async def map_themes_batched_llm(
             themes_block = "\n".join(
                 [f'{i}: "{t}"' for i, t in enumerate(batch_themes)]
             )
-            prompt = f"""**Task:** Map each numbered primary theme below to the single BEST matching dominant theme from the provided list.
+            prompt = f"""**Task:** You are given a list of numbered "Primary Themes" from student comments and a list of "Dominant Themes". Your task is to choose which single Dominant Theme is the best fit for each Primary Theme.
 
-**Dominant Themes (choose from these ONLY):**
-{formatted_dominant}
-
+---
+**List of Dominant Themes to choose from:**
+{formatted_dominant_themes}
+---
 **Primary Themes to Map:**
 {themes_block}
-
-**Output:** Return ONLY a JSON array. Each element must have "index" (the number) and "dominant_theme" (exact name from the list above).
+---
+**Best Fit Dominant Themes:**
+Return ONLY a JSON array. Each element must have "index" (the number of the Primary Theme) and "dominant_theme" (the exact name of the chosen Dominant Theme from the list above, nothing else).
 Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effectiveness"}}, ...]
 """
             config = GenerationConfig(temperature=0.0, seed=42)
@@ -442,12 +565,12 @@ else:
         primary_themes_to_map = df_master['primary_theme'].fillna("Unknown").tolist()
 
         print("Using BATCHED LLM mapping with deduplication...")
-        mapped_themes = await map_themes_batched_llm(
+        mapping_results = await map_themes_batched_llm(
             primary_themes_to_map, dominant_theme_names, semaphore,
             batch_size=PHASE3_BATCH_SIZE
         )
 
-        df_master['Dominant_Theme'] = mapped_themes
+        df_master['Dominant_Theme'] = mapping_results
         df_master['Dominant_Theme_Description'] = df_master['Dominant_Theme'].map(
             description_lookup
         )
