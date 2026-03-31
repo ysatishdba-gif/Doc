@@ -1,87 +1,62 @@
-clinical text in
+query topics + store topics in
 │
-│── stage 1: extraction
-│   send text to UMLS API, get back CUIs by embedding similarity
-│   params: top_k=6, top_p=5000, combined=true
-│   then run medspacy ConText (102 rules, batch_parse)
-│   negated phrases → drop their CUIs
-│   cache: API results yes, ConText no (same phrase can be negated in one doc, not another)
+│── adaptive params (computed once from store data, not per query)
+│   filter_min_ancestor_ic = p25(store ICs)
+│   ic_weight_alpha = query_ic_mean / max_store_ic, clamped [0.1, 0.9]
+│   ic_prune_ratio = p10/p50(store ICs), clamped [0.1, 0.9]
+│   sibling_ic_ratio = p25/p75(store ICs), clamped [0.1, 0.95]
+│   use_idf = entropy(IDF) > 0.3
 │
-│── stage 2: SAB filter
-│   keep SNOMEDCT_US only, drop ICD10/ICD9/everything else
-│   one vocab = one hierarchy = no conflicts in stage 4
+│── pass 1: topic gate (speed optimization, not a hard gate)
+│   step 1: query centroid × all store centroids (one matmul)
+│     sort scores, gap_split: find biggest gap, everything above admitted
+│   step 2: CUI overlap rescue
+│     excluded topics that share an exact CUI with query → admitted
+│   step 3: fallback
+│     zero admitted? score ALL topics in pass 2 (never miss for speed)
 │
-│── stage 3: metadata + IC
-│   fetch semantic types from BQ (_BQ_BATCH=5000)
-│   IC = -log((desc+1)/total), precomputed for 2.3M nodes, dict lookup
-│   higher IC = more specific
+│   before pass 2: precompute ancestors for admitted doc CUIs (8 hops)
+│   include topic_cui in matchable set
 │
-│── stage 4: hierarchy reduction
-│   ancestor_depth = log(20)/log(mean_in_degree), clamped [1,5]
-│   SNOMED → 5, ICD10 → 3 (fallback, log(1.0) breaks)
-│   computed once from graph, same every run
-│   walk UP 1 hop: if parent also in set + IC(child) >= IC(parent) + same type → drop parent
+│── pass 2: score each admitted topic (3 signals, no thresholds on any)
 │
-│── stage 5: embedding dedup
-│   fetch 3072-dim embeddings from BQ
+│   signal 1: cui_ratio
+│     for each query CUI, check against all topic CUIs:
+│       try exact match → credit = 1.0, stop
+│       try parent-child (8-hop BFS) → credit = IC(parent)/IC(child), stop
+│       try MICA → credit = Lin score, stop
+│       nothing → 0
+│     cui_ratio = sum(credits) / n_query_CUIs
 │
-│   n <= 20? → fast path (otsu + guards on full matrix)
-│   n > 20?  → louvain path:
-│     k-NN graph: k=20, edge threshold = mean of k-th neighbor dists (one per CUI, not all pairs)
-│     louvain: resolution=1.0, seed=42, groups cuis by modularity, removes nothing
-│     then otsu + guards WITHIN each community separately
+│   signal 2: vec_sim
+│     dot(query centroid, topic centroid)
+│     one number, no CUI-level comparison
 │
-│   otsu: sort pairwise dists, try every split
-│     score = w0 * w1 * (m0 - m1)^2, pick highest
-│     cap at median so never > 50% flagged
-│     below threshold → check guards
-│     above → skip
+│   signal 3: lin_avg
+│     only for query CUIs that cui_ratio couldn't match
+│     for each: compute Lin against every topic CUI, keep best
+│     Lin(A,B) = 2 * IC(MICA) / (IC(A) + IC(B))
+│     MICA = most specific shared ancestor
+│     average the best scores
 │
-│   guards (any fires → keep both, all fail → remove lower IC):
-│     g1: parent-child edge (O(1))
-│     g2: semantic types disjoint (O(|types|))
-│     g3: ancestor sets disjoint (BFS up [1,5])
-│     g4: sibling leaves (O(1))
+│   why three: "fever and chills" → cui_ratio carries it
+│              "worsening condition" → vec_sim carries it (no CUI overlap)
+│              "OA of left knee" → lin_avg carries it (parent-child hierarchy)
 │
-│   singletons merged if sim > mean(within-group) * 0.5
+│── pass 3: z-score normalization
+│   per signal across all candidates: z = (value - mean) / std
+│   final score = z_cui + z_vec + z_lin, shifted to [0, 1]
+│   highest-variance signal auto-dominates, no manual weights
+│   all flat → fallback w_cui=0.40, w_vec=0.30, w_lin=0.30
 │
-│   confidence scoring: prox/cent/ret, variance-weighted
-│   just ranks the CSV, doesn't affect anything
+│── pass 4: relative threshold
+│   threshold = best_score * 0.40 (score_ratio)
+│   score_min = 0.01 (structural floor, catches float artifacts)
+│   zero-evidence guard: suppress only if all 3 signals = 0.0
+│   no per-signal thresholds, no fixed result count
 │
-└── out: deduplicated surviving CUIs → topic formation
-
-
-surviving CUIs in (just codes, no text, no phrases)
+│── LLM reasoning (optional)
+│   top results → gemini with matched CUIs + topic labels + chunk text
+│   verdict: good/partial/poor + explanation
 │
-│── stage 6: hierarchical topic builder
-│   IC floor = p10 of surviving CUI ICs (one number, not an average)
-│   max_coverage = max(2, n/sqrt(n))
-│
-│   BFS UP from every CUI:
-│     hard cap: 5 hops
-│     gradient: at hop 3+, stop if IC(parent) < 0.3 * IC(current)
-│     hop 1-2 always walk (grace period)
-│     collects everything, floor filters AFTER
-│
-│   3 rules for an ancestor to become a grouping key:
-│     1. covers >= 2 surviving CUIs
-│     2. IC >= floor
-│     3. not in the surviving set itself
-│     all three pass → grouping key
-│
-│   convergence selection:
-│     sort passing ancestors by IC desc, greedy assign
-│     highest IC → subtopics
-│     ancestor of 2+ subtopics → topic grouper
-│     leftovers → singletons
-│
-│   each topic gets: SNOMED label, topic_cui, member CUIs, subtopics
-│
-│── stage 7: reps + anchors
-│   per topic: split by semantic type, HAC at 0.5, 1 rep per sub-cluster
-│   anchors (docs only): BFS up 4 hops from reps, IC_MIN=4.0
-│
-│── stage 8: centroids
-│   mean of member CUI embeddings, L2-normalized, 3072-dim
-│
-└── out: topics with labels + centroids → query matching
+└── out: ranked document chunks above threshold
