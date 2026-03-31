@@ -8,10 +8,13 @@
 #      → 10x fewer API calls for analysis
 #   3. BATCHED Phase 3 mapping (20 themes per call) + DEDUPLICATED unique themes
 #      → Maps only unique primary themes, then applies lookup to all rows
-#   4. ADDED concurrency (semaphore) to ALL phases consistently
-#   5. ADDED retry logic with exponential backoff
+#   4. PARALLEL Phase 0 + Phase 1 with SEPARATE semaphores
+#      → Both phases run simultaneously (different models, different rate limits)
+#   5. CONTEXT CACHING for grounding document (optional)
+#      → Upload LCME doc once, reuse cached version in all Phase 1 & 2 calls
+#   6. ADDED retry logic with exponential backoff
 #
-# Expected speedup: 8 hours → ~1-2 hours
+# Expected speedup: 8 hours → ~30-45 minutes
 # Expected cost reduction: ~80%
 # =============================================================================
 
@@ -23,6 +26,7 @@ import re
 import random
 from tqdm.asyncio import tqdm as an_tqdm
 import asyncio
+import time
 
 import vertexai
 from vertexai.generative_models import (
@@ -32,6 +36,13 @@ from vertexai.generative_models import (
 )
 import google.cloud.aiplatform
 from google.cloud import bigquery
+
+# Context caching (optional — reduces latency & cost for grounding doc)
+try:
+    from vertexai.preview.caching import CachedContent
+    CACHING_AVAILABLE = True
+except ImportError:
+    CACHING_AVAILABLE = False
 
 print(f"Pandas version: {pd.__version__}")
 print(f"SDK version: {google.cloud.aiplatform.__version__}")
@@ -49,10 +60,16 @@ MIME_TYPE = MIME_TYPE
 
 # --- TUNED PROCESSING CONFIGURATION ---
 CONCURRENT_REQUESTS = 60          # Increased from 50
-BATCH_SIZE_LLM = 10               # NEW: Comments per LLM call (batching)
+BATCH_SIZE_LLM = 10               # Comments per LLM call (batching)
 BATCH_SIZE_API = 60                # Concurrent API batches
 SAMPLE_SIZE_FOR_SYNTHESIS = 750
 PHASE3_BATCH_SIZE = 20             # Primary themes per LLM call in Phase 3
+
+# Separate semaphores: Phase 0 (screener_model) and Phase 1 (model) use
+# different models with different rate limits, so they should NOT compete
+# for the same concurrency pool. This lets both run at full speed in parallel.
+SCREENER_CONCURRENT = 60
+ANALYSIS_CONCURRENT = 60
 
 print(f"PROJECT_ID: {PROJECT_ID}")
 print(f"REGION: {REGION}")
@@ -67,6 +84,29 @@ client = bigquery.Client(project=PROJECT_ID)
 
 grounding_document_part = Part.from_uri(uri=GCS_CORPUS_URI, mime_type=MIME_TYPE)
 print(f"Grounding document prepared from: {GCS_CORPUS_URI}")
+
+# --- CONTEXT CACHING (optional — speeds up Phase 1 and Phase 2) ---
+# Instead of sending the full LCME document with every API call,
+# cache it once on the server. Each call then references the cached version,
+# reducing input token cost and improving latency.
+cached_model = None
+if CACHING_AVAILABLE:
+    try:
+        print("Setting up context caching for grounding document...")
+        cached_content = CachedContent.create(
+            model_name=MODEL_VERSION,
+            contents=[grounding_document_part],
+            display_name="lcme-handbook-cache",
+            ttl="3600s",  # 1 hour — enough for the full pipeline run
+        )
+        cached_model = GenerativeModel.from_cached_content(cached_content)
+        print(f"Context cache created successfully (TTL=1hr). Phase 1 & 2 will use cached model.")
+    except Exception as e:
+        print(f"Context caching not available ({e}). Falling back to standard calls.")
+        cached_model = None
+
+# Use cached_model for phases that need the grounding doc, else regular model
+analysis_model = cached_model if cached_model else model
 
 # --- LOAD DATA ---
 query = f"""
@@ -335,8 +375,11 @@ Return a JSON array with one object per comment in order. Each object must have:
         for attempt in range(retry_count + 1):
             try:
                 generation_config = GenerationConfig(temperature=0.0, seed=42)
-                response = await model.generate_content_async(
-                    contents=[prompt, grounding_document_part],
+                # If using cached model, grounding doc is already cached — just send prompt
+                # If not cached, include grounding doc explicitly (same as original)
+                contents = [prompt] if cached_model else [prompt, grounding_document_part]
+                response = await analysis_model.generate_content_async(
+                    contents=contents,
                     generation_config=generation_config,
                 )
 
@@ -449,8 +492,9 @@ async def synthesize_themes_phase2(primary_themes_list: list) -> dict or None:
 """
     generation_config = GenerationConfig(temperature=0.0, seed=42)
     try:
-        response = await model.generate_content_async(
-            contents=[prompt, grounding_document_part],
+        contents = [prompt] if cached_model else [prompt, grounding_document_part]
+        response = await analysis_model.generate_content_async(
+            contents=contents,
             generation_config=generation_config,
         )
         match = re.search(r'\{.*\}', response.text, re.DOTALL)
@@ -565,7 +609,12 @@ Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effe
 # MAIN EXECUTION
 # =============================================================================
 
-semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
+# Separate semaphores: screener_model and model have independent rate limits,
+# so they should NOT share a concurrency pool. This lets both phases run
+# at full speed simultaneously.
+screener_semaphore = asyncio.Semaphore(SCREENER_CONCURRENT)
+analysis_semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENT)
+phase3_semaphore = asyncio.Semaphore(CONCURRENT_REQUESTS)
 
 # Create batches of comments (reused by both Phase 0 and Phase 1)
 comment_batches = []
@@ -573,36 +622,48 @@ for i in range(0, len(df), BATCH_SIZE_LLM):
     batch = df.iloc[i:i + BATCH_SIZE_LLM][['Response_ID', 'Response']].to_dict('records')
     comment_batches.append(batch)
 
-# --- PHASE 0: SCREENING ALL COMMENTS (uses screener_model) ---
+# =============================================================================
+# PARALLEL EXECUTION: Phase 0 + Phase 1 run at the SAME TIME
+# =============================================================================
+# Phase 0 uses screener_model → screener_semaphore
+# Phase 1 uses model → analysis_semaphore
+# They don't depend on each other, so running in parallel cuts wall-clock
+# time nearly in half for these two phases.
+# =============================================================================
+
 print(f"\n{'='*70}")
-print("Phase 0: Screening all comments with the high-accuracy model")
+print("Phase 0 + Phase 1: Running SCREENING and ANALYSIS in PARALLEL")
 print(f"{'='*70}")
 print(f"Processing {len(df)} comments in {len(comment_batches)} batches of {BATCH_SIZE_LLM}...")
+print(f"  Phase 0 (screening): {SCREENER_CONCURRENT} concurrent batches → screener_model")
+print(f"  Phase 1 (analysis):  {ANALYSIS_CONCURRENT} concurrent batches → model")
 
-screening_tasks = [screen_comment_batch(batch, semaphore) for batch in comment_batches]
-screening_results = await an_tqdm.gather(*screening_tasks, desc="Screening Comments")
+start_time = time.time()
 
-# Flatten and build screener DataFrame
+# Build task lists for both phases
+screening_tasks = [screen_comment_batch(batch, screener_semaphore) for batch in comment_batches]
+analysis_tasks = [analyze_comment_batch(batch, analysis_semaphore) for batch in comment_batches]
+
+# Run BOTH phases simultaneously
+screening_results, analysis_results = await asyncio.gather(
+    an_tqdm.gather(*screening_tasks, desc="Phase 0: Screening"),
+    an_tqdm.gather(*analysis_tasks, desc="Phase 1: Analysis"),
+)
+
+elapsed = time.time() - start_time
+print(f"\nPhase 0 + Phase 1 completed in {elapsed:.1f}s (ran in parallel)")
+
+# --- Process Phase 0 results ---
 screening_flat = []
 for batch_result in screening_results:
     screening_flat.extend(batch_result)
 
 df_screener = pd.DataFrame(screening_flat)
 df_screener.set_index('response_id', inplace=True)
-print(f"\nScreening complete. Screened {len(df_screener)} total comments.")
 flagged_count = df_screener['is_inappropriate'].sum()
-print(f"Found {int(flagged_count)} comments flagged as inappropriate.")
+print(f"  Phase 0: Screened {len(df_screener)} comments, flagged {int(flagged_count)} as inappropriate.")
 
-# --- PHASE 1: PERFORM ROW-LEVEL THEMATIC ANALYSIS (uses model) ---
-print(f"\n{'='*70}")
-print("Phase 1: Performing Thematic Analysis")
-print(f"{'='*70}")
-print(f"Processing {len(df)} comments in {len(comment_batches)} batches of {BATCH_SIZE_LLM}...")
-
-analysis_tasks = [analyze_comment_batch(batch, semaphore) for batch in comment_batches]
-analysis_results = await an_tqdm.gather(*analysis_tasks, desc="Analyzing Comments")
-
-# Flatten analysis results
+# --- Process Phase 1 results ---
 analysis_flat = []
 for batch_result in analysis_results:
     analysis_flat.extend(batch_result)
@@ -621,9 +682,7 @@ for i, result in enumerate(analysis_flat):
 
 df_master = pd.DataFrame(processed_rows)
 df_errors = pd.DataFrame(error_rows)
-print(f"\nPhase 1 Complete: Successfully analyzed {len(df_master)} comments thematically.")
-if not df_errors.empty:
-    print(f"WARNING: Encountered {len(df_errors)} errors during thematic analysis.")
+print(f"  Phase 1: Analyzed {len(df_master)} comments, {len(df_errors)} errors.")
 
 # --- MERGE STEP 1: COMBINE THEMATIC AND SCREENER RESULTS (same as original) ---
 print("\n--- Merging Screener and Thematic Analysis Results into Master Table ---")
@@ -669,7 +728,7 @@ else:
 
         print("Using BATCHED LLM mapping with deduplication...")
         mapping_results = await map_themes_batched_llm(
-            primary_themes_to_map, dominant_theme_names, semaphore,
+            primary_themes_to_map, dominant_theme_names, phase3_semaphore,
             batch_size=PHASE3_BATCH_SIZE
         )
 
@@ -700,3 +759,11 @@ else:
     print("Master DataFrame is empty. Skipping upload.")
 
 print("\nProcess finished successfully!")
+
+# --- Cleanup context cache (optional) ---
+if CACHING_AVAILABLE and cached_model:
+    try:
+        cached_content.delete()
+        print("Context cache cleaned up.")
+    except Exception:
+        pass  # Cache will expire via TTL anyway
