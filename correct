@@ -4,7 +4,7 @@
 # Key optimizations vs. original:
 #   1. BATCHED Phase 0 (screening): 10 comments per call using screener_model
 #      → 10x fewer API calls for screening
-#   2. BATCHED Phase 1 (analysis): 10 comments per call using model
+#   2. BATCHED Phase 1 (comment analysis): 10 comments per call using model
 #      → 10x fewer API calls for analysis
 #   3. BATCHED Phase 3 mapping (20 themes per call) + DEDUPLICATED unique themes
 #      → Maps only unique primary themes, then applies lookup to all rows
@@ -41,8 +41,12 @@ from google.cloud import bigquery
 try:
     from vertexai.preview.caching import CachedContent
     CACHING_AVAILABLE = True
-except ImportError:
+    print("✅ CachedContent import successful")
+except ImportError as e:
     CACHING_AVAILABLE = False
+    print(f"⚠️  CachedContent import failed: {e}")
+    print("   Fix: pip install --upgrade google-cloud-aiplatform --break-system-packages")
+    print("   Context caching requires google-cloud-aiplatform >= 1.38.0")
 
 print(f"Pandas version: {pd.__version__}")
 print(f"SDK version: {google.cloud.aiplatform.__version__}")
@@ -92,7 +96,9 @@ print(f"Grounding document prepared from: {GCS_CORPUS_URI}")
 cached_model = None
 if CACHING_AVAILABLE:
     try:
-        print("Setting up context caching for grounding document...")
+        print(f"Setting up context caching for grounding document...")
+        print(f"  Model: {MODEL_VERSION}")
+        print(f"  Document: {GCS_CORPUS_URI}")
         cached_content = CachedContent.create(
             model_name=MODEL_VERSION,
             contents=[grounding_document_part],
@@ -100,10 +106,17 @@ if CACHING_AVAILABLE:
             ttl="3600s",  # 1 hour — enough for the full pipeline run
         )
         cached_model = GenerativeModel.from_cached_content(cached_content)
-        print(f"Context cache created successfully (TTL=1hr). Phase 1 & 2 will use cached model.")
+        print(f"✅ Context cache created successfully (TTL=1hr). Phase 1 & 2 will use cached model.")
     except Exception as e:
-        print(f"Context caching not available ({e}). Falling back to standard calls.")
+        print(f"⚠️  Context cache creation failed: {e}")
+        print(f"   Common causes:")
+        print(f"   - Model '{MODEL_VERSION}' may not support caching")
+        print(f"   - Supported models: gemini-1.5-pro, gemini-1.5-flash, gemini-2.0-flash, gemini-2.5-pro, gemini-2.5-flash")
+        print(f"   - Document may be too small (minimum 32,768 tokens required)")
+        print(f"   Falling back to standard calls (no impact on accuracy, just slower).")
         cached_model = None
+else:
+    print("⚠️  Context caching skipped (import failed). Using standard calls.")
 
 # Use cached_model for phases that need the grounding doc, else regular model
 analysis_model = cached_model if cached_model else model
@@ -326,7 +339,7 @@ Each object must have: "comment_index" (0-based), "response_id" (the ID shown ab
 
 
 # =============================================================================
-# OPTIMIZATION 2: BATCHED Phase 1 (Thematic Analysis) — uses model
+# OPTIMIZATION 2: BATCHED Phase 1 (Comment Analysis) — uses model
 # =============================================================================
 # Same as original analyze_comment_phase1() but processes 10 comments per call.
 # Uses model with temperature=0.0, seed=42 (same as original).
@@ -508,13 +521,8 @@ async def synthesize_themes_phase2(primary_themes_list: list) -> dict or None:
 # =============================================================================
 # OPTIMIZATION 3: Batched LLM mapping with DEDUPLICATION
 # =============================================================================
-# The original made one LLM call PER comment (N calls). This version:
-#   a) Deduplicates: only maps each UNIQUE primary theme once (typically 60-80%
-#      fewer themes to map than total comments)
-#   b) Batches 20 unique themes per LLM call
-#   c) Builds a lookup dict, then applies it to all rows instantly
-# Net effect: if you have 10,000 comments but only 800 unique primary themes,
-#   original = 10,000 calls → optimized = 40 calls (800 / 20)
+# Same prompt structure as original map_theme_phase3(), just batched.
+# Original prompt order preserved: Primary Theme shown FIRST, then Dominant Themes list.
 # =============================================================================
 
 async def map_themes_batched_llm(
@@ -527,6 +535,7 @@ async def map_themes_batched_llm(
     """
     Maps primary themes to dominant themes using batched LLM calls.
     DEDUPLICATES first so the LLM only processes each unique theme once.
+    Uses the exact same prompt wording/structure as the original map_theme_phase3().
     """
     formatted_dominant_themes = "- " + "\n- ".join(dominant_theme_names)
 
@@ -540,21 +549,30 @@ async def map_themes_batched_llm(
 
     async def map_batch(batch_themes: list[str]):
         async with semaphore:
-            themes_block = "\n".join(
-                [f'{i}: "{t}"' for i, t in enumerate(batch_themes)]
-            )
-            prompt = f"""**Task:** You are given a list of numbered "Primary Themes" from student comments and a list of "Dominant Themes". Your task is to choose which single Dominant Theme is the best fit for each Primary Theme.
-
+            # Build one prompt per theme — exact same structure as original
+            # but multiple themes in one call. Each theme gets its own
+            # clearly separated block using the EXACT original prompt wording.
+            all_theme_prompts = ""
+            for i, theme in enumerate(batch_themes):
+                all_theme_prompts += f"""
+--- THEME {i} ---
+**Task:** You are given a single "Primary Theme" from a student's comment and a list of "Dominant Themes". Your task is to choose which single Dominant Theme is the best fit for the Primary Theme. Respond with only the name of the chosen Dominant Theme, nothing else.
+---
+**Primary Theme:** "{theme}"
 ---
 **List of Dominant Themes to choose from:**
 {formatted_dominant_themes}
 ---
-**Primary Themes to Map:**
-{themes_block}
----
-**Best Fit Dominant Themes:**
-Return ONLY a JSON array. Each element must have "index" (the number of the Primary Theme) and "dominant_theme" (the exact name of the chosen Dominant Theme from the list above, nothing else).
-Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effectiveness"}}, ...]
+**Best Fit Dominant Theme:**
+"""
+
+            prompt = f"""You will process multiple theme-mapping tasks below. For each THEME, choose the best fit Dominant Theme from the list provided. Return ONLY a JSON array with one object per theme, in order.
+
+Each object must have: "index" (the THEME number) and "dominant_theme" (the exact name of the chosen Dominant Theme, nothing else).
+
+{all_theme_prompts}
+
+Return ONLY the JSON array. Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effectiveness"}}, ...]
 """
             config = GenerationConfig(temperature=0.0, seed=42)
 
@@ -570,23 +588,16 @@ Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effe
                             idx = m.get("index")
                             dt = m.get("dominant_theme", "").strip()
                             if idx is not None and 0 <= idx < len(batch_themes):
-                                # STRICT validation: must be an exact match
-                                # from the dominant themes list (same as old code
-                                # which returned model output directly)
-                                if dt in dominant_theme_names:
-                                    theme_lookup[batch_themes[idx]] = dt
-                                else:
-                                    # No fuzzy fallback — mark as error
-                                    # (old code would return raw text, which
-                                    # could also be imperfect)
-                                    theme_lookup[batch_themes[idx]] = f"ERROR: {dt}"
+                                # Return raw model output — same as old code's
+                                # response.text.strip()
+                                theme_lookup[batch_themes[idx]] = dt
                         return  # Success
                 except Exception as e:
                     if attempt < retry_count:
                         await asyncio.sleep(2 ** attempt)
                         continue
-                    # On failure, mark all themes in this batch as errors
-                    # (same behavior as old code returning "ERROR: ...")
+                    # On failure, mark as ERROR — same as old code's
+                    # return f"ERROR: {str(e)}"
                     for t in batch_themes:
                         if t not in theme_lookup:
                             theme_lookup[t] = f"ERROR: {str(e)}"
@@ -600,7 +611,7 @@ Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effe
     await an_tqdm.gather(*tasks, desc="Mapping Themes (Batched LLM)")
 
     # Step 3: Apply lookup to ALL primary themes (including duplicates) — instant
-    # Unmapped themes get ERROR (not silent default — same as old code)
+    # Unmapped themes get ERROR — same as old code's f"ERROR: {str(e)}"
     mapped = [theme_lookup.get(t, f"ERROR: unmapped") for t in all_primary_themes]
 
     error_count = sum(1 for m in mapped if m.startswith("ERROR"))
