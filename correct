@@ -63,7 +63,7 @@ CONCURRENT_REQUESTS = 60          # Increased from 50
 BATCH_SIZE_LLM = 10               # Comments per LLM call (batching)
 BATCH_SIZE_API = 60                # Concurrent API batches
 SAMPLE_SIZE_FOR_SYNTHESIS = 750
-PHASE3_BATCH_SIZE = 20             # Primary themes per LLM call in Phase 3
+PHASE3_BATCH_SIZE = 10             # Primary themes per LLM call in Phase 3
 
 # Separate semaphores: Phase 0 (screener_model) and Phase 1 (model) use
 # different models with different rate limits, so they should NOT compete
@@ -521,7 +521,7 @@ async def map_themes_batched_llm(
     all_primary_themes: list[str],
     dominant_theme_names: list[str],
     semaphore: asyncio.Semaphore,
-    batch_size: int = 20,
+    batch_size: int = 10,
     retry_count: int = 2
 ) -> list[str]:
     """
@@ -570,21 +570,26 @@ Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effe
                             idx = m.get("index")
                             dt = m.get("dominant_theme", "").strip()
                             if idx is not None and 0 <= idx < len(batch_themes):
-                                # Validate it's actually one of the dominant themes
+                                # STRICT validation: must be an exact match
+                                # from the dominant themes list (same as old code
+                                # which returned model output directly)
                                 if dt in dominant_theme_names:
                                     theme_lookup[batch_themes[idx]] = dt
                                 else:
-                                    # Fuzzy fallback: pick closest by checking if it's a substring
-                                    for dn in dominant_theme_names:
-                                        if dt.lower() in dn.lower() or dn.lower() in dt.lower():
-                                            theme_lookup[batch_themes[idx]] = dn
-                                            break
+                                    # No fuzzy fallback — mark as error
+                                    # (old code would return raw text, which
+                                    # could also be imperfect)
+                                    theme_lookup[batch_themes[idx]] = f"ERROR: {dt}"
                         return  # Success
                 except Exception as e:
                     if attempt < retry_count:
                         await asyncio.sleep(2 ** attempt)
                         continue
-                    print(f"  WARNING: Batch mapping failed after retries: {e}")
+                    # On failure, mark all themes in this batch as errors
+                    # (same behavior as old code returning "ERROR: ...")
+                    for t in batch_themes:
+                        if t not in theme_lookup:
+                            theme_lookup[t] = f"ERROR: {str(e)}"
 
     # Create and run all batch tasks concurrently
     tasks = []
@@ -595,12 +600,12 @@ Example: [{{"index": 0, "dominant_theme": "Teaching Quality & Instructional Effe
     await an_tqdm.gather(*tasks, desc="Mapping Themes (Batched LLM)")
 
     # Step 3: Apply lookup to ALL primary themes (including duplicates) — instant
-    default_theme = dominant_theme_names[0] if dominant_theme_names else "Unknown"
-    mapped = [theme_lookup.get(t, default_theme) for t in all_primary_themes]
+    # Unmapped themes get ERROR (not silent default — same as old code)
+    mapped = [theme_lookup.get(t, f"ERROR: unmapped") for t in all_primary_themes]
 
-    unmapped_count = sum(1 for t in all_primary_themes if t not in theme_lookup)
-    if unmapped_count > 0:
-        print(f"  Note: {unmapped_count} themes fell back to default ('{default_theme}')")
+    error_count = sum(1 for m in mapped if m.startswith("ERROR"))
+    if error_count > 0:
+        print(f"  WARNING: {error_count} themes could not be mapped (marked as ERROR)")
 
     return mapped
 
