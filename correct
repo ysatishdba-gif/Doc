@@ -10,9 +10,7 @@
 #      → Maps only unique primary themes, then applies lookup to all rows
 #   4. PARALLEL Phase 0 + Phase 1 with SEPARATE semaphores
 #      → Both phases run simultaneously (different models, different rate limits)
-#   5. CONTEXT CACHING for grounding document (optional)
-#      → Upload LCME doc once, reuse cached version in all Phase 1 & 2 calls
-#   6. ADDED retry logic with exponential backoff
+#   5. ADDED retry logic with exponential backoff
 #
 # Expected speedup: 8 hours → ~30-45 minutes
 # Expected cost reduction: ~80%
@@ -36,17 +34,6 @@ from vertexai.generative_models import (
 )
 import google.cloud.aiplatform
 from google.cloud import bigquery
-
-# Context caching (optional — reduces latency & cost for grounding doc)
-try:
-    from vertexai.preview.caching import CachedContent
-    CACHING_AVAILABLE = True
-    print("✅ CachedContent import successful")
-except ImportError as e:
-    CACHING_AVAILABLE = False
-    print(f"⚠️  CachedContent import failed: {e}")
-    print("   Fix: pip install --upgrade google-cloud-aiplatform --break-system-packages")
-    print("   Context caching requires google-cloud-aiplatform >= 1.38.0")
 
 print(f"Pandas version: {pd.__version__}")
 print(f"SDK version: {google.cloud.aiplatform.__version__}")
@@ -80,7 +67,7 @@ print(f"REGION: {REGION}")
 print(f"SCREENER_MODEL_NAME: {SCREENER_MODEL_NAME}")
 print(f"MODEL_VERSION: {MODEL_VERSION}")
 
-# --- INITIALIZE ---
+# --- INITIALIZE (same as original) ---
 vertexai.init(project=PROJECT_ID, location=REGION)
 model = GenerativeModel(MODEL_VERSION)
 screener_model = GenerativeModel(SCREENER_MODEL_NAME)
@@ -88,38 +75,6 @@ client = bigquery.Client(project=PROJECT_ID)
 
 grounding_document_part = Part.from_uri(uri=GCS_CORPUS_URI, mime_type=MIME_TYPE)
 print(f"Grounding document prepared from: {GCS_CORPUS_URI}")
-
-# --- CONTEXT CACHING (optional — speeds up Phase 1 and Phase 2) ---
-# Instead of sending the full LCME document with every API call,
-# cache it once on the server. Each call then references the cached version,
-# reducing input token cost and improving latency.
-cached_model = None
-if CACHING_AVAILABLE:
-    try:
-        print(f"Setting up context caching for grounding document...")
-        print(f"  Model: {MODEL_VERSION}")
-        print(f"  Document: {GCS_CORPUS_URI}")
-        cached_content = CachedContent.create(
-            model_name=MODEL_VERSION,
-            contents=[grounding_document_part],
-            display_name="lcme-handbook-cache",
-            ttl="3600s",  # 1 hour — enough for the full pipeline run
-        )
-        cached_model = GenerativeModel.from_cached_content(cached_content)
-        print(f"✅ Context cache created successfully (TTL=1hr). Phase 1 & 2 will use cached model.")
-    except Exception as e:
-        print(f"⚠️  Context cache creation failed: {e}")
-        print(f"   Common causes:")
-        print(f"   - Model '{MODEL_VERSION}' may not support caching")
-        print(f"   - Supported models: gemini-1.5-pro, gemini-1.5-flash, gemini-2.0-flash, gemini-2.5-pro, gemini-2.5-flash")
-        print(f"   - Document may be too small (minimum 32,768 tokens required)")
-        print(f"   Falling back to standard calls (no impact on accuracy, just slower).")
-        cached_model = None
-else:
-    print("⚠️  Context caching skipped (import failed). Using standard calls.")
-
-# Use cached_model for phases that need the grounding doc, else regular model
-analysis_model = cached_model if cached_model else model
 
 # --- LOAD DATA ---
 query = f"""
@@ -390,11 +345,8 @@ Return a JSON array with one object per comment in order. Each object must have:
         for attempt in range(retry_count + 1):
             try:
                 generation_config = GenerationConfig(temperature=0.0, seed=42)
-                # If using cached model, grounding doc is already cached — just send prompt
-                # If not cached, include grounding doc explicitly (same as original)
-                contents = [prompt] if cached_model else [prompt, grounding_document_part]
-                response = await analysis_model.generate_content_async(
-                    contents=contents,
+                response = await model.generate_content_async(
+                    contents=[prompt, grounding_document_part],
                     generation_config=generation_config,
                 )
 
@@ -507,9 +459,8 @@ async def synthesize_themes_phase2(primary_themes_list: list) -> dict or None:
 """
     generation_config = GenerationConfig(temperature=0.0, seed=42)
     try:
-        contents = [prompt] if cached_model else [prompt, grounding_document_part]
-        response = await analysis_model.generate_content_async(
-            contents=contents,
+        response = await model.generate_content_async(
+            contents=[prompt, grounding_document_part],
             generation_config=generation_config,
         )
         match = re.search(r'\{.*\}', response.text, re.DOTALL)
@@ -777,11 +728,3 @@ else:
     print("Master DataFrame is empty. Skipping upload.")
 
 print("\nProcess finished successfully!")
-
-# --- Cleanup context cache (optional) ---
-if CACHING_AVAILABLE and cached_model:
-    try:
-        cached_content.delete()
-        print("Context cache cleaned up.")
-    except Exception:
-        pass  # Cache will expire via TTL anyway
