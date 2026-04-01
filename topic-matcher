@@ -1914,3 +1914,248 @@ class TopicIndex:
                 removed = [terms.get(c, c) for c in result.removed_cuis]
                 lines.append(f"    - Removed: {', '.join(removed)}")
         return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CUIMatcher — Clean wrapper for query-document matching.
+#
+# Takes two inputs:
+#   query:    output from CUISummarizer + CUITopics for the query text
+#   document: output from CUISummarizer + CUITopics for one or more documents
+#
+# All existing TopicIndex, ChunkMatcher, ChunkStore code above is unchanged.
+# This wrapper converts between the new module payloads and the existing
+# matching engine.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CUIMatcher:
+    """Match query topics against document topics.
+
+    Wraps the existing TopicIndex + ChunkMatcher with a clean interface
+    that takes CUISummarizer + CUITopics output directly.
+
+    Usage:
+        matcher = CUIMatcher(hierarchy, ic_precomputed)
+
+        # index one or more documents
+        matcher.index_document("doc_1", doc_summary, doc_topics)
+        matcher.index_document("doc_2", doc_summary2, doc_topics2)
+
+        # match a query
+        results = matcher.match_query(query_summary, query_topics)
+
+        # or one-shot: match query against a single document
+        results = CUIMatcher.match(query_summary, query_topics,
+                                   doc_summary, doc_topics,
+                                   hierarchy, ic_precomputed)
+    """
+
+    def __init__(self, hierarchy, ic_map):
+        """
+        Args:
+            hierarchy:  networkx DiGraph (UMLS hierarchy)
+            ic_map:     dict {CUI: float} precomputed IC scores
+        """
+        self._graph = hierarchy
+        self._ic_map = ic_map
+        self._chunks = {}       # chunk_id → chunk data (ChunkStore format)
+        self._index = None      # TopicIndex (built lazily on first match)
+        self._matcher = ChunkMatcher(graph=hierarchy, ic_map=ic_map)
+
+    def index_document(self, doc_id, summarizer_output, topics_output):
+        """Add a document to the index.
+
+        Args:
+            doc_id:            unique document identifier
+            summarizer_output: output of CUISummarizer.summarize()
+            topics_output:     output of CUITopics.build_topics()
+        """
+        chunk_data = self._to_chunk(doc_id, summarizer_output, topics_output)
+        self._chunks[doc_id] = chunk_data
+        self._index = None  # invalidate — rebuilt on next match
+
+    def index_documents(self, documents):
+        """Add multiple documents at once.
+
+        Args:
+            documents: list of (doc_id, summarizer_output, topics_output) tuples
+        """
+        for doc_id, summary, topics in documents:
+            chunk_data = self._to_chunk(doc_id, summary, topics)
+            self._chunks[doc_id] = chunk_data
+        self._index = None
+
+    def match_query(self, query_summarizer_output, query_topics_output, top_k=10):
+        """Match a query against all indexed documents.
+
+        Args:
+            query_summarizer_output: output of CUISummarizer.summarize() for query
+            query_topics_output:     output of CUITopics.build_topics() for query
+            top_k:                   max results (None = all above threshold)
+
+        Returns:
+            list of dicts, each with: doc_id, chunk_id, score, topic_label,
+            matched_cuis, cui_overlap_ratio, vector_sim, lin_score
+        """
+        if not self._chunks:
+            return []
+
+        # build index if needed
+        if self._index is None:
+            self._index = TopicIndex()
+            self._index.build(self._chunks, graph=self._graph)
+
+        # convert query to internal format
+        query_cuis, query_embedding, query_topics = self._to_query(
+            query_summarizer_output, query_topics_output)
+
+        if not query_cuis:
+            return []
+
+        # run matching (Pass 1-4)
+        if self._index.groups and query_topics:
+            raw = self._index.match(
+                query_topics, query_cuis, query_embedding,
+                self._matcher, top_k=top_k)
+        else:
+            raw = self._matcher.match(
+                query_cuis, query_embedding, self._chunks,
+                top_k=top_k, query_topics=query_topics)
+
+        # format results
+        return self._format_results(raw)
+
+    @staticmethod
+    def match(query_summary, query_topics, doc_summary, doc_topics,
+              hierarchy, ic_map, doc_id="document", top_k=10):
+        """One-shot: match query against a single document.
+
+        Args:
+            query_summary:  CUISummarizer output for query
+            query_topics:   CUITopics output for query
+            doc_summary:    CUISummarizer output for document
+            doc_topics:     CUITopics output for document
+            hierarchy:      networkx DiGraph
+            ic_map:         dict {CUI: float}
+            doc_id:         document identifier
+            top_k:          max results
+
+        Returns:
+            list of match result dicts
+        """
+        m = CUIMatcher(hierarchy, ic_map)
+        m.index_document(doc_id, doc_summary, doc_topics)
+        return m.match_query(query_summary, query_topics, top_k=top_k)
+
+    # ── converters ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _to_chunk(doc_id, summarizer_output, topics_output):
+        """Convert CUISummarizer + CUITopics output to ChunkStore chunk format."""
+        # surviving CUIs
+        cuis = set()
+        for c in summarizer_output.get("concise_cuis", []):
+            cuis.add(c["cui"] if isinstance(c, dict) else c)
+
+        # topics → internal format
+        topics = {}
+        for t in topics_output.get("topics", []):
+            tid = t["topic_id"]
+            members = [m["cui"] if isinstance(m, dict) else m for m in t.get("members", [])]
+            topics[tid] = {
+                "centroid": t.get("centroid"),
+                "members": members,
+                "topic_cui": t.get("topic_cui", ""),
+            }
+
+        return {
+            "doc_id": doc_id,
+            "cuis": cuis,
+            "topics": topics,
+        }
+
+    @staticmethod
+    def _to_query(summarizer_output, topics_output):
+        """Convert CUISummarizer + CUITopics output to query format for TopicIndex.match.
+
+        Returns:
+            query_cuis:      set of CUI strings
+            query_embedding: numpy centroid (from first topic, or mean of all)
+            query_topics:    dict in HierarchicalTopicBuilder format
+        """
+        # query CUIs
+        query_cuis = set()
+        for c in summarizer_output.get("concise_cuis", []):
+            query_cuis.add(c["cui"] if isinstance(c, dict) else c)
+
+        # query centroid — mean of all topic centroids
+        centroids = []
+        for t in topics_output.get("topics", []):
+            c = t.get("centroid")
+            if c is not None:
+                centroids.append(np.array(c, dtype=np.float32))
+
+        if centroids:
+            mean = np.mean(centroids, axis=0)
+            norm = np.linalg.norm(mean)
+            query_embedding = (mean / norm).astype(np.float32) if norm > 0 else mean
+        else:
+            query_embedding = None
+
+        # query topics — convert to HierarchicalTopicBuilder.build() format
+        query_topics = {}
+        for t in topics_output.get("topics", []):
+            tid = t["topic_id"]
+            members = [m["cui"] if isinstance(m, dict) else m for m in t.get("members", [])]
+            subtopics = {}
+            for st in t.get("subtopics", []):
+                st_members = [m["cui"] if isinstance(m, dict) else m
+                              for m in st.get("members", [])]
+                subtopics[st["subtopic_id"]] = {
+                    "subtopic_cui": st.get("subtopic_cui"),
+                    "members": st_members,
+                }
+            # compute topic centroid from the topic output
+            centroid = t.get("centroid")
+            query_topics[tid] = {
+                "topic_cui": t.get("topic_cui"),
+                "members": members,
+                "subtopics": subtopics,
+                "ungrouped": [],
+                "centroid": centroid,
+            }
+
+        return query_cuis, query_embedding, query_topics
+
+    @staticmethod
+    def _format_results(raw_results):
+        """Convert internal match results to clean output dicts."""
+        out = []
+        for r in raw_results:
+            if isinstance(r, TopicGroupMatch):
+                out.append({
+                    "doc_id": r.document_id,
+                    "chunk_id": r.chunk_id,
+                    "score": round(r.score, 4),
+                    "topic_label": r.topic_label or "",
+                    "matched_cuis": list(r.matched_cuis) if r.matched_cuis else [],
+                    "cui_overlap_ratio": round(r.cui_overlap_ratio, 4),
+                    "vector_sim": round(r.vector_sim, 4),
+                    "lin_score": round(r.lin_score, 4),
+                    "is_variant": r.is_variant,
+                    "change_type": r.change_type or "",
+                })
+            elif isinstance(r, ChunkMatch):
+                out.append({
+                    "doc_id": r.chunk_id,
+                    "chunk_id": r.chunk_id,
+                    "score": round(r.score, 4),
+                    "topic_label": "",
+                    "matched_cuis": [d.cui for d in r.details] if r.details else [],
+                    "cui_overlap_ratio": round(r.cui_overlap, 4),
+                    "vector_sim": round(r.vec_sim, 4),
+                    "lin_score": round(r.lin_avg, 4),
+                    "is_variant": False,
+                    "change_type": "",
+                })
+        return out
