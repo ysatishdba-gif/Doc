@@ -112,8 +112,7 @@ class Verdict(str, Enum):
 # ── Private implementation constants (not user-configurable) ─────────────────
 _BQ_BATCH, _BQ_TIMEOUT, _API_TIMEOUT, _GCLOUD_TIMEOUT = 5000, 300, 200, 30
 _EMB_FETCH_WORKERS, _KNN_BLOCK_SIZE, _RANDOM_SEED = 4, 2000, 42
-_CACHE_METADATA, _CACHE_IC, _CACHE_EMBEDDING = 50_000, 100_000, 50_000
-_CACHE_EXTRACTION, _ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 10_000, 200_000, 10_000
+_ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 200_000, 10_000
 _FAST_PATH_THRESHOLD, _CROSS_TOPIC_DEDUP_MIN = 200, 200
 # Minimum CUI count for Louvain to produce meaningful communities.
 # Below this threshold the k-NN graph is near-fully-connected (k gets
@@ -542,63 +541,6 @@ class ReductionResult:
     processing_time_ms: float
     embedding_coverage: float
 
-class Cache:
-    def __init__(self, max_size, persist_path=None):
-        self._max = max_size
-        self._d = OrderedDict()
-        self._lock = threading.Lock()
-        self._persist_path = persist_path
-        self._dirty = False
-        if persist_path:
-            self._load()
-
-    def _load(self):
-        try:
-            if self._persist_path and os.path.exists(self._persist_path):
-                with open(self._persist_path, "rb") as f:
-                    data = pickle.load(f)
-                if isinstance(data, dict):
-                    items = list(data.items())[-self._max:]
-                    self._d = OrderedDict(items)
-                    log(f"    Cache loaded: {len(self._d)} entries from {self._persist_path}", level="DEBUG")
-        except Exception as e:
-            log(f"    Cache load failed ({self._persist_path}): {e}", level="WARNING")
-
-    def flush(self):
-        if not self._persist_path or not self._dirty:
-            return
-        try:
-            os.makedirs(os.path.dirname(self._persist_path) or ".", exist_ok=True)
-            with self._lock:
-                with open(self._persist_path, "wb") as f:
-                    pickle.dump(dict(self._d), f, protocol=pickle.HIGHEST_PROTOCOL)
-                self._dirty = False
-                log(f"    Cache saved: {len(self._d)} entries to {self._persist_path}", level="DEBUG")
-        except Exception as e:
-            log(f"    Cache save failed ({self._persist_path}): {e}", level="WARNING")
-
-    def get(self, key):
-        with self._lock:
-            if key in self._d:
-                self._d.move_to_end(key)
-                return self._d[key]
-        return None
-
-    def put(self, key, val):
-        with self._lock:
-            if key in self._d:
-                self._d.move_to_end(key)
-            self._d[key] = val
-            self._dirty = True
-            if len(self._d) > self._max:
-                # batch evict to 90% capacity to avoid per-insert overhead
-                trim_to = int(self._max * 0.9)
-                excess = len(self._d) - trim_to
-                for _ in range(excess):
-                    self._d.popitem(last=False)
-
-    def __len__(self):
-        return len(self._d)
 
 # ── BigQuery Fetchers ─────────────────────────────────────────────────────────
 
@@ -607,23 +549,12 @@ class MetadataFetcher:
         self.bq = bq
         self.pid = pid
         self.did = did
-        path = os.path.join(cache_dir, "metadata_cache.pkl") if cache_dir else None
-        self._cache = Cache(_CACHE_METADATA, persist_path=path)
 
     @timed("metadata_fetch")
     def fetch(self, cuis):
         result = {}
-        missing = []
-        for c in cuis:
-            cached = self._cache.get(c)
-            if cached is not None:
-                result[c] = cached
-            else:
-                missing.append(c)
-        if not missing:
-            return result
-        for i in range(0, len(missing), _BQ_BATCH):
-            batch = missing[i:i + _BQ_BATCH]
+        for i in range(0, len(cuis), _BQ_BATCH):
+            batch = cuis[i:i + _BQ_BATCH]
             query = f"""
             SELECT
               c.CUI AS cui,
@@ -643,7 +574,6 @@ class MetadataFetcher:
                     semantic_types=list(row.stys or []),
                     semantic_type_ids=list(row.tuis or []),
                     ic_score=0.0, source_vocabs=list(row.sabs or []))
-                self._cache.put(row.cui, meta)
                 result[row.cui] = meta
         return result
 
@@ -651,7 +581,6 @@ class ICComputer:
     def __init__(self, graph, precomputed=None):
         self.graph = graph
         self.precomputed = precomputed or {}
-        self._cache = Cache(_CACHE_IC)
         self._total = max(graph.number_of_nodes(), 1)
 
     @timed("ic_compute")
@@ -661,13 +590,8 @@ class ICComputer:
             if cui in self.precomputed:
                 ic = self.precomputed[cui]
             else:
-                cached = self._cache.get(cui)
-                if cached is not None:
-                    ic = cached
-                else:
-                    desc = self._count_descendants(cui)
-                    ic = -np.log((desc + 1) / self._total)
-                    self._cache.put(cui, ic)
+                desc = self._count_descendants(cui)
+                ic = -np.log((desc + 1) / self._total)
             result[cui] = ic
             m = metadata.get(cui)
             if m:
@@ -754,8 +678,6 @@ class EmbeddingFetcher:
         self.pid = pid
         self.did = did
         self.table = embedding_table
-        path = os.path.join(cache_dir, "embedding_cache.pkl") if cache_dir else None
-        self._cache = Cache(_CACHE_EMBEDDING, persist_path=path)
         self._pool = ThreadPoolExecutor(max_workers=_EMB_FETCH_WORKERS)
 
     def _fetch_batch(self, batch):
@@ -783,26 +705,16 @@ class EmbeddingFetcher:
 
     @timed("embedding_fetch")
     def fetch(self, cuis):
-        result, missing = {}, []
-        for c in cuis:
-            cached = self._cache.get(c)
-            if cached is not None:
-                result[c] = cached
-            else:
-                missing.append(c)
-        if not missing:
-            return result
-        batches = [missing[i:i + _BQ_BATCH] for i in range(0, len(missing), _BQ_BATCH)]
+        result = {}
+        batches = [cuis[i:i + _BQ_BATCH] for i in range(0, len(cuis), _BQ_BATCH)]
         futures = [self._pool.submit(self._fetch_batch, b) for b in batches]
         for f in futures:
             for cui, vec in f.result():
-                self._cache.put(cui, vec)
                 result[cui] = vec
         coverage = len(result) / len(cuis) * 100 if cuis else 0
         dim = next(iter(result.values())).shape[0] if result else 0
         log(f"    Embeddings: {len(result)}/{len(cuis)} ({coverage:.1f}%) | "
-            f"dim={dim} | cache_hits={len(cuis)-len(missing)} | "
-            f"fetched={len(result)-(len(cuis)-len(missing))}", level="DEBUG")
+            f"dim={dim}", level="DEBUG")
         return result
 
     def close(self):
@@ -1695,13 +1607,12 @@ class CUIReductionSystem:
                  ic_scores=None,
                  cache_dir=None):
         self.bq = bigquery.Client(project=project_id)
-        self.cache_dir = cache_dir
-        self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id, cache_dir=cache_dir)
+        self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
         self.ic_computer = ICComputer(full_network, ic_scores)
         self.sab_filter = SABFilter(allowed_sabs)
         self.hierarchy_reducer = HierarchyReducer(full_network)
         self.emb_fetcher = EmbeddingFetcher(
-            self.bq, project_id, dataset_id, embedding_table, cache_dir=cache_dir)
+            self.bq, project_id, dataset_id, embedding_table)
 
     @timed("full_pipeline")
     def reduce(self, cuis, context_string, extraction_distances=None):
@@ -1852,7 +1763,6 @@ class CUIReductionSystem:
                 audit_trail=all_audit,
                 processing_time_ms=elapsed,
                 embedding_coverage=emb_cov))
-        self._flush_caches()
         return results
 
     def _build_topics(self, topics, metadata):
@@ -1877,13 +1787,8 @@ class CUIReductionSystem:
                 pruned[tid] = TopicInfo(tid, t.semantic_types, kept)
         return pruned
 
-    def _flush_caches(self):
-        self.fetcher._cache.flush()
-        self.emb_fetcher._cache.flush()
-
     def close(self):
         """Shut down resources. Call when done processing all documents."""
-        self._flush_caches()
         self.emb_fetcher.close()
 
     def _empty(self, ctx, t0, audit=None):
@@ -2451,8 +2356,6 @@ class CUIExtractor:
         self.top_p = top_p
         self.cluster_set = cluster_set
         self.combined = combined
-        path = os.path.join(cache_dir, "extraction_cache.pkl") if cache_dir else None
-        self._cache = Cache(_CACHE_EXTRACTION, persist_path=path)
         self.session = requests.Session()
         try:
             token = subprocess.run(
@@ -2497,73 +2400,49 @@ class CUIExtractor:
         Returns:
             dict {phrase: {"cuis": {cui: distance}, "context": ClinicalContext}}
         """
-        # ── Phase 1: CUI extraction (cacheable) ──────────────────────────
-        cache_key = (
-            "||".join(sorted(text_list)),
-            self.top_k, self.top_p,
-            self.cluster_set, self.combined
-        )
-
-        raw_per_phrase = None
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            if isinstance(cached, dict):
-                first = next(iter(cached.values()), None)
-                # Accept both formats: raw {phrase: {cui: dist}} or
-                # tagged {phrase: {"cuis": {cui: dist}, ...}}
-                if isinstance(first, dict) and "cuis" in first:
-                    raw_per_phrase = {p: v["cuis"] for p, v in cached.items()
-                                     if v.get("cuis")}
-                elif isinstance(first, dict):
-                    raw_per_phrase = {p: v for p, v in cached.items() if v}
-
-        if raw_per_phrase is None:
-            # Cache miss — call extraction API
-            payload = {
-                "cluster_set": self.cluster_set,
-                "text_list": text_list,
-                "context_list": context_list,
-                "top_k": self.top_k,
-                "top_p": self.top_p,
-                "combined": self.combined
-            }
-            try:
+        # ── Phase 1: CUI extraction ───────────────────────────────────────
+        payload = {
+            "cluster_set": self.cluster_set,
+            "text_list": text_list,
+            "context_list": context_list,
+            "top_k": self.top_k,
+            "top_p": self.top_p,
+            "combined": self.combined
+        }
+        try:
+            resp = self.session.post(
+                self.url, headers=self.headers,
+                json=payload, timeout=_API_TIMEOUT)
+            if resp.status_code == 401:
+                self._refresh_token()
                 resp = self.session.post(
                     self.url, headers=self.headers,
                     json=payload, timeout=_API_TIMEOUT)
-                if resp.status_code == 401:
-                    self._refresh_token()
-                    resp = self.session.post(
-                        self.url, headers=self.headers,
-                        json=payload, timeout=_API_TIMEOUT)
-                resp.raise_for_status()
-                data = resp.json()
-            except requests.exceptions.RequestException as e:
-                log(f"    Extraction API error: {e}", level="ERROR")
-                return {}
-            except (ValueError, KeyError) as e:
-                log(f"    Extraction API response parse error: {e}", level="ERROR")
-                return {}
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            log(f"    Extraction API error: {e}", level="ERROR")
+            return {}
+        except (ValueError, KeyError) as e:
+            log(f"    Extraction API response parse error: {e}", level="ERROR")
+            return {}
 
-            raw_per_phrase = {}
-            output = data.get("output", {})
-            for phrase, clusters in output.items():
-                if not isinstance(clusters, list):
-                    continue
-                cui_dists = {}
-                for cluster in clusters:
-                    for member in cluster.get("members", []):
-                        c = str(member.get("member_code", ""))
-                        if c:
-                            dist = member.get("member_code_distance")
-                            d = float(dist) if dist is not None else None
-                            if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
-                                cui_dists[c] = d
-                if cui_dists:
-                    raw_per_phrase[phrase] = cui_dists
-        else:
-            log(f"    Extraction: {sum(len(v) for v in raw_per_phrase.values())} "
-                f"CUIs across {len(raw_per_phrase)} phrases (API cached)")
+        raw_per_phrase = {}
+        output = data.get("output", {})
+        for phrase, clusters in output.items():
+            if not isinstance(clusters, list):
+                continue
+            cui_dists = {}
+            for cluster in clusters:
+                for member in cluster.get("members", []):
+                    c = str(member.get("member_code", ""))
+                    if c:
+                        dist = member.get("member_code_distance")
+                        d = float(dist) if dist is not None else None
+                        if c not in cui_dists or (d is not None and d < cui_dists.get(c, float('inf'))):
+                            cui_dists[c] = d
+            if cui_dists:
+                raw_per_phrase[phrase] = cui_dists
 
         # ── Phase 2: ConText tagging (never cached, always fresh) ─────────
         # batch_parse processes the full document once — O(n_tokens) total,
@@ -2598,6 +2477,4 @@ class CUIExtractor:
             f"(negated_removed={n_negated}, hist={n_historical}, "
             f"hypo={n_hypothetical}, family={n_family})")
 
-        # Cache raw CUI extraction only (no ConText tags)
-        self._cache.put(cache_key, {p: v["cuis"] for p, v in per_phrase.items()})
         return per_phrase
