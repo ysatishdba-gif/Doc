@@ -1,43 +1,27 @@
-"""
-CUI Pipeline — Configuration
-"""
+from config import (PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH,
+                    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED)
+from cui_core import CUIExtractor
+from cui_summarizer import CUISummarizer
+from cui_topics import CUITopics
 
-import os, sys, pickle
-import networkx
+extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P, cluster_set=CLUSTER_SET, combined=COMBINED)
+summarizer = CUISummarizer(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH)
+topics_mod = CUITopics(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH)
 
-PROJECT_ID      = "your-project-id"
-DATASET_ID      = "your-dataset-id"
-EMBEDDING_TABLE = "cui_embeddings"
+queries = [
+    "severe persistent asthma with allergic rhinitis",
+    "knee arthroplasty",
+    "type 2 diabetes with hypertension",
+]
 
-API_URL         = "your-extraction-api-url"
-TOP_K           = 6
-TOP_P           = 5000
-CLUSTER_SET     = "umls"
-COMBINED        = True
+for q in queries:
+    raw = extractor.extract([q], [q])
+    cuis = [c for d in raw.values() for c in d["cuis"]]
 
-OUTPUT_DIR      = "output/"
-HIERARCHY_PATH  = "umls_hierarchy.pkl"
-IC_PATH         = "ic_precomputed.pkl"
+    s = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
+    t = topics_mod.build_topics([c["cui"] for c in s["concise_cuis"]])
 
-ALLOWED_SABS    = {"SNOMEDCT_US"}
+    print(q, "->", s["metrics"]["output_code_count"], "CUIs,", t["metrics"]["topic_count"], "topics")
 
-LLM_PROJECT_ID  = PROJECT_ID
-LLM_LOCATION    = "us-central1"
-LLM_MODEL       = "gemini-2.0-flash"
-LLM_MAX_TOKENS  = 1500
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-if not os.path.exists(HIERARCHY_PATH):
-    print(f"ERROR: {HIERARCHY_PATH} not found"); sys.exit(1)
-with open(HIERARCHY_PATH, "rb") as f:
-    hierarchy = pickle.load(f)
-assert isinstance(hierarchy, networkx.DiGraph)
-
-if not os.path.exists(IC_PATH):
-    print(f"ERROR: {IC_PATH} not found. Run ic_precompute.py first."); sys.exit(1)
-with open(IC_PATH, "rb") as f:
-    ic_precomputed = pickle.load(f)
-assert isinstance(ic_precomputed, dict) and len(ic_precomputed) > 0
-
-print(f"Config: {hierarchy.number_of_nodes()} nodes, {len(ic_precomputed)} IC scores")
+summarizer.close()
+topics_mod.close()
