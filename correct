@@ -9,37 +9,32 @@ summarizer = CUISummarizer(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBE
 topics_mod = CUITopics(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
 
 
-# --- AC1: core summarization + AC2: metrics ---
-
-print("=" * 60)
-print("AC1+AC2: Summarize + Metrics")
-print("=" * 60)
-
+# extract CUIs from a query
 raw = extractor.extract(["severe persistent asthma with allergic rhinitis"],
                          ["severe persistent asthma with allergic rhinitis"])
 cuis = [c for d in raw.values() for c in d["cuis"]]
-print(f"\nExtracted: {len(cuis)} raw CUIs")
+print(f"extracted: {len(cuis)} CUIs")
 
+
+# summarize with source filter
 s = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
 m = s["metrics"]
+print(f"\nsummarized: {m['input_code_count']} -> {m['output_code_count']}")
+print(f"retention: {m['information_retention_score']}")
 
-print(f"\nMetrics:")
-print(f"  input_code_count:            {m['input_code_count']}")
-print(f"  output_code_count:           {m['output_code_count']}")
-print(f"  information_retention_score: {m['information_retention_score']}")
-
-print(f"\nKept ({len(s['concise_cuis'])}):")
+print(f"\nkept:")
 for c in s["concise_cuis"]:
     print(f"  {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
 
-if s["removed_cuis"]:
-    print(f"\nRemoved ({len(s['removed_cuis'])}):")
-    for c in s["removed_cuis"]:
-        print(f"  {c['cui']}  {c['preferred_term']}  <- {c['reason']} (by {c['retained_by']})")
+print(f"\nremoved:")
+for c in s["removed_cuis"]:
+    print(f"  {c['cui']}  {c['preferred_term']}  <- {c['reason']} (by {c['retained_by']})")
 
+
+# build topics from surviving CUIs
 surviving = [c["cui"] for c in s["concise_cuis"]]
 t = topics_mod.build_topics(surviving)
-print(f"\nTopics ({t['metrics']['topic_count']}):")
+print(f"\ntopics: {t['metrics']['topic_count']}")
 for topic in t["topics"]:
     print(f"\n  [{topic['topic_id']}] {topic['topic_label']}")
     for mem in topic["members"]:
@@ -50,67 +45,35 @@ for topic in t["topics"]:
             print(f"      {sm['cui']}  {sm['preferred_term']}  IC={sm['ic']}")
 
 
-# --- AC3: source filtering ---
-
-print("\n" + "=" * 60)
-print("AC3: Source Filtering")
-print("=" * 60)
-
-r_filtered = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
+# same CUIs without source filter vs with
 r_all = summarizer.summarize(cuis)
-print(f"\n  sources=['SNOMEDCT_US']: {r_filtered['metrics']['input_code_count']} -> {r_filtered['metrics']['output_code_count']}")
-print(f"  sources=None (all):      {r_all['metrics']['input_code_count']} -> {r_all['metrics']['output_code_count']}")
+r_snomed = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
+print(f"\nno filter: {r_all['metrics']['input_code_count']} -> {r_all['metrics']['output_code_count']}")
+print(f"SNOMEDCT_US only: {r_snomed['metrics']['input_code_count']} -> {r_snomed['metrics']['output_code_count']}")
 
 
-# --- AC4: network object ---
-
-print("\n" + "=" * 60)
-print("AC4: Network Object")
-print("=" * 60)
-
+# network object
 s_net = summarizer.summarize(cuis, sources=["SNOMEDCT_US"], return_network_object=True)
 net = s_net["network_object"]
-print(f"\n  nodes: {net['node_count']}  edges: {net['edge_count']}")
+print(f"\nnetwork: {net['node_count']} nodes, {net['edge_count']} edges")
 for n in net["nodes"]:
-    status = "SELECTED" if n["is_selected"] else f"REMOVED ({n.get('removal_reason', '')})"
-    print(f"    {n['cui']}  {n['preferred_term']}  {status}")
+    sel = "kept" if n["is_selected"] else f"removed ({n.get('removal_reason', '')})"
+    print(f"  {n['cui']}  {n['preferred_term']}  {sel}")
 for e in net["edges"]:
-    print(f"    edge: {e['source']} -> {e['target']}  ({e['relationship']})")
+    print(f"  {e['source']} -> {e['target']}  {e['relationship']}")
 
 
-# --- AC5: non-hierarchical codes ---
-
-print("\n" + "=" * 60)
-print("AC5: Non-Hierarchical Codes")
-print("=" * 60)
-
+# unrelated codes — nothing should be removed
 raw_nh = extractor.extract(["headache", "glioblastoma"], ["headache", "glioblastoma"])
 cuis_nh = [c for d in raw_nh.values() for c in d["cuis"]]
 s_nh = summarizer.summarize(cuis_nh, sources=["SNOMEDCT_US"])
-print(f"\n  Input: headache + glioblastoma (unrelated)")
-print(f"  In: {s_nh['metrics']['input_code_count']}  Out: {s_nh['metrics']['output_code_count']}")
-for c in s_nh["concise_cuis"]:
-    print(f"    {c['cui']}  {c['preferred_term']}")
+print(f"\nunrelated (headache + glioblastoma): {s_nh['metrics']['input_code_count']} -> {s_nh['metrics']['output_code_count']}")
 
 
-# --- AC6: empty input ---
-
-print("\n" + "=" * 60)
-print("AC6: Empty Input")
-print("=" * 60)
-
+# empty input
 s_empty = summarizer.summarize([])
-print(f"\n  concise_cuis: {s_empty['concise_cuis']}")
-print(f"  input_code_count:            {s_empty['metrics']['input_code_count']}")
-print(f"  output_code_count:           {s_empty['metrics']['output_code_count']}")
-print(f"  information_retention_score: {s_empty['metrics']['information_retention_score']}")
+print(f"empty: {s_empty['metrics']['input_code_count']} -> {s_empty['metrics']['output_code_count']} retention={s_empty['metrics']['information_retention_score']}")
 
-
-# --- done ---
-
-print("\n" + "=" * 60)
-print("All acceptance criteria demonstrated.")
-print("=" * 60)
 
 summarizer.close()
 topics_mod.close()
