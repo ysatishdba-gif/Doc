@@ -1,355 +1,242 @@
-INPUT: "knee arthroplasty"
-│
-│
-═══ PIPELINE 1: CUI Summary ════════════════════════════════════════════════
-│
-├── STAGE 1: API extraction (TOP_K=3, COMBINED=True)
-│   │
-│   └── 25 CUIs returned:
-│       C0745532  dist=0.218  Knee arthroplasty prosthesis placement
-│       C1536796  dist=0.221  Knee arthroplasty (& replacement)
-│       C0187960  dist=0.224  Prosthetic arthroplasty of knee joint
-│       C0375841  dist=0.225  Knee joint replacement
-│       C5768203  dist=0.229  Prosthetic arthroplasty of right knee
-│       C0845658  dist=0.232  Total arthroplasty of knee, unilateral
-│       C3873937  dist=0.235  Knee femur prosthesis
-│       C5568443  dist=0.238  Arthroplasty of knee planned
-│       C0086511  dist=0.241  Knee Replacement Arthroplasty
-│       C5688901  dist=0.243  Arthroplasty using robotic assistance
-│       C0188146  dist=0.245  Arthroplasty of knee, tibial plateau
-│       ... +14 more (ICD10PCS, ICD10CM codes)
-│
-│   ConText: negated=0, historical=0 → all 25 survive
-│
-├── STAGE 2: SAB filter (ALLOWED_SABS = {SNOMEDCT_US})
-│   │
-│   │  REMOVED (15):
-│   │    C0745532  ← ICD10PCS
-│   │    C1536796  ← ICD10PCS
-│   │    ... 13 more non-SNOMED
-│   │
-│   └── 25 → 10 surviving:
-│       C0187960  IC=12.8  Prosthetic arthroplasty of knee joint    [Procedure]
-│       C0375841  IC=11.2  Knee joint replacement                    [Procedure]
-│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee    [Procedure]
-│       C0845658  IC=13.5  Total arthroplasty of knee, unilateral   [Procedure]
-│       C3873937  IC=14.8  Knee femur prosthesis                     [Device]
-│       C5768204  IC=14.8  Prosthetic arthroplasty of left knee     [Procedure]
-│       C5568443  IC=14.8  Arthroplasty of knee planned             [Procedure]
-│       C0086511  IC=10.5  Knee Replacement Arthroplasty            [Procedure]
-│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau     [Procedure]
-│       C5688901  IC=14.8  Arthroplasty using robotic assistance    [Procedure]
-│
-├── STAGE 3: metadata + IC lookup
-│   │
-│   │  IC = −log((descendants+1)/total)
-│   │  All 10 valid SNOMED, all have IC scores
-│   │
-│   └── 10 → 10 (nothing removed)
-│
-├── STAGE 4: hierarchy reduction (ancestor_depth=5, UP 1 hop)
-│   │
-│   │  Check: is parent also in our set? same type? IC(child) ≥ IC(parent)?
-│   │
-│   │  PAIR 1:
-│   │    C0086511  IC=10.5  Knee Replacement Arthroplasty      ← PARENT
-│   │    C0845658  IC=13.5  Total arthroplasty of knee          ← CHILD
-│   │    same type (Procedure), IC 13.5 ≥ 10.5 → REMOVE C0086511
-│   │
-│   │  PAIR 2:
-│   │    C0375841  IC=11.2  Knee joint replacement              ← PARENT
-│   │    C0187960  IC=12.8  Prosthetic arthroplasty of knee     ← CHILD
-│   │    same type (Procedure), IC 12.8 ≥ 11.2 → REMOVE C0375841
-│   │
-│   └── 10 → 8 surviving:
-│       C0187960  IC=12.8  Prosthetic arthroplasty of knee joint
-│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee
-│       C0845658  IC=13.5  Total arthroplasty of knee, unilateral
-│       C3873937  IC=14.8  Knee femur prosthesis                  [Device]
-│       C5768204  IC=14.8  Prosthetic arthroplasty of left knee
-│       C5568443  IC=14.8  Arthroplasty of knee planned
-│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau
-│       C5688901  IC=14.8  Arthroplasty using robotic assistance
-│
-├── STAGE 5: embedding reduction (n=8 ≤ 20 → fast path, no Louvain)
-│   │
-│   │  Fetch 3072-dim embeddings for 8 CUIs
-│   │  8×8 matrix → 28 pairwise cosine distances
-│   │
-│   │  OTSU on 28 distances:
-│   │    sorted: 0.03, 0.04, 0.06, 0.07, ─gap─, 0.18, 0.22, 0.25, ...0.45
-│   │    try split at 0.07: score = 0.0021
-│   │    try split at 0.18: score = 0.0038  ← HIGHEST
-│   │    try split at 0.22: score = 0.0029
-│   │    → threshold = 0.18, median cap = 0.25, tight_t = 0.18
-│   │
-│   │  6 pairs below 0.18 → check guards:
-│   │
-│   │  PAIR: C0187960 (Prosthetic arthroplasty) ↔ C0845658 (Total arthroplasty)
-│   │    dist=0.03
-│   │    G1: parent-child? NO
-│   │    G2: types? NO (both Procedure)
-│   │    G3: ancestors? NO (share "Arthroplasty of knee")
-│   │    G4: siblings? NO
-│   │    → ALL FAILED → REMOVE C0845658 (lower IC: 13.5 < 14.8)
-│   │
-│   │  PAIR: C5768203 (right knee) ↔ C5768204 (left knee)
-│   │    dist=0.04
-│   │    G1: parent-child? NO
-│   │    G2: types? NO (both Procedure)
-│   │    G3: ancestors? NO (share same ancestors)
-│   │    G4: sibling leaves? YES — both leaf nodes, same parent
-│   │    → G4 FIRED → KEEP BOTH
-│   │    ... but C5768204 removed by another pair later (dup of C0187960)
-│   │
-│   │  PAIR: C3873937 (Knee femur prosthesis) ↔ C0188146 (Arthroplasty tibial)
-│   │    dist=0.12
-│   │    G1: parent-child? NO
-│   │    G2: types? YES — Device ≠ Procedure
-│   │    → G2 FIRED → KEEP BOTH
-│   │
-│   │  ... 3 more pairs checked, 2 more duplicates found ...
-│   │
-│   └── 8 → 5 surviving:
-│       C5568443  IC=14.8  Arthroplasty of knee planned           (planning)
-│       C5688901  IC=14.8  Arthroplasty using robotic assistance  (method)
-│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee  (laterality)
-│       C3873937  IC=14.8  Knee femur prosthesis                   (device)
-│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau   (site)
-│
-│
-═══ PIPELINE 2: TOPIC FORMATION ══════════════════════════════════════════════
-│
-├── ADAPTIVE PARAMETERS:
-│   │  IC floor = p10([14.8, 14.8, 14.8, 14.8, 14.8]) = 14.8
-│   │  max_coverage = max(2, 5/√5) = 2
-│
-├── STAGE 6: BFS walk UP from each CUI (max 5 hops, gradient 0.3 at hop 3+)
-│   │
-│   │  FROM C5568443 (Arthroplasty of knee planned, IC=14.8):
-│   │    hop 1: Arthroplasty of knee joint       IC=9.7   (grace period, always walk)
-│   │    hop 2: Operation on knee                IC=6.4   (grace period, always walk)
-│   │    hop 3: Surgical procedure on joint      IC=3.1   (ratio 3.1/6.4=0.48 > 0.3 → walk)
-│   │    hop 4: Procedure                        IC=0.8   (ratio 0.8/3.1=0.26 < 0.3 → STOP)
-│   │
-│   │  FROM C5688901 (Robotic assistance, IC=14.8):
-│   │    hop 1: Arthroplasty of knee joint       IC=9.7   ← SAME as C5568443
-│   │    hop 2: Operation on knee                IC=6.4
-│   │    hop 3: Surgical procedure on joint      IC=3.1
-│   │    hop 4: STOP (gradient)
-│   │
-│   │  FROM C0188146 (Tibial plateau, IC=14.8):
-│   │    hop 1: Arthroplasty of knee joint       IC=9.7   ← SAME again
-│   │    hop 2: Operation on knee                IC=6.4
-│   │    hop 3: STOP
-│   │
-│   │  FROM C5768203 (Right knee, IC=14.8):
-│   │    hop 1: Prosthesis of knee               IC=10.2  ← DIFFERENT branch
-│   │    hop 2: Operation on knee                IC=6.4
-│   │    hop 3: STOP
-│   │
-│   │  FROM C3873937 (Knee femur prosthesis, IC=14.8):
-│   │    hop 1: Prosthesis of knee               IC=10.2  ← SAME as C5768203
-│   │    hop 2: Operation on knee                IC=6.4
-│   │    hop 3: STOP
-│   │
-│   │  ALL ANCESTORS COLLECTED:
-│   │    Arthroplasty of knee joint   IC=9.7    from: C5568443, C5688901, C0188146
-│   │    Prosthesis of knee           IC=10.2   from: C5768203, C3873937
-│   │    Operation on knee            IC=6.4    from: all 5
-│   │    Surgical procedure on joint  IC=3.1    from: C5568443, C5688901
-│   │    Procedure                    IC=0.8    from: C5568443 (stopped at gradient)
-│   │
-├── FILTER: 3 rules on each ancestor
-│   │
-│   │  Arthroplasty of knee joint  IC=9.7
-│   │    covers ≥2? YES (3 CUIs)
-│   │    IC ≥ 14.8 (floor)? NO → REJECTED
-│   │
-│   │  Prosthesis of knee  IC=10.2
-│   │    covers ≥2? YES (2 CUIs)
-│   │    IC ≥ 14.8? NO → REJECTED
-│   │
-│   │  Operation on knee  IC=6.4
-│   │    covers ≥2? YES (5 CUIs)
-│   │    IC ≥ 14.8? NO → REJECTED
-│   │
-│   │  ALL REJECTED (floor is 14.8 — very high because all 5 CUIs are IC=14.8)
-│   │
-│   │  → No convergence points found
-│   │  → All 5 CUIs become part of a single topic using the
-│   │    best available ancestor below the strict floor
-│   │  → "Arthroplasty of knee joint" (IC=9.7) selected as topic_cui
-│   │
-│   └── FINAL TOPIC:
-│       │
-│       │  TOPIC: Arthroplasty of knee joint (topic_cui)
-│       │  │
-│       │  ├── Subtopic A: Prosthesis of knee (IC=10.2)
-│       │  │   ├── C5768203  IC=14.8  Prosthetic arthroplasty of R knee
-│       │  │   └── C3873937  IC=14.8  Knee femur prosthesis
-│       │  │
-│       │  └── Subtopic B: Arthroplasty of knee joint (IC=9.7)
-│       │      ├── C5568443  IC=14.8  Arthroplasty of knee planned
-│       │      ├── C5688901  IC=14.8  Arthroplasty using robotic assistance
-│       │      └── C0188146  IC=14.8  Arthroplasty of knee, tibial plateau
-│       │
-│       │  1 topic, 2 subtopics, 5 member CUIs
-│       │
-├── STAGE 7: representatives
-│   │  Rep from Subtopic A: C5768203 (highest centroid sim)
-│   │  Rep from Subtopic B: C5568443 (highest centroid sim)
-│   │  → 2 reps
-│   │
-├── STAGE 8: centroid
-│   │  mean(embeddings of C5568443, C5688901, C5768203, C3873937, C0188146)
-│   │  L2-normalize → 3072-dim query centroid
-│   │
-│
-│
-═══ PIPELINE 3: QUERY MATCHING ═══════════════════════════════════════════════
-│
-│  Query: 1 topic, 5 CUIs, 1 centroid
-│  Store: 5 documents, 236 topic groups
-│
-├── PASS 1: topic gate
-│   │
-│   │  Query centroid × 236 group centroids (one matrix multiply):
-│   │
-│   │    topic_14 (case_2 knee surgery):  sim = 0.72
-│   │    topic_71 (case_1 asthma group):  sim = 0.15
-│   │    topic_03 (case_1 medications):   sim = 0.08
-│   │    topic_99 (case_3 diabetes):      sim = 0.06
-│   │    ... 232 more below 0.06 ...
-│   │
-│   │  gap_split:
-│   │    sorted: 0.72, 0.15, 0.08, 0.06, ...
-│   │    gaps:   0.72→0.15 = 0.57 ← BIGGEST
-│   │            0.15→0.08 = 0.07
-│   │            0.08→0.06 = 0.02
-│   │    split at 0.57 → topic_14 (0.72) admitted
-│   │
-│   │  CUI overlap rescue on excluded:
-│   │    topic_71 shares C3873937 (Knee femur prosthesis) → admitted
-│   │    others: no shared CUIs
-│   │
-│   │  → 2/236 admitted to Pass 2
-│   │
-│   │  Precompute: ancestors for all doc CUIs in admitted groups (8 hops)
-│   │  Include: topic_cui in matchable set
-│   │
-├── PASS 2: score topic_14 (case_2 knee surgery)
-│   │
-│   │  Topic_14 members: C5768203, C0845658, C0187960, C0375841, C0086511 + topic_cui
-│   │
-│   │  ── SIGNAL 1: cui_ratio ──
-│   │
-│   │  Q1 (C5768203) vs topic_14:
-│   │    vs C5768203: EXACT MATCH → credit = 1.000 → STOP Q1
-│   │
-│   │  Q2 (C0188146, tibial plateau) vs topic_14:
-│   │    exact? NO for all
-│   │    parent-child? walk 8 hops UP from Q2 and each topic CUI:
-│   │      C0187960 is parent of Q2 → YES
-│   │      credit = IC(C0187960)/IC(C0188146) = 12.8/14.8 = 0.865 → STOP Q2
-│   │
-│   │  Q3 (C5688901, robotic) vs topic_14:
-│   │    exact? NO
-│   │    parent-child? NO
-│   │    MICA:
-│   │      Q3 vs C0187960: MICA = Arthroplasty of knee (IC=9.7)
-│   │        Lin = 2×9.7/(14.8+12.8) = 19.4/27.6 = 0.703 ← best
-│   │      Q3 vs C0845658: MICA = Arthroplasty of knee (IC=9.7)
-│   │        Lin = 2×9.7/(14.8+13.5) = 19.4/28.3 = 0.686
-│   │      Q3 vs C0375841: MICA = Operation on knee (IC=6.4)
-│   │        Lin = 2×6.4/(14.8+11.2) = 12.8/26.0 = 0.492
-│   │    credit = 0.703 → STOP Q3
-│   │
-│   │  Q4 (C3873937, prosthesis [Device]) vs topic_14:
-│   │    exact? NO
-│   │    parent-child? NO (Device vs Procedure branches)
-│   │    MICA:
-│   │      Q4 vs C0845658: MICA = Knee procedure (IC=5.5)
-│   │        Lin = 2×5.5/(14.8+13.5) = 11.0/28.3 = 0.389 ← best
-│   │    credit = 0.389 → STOP Q4
-│   │
-│   │  Q5 (C5568443, planned) vs topic_14:
-│   │    exact? NO
-│   │    parent-child? C0086511 is ancestor of Q5 at hop 2 → YES
-│   │      credit = IC(C0086511)/IC(C5568443) = 10.5/14.8 = 0.709 → STOP Q5
-│   │
-│   │  cui_ratio = (1.000 + 0.865 + 0.703 + 0.389 + 0.709) / 5 = 0.733
-│   │
-│   │  ── SIGNAL 2: vec_sim ──
-│   │
-│   │  dot(query centroid, topic_14 centroid) = 0.82
-│   │  (both are knee arthroplasty embeddings → high similarity)
-│   │
-│   │  ── SIGNAL 3: lin_avg ──
-│   │
-│   │  Q1: exact → skip
-│   │  Q2: parent-child → skip
-│   │  Q3: MICA match → Lin = 0.703
-│   │  Q4: MICA match → Lin = 0.389
-│   │  Q5: parent-child → skip
-│   │
-│   │  lin_avg = (0.703 + 0.389) / 2 = 0.546
-│   │
-│   │  → topic_14: cui_ratio=0.733  vec_sim=0.82  lin_avg=0.546
-│   │
-├── PASS 2: score topic_71 (case_1 asthma group with shared CUI)
-│   │
-│   │  Q1 (C5768203): exact? NO. parent-child? NO. MICA → Lin=0.12
-│   │  Q2 (C0188146): no match → 0
-│   │  Q3 (C5688901): no match → 0
-│   │  Q4 (C3873937): EXACT MATCH with shared CUI → credit=1.000
-│   │  Q5 (C5568443): no match → 0
-│   │
-│   │  cui_ratio = (0.12 + 0 + 0 + 1.000 + 0) / 5 = 0.224
-│   │  vec_sim = 0.15 (asthma centroid far from knee centroid)
-│   │  lin_avg = average(0.12, 0, 0, 0) = 0.03
-│   │
-│   │  → topic_71: cui_ratio=0.224  vec_sim=0.15  lin_avg=0.03
-│   │
-├── PASS 3: z-score normalize
-│   │
-│   │              cui_ratio    vec_sim    lin_avg
-│   │  topic_14      0.733       0.82       0.546
-│   │  topic_71      0.224       0.15       0.030
-│   │
-│   │  mean:         0.479       0.485      0.288
-│   │  std:          0.360       0.474      0.365
-│   │
-│   │  z-scores:
-│   │  topic_14: z_cui=(0.733-0.479)/0.360 = +0.71
-│   │            z_vec=(0.82-0.485)/0.474  = +0.71
-│   │            z_lin=(0.546-0.288)/0.365 = +0.71
-│   │            sum = +2.13
-│   │
-│   │  topic_71: z_cui=(0.224-0.479)/0.360 = -0.71
-│   │            z_vec=(0.15-0.485)/0.474  = -0.71
-│   │            z_lin=(0.030-0.288)/0.365 = -0.71
-│   │            sum = -2.13
-│   │
-│   │  normalize to [0,1]:
-│   │    topic_14: (2.13-(-2.13)) / 4.26 = 1.000
-│   │    topic_71: (-2.13-(-2.13)) / 4.26 = 0.000
-│   │
-├── PASS 4: relative threshold
-│   │
-│   │  best = 1.000 (topic_14)
-│   │  threshold = 1.000 × 0.40 = 0.400
-│   │
-│   │  topic_14: 1.000 ≥ 0.400 → ✓ RETURNED
-│   │  topic_71: 0.000 < 0.400 → ✗ dropped
-│   │
-│   │  zero-evidence guard: topic_71 has cui_ratio=0.224 (not all zero) → not suppressed
-│   │                       dropped by threshold, not by guard
-│   │
-└── RESULT:
-    │
-    │  #1  case_2  score=1.000
-    │      matched CUIs: C5768203 (exact), C0188146 (parent-child), C5688901 (MICA)
-    │      chunk text: "Patient underwent total knee arthroplasty of right knee..."
-    │
-    │  
+CUI Summarization Pipeline — Walkthrough
+=========================================
+
+query: "severe persistent asthma with allergic rhinitis"
+
+
+STAGE 1: CUI extraction (API call)
+-----------------------------------
+API: top_k=6, top_p=5000, combined=True
+
+11 CUIs returned:
+  C0264408  dist=0.19  Severe persistent asthma
+  C2887456  dist=0.21  Moderate persistent asthma
+  C0004096  dist=0.23  Asthma
+  C4040110  dist=0.25  Severe exacerbation of moderate persistent asthma
+  C0035204  dist=0.28  Respiratory tract diseases
+  C0024115  dist=0.30  Lung disease
+  C0264310  dist=0.18  Allergic rhinitis
+  C0020523  dist=0.26  Hypersensitivity reaction
+  C1960050  dist=0.29  Allergic rhinitis due to pollen
+  C0231832  dist=0.32  Nasal congestion
+  C0013404  dist=0.35  Dyspnea
+
+
+STAGE 2: source filter (sources=["SNOMEDCT_US"])
+-------------------------------------------------
+check each CUI's source_vocabs from MRCONSO
+keep only CUIs present in SNOMEDCT_US
+
+removed:
+  C0035204 — only in ICD10CM, MEDCIN
+  C0024115 — only in ICD10CM, CSP
+
+11 -> 9 surviving
+
+
+STAGE 3: metadata + IC lookup
+------------------------------
+fetch semantic types from MRSTY
+IC = -log((descendants + 1) / total_nodes)
+
+  C0264408  IC=14.2  Severe persistent asthma         [Disease or Syndrome]
+  C2887456  IC=14.5  Moderate persistent asthma        [Disease or Syndrome]
+  C0004096  IC=7.8   Asthma                            [Disease or Syndrome]
+  C4040110  IC=14.8  Severe exac. mod. persistent      [Disease or Syndrome]
+  C0264310  IC=12.1  Allergic rhinitis                 [Disease or Syndrome]
+  C0020523  IC=6.5   Hypersensitivity reaction         [Pathologic Function]
+  C1960050  IC=14.3  Allergic rhinitis due to pollen   [Disease or Syndrome]
+  C0231832  IC=11.8  Nasal congestion                  [Sign or Symptom]
+  C0013404  IC=10.2  Dyspnea                           [Sign or Symptom]
+
+
+STAGE 4: hierarchy reduction (full ancestor reachability)
+----------------------------------------------------------
+for each CUI, get all ancestors via networkx.ancestors()
+if an ancestor is also in our set AND same semantic type AND IC(descendant) >= IC(ancestor)
+  -> remove the ancestor
+
+  C0264408 (IC=14.2) -> ancestors include C0004096 (IC=7.8)
+    C0004096 in set? YES
+    same type? Disease = Disease -> YES
+    IC 14.2 >= 7.8? YES
+    -> REMOVE C0004096 (retained by C0264408)
+
+  C0264310 (IC=12.1) -> ancestors include C0020523 (IC=6.5)
+    C0020523 in set? YES
+    same type? Disease vs Pathologic Function -> NO overlap
+    -> KEEP C0020523 (different semantic type, guard fires)
+
+  C1960050 (IC=14.3) -> ancestors include C0264310 (IC=12.1)
+    C0264310 in set? YES
+    same type? Disease = Disease -> YES
+    IC 14.3 >= 12.1? YES
+    -> REMOVE C0264310 (retained by C1960050)
+
+  no other ancestor-descendant pairs found in set
+
+9 -> 7 surviving:
+  C0264408  IC=14.2  Severe persistent asthma
+  C2887456  IC=14.5  Moderate persistent asthma
+  C4040110  IC=14.8  Severe exac. mod. persistent
+  C0020523  IC=6.5   Hypersensitivity reaction
+  C1960050  IC=14.3  Allergic rhinitis due to pollen
+  C0231832  IC=11.8  Nasal congestion
+  C0013404  IC=10.2  Dyspnea
+
+
+STAGE 5: embedding dedup (n=7, fast path, no Louvain)
+------------------------------------------------------
+fetch 3072-dim embeddings from BQ
+7x7 matrix -> 21 pairwise cosine distances
+
+Otsu threshold on 21 distances:
+  sorted: 0.04, 0.06, 0.08, ---gap---, 0.22, 0.28, ...
+  threshold = 0.12
+
+3 pairs below threshold:
+
+  C0264408 (Severe persistent) <-> C2887456 (Moderate persistent)
+    dist=0.04
+    G1 parent-child in set? NO
+    G2 different semantic type? NO (both Disease)
+    G3 shared ancestor? NO (share "Persistent asthma")
+    G4 sibling leaves? YES — both leaf nodes under same parent
+    -> G4 FIRES -> KEEP BOTH
+
+  C0264408 (Severe persistent) <-> C4040110 (Severe exac. moderate)
+    dist=0.06
+    G1 parent-child? NO
+    G2 different type? NO
+    G3 shared ancestor? NO
+    G4 sibling? NO (different depths)
+    -> ALL GUARDS FAILED -> REMOVE C4040110 (lower IC vs C0264408? no, 14.8 > 14.2)
+       actually remove C0264408? no — C4040110 is more specific
+       -> REMOVE C0264408 (IC 14.2 < 14.8)
+
+  C0231832 (Nasal congestion) <-> C0013404 (Dyspnea)
+    dist=0.08
+    G1 parent-child? NO
+    G2 different type? NO (both Sign or Symptom)
+    G3 shared ancestor? NO
+    G4 sibling? NO
+    -> ALL GUARDS FAILED -> REMOVE C0231832 (IC 11.8 < 10.2? no)
+       -> REMOVE C0013404 (IC 10.2 < 11.8)
+
+7 -> 5 surviving:
+  C2887456  IC=14.5  Moderate persistent asthma
+  C4040110  IC=14.8  Severe exac. mod. persistent
+  C0020523  IC=6.5   Hypersensitivity reaction
+  C1960050  IC=14.3  Allergic rhinitis due to pollen
+  C0231832  IC=11.8  Nasal congestion
+
+
+METRICS:
+  input_code_count: 11
+  output_code_count: 5
+  information_retention_score: 0.92
+  stages: 11 -> 9 (src) -> 7 (hier) -> 5 (emb)
+
+
+TOPIC FORMATION
+===============
+
+input: 5 surviving CUIs
+BFS walk UP from each CUI (max 5 hops, IC gradient check at hop 3+)
+
+  C2887456 (Moderate persistent asthma)
+    hop 1: Persistent asthma      IC=10.1
+    hop 2: Asthma                 IC=7.8
+    hop 3: gradient 7.8/10.1=0.77 > 0.3 -> walk
+           Obstructive lung disease  IC=5.2
+    hop 4: gradient 5.2/7.8=0.67 > 0.3 -> walk
+           Respiratory disease    IC=3.1
+    hop 5: gradient 3.1/5.2=0.60 > 0.3 -> walk
+           Disease                IC=0.8 -> STOP (max depth)
+
+  C4040110 (Severe exac. moderate persistent)
+    hop 1: Persistent asthma      IC=10.1  <- SAME as C2887456
+    hop 2: Asthma                 IC=7.8
+    hop 3: STOP
+
+  C1960050 (Allergic rhinitis due to pollen)
+    hop 1: Allergic rhinitis      IC=12.1
+    hop 2: Rhinitis               IC=8.4
+    hop 3: STOP
+
+  C0020523 (Hypersensitivity reaction)
+    hop 1: Immune response        IC=4.2
+    hop 2: STOP
+
+  C0231832 (Nasal congestion)
+    hop 1: Nasal disorder         IC=7.9
+    hop 2: Nose disease           IC=5.8
+    hop 3: STOP
+
+convergence:
+  C2887456 + C4040110 -> both reach "Persistent asthma" (IC=10.1)
+    -> TOPIC 0: "Persistent asthma"
+       members: C2887456, C4040110
+
+  C1960050, C0020523, C0231832 -> no shared ancestor above IC floor
+    -> 3 singleton topics
+
+result:
+  topic 0: Persistent asthma
+    C2887456  IC=14.5  Moderate persistent asthma
+    C4040110  IC=14.8  Severe exac. moderate persistent asthma
+
+  topic 1: Allergic rhinitis due to pollen (singleton)
+    C1960050  IC=14.3
+
+  topic 2: Hypersensitivity reaction (singleton)
+    C0020523  IC=6.5
+
+  topic 3: Nasal congestion (singleton)
+    C0231832  IC=11.8
+
+5 CUIs -> 4 topics (3 singletons)
+
+
+NETWORK OBJECT (return_network_object=True)
+============================================
+
+nodes:
+  C0264408  Severe persistent asthma         is_selected=True
+  C2887456  Moderate persistent asthma        is_selected=True
+  C0004096  Asthma                            is_selected=False  removal=ancestor_subsumed
+  C4040110  Severe exac. mod. persistent      is_selected=True
+  C0264310  Allergic rhinitis                 is_selected=False  removal=ancestor_subsumed
+  C0020523  Hypersensitivity reaction         is_selected=True
+  C1960050  Allergic rhinitis due to pollen   is_selected=True
+  C0231832  Nasal congestion                  is_selected=True
+  C0013404  Dyspnea                           is_selected=False  removal=embedding_duplicate
+
+edges:
+  C0004096 -> C0264408  parent_child
+  C0004096 -> C2887456  parent_child
+  C0264310 -> C1960050  parent_child
+
+
+SOURCE FILTER COMPARISON
+=========================
+
+same 11 CUIs, different filters:
+
+  sources=None (all):           11 -> 8  (keeps ICD10CM CUIs)
+  sources=["SNOMEDCT_US"]:      11 -> 5  (SNOMED only)
+
+
+EDGE CASES
+===========
+
+unrelated codes:
+  summarizer.summarize(["C0018681", "C0017636"], sources=["SNOMEDCT_US"])
+  Headache + Glioblastoma
+  ancestors(Headache) does not contain Glioblastoma
+  ancestors(Glioblastoma) does not contain Headache
+  -> both kept, 2 in 2 out
+
+empty input:
+  summarizer.summarize([])
+  -> concise_cuis=[], input_code_count=0, output_code_count=0, retention=0.0
