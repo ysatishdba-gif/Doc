@@ -1,11 +1,8 @@
-"""
-Wraps CUI reduction stages 2-5 into a standalone summarization module.
-Input: raw CUI codes. Output: concise set + metrics + optional network graph.
-"""
+# cui_summarizer.py
+# Reduces a CUI set to the most specific non-redundant subset.
+# Uses stages 2-5 from cui_core (SAB filter, hierarchy, embedding dedup).
 
-import os, time, pickle, logging
-import numpy as np
-import networkx
+import time, pickle, logging
 from google.cloud import bigquery
 
 from cui_core import (
@@ -15,143 +12,135 @@ from cui_core import (
     fetch_preferred_terms,
 )
 
-log = logging.getLogger("cui_summarizer")
-log.setLevel(logging.INFO)
-log.propagate = False
-if not log.handlers:
-    log.addHandler(logging.StreamHandler())
+log = logging.getLogger(__name__)
 
 
 class CUISummarizer:
 
-    def __init__(self, project_id, dataset_id, hierarchy_path, ic_path,
-                 embedding_table="cui_embeddings"):
-        with open(hierarchy_path, "rb") as f:
+    def __init__(self, project_id, dataset_id, hier_path, ic_path,
+                 emb_table="cui_embeddings"):
+        with open(hier_path, "rb") as f:
             self._graph = pickle.load(f)
         with open(ic_path, "rb") as f:
             self._ic_pre = pickle.load(f)
 
         self._bq = bigquery.Client(project=project_id)
-        self._pid = project_id
-        self._did = dataset_id
+        self._pid, self._did = project_id, dataset_id
         self._meta = MetadataFetcher(self._bq, project_id, dataset_id)
         self._ic = ICComputer(self._graph, self._ic_pre)
         self._hier = HierarchyReducer(self._graph)
-        self._emb = EmbeddingFetcher(self._bq, project_id, dataset_id, embedding_table)
+        self._emb = EmbeddingFetcher(self._bq, project_id, dataset_id, emb_table)
         self._depth = _compute_ancestor_depth(self._graph)
 
     def summarize(self, cuis, sources=None, return_network_object=False):
-        """
-        cuis:    list of CUI strings
-        sources: optional vocab filter, e.g. ["SNOMEDCT_US"]. None = keep all.
-        return_network_object: include node/edge graph in output
-        """
         t0 = time.perf_counter()
         _clear_ancestor_cache()
 
+        # empty in, empty out
         if not cuis:
-            return self._empty(return_network_object)
+            return self._empty_result(return_network_object)
 
         cuis = list(dict.fromkeys(cuis))
         n_in = len(cuis)
         audit = []
 
-        # metadata + IC + terms
-        metadata = self._meta.fetch(cuis)
-        ic_map = self._ic.compute(cuis, metadata)
+        # metadata + IC + preferred terms for everything upfront
+        meta = self._meta.fetch(cuis)
+        ic = self._ic.compute(cuis, meta)
         terms = fetch_preferred_terms(self._bq, self._pid, self._did, cuis)
 
-        # source filter
+        # optional source vocab filter
         if sources:
-            after_src, a = SABFilter(set(sources)).run(cuis, metadata)
-            audit += a
+            after_src, aud = SABFilter(set(sources)).run(cuis, meta)
+            audit += aud
         else:
-            after_src = [c for c in cuis if c in metadata]
+            after_src = [c for c in cuis if c in meta]
             audit += [AuditEntry(c, "", "no_metadata", "not in BQ")
-                      for c in cuis if c not in metadata]
+                      for c in cuis if c not in meta]
         n_src = len(after_src)
 
         if not after_src:
-            return self._build(cuis, [], audit, metadata, ic_map, terms,
-                               set(), return_network_object,
-                               n_src, 0, 0, self._ms(t0))
+            return self._pack(cuis, [], audit, meta, ic, terms, set(),
+                              return_network_object, n_src, 0, 0, self._elapsed(t0))
 
-        # hierarchy reduction
-        after_hier, a, hier_edges = self._hier.run(after_src, ic_map, metadata)
-        audit += a
+        # hierarchy: drop parents when child exists
+        after_hier, aud, edges = self._hier.run(after_src, ic, meta)
+        audit += aud
         n_hier = len(after_hier)
 
-        # nothing left to dedup
         if len(after_hier) <= 1:
-            return self._build(cuis, after_hier, audit, metadata, ic_map, terms,
-                               hier_edges, return_network_object,
-                               n_src, n_hier, n_hier, self._ms(t0))
+            return self._pack(cuis, after_hier, audit, meta, ic, terms, edges,
+                              return_network_object, n_src, n_hier, n_hier, self._elapsed(t0))
 
-        # embedding dedup
-        embeddings = self._emb.fetch(after_hier)
-        n_with_emb = sum(1 for c in after_hier if c in embeddings)
-        if n_with_emb <= 1:
+        # embedding dedup: Otsu + guards
+        embs = self._emb.fetch(after_hier)
+        n_emb_ok = sum(1 for c in after_hier if c in embs)
+        if n_emb_ok <= 1:
             after_emb = after_hier
         else:
-            _, after_emb, a = EmbeddingReducer.run(
-                after_hier, metadata, embeddings, ic_map,
-                hier_edges, self._graph, self._depth)
-            audit += a
+            _, after_emb, aud = EmbeddingReducer.run(
+                after_hier, meta, embs, ic, edges, self._graph, self._depth)
+            audit += aud
         n_emb = len(after_emb)
 
-        ms = self._ms(t0)
-        log.info(f"{n_in} -> src:{n_src} -> hier:{n_hier} -> emb:{n_emb} ({ms:.0f}ms)")
+        ms = self._elapsed(t0)
+        log.info(f"{n_in} -> src:{n_src} hier:{n_hier} emb:{n_emb} ({ms:.0f}ms)")
 
-        return self._build(cuis, after_emb, audit, metadata, ic_map, terms,
-                           hier_edges, return_network_object,
-                           n_src, n_hier, n_emb, ms)
+        return self._pack(cuis, after_emb, audit, meta, ic, terms, edges,
+                          return_network_object, n_src, n_hier, n_emb, ms)
 
-    # --- result assembly ---
+    # -- result packing --
 
-    def _build(self, input_cuis, output, audit, meta, ic, terms,
-               hier_edges, want_net, n_src, n_hier, n_emb, ms):
-        n_in = len(input_cuis)
-        out_set = set(output)
+    def _pack(self, inp, out, audit, meta, ic, terms, edges,
+              want_net, n_src, n_hier, n_emb, ms):
+        n_in = len(inp)
+        out_set = set(out)
 
-        concise = [self._cui(c, meta, ic, terms) for c in output]
+        concise = [self._cui_row(c, meta, ic, terms) for c in out]
 
-        removed, seen = [], set()
-        for e in audit:
-            if e.removed_cui and e.removed_cui not in seen:
-                seen.add(e.removed_cui)
-                d = self._cui(e.removed_cui, meta, ic, terms)
-                d["reason"] = e.reason
-                d["retained_by"] = e.kept_cui or ""
-                removed.append(d)
+        removed = []
+        seen = set()
+        for a in audit:
+            if a.removed_cui and a.removed_cui not in seen:
+                seen.add(a.removed_cui)
+                r = self._cui_row(a.removed_cui, meta, ic, terms)
+                r["reason"] = a.reason
+                r["retained_by"] = a.kept_cui or ""
+                removed.append(r)
 
-        retention = self._retention(input_cuis, out_set, audit, ic)
+        # IC-weighted retention score
+        total_ic = sum(ic.get(c, 0.0) for c in inp)
+        kept_by = {a.removed_cui: a.kept_cui for a in audit if a.removed_cui and a.kept_cui}
+        ret_ic = 0.0
+        for c in inp:
+            v = ic.get(c, 0.0)
+            if c in out_set:
+                ret_ic += v
+            elif c in kept_by:
+                ret_ic += min(ic.get(kept_by[c], 0.0), v)
+        retention = min(ret_ic / total_ic, 1.0) if total_ic > 0 else 0.0
 
         result = {
             "concise_cuis": concise,
             "removed_cuis": removed,
             "metrics": {
                 "input_code_count": n_in,
-                "output_code_count": len(output),
+                "output_code_count": len(out),
                 "information_retention_score": round(retention, 4),
-                "reduction_ratio": round(len(output) / n_in, 4) if n_in else 0.0,
-                "stages": {
-                    "input": n_in,
-                    "after_source_filter": n_src,
-                    "after_hierarchy": n_hier,
-                    "after_embedding_dedup": n_emb,
-                },
+                "reduction_ratio": round(len(out) / n_in, 4) if n_in else 0.0,
+                "stages": {"input": n_in, "after_source_filter": n_src,
+                           "after_hierarchy": n_hier, "after_embedding_dedup": n_emb},
                 "processing_time_ms": round(ms, 1),
             },
             "network_object": None,
         }
 
         if want_net:
-            result["network_object"] = self._net(
-                input_cuis, out_set, hier_edges, meta, ic, audit, terms)
+            result["network_object"] = self._build_net(inp, out_set, edges, meta, ic, audit, terms)
 
         return result
 
-    def _empty(self, want_net):
+    def _empty_result(self, want_net):
         z = {"input_code_count": 0, "output_code_count": 0,
              "information_retention_score": 0.0, "reduction_ratio": 0.0,
              "stages": {"input": 0, "after_source_filter": 0,
@@ -160,10 +149,10 @@ class CUISummarizer:
         net = {"nodes": [], "edges": [], "node_count": 0, "edge_count": 0} if want_net else None
         return {"concise_cuis": [], "removed_cuis": [], "metrics": z, "network_object": net}
 
-    # --- helpers ---
+    # -- helpers --
 
     @staticmethod
-    def _cui(cui, meta, ic, terms):
+    def _cui_row(cui, meta, ic, terms):
         m = meta.get(cui)
         return {
             "cui": cui,
@@ -173,35 +162,15 @@ class CUISummarizer:
         }
 
     @staticmethod
-    def _retention(inputs, out_set, audit, ic):
-        if not inputs:
-            return 0.0
-        total = sum(ic.get(c, 0.0) for c in inputs)
-        if total <= 0:
-            return 0.0
-        kept_by = {e.removed_cui: e.kept_cui
-                   for e in audit if e.removed_cui and e.kept_cui}
-        ret = 0.0
-        for c in inputs:
-            v = ic.get(c, 0.0)
-            if c in out_set:
-                ret += v
-            elif c in kept_by:
-                ret += min(ic.get(kept_by[c], 0.0), v)
-        return min(ret / total, 1.0)
-
-    @staticmethod
-    def _net(inputs, out_set, edges, meta, ic, audit, terms):
-        cui_set = set(inputs)
-        kept_by = {e.removed_cui: e.kept_cui
-                   for e in audit if e.removed_cui and e.kept_cui}
-        reasons = {e.removed_cui: e.reason for e in audit if e.removed_cui}
+    def _build_net(inp, out_set, edges, meta, ic, audit, terms):
+        cui_set = set(inp)
+        kept_by = {a.removed_cui: a.kept_cui for a in audit if a.removed_cui and a.kept_cui}
+        reasons = {a.removed_cui: a.reason for a in audit if a.removed_cui}
 
         nodes = []
-        for c in inputs:
+        for c in inp:
             m = meta.get(c)
-            n = {"cui": c,
-                 "preferred_term": terms.get(c, c),
+            n = {"cui": c, "preferred_term": terms.get(c, c),
                  "ic": round(ic.get(c, 0.0), 4),
                  "semantic_types": list(m.semantic_types) if m and m.semantic_types else [],
                  "source_vocabs": list(m.source_vocabs) if m and m.source_vocabs else [],
@@ -220,7 +189,7 @@ class CUISummarizer:
                 "node_count": len(nodes), "edge_count": len(edge_list)}
 
     @staticmethod
-    def _ms(t0):
+    def _elapsed(t0):
         return (time.perf_counter() - t0) * 1000
 
     def close(self):
