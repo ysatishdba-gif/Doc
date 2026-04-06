@@ -2,13 +2,12 @@ _VERSION = "2026-03-23-v7.5"
 import os
 import re
 import time
-import pickle
 import logging
 import threading
 import functools
 import subprocess
 from enum import Enum
-from typing import List, Dict, Set
+from typing import List, Dict
 from dataclasses import dataclass
 from collections import defaultdict, deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -27,17 +26,12 @@ from scipy.spatial.distance import squareform
 # All string-based control flow uses these enums exclusively.
 # No bare string comparisons ("== 'historical'") appear in pipeline logic.
 
-# ── Clinical context — output of ClinicalContextParser ───────────────────────
-# Plain dataclass carrying the four clinical context boolean attributes.
-# No hardcoded category names, no enum, no priority dict.
-# The booleans are set by ClinicalContextParser using medspacy ConText.
+# ── Clinical context flags ────────────────────────────────────────────────────
 
 @dataclass
 class ClinicalContext:
-    """Negation and temporal context for a clinical phrase.
-
-    All fields are set by ClinicalContextParser via medspacy ConText.
-    Default (all False) = current, present, not negated.
+    """Clinical context flags for a phrase.
+    Default (all False) = current, present, affirmed.
     """
     negated:      bool = False
     historical:   bool = False
@@ -112,7 +106,7 @@ class Verdict(str, Enum):
 _BQ_BATCH, _BQ_TIMEOUT, _API_TIMEOUT, _GCLOUD_TIMEOUT = 5000, 300, 200, 30
 _EMB_FETCH_WORKERS, _KNN_BLOCK_SIZE, _RANDOM_SEED = 4, 2000, 42
 _ANCESTOR_CACHE_MAX, _TIMING_MAX_PER_KEY = 200_000, 10_000
-_FAST_PATH_THRESHOLD, _CROSS_TOPIC_DEDUP_MIN = 200, 200
+_FAST_PATH_THRESHOLD = 200
 # Minimum CUI count for Louvain to produce meaningful communities.
 # Below this threshold the k-NN graph is near-fully-connected (k gets
 # capped at n-1) and Louvain produces arbitrary communities driven by
@@ -335,143 +329,6 @@ def _union_find(n):
 
 
 # ── Clinical Context Parser ───────────────────────────────────────────────────
-# Negation and temporal detection via medspacy ConText (built-in rules only).
-# Zero custom rules, zero overrides, zero string matching in application code.
-# medspacy's 102 published rules are the package's responsibility, not ours.
-
-class ClinicalContextParser:
-    """Detect negation and temporal context using medspacy ConText defaults.
-
-    Uses ONLY the built-in rules shipped with medspacy — zero custom
-    additions. The 102 ConText rules are published, validated clinical
-    NLP (Chapman 2001, Harkema 2009) maintained by the medspacy team.
-
-    batch_parse() processes the full document once and returns context
-    for all phrases — O(1) amortized per phrase vs O(n_tokens) per call.
-    """
-
-    _nlp = None
-
-    @classmethod
-    def _ensure_loaded(cls):
-        if cls._nlp is not None:
-            return
-        import medspacy
-        cls._nlp = medspacy.load(enable=["medspacy_context"])
-        log(f"    ClinicalContextParser: medspacy loaded "
-            f"({len(cls._nlp.get_pipe('medspacy_context').rules)} built-in rules)")
-
-    def batch_parse(self, phrases: List[str], context: str = "") -> Dict[str, "ClinicalContext"]:
-        """Process all phrases against the same context in a single pass.
-
-        Runs medspacy once on the context text, sets all phrase spans as
-        entities, and reads ConText results for each. This avoids
-        re-tokenizing the full document per phrase.
-
-        Args:
-            phrases: list of clinical phrases to evaluate
-            context: surrounding text (full sentence/note, or empty)
-
-        Returns:
-            dict {phrase: ClinicalContext} for every input phrase.
-            Phrases not found in context are processed standalone.
-        """
-        self._ensure_loaded()
-        nlp = self.__class__._nlp
-        result = {}
-
-        if not phrases:
-            return result
-
-        # ── Group phrases by whether they appear in context ───────────────
-        in_context = []     # (phrase, start, end) — found in context
-        standalone = []     # phrases not found — process alone
-
-        if context:
-            ctx_s = context.strip()
-            ctx_lower = ctx_s.lower()
-            for phrase in phrases:
-                phrase_s = phrase.strip()
-                if not phrase_s:
-                    result[phrase] = ClinicalContext()
-                    continue
-                pos = ctx_lower.find(phrase_s.lower())
-                if pos != -1:
-                    in_context.append((phrase, pos, pos + len(phrase_s)))
-                else:
-                    standalone.append(phrase)
-        else:
-            ctx_s = ""
-            standalone = [p for p in phrases if p.strip()]
-            for p in phrases:
-                if not p.strip():
-                    result[p] = ClinicalContext()
-
-        # ── Single pass over context for all found phrases ────────────────
-        if in_context and ctx_s:
-            doc = nlp.make_doc(ctx_s)
-            for name, proc in nlp.pipeline:
-                if name != "medspacy_context":
-                    doc = proc(doc)
-
-            spans = []
-            span_phrases = []
-            for phrase, start, end in in_context:
-                span = doc.char_span(start, end, label="CONCEPT",
-                                     alignment_mode="expand")
-                if span is not None:
-                    spans.append(span)
-                    span_phrases.append(phrase)
-                else:
-                    standalone.append(phrase)
-
-            if spans:
-                doc.ents = spans
-                doc = nlp.get_pipe("medspacy_context")(doc)
-                for ent, phrase in zip(doc.ents, span_phrases):
-                    result[phrase] = ClinicalContext(
-                        negated=ent._.is_negated,
-                        historical=ent._.is_historical,
-                        hypothetical=ent._.is_hypothetical,
-                        family=ent._.is_family,
-                    )
-
-        # ── Standalone phrases (not found in context) ─────────────────────
-        for phrase in standalone:
-            phrase_s = phrase.strip()
-            doc = nlp.make_doc(phrase_s)
-            for name, proc in nlp.pipeline:
-                if name != "medspacy_context":
-                    doc = proc(doc)
-            span = doc.char_span(0, len(phrase_s), label="CONCEPT",
-                                 alignment_mode="expand")
-            if span is None:
-                result[phrase] = ClinicalContext()
-                continue
-            doc.ents = [span]
-            doc = nlp.get_pipe("medspacy_context")(doc)
-            ent = doc.ents[0]
-            result[phrase] = ClinicalContext(
-                negated=ent._.is_negated,
-                historical=ent._.is_historical,
-                hypothetical=ent._.is_hypothetical,
-                family=ent._.is_family,
-            )
-
-        # ── Fill missing (shouldn't happen, but safe default) ─────────────
-        for phrase in phrases:
-            if phrase not in result:
-                result[phrase] = ClinicalContext()
-
-        return result
-
-    def parse(self, phrase: str, context: str = "") -> "ClinicalContext":
-        """Single-phrase convenience wrapper. For batch use batch_parse()."""
-        return self.batch_parse([phrase], context).get(phrase, ClinicalContext())
-
-
-# Module-level singleton — _ensure_loaded() is lazy on first parse() call.
-_clinical_context_parser = ClinicalContextParser()
 
 # ── Data Models ──────────────────────────────────────────────────────────────
 @dataclass
@@ -483,49 +340,17 @@ class CUIMetadata:
     source_vocabs: List[str]
 
 @dataclass
-class TopicInfo:
-    topic_id: str
-    semantic_types: Set[str]
-    cuis: List[str]
-
-@dataclass
 class AuditEntry:
     removed_cui: str
     kept_cui: str
     reason: str
     detail: str
 
-@dataclass
-class ConfidenceEntry:
-    cui: str
-    confidence: float
-    extraction_proximity: float
-    centrality: float
-    retention_power: float
-    semantic_types: List[str]
-    explains_cuis: List[str]
-
-@dataclass
-@dataclass
-class ReductionResult:
-    context_string: str
-    input_count: int
-    after_filter_count: int
-    after_hierarchy_count: int
-    after_redundancy_count: int
-    topics: Dict[str, TopicInfo]
-    all_reduced_cuis: List[str]
-    confidence: List[ConfidenceEntry]
-    retention_map: Dict[str, List[str]]
-    audit_trail: List[AuditEntry]
-    processing_time_ms: float
-    embedding_coverage: float
-
 
 # ── BigQuery Fetchers ─────────────────────────────────────────────────────────
 
 class MetadataFetcher:
-    def __init__(self, bq, pid, did, cache_dir=None):
+    def __init__(self, bq, pid, did):
         self.bq = bq
         self.pid = pid
         self.did = did
@@ -653,7 +478,7 @@ class HierarchyReducer:
         return surviving, audit, edges
 
 class EmbeddingFetcher:
-    def __init__(self, bq, pid, did, embedding_table, cache_dir=None):
+    def __init__(self, bq, pid, did, embedding_table):
         self.bq = bq
         self.pid = pid
         self.did = did
@@ -1377,558 +1202,9 @@ def _resolve_group(r_cuis, metadata, ic_map, hierarchy_edges, dist, index_map,
                 detail=f"dist {pair_dist:.3f} < tight {tight_t:.3f}"))
     return kept, audit
 
-class CrossTopicDedup:
-    """Cosine k-NN + guard checks → Union-Find components → keep all that differ."""
-
-    @staticmethod
-    @timed("cross_topic_dedup")
-    def run(surviving, embeddings, metadata, graph=None, ancestor_depth=3):
-        with_emb = [c for c in surviving if c in embeddings]
-        if len(with_emb) <= 1:
-            return surviving, []
-        n = len(with_emb)
-        matrix = np.array([embeddings[c] for c in with_emb], dtype=np.float32)
-
-        global_cent = np.mean(matrix, axis=0).astype(np.float32)
-        g_norm = np.linalg.norm(global_cent)
-        if g_norm > 0:
-            global_cent = global_cent / g_norm
-
-        k = min(_XTD_KNN_K, n - 1)
-        neighbors, sim_scores = _cosine_knn(matrix, k)
-
-        nn_dists = []
-        for i in range(n):
-            for j_pos in range(len(neighbors[i])):
-                j = int(neighbors[i][j_pos])
-                # only upper triangle to avoid counting each pair twice
-                if j > i:
-                    nn_dists.append(1.0 - float(sim_scores[i][j_pos]))
-        if not nn_dists:
-            return surviving, []
-        threshold = _otsu_threshold(np.array(nn_dists, dtype=np.float32))
-
-        edges = []
-        for i in range(n):
-            for j_pos in range(len(neighbors[i])):
-                j = int(neighbors[i][j_pos])
-                if j < 0 or j >= n or j <= i:
-                    continue
-                d = 1.0 - float(sim_scores[i][j_pos])
-                if d > threshold:
-                    continue
-                if _are_cuis_different(with_emb[i], with_emb[j], metadata, None, graph, ancestor_depth):
-                    continue
-                edges.append((i, j, d))
-        if not edges:
-            return surviving, []
-
-        find, union = _union_find(n)
-        for i, j, _ in edges:
-            union(i, j)
-
-        comp_members = defaultdict(list)
-        for i in range(n):
-            comp_members[find(i)].append(i)
-
-        edge_set = {(min(i, j), max(i, j)) for i, j, _ in edges}
-        centralities = matrix @ global_cent
-        removed, audit = set(), []
-        for root, members in comp_members.items():
-            if len(members) <= 1:
-                continue
-            sorted_m = sorted(members, key=lambda i: float(centralities[i]), reverse=True)
-            kept_in_comp = []
-            for idx in sorted_m:
-                dup_of = next((k for k in kept_in_comp
-                              if (min(idx, k), max(idx, k)) in edge_set), None)
-                if dup_of is None:
-                    kept_in_comp.append(idx)
-                else:
-                    dc, kc = with_emb[idx], with_emb[dup_of]
-                    removed.add(dc)
-                    audit.append(AuditEntry(dc, kc,
-                        "cross_topic_dedup", f"component size={len(members)}"))
-        return [c for c in surviving if c not in removed], audit
-
-class ConfidenceScorer:
-    """Variance-weighted confidence: prox(extraction), cent(topic centroid), ret(retention power).
-    Weights = std of each signal, normalized. Flat signals get near-zero weight.
-    """
-
-    @staticmethod
-    @timed("confidence_score")
-    def score(surviving, metadata, audit_trail,
-              embeddings, cui_topic,
-              extraction_distances=None):
-
-        explains = defaultdict(list)
-        for entry in audit_trail:
-            if entry.kept_cui and entry.removed_cui:
-                explains[entry.kept_cui].append(entry.removed_cui)
-        max_retained = max((len(v) for v in explains.values()), default=0)
-
-        ext_prox = {}
-        if extraction_distances:
-            for cui, d in extraction_distances.items():
-                if d is not None:
-                    ext_prox[cui] = max(1.0 - d, 0.0)
-        has_ext = len(ext_prox) > 0
-
-        t_centroids = {}
-        topic_members = defaultdict(list)
-        for cui, tid in cui_topic.items():
-            if cui in embeddings:
-                topic_members[tid].append(cui)
-        for tid, members in topic_members.items():
-            tc = np.mean([embeddings[c] for c in members], axis=0).astype(np.float32)
-            tc_norm = np.linalg.norm(tc)
-            if tc_norm > 0:
-                t_centroids[tid] = tc / tc_norm
-
-        signals, retention_map = [], {}
-        raw_cents = []
-        for cui in surviving:
-            retained = explains.get(cui, [])
-            retention_map[cui] = retained
-            prox = ext_prox.get(cui, 0.0)
-            tid = cui_topic.get(cui)
-            tc = t_centroids.get(tid) if tid is not None else None
-            if tc is not None and cui in embeddings:
-                cent = max(float(np.dot(embeddings[cui], tc)), 0.0)
-            else:
-                cent = None  # placeholder — filled after median computed
-            ret = np.log1p(len(retained)) / np.log1p(max_retained) if max_retained > 0 else 0.0
-            signals.append((cui, prox, cent, ret))
-            if cent is not None:
-                raw_cents.append(cent)
-        if not signals:
-            return [], [], {}
-        # CUIs without embeddings get median centrality (neutral, not penalized)
-        median_cent = float(np.median(raw_cents)) if raw_cents else 0.0
-        signals = [(cui, prox, cent if cent is not None else median_cent, ret)
-                   for cui, prox, cent, ret in signals]
-
-        prox_arr = np.array([s[1] for s in signals])
-        cent_arr = np.array([s[2] for s in signals])
-        ret_arr  = np.array([s[3] for s in signals])
-        if has_ext:
-            stds = np.array([prox_arr.std(), cent_arr.std(), ret_arr.std()])
-        else:
-            stds = np.array([0.0, cent_arr.std(), ret_arr.std()])
-        total_std = stds.sum()
-        if total_std > 1e-8:
-            w = stds / total_std
-        else:
-            # All signals flat — IC-weighted fallback.
-            # IC is available through metadata (CUIMetadata.ic_score).
-            # Boost the retention-power signal for higher-IC concepts.
-            # Falls back to equal weights if metadata has no IC data.
-            ic_vals = np.array([
-                metadata[cui].ic_score if (cui in metadata and metadata[cui] is not None)
-                else 0.0
-                for cui, *_ in signals
-            ]) if signals else np.array([])
-            ic_std = float(ic_vals.std()) if len(ic_vals) > 1 else 0.0
-            if ic_std > 1e-8:
-                ic_w = min(ic_std / (ic_std + 1.0), 0.5)
-                if has_ext:
-                    w = np.array([1/3 - ic_w/3, 1/3 - ic_w/3, 1/3 + 2*ic_w/3])
-                else:
-                    w = np.array([0.0, 0.5 - ic_w/2, 0.5 + ic_w/2])
-            else:
-                w = np.array([1/3, 1/3, 1/3]) if has_ext else np.array([0.0, 0.5, 0.5])
-
-        entries = []
-        for cui, prox, cent, ret in signals:
-            conf = w[0] * prox + w[1] * cent + w[2] * ret
-            m = metadata.get(cui)
-            entries.append(ConfidenceEntry(
-                cui=cui,
-                confidence=round(float(conf), 4),
-                extraction_proximity=round(prox, 3),
-                centrality=round(cent, 3),
-                retention_power=round(ret, 3),
-                semantic_types=list(m.semantic_types) if m else [],
-                explains_cuis=retention_map[cui]))
-
-        entries.sort(key=lambda e: e.confidence, reverse=True)
-        sorted_cuis = [e.cui for e in entries]
-        log(f"    Confidence weights: prox={w[0]:.2f} cent={w[1]:.2f} ret={w[2]:.2f} "
-            f"(stds={stds[0]:.3f}/{stds[1]:.3f}/{stds[2]:.3f})", level="DEBUG")
-        return sorted_cuis, entries, retention_map
-
-class CUIReductionSystem:
-    def __init__(self, project_id, dataset_id, full_network,
-                 allowed_sabs, embedding_table,
-                 ic_scores=None,
-                 cache_dir=None):
-        self.bq = bigquery.Client(project=project_id)
-        self.fetcher = MetadataFetcher(self.bq, project_id, dataset_id)
-        self.ic_computer = ICComputer(full_network, ic_scores)
-        self.sab_filter = SABFilter(allowed_sabs)
-        self.hierarchy_reducer = HierarchyReducer(full_network)
-        self.emb_fetcher = EmbeddingFetcher(
-            self.bq, project_id, dataset_id, embedding_table)
-
-    @timed("full_pipeline")
-    def reduce(self, cuis, context_string, extraction_distances=None):
-        results = self.reduce_batch([(cuis, context_string, extraction_distances)])
-        return results[0]
-
-    @timed("query_reduce")
-    def reduce_query(self, cuis):
-        """Lightweight reduction for query CUIs — stages 1-4 only.
-
-        Runs: Metadata fetch → IC compute → SAB filter → Hierarchy reduce.
-        Skips: Embedding fetch, Louvain, HAC dedup, confidence scoring.
-
-        WHY this is correct for queries:
-          - Stages 5-13 exist to deduplicate within a document's 80-100 CUIs
-          - A query has 5-20 CUIs — nothing meaningful to cluster or deduplicate
-          - Stages 1-4 remove bad vocabularies and redundant parent CUIs
-          - Embedding centroid is computed separately in run_query.py
-            using emb_fetcher.fetch() on just the 5-10 surviving CUIs
-
-        Performance:
-          Full pipeline: 60-574s (BQ embedding fetch for all CUIs)
-          This method:   1-3s   (BQ metadata fetch only, embeddings cached)
-
-        Args:
-            cuis: list of raw CUI strings from extraction
-
-        Returns:
-            set of surviving CUI strings
-        """
-        if not cuis:
-            return set()
-        cuis = list(set(cuis))
-
-        # Stage 1: Metadata fetch
-        metadata = self.fetcher.fetch(cuis)
-
-        # Stage 2: IC compute
-        ic_map = self.ic_computer.compute(cuis, metadata)
-
-        # Stage 3: SAB filter
-        after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
-        if not after_sab:
-            return set()
-
-        # Stage 4: Hierarchy reduce
-        after_hier, hier_audit, _ = self.hierarchy_reducer.run(after_sab, ic_map, metadata)
-
-        log(f"    Query reduce: {len(cuis)} raw → {len(after_sab)} (SAB) → "
-            f"{len(after_hier)} (hierarchy)")
-        return set(after_hier)
-
-    @timed("batch_pipeline")
-    def reduce_batch(self, inputs):
-        """Run pipeline. inputs: list of (cuis, context, [extraction_distances])."""
-        t0 = time.perf_counter()
-        _clear_ancestor_cache()
-
-        normalized = []
-        for item in inputs:
-            if len(item) == 3:
-                normalized.append((item[0], item[1], item[2]))
-            else:
-                normalized.append((item[0], item[1], None))
-
-        all_cuis = set()
-        for cuis, _, _ in normalized:
-            all_cuis.update(cuis)
-
-        metadata = self.fetcher.fetch(list(all_cuis))
-        ic_map = self.ic_computer.compute(list(all_cuis), metadata)
-        ancestor_depth = _compute_ancestor_depth(self.hierarchy_reducer.graph)
-        log(f"[Batch] {len(inputs)} phrases, {len(all_cuis)} unique CUIs, "
-            f"metadata={len(metadata)}, ancestor_depth={ancestor_depth}")
-
-        per_text = []
-        all_filtered = set()
-        for cuis, context_string, ext_dists in normalized:
-            if not cuis:
-                per_text.append((context_string, [], [], [], set(), [], None))
-                continue
-            after_sab, sab_audit = self.sab_filter.run(cuis, metadata)
-            after_hier, hier_audit, hier_edges = self.hierarchy_reducer.run(after_sab, ic_map, metadata)
-            log(f"  [{context_string[:50]}] {len(cuis)} -> SAB:{len(after_sab)} -> Hier:{len(after_hier)}")
-            audit = sab_audit + hier_audit
-            all_filtered.update(after_hier)
-            per_text.append((context_string, cuis, after_sab, after_hier, hier_edges, audit, ext_dists))
-
-        log(f"[Batch] Embeddings: {len(all_filtered)} post-filter CUIs")
-        all_embeddings = self.emb_fetcher.fetch(list(all_filtered))
-
-        results = []
-        for context_string, cuis, after_filter, after_hier, hier_edges, all_audit, ext_dists in per_text:
-            t_start = time.perf_counter()
-            if not after_hier:
-                results.append(self._empty(context_string, t_start, all_audit))
-                continue
-            embeddings = {c: all_embeddings[c] for c in after_hier if c in all_embeddings}
-            emb_cov = len(embeddings) / len(after_hier) if after_hier else 0
-
-            topics, surviving, emb_audit = EmbeddingReducer.run(
-                after_hier, metadata, embeddings, ic_map, hier_edges,
-                self.hierarchy_reducer.graph, ancestor_depth)
-            all_audit.extend(emb_audit)
-            log(f"    Embedding Reduction: {len(after_hier)} -> {len(surviving)}", level="DEBUG")
-
-            topics_out = self._build_topics(topics, metadata)
-
-            if len(after_hier) > _CROSS_TOPIC_DEDUP_MIN:  # cross-topic dedup for large inputs only
-                before_xtd = len(surviving)
-                surviving, xtd_audit = CrossTopicDedup.run(
-                    surviving, embeddings, metadata,
-                    self.hierarchy_reducer.graph, ancestor_depth)
-                all_audit.extend(xtd_audit)
-                log(f"    Cross-Topic Dedup: {before_xtd} -> {len(surviving)}", level="DEBUG")
-
-            surviving_set = set(surviving)
-            cui_topic = {}
-            for topic_id, topic in topics_out.items():
-                for c in topic.cuis:
-                    if c in surviving_set:
-                        cui_topic[c] = topic_id
-
-            sorted_cuis, confidence, retention_map = ConfidenceScorer.score(
-                surviving, metadata, all_audit,
-                embeddings, cui_topic,
-                extraction_distances=ext_dists)
-
-            topics_out = self._prune_topics(topics_out, set(sorted_cuis))
-
-            unaccounted = set(cuis) - set(surviving) - {e.removed_cui for e in all_audit}
-            for cui in unaccounted:
-                all_audit.append(AuditEntry(cui, "", "unaccounted", ""))
-            elapsed = (time.perf_counter() - t_start) * 1000
-            log(f"    Pipeline: {len(cuis)} -> SAB:{len(after_filter)} -> "
-                f"Hier:{len(after_hier)} -> Emb:{len(surviving)} CUIs, "
-                f"{len(topics_out)} topics ({elapsed:.0f}ms)")
-            results.append(ReductionResult(
-                context_string=context_string,
-                input_count=len(cuis),
-                after_filter_count=len(after_filter),
-                after_hierarchy_count=len(after_hier),
-                after_redundancy_count=len(surviving),
-                topics=topics_out,
-                all_reduced_cuis=sorted_cuis,
-                confidence=confidence,
-                retention_map=retention_map,
-                audit_trail=all_audit,
-                processing_time_ms=elapsed,
-                embedding_coverage=emb_cov))
-        return results
-
-    def _build_topics(self, topics, metadata):
-        out = {}
-        for tid, t_cuis in topics.items():
-            if not t_cuis:
-                continue
-            types = set()
-            for c in t_cuis:
-                m = metadata.get(c)
-                if m and m.semantic_types:
-                    types.update(m.semantic_types)
-            out[tid] = TopicInfo(tid, types or {"Unknown"}, t_cuis)
-        return out
-
-    @staticmethod
-    def _prune_topics(topics_out, keep_set):
-        pruned = {}
-        for tid, t in topics_out.items():
-            kept = [c for c in t.cuis if c in keep_set]
-            if kept:
-                pruned[tid] = TopicInfo(tid, t.semantic_types, kept)
-        return pruned
-
-    def close(self):
-        """Shut down resources. Call when done processing all documents."""
-        self.emb_fetcher.close()
-
-    def _empty(self, ctx, t0, audit=None):
-        return ReductionResult(
-            ctx, 0, 0, 0, 0, {}, [], [], {},
-            audit or [], (time.perf_counter() - t0) * 1000, 0.0)
-
-    def get_stats(self):
-        with _timing_lock:
-            out = {}
-            for k, v in _timings.items():
-                if v:
-                    vals = list(v)
-                    out[k] = {"count": len(vals), "mean_ms": float(np.mean(vals)),
-                              "p99_ms": float(np.percentile(vals, 99))}
-            return out
-
-class Evaluator:
-    """Quality evaluation: intrinsic_metrics (reduction, confidence, topic coherence) +
-    reconstruction_check (verify each merge). Both return flat row lists for CSV output.
-    """
-
-    def __init__(self, graph):
-        self.graph = graph
-
-    def intrinsic_metrics(self, case_name, entity_results, topics, embeddings):
-        """Returns rows: [case, metric_type, scope, metric_name, value, flag]"""
-        rows = []
-
-        for entity_text, result in entity_results:
-            inp = result.input_count
-            final = result.after_redundancy_count
-            ratio = 1 - (final / inp) if inp > 0 else 0
-            flag = ""
-            if ratio > _EVAL_AGGRESSIVE_RATIO:
-                flag = f"WARNING: very aggressive (>{_EVAL_AGGRESSIVE_RATIO*100:.0f}% removed)"
-            elif ratio < _EVAL_MINIMAL_RATIO:
-                flag = f"WARNING: minimal reduction (<{_EVAL_MINIMAL_RATIO*100:.0f}% removed)"
-            rows.append([case_name, "reduction", entity_text, "input_count", inp, ""])
-            rows.append([case_name, "reduction", entity_text, "after_sab", result.after_filter_count, ""])
-            rows.append([case_name, "reduction", entity_text, "after_hierarchy", result.after_hierarchy_count, ""])
-            rows.append([case_name, "reduction", entity_text, "final_count", final, ""])
-            rows.append([case_name, "reduction", entity_text, "reduction_ratio", round(ratio, 3), flag])
-
-        for entity_text, result in entity_results:
-            if not result.confidence:
-                continue
-            scores = [e.confidence for e in result.confidence]
-            spread = max(scores) - min(scores)
-            std = float(np.std(scores))
-            flag = ""
-            if spread < _EVAL_COMPRESSED_SPREAD:
-                flag = "WARNING: scores too compressed, not discriminating"
-            rows.append([case_name, "confidence", entity_text, "min", round(min(scores), 4), ""])
-            rows.append([case_name, "confidence", entity_text, "max", round(max(scores), 4), ""])
-            rows.append([case_name, "confidence", entity_text, "spread", round(spread, 4), flag])
-            rows.append([case_name, "confidence", entity_text, "std", round(std, 4), ""])
-
-        if topics and embeddings:
-            intra_sims, inter_sims = [], []
-            topic_centroids = {}
-            for tid, members in topics.items():
-                vecs = [embeddings[c] for c in members if c in embeddings]
-                if len(vecs) < 2:
-                    continue
-                mat = np.array(vecs, dtype=np.float32)
-                centroid = mat.mean(axis=0)
-                norm = np.linalg.norm(centroid)
-                if norm > 0:
-                    centroid = centroid / norm
-                topic_centroids[tid] = centroid
-                sims = mat @ mat.T
-                n = len(vecs)
-                for i in range(n):
-                    for j in range(i+1, n):
-                        intra_sims.append(float(sims[i][j]))
-            tids = list(topic_centroids.keys())
-            for i in range(len(tids)):
-                for j in range(i+1, len(tids)):
-                    sim = float(np.dot(topic_centroids[tids[i]], topic_centroids[tids[j]]))
-                    inter_sims.append(sim)
-            avg_intra = float(np.mean(intra_sims)) if intra_sims else 0
-            avg_inter = float(np.mean(inter_sims)) if inter_sims else 0
-            separation = avg_intra - avg_inter
-            flag = "WARNING: topics not well separated" if separation < _EVAL_SEPARATION_MIN else ""
-            rows.append([case_name, "topic_coherence", "ALL", "avg_intra_similarity", round(avg_intra, 4), ""])
-            rows.append([case_name, "topic_coherence", "ALL", "avg_inter_similarity", round(avg_inter, 4), ""])
-            rows.append([case_name, "topic_coherence", "ALL", "separation", round(separation, 4), flag])
-            rows.append([case_name, "topic_coherence", "ALL", "topic_count", len(topics), ""])
-
-        reason_counts = defaultdict(int)
-        for _, result in entity_results:
-            for a in result.audit_trail:
-                reason_counts[a.reason] += 1
-        for reason, count in sorted(reason_counts.items()):
-            rows.append([case_name, "removal_breakdown", "ALL", reason, count, ""])
-
-        return rows
-
-    def reconstruction_check(self, case_name, entity_results, embeddings, metadata, terms):
-        """Verify each merge: embedding dist, shared parent/ancestors/semtypes → verdict."""
-        rows = []
-        check_reasons = {"true_duplicate", "cross_topic_dedup", "ancestor_subsumed"}
-        graph = self.graph
-
-        for entity_text, result in entity_results:
-            for a in result.audit_trail:
-                if a.reason not in check_reasons or not a.removed_cui or not a.kept_cui:
-                    continue
-                rm, kp = a.removed_cui, a.kept_cui
-                cos_dist = round(1.0 - float(np.dot(embeddings[rm], embeddings[kp])), 4) \
-                    if rm in embeddings and kp in embeddings else ""
-                same_parent, shared_anc, shared_st = "", "", 0
-                if graph:
-                    r_par = set(graph.predecessors(rm)) if graph.has_node(rm) else set()
-                    k_par = set(graph.predecessors(kp)) if graph.has_node(kp) else set()
-                    same_parent = "YES" if (r_par & k_par) else "NO"
-                    r_anc, k_anc = _get_ancestors(graph, rm, _EVAL_RECON_DEPTH), _get_ancestors(graph, kp, _EVAL_RECON_DEPTH)
-                    shared_anc = len(r_anc & k_anc) if r_anc and k_anc else 0
-                r_m, k_m = metadata.get(rm), metadata.get(kp)
-                r_t = set(r_m.semantic_types) if r_m and r_m.semantic_types else set()
-                k_t = set(k_m.semantic_types) if k_m and k_m.semantic_types else set()
-                shared_st = len(r_t & k_t) if r_t and k_t else 0
-                problems = []
-                if cos_dist and cos_dist > _EVAL_SUSPECT_DIST:
-                    problems.append(f"distant embedding ({cos_dist})")
-                if same_parent == "NO" and shared_anc == 0:
-                    problems.append("no shared ancestors")
-                if shared_st == 0 and r_t and k_t:
-                    problems.append("no shared semantic types")
-                verdict = "SUSPECT: " + "; ".join(problems) if problems else "OK"
-                rows.append([case_name, entity_text, rm, terms.get(rm, rm),
-                    kp, terms.get(kp, kp), a.reason, cos_dist, same_parent,
-                    shared_anc, shared_st, verdict])
-        return rows
-
-    @staticmethod
-    def metric_headers():
-        return ["case", "metric_type", "scope", "metric_name", "value", "flag"]
-
-    @staticmethod
-    def reconstruction_headers():
-        return ["case", "entity", "removed_cui", "removed_term", "kept_cui", "kept_term",
-                "reason", "cosine_dist", "same_parent", "shared_ancestors", "shared_semtypes", "verdict"]
-
-def fetch_preferred_terms(bq_client, project_id, dataset_id, cuis):
-    """Fetch preferred English terms for CUIs from MRCONSO.
-
-    Args:
-        bq_client: BigQuery client
-        project_id: GCP project ID
-        dataset_id: UMLS dataset ID
-        cuis: collection of CUI strings
-
-    Returns:
-        dict {cui: preferred_term_string}
-    """
-    cuis = list(cuis)
-    if not cuis:
-        return {}
-    terms = {}
-    for i in range(0, len(cuis), _BQ_BATCH):
-        batch = cuis[i:i + _BQ_BATCH]
-        query = f"""
-        SELECT CUI, STR
-        FROM `{project_id}.{dataset_id}.MRCONSO`
-        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
-          AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
-        """
-        jc = bigquery.QueryJobConfig(query_parameters=[
-            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-        for row in bq_client.query(query, job_config=jc).result():
-            if row.CUI not in terms:
-                terms[row.CUI] = row.STR
-    for c in cuis:
-        if c not in terms:
-            terms[c] = c
-    return terms
-
-
 class CUIExtractor:
     def __init__(self, api_url, top_k=3, top_p=5000,
-                 cluster_set="umls", combined=True, cache_dir=None):
+                 cluster_set="umls", combined=True):
         self.url = api_url
         self.top_k = top_k
         self.top_p = top_p
@@ -1961,24 +1237,11 @@ class CUIExtractor:
 
     @timed("cui_extraction")
     def extract(self, text_list, context_list):
-        """Extract CUIs per phrase with negation filtering and temporal tagging.
-
-        Two-phase design:
-          Phase 1 — CUI extraction (cacheable): API call for CUI distances.
-            Cached by (phrases, top_k, top_p, cluster_set, combined).
-            Context is NOT part of the cache key — CUI extraction depends
-            on the phrase+context embedding, but the cache is keyed on
-            phrases only for cross-document hit rates.
-
-          Phase 2 — ConText tagging (never cached): medspacy negation/temporal.
-            Always runs fresh because the same phrase ("knee pain") can be
-            negated in one document and affirmed in another.
-            Uses batch_parse() — single pass over the context document.
+        """Extract CUIs per phrase via API.
 
         Returns:
-            dict {phrase: {"cuis": {cui: distance}, "context": ClinicalContext}}
+            dict {phrase: {"cuis": {cui: distance}}}
         """
-        # ── Phase 1: CUI extraction ───────────────────────────────────────
         payload = {
             "cluster_set": self.cluster_set,
             "text_list": text_list,
@@ -2022,37 +1285,35 @@ class CUIExtractor:
             if cui_dists:
                 raw_per_phrase[phrase] = cui_dists
 
-        # ── Phase 2: ConText tagging (never cached, always fresh) ─────────
-        # batch_parse processes the full document once — O(n_tokens) total,
-        # not O(n_tokens × n_phrases).
-        full_context = max(context_list, key=len) if context_list else ""
-        phrase_contexts = _clinical_context_parser.batch_parse(
-            list(raw_per_phrase.keys()), full_context)
+        per_phrase = {phrase: {"cuis": cui_dists}
+                      for phrase, cui_dists in raw_per_phrase.items()}
 
-        per_phrase: Dict[str, dict] = {}
-        n_negated = n_historical = n_hypothetical = n_family = 0
-
-        for phrase, cui_dists in raw_per_phrase.items():
-            cc = phrase_contexts.get(phrase, ClinicalContext())
-
-            if cc.negated:
-                n_negated += len(cui_dists)
-                log(f"    Negation [{phrase!r}]: discarded {len(cui_dists)} CUIs",
-                    level="DEBUG")
-                continue
-
-            if cc.historical:   n_historical   += 1
-            elif cc.hypothetical: n_hypothetical += 1
-            elif cc.family:     n_family       += 1
-
-            per_phrase[phrase] = {
-                "cuis":    cui_dists,
-                "context": cc,
-            }
-
-        total = sum(len(v.get("cuis", {})) for v in per_phrase.values())
-        log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases "
-            f"(negated_removed={n_negated}, hist={n_historical}, "
-            f"hypo={n_hypothetical}, family={n_family})")
+        total = sum(len(v["cuis"]) for v in per_phrase.values())
+        log(f"    Extraction: {total} CUIs across {len(per_phrase)} phrases")
 
         return per_phrase
+
+
+def fetch_preferred_terms(bq_client, project_id, dataset_id, cuis):
+    """Fetch preferred English terms from MRCONSO."""
+    cuis = list(cuis)
+    if not cuis:
+        return {}
+    terms = {}
+    for i in range(0, len(cuis), _BQ_BATCH):
+        batch = cuis[i:i + _BQ_BATCH]
+        query = f"""
+        SELECT CUI, STR
+        FROM `{project_id}.{dataset_id}.MRCONSO`
+        WHERE CUI IN UNNEST(@cuis) AND LAT = 'ENG'
+          AND ISPREF = 'Y' AND TS = 'P' AND STT = 'PF'
+        """
+        jc = bigquery.QueryJobConfig(query_parameters=[
+            bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
+        for row in bq_client.query(query, job_config=jc).result():
+            if row.CUI not in terms:
+                terms[row.CUI] = row.STR
+    for c in cuis:
+        if c not in terms:
+            terms[c] = c
+    return terms
