@@ -344,44 +344,42 @@ class HierarchyReducer:
     def run(self, cuis, ic_map, metadata):
         cui_set = set(cuis)
         edges = set()
-        parent_children = defaultdict(set)
+        # for each CUI, find all ancestors in the graph that are also in the input
+        ancestor_of = defaultdict(set)  # ancestor → set of descendants in input
         for cui in cuis:
             if not self.graph.has_node(cui):
                 continue
-            for parent in self.graph.predecessors(cui):
-                if parent in cui_set and parent != cui:
-                    parent_children[parent].add(cui)
-                    edges.add((parent, cui))
+            for anc in networkx.ancestors(self.graph, cui):
+                if anc in cui_set and anc != cui:
+                    ancestor_of[anc].add(cui)
+                    edges.add((anc, cui))
 
-        # A parent is removed if ANY of its children qualifies:
-        #   child IC >= parent IC  AND  semantic types overlap (or either is untyped)
-        # The parent is subsumed — its children carry all its meaning plus more.
-        # ALL qualifying children are kept; only the parent is removed.
+        # an ancestor is removed if ANY descendant in the input qualifies:
+        #   descendant IC >= ancestor IC  AND  semantic types overlap
         remove_set = set()
         audit = []
-        for parent, children in parent_children.items():
-            p_ic = ic_map.get(parent, 0)
-            p_meta = metadata.get(parent)
-            p_types = set(p_meta.semantic_types) if p_meta and p_meta.semantic_types else set()
-            best_child, best_c_ic = None, -1.0
-            for child in children:
-                c_ic = ic_map.get(child, 0)
-                if c_ic < p_ic:
+        for anc, descendants in ancestor_of.items():
+            a_ic = ic_map.get(anc, 0)
+            a_meta = metadata.get(anc)
+            a_types = set(a_meta.semantic_types) if a_meta and a_meta.semantic_types else set()
+            best_desc, best_d_ic = None, -1.0
+            for desc in descendants:
+                d_ic = ic_map.get(desc, 0)
+                if d_ic < a_ic:
                     continue
-                c_meta = metadata.get(child)
-                c_types = set(c_meta.semantic_types) if c_meta and c_meta.semantic_types else set()
-                if p_types and c_types and not (p_types & c_types):
+                d_meta = metadata.get(desc)
+                d_types = set(d_meta.semantic_types) if d_meta and d_meta.semantic_types else set()
+                if a_types and d_types and not (a_types & d_types):
                     continue
-                # this child qualifies — parent is subsumed
-                if c_ic > best_c_ic:
-                    best_c_ic = c_ic
-                    best_child = child
-            if best_child is not None:
-                remove_set.add(parent)
+                if d_ic > best_d_ic:
+                    best_d_ic = d_ic
+                    best_desc = desc
+            if best_desc is not None:
+                remove_set.add(anc)
                 audit.append(AuditEntry(
-                    parent, best_child,
+                    anc, best_desc,
                     "ancestor_subsumed",
-                    f"child IC {best_c_ic:.2f} >= parent IC {p_ic:.2f}"))
+                    f"descendant IC {best_d_ic:.2f} >= ancestor IC {a_ic:.2f}"))
 
         surviving = [c for c in cuis if c not in remove_set]
         return surviving, audit, edges
