@@ -1,12 +1,9 @@
-"""
-Wraps topic formation (stages 6-8) into a standalone module.
-Input: surviving CUI codes from CUISummarizer.
-Output: labeled topics with subtopics and centroids.
-"""
+# cui_topics.py
+# Takes surviving CUIs from the summarizer, groups into topics via UMLS hierarchy.
+# Outputs labeled topics with subtopics and centroids.
 
-import os, time, pickle, logging
+import time, pickle, logging
 import numpy as np
-import networkx
 from google.cloud import bigquery
 
 from cui_core import (
@@ -14,141 +11,103 @@ from cui_core import (
     HierarchicalTopicBuilder, fetch_preferred_terms,
 )
 
-log = logging.getLogger("cui_topics")
-log.setLevel(logging.INFO)
-log.propagate = False
-if not log.handlers:
-    log.addHandler(logging.StreamHandler())
+log = logging.getLogger(__name__)
 
 
 class CUITopics:
 
-    def __init__(self, project_id, dataset_id, hierarchy_path, ic_path,
-                 embedding_table="cui_embeddings"):
-        with open(hierarchy_path, "rb") as f:
+    def __init__(self, project_id, dataset_id, hier_path, ic_path,
+                 emb_table="cui_embeddings"):
+        with open(hier_path, "rb") as f:
             self._graph = pickle.load(f)
         with open(ic_path, "rb") as f:
             self._ic_pre = pickle.load(f)
 
         self._bq = bigquery.Client(project=project_id)
-        self._pid = project_id
-        self._did = dataset_id
+        self._pid, self._did = project_id, dataset_id
         self._meta = MetadataFetcher(self._bq, project_id, dataset_id)
         self._ic = ICComputer(self._graph, self._ic_pre)
-        self._emb = EmbeddingFetcher(self._bq, project_id, dataset_id, embedding_table)
+        self._emb = EmbeddingFetcher(self._bq, project_id, dataset_id, emb_table)
 
     def build_topics(self, cuis):
-        """
-        cuis: list of CUI strings (concise set from CUISummarizer)
-        returns dict with topics list + metrics
-        """
         t0 = time.perf_counter()
 
         if not cuis:
-            return {"topics": [], "metrics": self._zero_metrics(0.0)}
+            return {"topics": [], "metrics": {"input_cui_count": 0, "topic_count": 0,
+                                               "singleton_count": 0, "processing_time_ms": 0.0}}
 
         cuis = list(dict.fromkeys(cuis))
         n_in = len(cuis)
 
-        # fetch everything we need
-        metadata = self._meta.fetch(cuis)
-        ic_map = self._ic.compute(cuis, metadata)
-        embeddings = self._emb.fetch(cuis)
+        meta = self._meta.fetch(cuis)
+        ic = self._ic.compute(cuis, meta)
+        embs = self._emb.fetch(cuis)
         terms = fetch_preferred_terms(self._bq, self._pid, self._did, cuis)
 
-        # build topics from hierarchy
-        h_topics = HierarchicalTopicBuilder.build(cuis, self._graph, ic_map)
-        if not h_topics:
-            return {"topics": [], "metrics": self._zero_metrics(self._ms(t0))}
+        # hierarchy-based topic grouping
+        h = HierarchicalTopicBuilder.build(cuis, self._graph, ic)
+        if not h:
+            ms = (time.perf_counter() - t0) * 1000
+            return {"topics": [], "metrics": {"input_cui_count": n_in, "topic_count": 0,
+                                               "singleton_count": 0, "processing_time_ms": round(ms, 1)}}
 
-        # label: grouping ancestor if available, else highest-IC member
-        for tid, t in h_topics.items():
+        # label each topic: use grouping ancestor, fall back to highest-IC member
+        for t in h.values():
             g = t.get("_grouping_cui")
-            if g:
-                t["topic_cui"] = g
-            elif t.get("members"):
-                t["topic_cui"] = max(t["members"], key=lambda c: ic_map.get(c, 0.0))
+            t["topic_cui"] = g if g else max(t.get("members", [""]), key=lambda c: ic.get(c, 0.0))
 
-        # grab terms for any label CUIs we don't have yet
-        label_cuis = {t["topic_cui"] for t in h_topics.values() if t.get("topic_cui")}
-        missing = label_cuis - set(terms)
-        if missing:
-            terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, missing))
+        # grab any missing terms for label CUIs
+        label_cuis = {t["topic_cui"] for t in h.values() if t.get("topic_cui")} - set(terms)
+        if label_cuis:
+            terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, label_cuis))
 
-        # centroids: mean of member embeddings, L2-normed
+        # centroids per topic
         centroids = {}
-        for tid, t in h_topics.items():
-            vecs = [embeddings[c] for c in t.get("members", []) if c in embeddings]
-            if not vecs:
+        for tid, t in h.items():
+            vecs = [embs[c] for c in t.get("members", []) if c in embs]
+            if vecs:
+                mu = np.mean(vecs, axis=0, dtype=np.float32)
+                n = np.linalg.norm(mu)
+                centroids[tid] = (mu / n).tolist() if n > 0 else None
+            else:
                 centroids[tid] = None
-                continue
-            mu = np.mean(vecs, axis=0).astype(np.float32)
-            n = np.linalg.norm(mu)
-            centroids[tid] = (mu / n).tolist() if n > 0 else None
 
-        # format
+        # format output
         topics_out = []
-        for tid in sorted(h_topics):
-            t = h_topics[tid]
-            tc = t.get("topic_cui") or ""
+        for tid in sorted(h):
+            t = h[tid]
+            tc = t.get("topic_cui", "")
 
             members = []
             for c in t.get("members", []):
-                m = metadata.get(c)
-                members.append({
-                    "cui": c,
-                    "preferred_term": terms.get(c, c),
-                    "ic": round(ic_map.get(c, 0.0), 4),
-                    "semantic_types": list(m.semantic_types) if m and m.semantic_types else [],
-                })
+                m = meta.get(c)
+                members.append({"cui": c, "preferred_term": terms.get(c, c),
+                                "ic": round(ic.get(c, 0.0), 4),
+                                "semantic_types": list(m.semantic_types) if m and m.semantic_types else []})
 
             subtopics = []
-            for stid in sorted(t.get("subtopics", {})):
-                st = t["subtopics"][stid]
-                sc = st.get("subtopic_cui") or ""
-                st_members = [{"cui": c,
-                               "preferred_term": terms.get(c, c),
-                               "ic": round(ic_map.get(c, 0.0), 4)}
-                              for c in st.get("members", [])]
-                subtopics.append({
-                    "subtopic_id": stid,
-                    "subtopic_cui": sc,
-                    "subtopic_label": terms.get(sc, sc) if sc else "",
-                    "members": st_members,
-                })
+            for sid in sorted(t.get("subtopics", {})):
+                st = t["subtopics"][sid]
+                sc = st.get("subtopic_cui", "")
+                st_mem = [{"cui": c, "preferred_term": terms.get(c, c),
+                           "ic": round(ic.get(c, 0.0), 4)} for c in st.get("members", [])]
+                subtopics.append({"subtopic_id": sid, "subtopic_cui": sc,
+                                  "subtopic_label": terms.get(sc, sc) if sc else "",
+                                  "members": st_mem})
 
-            topics_out.append({
-                "topic_id": tid,
-                "topic_cui": tc,
-                "topic_label": terms.get(tc, tc) if tc else "",
-                "members": members,
-                "subtopics": subtopics,
-                "centroid": centroids.get(tid),
-            })
+            topics_out.append({"topic_id": tid, "topic_cui": tc,
+                               "topic_label": terms.get(tc, tc) if tc else "",
+                               "members": members, "subtopics": subtopics,
+                               "centroid": centroids.get(tid)})
 
-        ms = self._ms(t0)
+        ms = (time.perf_counter() - t0) * 1000
         n_topics = len(topics_out)
-        n_single = sum(1 for t in topics_out if len(t["members"]) == 1)
-        log.info(f"{n_in} CUIs -> {n_topics} topics ({n_single} singletons) ({ms:.0f}ms)")
+        n_sing = sum(1 for t in topics_out if len(t["members"]) == 1)
+        log.info(f"{n_in} CUIs -> {n_topics} topics ({n_sing} singletons) {ms:.0f}ms")
 
-        return {
-            "topics": topics_out,
-            "metrics": {
-                "input_cui_count": n_in,
-                "topic_count": n_topics,
-                "singleton_count": n_single,
-                "processing_time_ms": round(ms, 1),
-            },
-        }
-
-    @staticmethod
-    def _zero_metrics(ms):
-        return {"input_cui_count": 0, "topic_count": 0,
-                "singleton_count": 0, "processing_time_ms": round(ms, 1)}
-
-    @staticmethod
-    def _ms(t0):
-        return (time.perf_counter() - t0) * 1000
+        return {"topics": topics_out,
+                "metrics": {"input_cui_count": n_in, "topic_count": n_topics,
+                            "singleton_count": n_sing, "processing_time_ms": round(ms, 1)}}
 
     def close(self):
         self._emb.close()
