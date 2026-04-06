@@ -9,70 +9,60 @@ summarizer = CUISummarizer(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBE
 topics_mod = CUITopics(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
 
 
-# extract CUIs from a query
+# --- run 1: from text query (comment this block for run 2) ---
 query = "severe persistent asthma with allergic rhinitis"
 raw = extractor.extract([query], [query])
 cuis = [c for d in raw.values() for c in d["cuis"]]
-print(f"extracted: {len(cuis)} CUIs")
+print("extracted CUIs:", cuis)
+
+# --- run 2: from CUI list (uncomment this for run 2, comment the block above) ---
+# cuis = ["C0264408", "C2887456", "C4040110", "C0004096", "C0001927", "C0064620"]
 
 
-# summarize with source filter
+print("input:", len(cuis), "CUIs")
+
+# summarize
 s = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
-m = s["metrics"]
-print(f"\nsummarized: {m['input_code_count']} -> {m['output_code_count']}")
-print(f"retention: {m['information_retention_score']}")
+print("\nmetrics:", s["metrics"])
 
-print(f"\nkept:")
+print("\nkept:")
 for c in s["concise_cuis"]:
     print(f"  {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
 
-print(f"\nremoved:")
+print("\nremoved:")
 for c in s["removed_cuis"]:
     print(f"  {c['cui']}  {c['preferred_term']}  <- {c['reason']} (by {c['retained_by']})")
 
-
-# build topics from surviving CUIs
+# topics
 surviving = [c["cui"] for c in s["concise_cuis"]]
 t = topics_mod.build_topics(surviving)
-print(f"\ntopics: {t['metrics']['topic_count']}")
+print("\ntopics:", t["metrics"]["topic_count"])
 for topic in t["topics"]:
-    print(f"\n  [{topic['topic_id']}] {topic['topic_label']}")
+    print(f"  [{topic['topic_id']}] {topic['topic_label']}")
     for mem in topic["members"]:
-        print(f"      {mem['cui']}  {mem['preferred_term']}  IC={mem['ic']}")
-    for st in topic["subtopics"]:
-        print(f"    subtopic: {st['subtopic_label']}")
-        for sm in st["members"]:
-            print(f"      {sm['cui']}  {sm['preferred_term']}  IC={sm['ic']}")
+        print(f"    {mem['cui']}  {mem['preferred_term']}  IC={mem['ic']}")
 
-
-# same CUIs without source filter vs with
+# source filter comparison
 r_all = summarizer.summarize(cuis)
 r_snomed = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
-print(f"\nno filter: {r_all['metrics']['input_code_count']} -> {r_all['metrics']['output_code_count']}")
-print(f"SNOMEDCT_US only: {r_snomed['metrics']['input_code_count']} -> {r_snomed['metrics']['output_code_count']}")
-
+print(f"\nno filter: {r_all['metrics']['output_code_count']}  SNOMEDCT_US: {r_snomed['metrics']['output_code_count']}")
 
 # network object
 s_net = summarizer.summarize(cuis, sources=["SNOMEDCT_US"], return_network_object=True)
 net = s_net["network_object"]
 print(f"\nnetwork: {net['node_count']} nodes, {net['edge_count']} edges")
 for n in net["nodes"]:
-    sel = "kept" if n["is_selected"] else f"removed ({n.get('removal_reason', '')})"
-    print(f"  {n['cui']}  {n['preferred_term']}  {sel}")
+    print(f"  {n['cui']}  {n['preferred_term']}  is_selected={n['is_selected']}")
 for e in net["edges"]:
-    print(f"  {e['source']} -> {e['target']}  {e['relationship']}")
+    print(f"  {e['source']} -> {e['target']}")
 
+# unrelated codes
+s_nh = summarizer.summarize(["C0018681", "C0017636"], sources=["SNOMEDCT_US"])
+print(f"\nunrelated: {s_nh['metrics']['input_code_count']} in, {s_nh['metrics']['output_code_count']} out")
 
-# unrelated codes — nothing should be removed
-raw_nh = extractor.extract(["headache", "glioblastoma"], ["headache", "glioblastoma"])
-cuis_nh = [c for d in raw_nh.values() for c in d["cuis"]]
-s_nh = summarizer.summarize(cuis_nh, sources=["SNOMEDCT_US"])
-print(f"\nunrelated (headache + glioblastoma): {s_nh['metrics']['input_code_count']} -> {s_nh['metrics']['output_code_count']}")
-
-
-# empty input
+# empty
 s_empty = summarizer.summarize([])
-print(f"empty: {s_empty['metrics']['input_code_count']} -> {s_empty['metrics']['output_code_count']} retention={s_empty['metrics']['information_retention_score']}")
+print(f"empty: {s_empty['metrics']}")
 
 
 summarizer.close()
