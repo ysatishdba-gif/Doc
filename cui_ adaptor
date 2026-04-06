@@ -57,7 +57,7 @@ from dataclasses import dataclass
 # Import enums from cui_core — single source of truth for all
 # clinical domain string constants. Never compare bare strings in pipeline logic.
 from cui_core import (
-    ClinicalContext, MatchType
+    MatchType
 )
 
 logger = logging.getLogger("cui_reduction")
@@ -180,10 +180,7 @@ class ChunkStore:
             text: original chunk text (for LLM reasoning)
             embeddings: dict {cui: numpy_array} — if provided, computes
                         per-topic centroids for embedding-based topic filter
-            temporal_map: dict {cui: temporal_flag} — "current" | "historical"
-                          | "hypothetical" | "family" | "unknown"
-                          from ClinicalContextParser. Stored for query-time
-                          temporal mismatch penalisation.
+            temporal_map: dict {cui: str} — unused, kept for backward compat
         """
         topics = topics or {}
         # compute per-topic centroids if embeddings available
@@ -244,9 +241,7 @@ class ChunkStore:
             if "text" not in chunk:
                 chunk["text"] = ""
             if "temporal_map" not in chunk:
-                # old store: assume all CUIs are current (default ClinicalContext)
-                chunk["temporal_map"] = {c: ClinicalContext()
-                                         for c in chunk.get("cuis", set())}
+                chunk["temporal_map"] = {}
         logger.info(f"ChunkStore loaded: {len(store._data)} chunks from {path}")
         return store
 
@@ -1920,7 +1915,7 @@ class TopicIndex:
 # query-vs-document matching wrapper
 # converts summarizer+topics output into the format TopicIndex/ChunkMatcher expect
 
-class CUIMatcher:
+class CUIAdaptor:
 
     def __init__(self, hierarchy, ic_map):
         self._graph = hierarchy
@@ -1930,7 +1925,7 @@ class CUIMatcher:
         self._m = ChunkMatcher(graph=hierarchy, ic_map=ic_map)
 
     def index_document(self, doc_id, summary, topics):
-        cuis = {c["cui"] if isinstance(c, dict) else c for c in summary.get("concise_cuis", [])}
+        cuis = {c["cui"] if isinstance(c, dict) else c for c in summary.get("surviving_cuis", [])}
         t_map = {}
         for t in topics.get("topics", []):
             mems = [m["cui"] if isinstance(m, dict) else m for m in t.get("members", [])]
@@ -1951,7 +1946,7 @@ class CUIMatcher:
             self._idx.build(self._chunks, graph=self._graph)
 
         # build query inputs
-        q_cuis = {c["cui"] if isinstance(c, dict) else c for c in q_summary.get("concise_cuis", [])}
+        q_cuis = {c["cui"] if isinstance(c, dict) else c for c in q_summary.get("surviving_cuis", [])}
         cents = [np.array(t["centroid"], dtype=np.float32)
                  for t in q_topics.get("topics", []) if t.get("centroid") is not None]
         if cents:
@@ -2001,6 +1996,6 @@ class CUIMatcher:
 
     @staticmethod
     def match(q_sum, q_top, d_sum, d_top, hierarchy, ic_map, doc_id="document", top_k=10):
-        m = CUIMatcher(hierarchy, ic_map)
+        m = CUIAdaptor(hierarchy, ic_map)
         m.index_document(doc_id, d_sum, d_top)
         return m.match_query(q_sum, q_top, top_k=top_k)
