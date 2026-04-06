@@ -1,75 +1,355 @@
-from config import (PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH,
-                    EMBEDDING_TABLE, API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED)
-from cui_core import CUIExtractor
-from cui_summarizer import CUISummarizer
-from cui_topics import CUITopics
-
-extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P, cluster_set=CLUSTER_SET, combined=COMBINED)
-summarizer = CUISummarizer(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
-topics_mod = CUITopics(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
-
-
-# --- run 1: from text query (comment this block for run 2) ---
-query = "severe persistent asthma with allergic rhinitis"
-raw = extractor.extract([query], [query])
-cuis = [c for d in raw.values() for c in d["cuis"]]
-
-# --- run 2: from CUI list (uncomment this for run 2, comment the block above) ---
-# cuis = [
-#     "C0264408", "C2887456", "C4040110", "C1960050", "C2887453",  # asthma severity
-#     "C4040055", "C4040085", "C4041140", "C0264423", "C0264429",  # asthma variants
-#     "C0001927", "C0064620", "C0072554", "C0032952", "C0990865",  # medications
-#     "C0239580", "C0013404", "C0043144", "C0024115", "C0231832",  # respiratory findings
-#     "C0006277", "C0024109", "C0035204", "C0004096", "C0340044",  # respiratory conditions
-#     "C0020538", "C0011849", "C0011860", "C0020473", "C0018801",  # comorbidities
-#     "C0199176", "C0430022", "C0428883", "C0042963", "C0024299",  # labs and vitals
-# ]
-
-print("input CUIs:", cuis)
-print("count:", len(cuis))
-
-# summarize
-s = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
-m = s["metrics"]
-print(f"\n{m['input_code_count']} in -> {m['output_code_count']} out  retention={m['information_retention_score']}")
-
-print("\nkept:")
-for c in s["concise_cuis"]:
-    print(f"  {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
-
-print("\nremoved:")
-for c in s["removed_cuis"]:
-    print(f"  {c['cui']}  {c['preferred_term']}  <- {c['reason']} (by {c['retained_by']})")
-
-# topics
-surviving = [c["cui"] for c in s["concise_cuis"]]
-t = topics_mod.build_topics(surviving)
-print("\ntopics:", t["metrics"]["topic_count"])
-for topic in t["topics"]:
-    print(f"  [{topic['topic_id']}] {topic['topic_label']}")
-    for mem in topic["members"]:
-        print(f"    {mem['cui']}  {mem['preferred_term']}  IC={mem['ic']}")
-
-# source filter comparison
-r_all = summarizer.summarize(cuis)
-r_snomed = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
-print(f"\nno filter: {r_all['metrics']['output_code_count']}  SNOMEDCT_US: {r_snomed['metrics']['output_code_count']}")
-
-# network object
-s_net = summarizer.summarize(cuis, sources=["SNOMEDCT_US"], return_network_object=True)
-net = s_net["network_object"]
-print(f"\nnetwork: {net['node_count']} nodes, {net['edge_count']} edges")
-for n in net["nodes"]:
-    print(f"  {n['cui']}  {n['preferred_term']}  is_selected={n['is_selected']}")
-for e in net["edges"]:
-    print(f"  {e['source']} -> {e['target']}")
-
-# unrelated codes payload
-print("\nunrelated codes payload:  summarizer.summarize(['C0018681', 'C0017636'], sources=['SNOMEDCT_US'])")
-
-# empty input payload
-print("empty input payload:     summarizer.summarize([])")
-
-
-summarizer.close()
-topics_mod.close()
+INPUT: "knee arthroplasty"
+│
+│
+═══ PIPELINE 1: CUI Summary ════════════════════════════════════════════════
+│
+├── STAGE 1: API extraction (TOP_K=3, COMBINED=True)
+│   │
+│   └── 25 CUIs returned:
+│       C0745532  dist=0.218  Knee arthroplasty prosthesis placement
+│       C1536796  dist=0.221  Knee arthroplasty (& replacement)
+│       C0187960  dist=0.224  Prosthetic arthroplasty of knee joint
+│       C0375841  dist=0.225  Knee joint replacement
+│       C5768203  dist=0.229  Prosthetic arthroplasty of right knee
+│       C0845658  dist=0.232  Total arthroplasty of knee, unilateral
+│       C3873937  dist=0.235  Knee femur prosthesis
+│       C5568443  dist=0.238  Arthroplasty of knee planned
+│       C0086511  dist=0.241  Knee Replacement Arthroplasty
+│       C5688901  dist=0.243  Arthroplasty using robotic assistance
+│       C0188146  dist=0.245  Arthroplasty of knee, tibial plateau
+│       ... +14 more (ICD10PCS, ICD10CM codes)
+│
+│   ConText: negated=0, historical=0 → all 25 survive
+│
+├── STAGE 2: SAB filter (ALLOWED_SABS = {SNOMEDCT_US})
+│   │
+│   │  REMOVED (15):
+│   │    C0745532  ← ICD10PCS
+│   │    C1536796  ← ICD10PCS
+│   │    ... 13 more non-SNOMED
+│   │
+│   └── 25 → 10 surviving:
+│       C0187960  IC=12.8  Prosthetic arthroplasty of knee joint    [Procedure]
+│       C0375841  IC=11.2  Knee joint replacement                    [Procedure]
+│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee    [Procedure]
+│       C0845658  IC=13.5  Total arthroplasty of knee, unilateral   [Procedure]
+│       C3873937  IC=14.8  Knee femur prosthesis                     [Device]
+│       C5768204  IC=14.8  Prosthetic arthroplasty of left knee     [Procedure]
+│       C5568443  IC=14.8  Arthroplasty of knee planned             [Procedure]
+│       C0086511  IC=10.5  Knee Replacement Arthroplasty            [Procedure]
+│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau     [Procedure]
+│       C5688901  IC=14.8  Arthroplasty using robotic assistance    [Procedure]
+│
+├── STAGE 3: metadata + IC lookup
+│   │
+│   │  IC = −log((descendants+1)/total)
+│   │  All 10 valid SNOMED, all have IC scores
+│   │
+│   └── 10 → 10 (nothing removed)
+│
+├── STAGE 4: hierarchy reduction (ancestor_depth=5, UP 1 hop)
+│   │
+│   │  Check: is parent also in our set? same type? IC(child) ≥ IC(parent)?
+│   │
+│   │  PAIR 1:
+│   │    C0086511  IC=10.5  Knee Replacement Arthroplasty      ← PARENT
+│   │    C0845658  IC=13.5  Total arthroplasty of knee          ← CHILD
+│   │    same type (Procedure), IC 13.5 ≥ 10.5 → REMOVE C0086511
+│   │
+│   │  PAIR 2:
+│   │    C0375841  IC=11.2  Knee joint replacement              ← PARENT
+│   │    C0187960  IC=12.8  Prosthetic arthroplasty of knee     ← CHILD
+│   │    same type (Procedure), IC 12.8 ≥ 11.2 → REMOVE C0375841
+│   │
+│   └── 10 → 8 surviving:
+│       C0187960  IC=12.8  Prosthetic arthroplasty of knee joint
+│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee
+│       C0845658  IC=13.5  Total arthroplasty of knee, unilateral
+│       C3873937  IC=14.8  Knee femur prosthesis                  [Device]
+│       C5768204  IC=14.8  Prosthetic arthroplasty of left knee
+│       C5568443  IC=14.8  Arthroplasty of knee planned
+│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau
+│       C5688901  IC=14.8  Arthroplasty using robotic assistance
+│
+├── STAGE 5: embedding reduction (n=8 ≤ 20 → fast path, no Louvain)
+│   │
+│   │  Fetch 3072-dim embeddings for 8 CUIs
+│   │  8×8 matrix → 28 pairwise cosine distances
+│   │
+│   │  OTSU on 28 distances:
+│   │    sorted: 0.03, 0.04, 0.06, 0.07, ─gap─, 0.18, 0.22, 0.25, ...0.45
+│   │    try split at 0.07: score = 0.0021
+│   │    try split at 0.18: score = 0.0038  ← HIGHEST
+│   │    try split at 0.22: score = 0.0029
+│   │    → threshold = 0.18, median cap = 0.25, tight_t = 0.18
+│   │
+│   │  6 pairs below 0.18 → check guards:
+│   │
+│   │  PAIR: C0187960 (Prosthetic arthroplasty) ↔ C0845658 (Total arthroplasty)
+│   │    dist=0.03
+│   │    G1: parent-child? NO
+│   │    G2: types? NO (both Procedure)
+│   │    G3: ancestors? NO (share "Arthroplasty of knee")
+│   │    G4: siblings? NO
+│   │    → ALL FAILED → REMOVE C0845658 (lower IC: 13.5 < 14.8)
+│   │
+│   │  PAIR: C5768203 (right knee) ↔ C5768204 (left knee)
+│   │    dist=0.04
+│   │    G1: parent-child? NO
+│   │    G2: types? NO (both Procedure)
+│   │    G3: ancestors? NO (share same ancestors)
+│   │    G4: sibling leaves? YES — both leaf nodes, same parent
+│   │    → G4 FIRED → KEEP BOTH
+│   │    ... but C5768204 removed by another pair later (dup of C0187960)
+│   │
+│   │  PAIR: C3873937 (Knee femur prosthesis) ↔ C0188146 (Arthroplasty tibial)
+│   │    dist=0.12
+│   │    G1: parent-child? NO
+│   │    G2: types? YES — Device ≠ Procedure
+│   │    → G2 FIRED → KEEP BOTH
+│   │
+│   │  ... 3 more pairs checked, 2 more duplicates found ...
+│   │
+│   └── 8 → 5 surviving:
+│       C5568443  IC=14.8  Arthroplasty of knee planned           (planning)
+│       C5688901  IC=14.8  Arthroplasty using robotic assistance  (method)
+│       C5768203  IC=14.8  Prosthetic arthroplasty of right knee  (laterality)
+│       C3873937  IC=14.8  Knee femur prosthesis                   (device)
+│       C0188146  IC=14.8  Arthroplasty of knee, tibial plateau   (site)
+│
+│
+═══ PIPELINE 2: TOPIC FORMATION ══════════════════════════════════════════════
+│
+├── ADAPTIVE PARAMETERS:
+│   │  IC floor = p10([14.8, 14.8, 14.8, 14.8, 14.8]) = 14.8
+│   │  max_coverage = max(2, 5/√5) = 2
+│
+├── STAGE 6: BFS walk UP from each CUI (max 5 hops, gradient 0.3 at hop 3+)
+│   │
+│   │  FROM C5568443 (Arthroplasty of knee planned, IC=14.8):
+│   │    hop 1: Arthroplasty of knee joint       IC=9.7   (grace period, always walk)
+│   │    hop 2: Operation on knee                IC=6.4   (grace period, always walk)
+│   │    hop 3: Surgical procedure on joint      IC=3.1   (ratio 3.1/6.4=0.48 > 0.3 → walk)
+│   │    hop 4: Procedure                        IC=0.8   (ratio 0.8/3.1=0.26 < 0.3 → STOP)
+│   │
+│   │  FROM C5688901 (Robotic assistance, IC=14.8):
+│   │    hop 1: Arthroplasty of knee joint       IC=9.7   ← SAME as C5568443
+│   │    hop 2: Operation on knee                IC=6.4
+│   │    hop 3: Surgical procedure on joint      IC=3.1
+│   │    hop 4: STOP (gradient)
+│   │
+│   │  FROM C0188146 (Tibial plateau, IC=14.8):
+│   │    hop 1: Arthroplasty of knee joint       IC=9.7   ← SAME again
+│   │    hop 2: Operation on knee                IC=6.4
+│   │    hop 3: STOP
+│   │
+│   │  FROM C5768203 (Right knee, IC=14.8):
+│   │    hop 1: Prosthesis of knee               IC=10.2  ← DIFFERENT branch
+│   │    hop 2: Operation on knee                IC=6.4
+│   │    hop 3: STOP
+│   │
+│   │  FROM C3873937 (Knee femur prosthesis, IC=14.8):
+│   │    hop 1: Prosthesis of knee               IC=10.2  ← SAME as C5768203
+│   │    hop 2: Operation on knee                IC=6.4
+│   │    hop 3: STOP
+│   │
+│   │  ALL ANCESTORS COLLECTED:
+│   │    Arthroplasty of knee joint   IC=9.7    from: C5568443, C5688901, C0188146
+│   │    Prosthesis of knee           IC=10.2   from: C5768203, C3873937
+│   │    Operation on knee            IC=6.4    from: all 5
+│   │    Surgical procedure on joint  IC=3.1    from: C5568443, C5688901
+│   │    Procedure                    IC=0.8    from: C5568443 (stopped at gradient)
+│   │
+├── FILTER: 3 rules on each ancestor
+│   │
+│   │  Arthroplasty of knee joint  IC=9.7
+│   │    covers ≥2? YES (3 CUIs)
+│   │    IC ≥ 14.8 (floor)? NO → REJECTED
+│   │
+│   │  Prosthesis of knee  IC=10.2
+│   │    covers ≥2? YES (2 CUIs)
+│   │    IC ≥ 14.8? NO → REJECTED
+│   │
+│   │  Operation on knee  IC=6.4
+│   │    covers ≥2? YES (5 CUIs)
+│   │    IC ≥ 14.8? NO → REJECTED
+│   │
+│   │  ALL REJECTED (floor is 14.8 — very high because all 5 CUIs are IC=14.8)
+│   │
+│   │  → No convergence points found
+│   │  → All 5 CUIs become part of a single topic using the
+│   │    best available ancestor below the strict floor
+│   │  → "Arthroplasty of knee joint" (IC=9.7) selected as topic_cui
+│   │
+│   └── FINAL TOPIC:
+│       │
+│       │  TOPIC: Arthroplasty of knee joint (topic_cui)
+│       │  │
+│       │  ├── Subtopic A: Prosthesis of knee (IC=10.2)
+│       │  │   ├── C5768203  IC=14.8  Prosthetic arthroplasty of R knee
+│       │  │   └── C3873937  IC=14.8  Knee femur prosthesis
+│       │  │
+│       │  └── Subtopic B: Arthroplasty of knee joint (IC=9.7)
+│       │      ├── C5568443  IC=14.8  Arthroplasty of knee planned
+│       │      ├── C5688901  IC=14.8  Arthroplasty using robotic assistance
+│       │      └── C0188146  IC=14.8  Arthroplasty of knee, tibial plateau
+│       │
+│       │  1 topic, 2 subtopics, 5 member CUIs
+│       │
+├── STAGE 7: representatives
+│   │  Rep from Subtopic A: C5768203 (highest centroid sim)
+│   │  Rep from Subtopic B: C5568443 (highest centroid sim)
+│   │  → 2 reps
+│   │
+├── STAGE 8: centroid
+│   │  mean(embeddings of C5568443, C5688901, C5768203, C3873937, C0188146)
+│   │  L2-normalize → 3072-dim query centroid
+│   │
+│
+│
+═══ PIPELINE 3: QUERY MATCHING ═══════════════════════════════════════════════
+│
+│  Query: 1 topic, 5 CUIs, 1 centroid
+│  Store: 5 documents, 236 topic groups
+│
+├── PASS 1: topic gate
+│   │
+│   │  Query centroid × 236 group centroids (one matrix multiply):
+│   │
+│   │    topic_14 (case_2 knee surgery):  sim = 0.72
+│   │    topic_71 (case_1 asthma group):  sim = 0.15
+│   │    topic_03 (case_1 medications):   sim = 0.08
+│   │    topic_99 (case_3 diabetes):      sim = 0.06
+│   │    ... 232 more below 0.06 ...
+│   │
+│   │  gap_split:
+│   │    sorted: 0.72, 0.15, 0.08, 0.06, ...
+│   │    gaps:   0.72→0.15 = 0.57 ← BIGGEST
+│   │            0.15→0.08 = 0.07
+│   │            0.08→0.06 = 0.02
+│   │    split at 0.57 → topic_14 (0.72) admitted
+│   │
+│   │  CUI overlap rescue on excluded:
+│   │    topic_71 shares C3873937 (Knee femur prosthesis) → admitted
+│   │    others: no shared CUIs
+│   │
+│   │  → 2/236 admitted to Pass 2
+│   │
+│   │  Precompute: ancestors for all doc CUIs in admitted groups (8 hops)
+│   │  Include: topic_cui in matchable set
+│   │
+├── PASS 2: score topic_14 (case_2 knee surgery)
+│   │
+│   │  Topic_14 members: C5768203, C0845658, C0187960, C0375841, C0086511 + topic_cui
+│   │
+│   │  ── SIGNAL 1: cui_ratio ──
+│   │
+│   │  Q1 (C5768203) vs topic_14:
+│   │    vs C5768203: EXACT MATCH → credit = 1.000 → STOP Q1
+│   │
+│   │  Q2 (C0188146, tibial plateau) vs topic_14:
+│   │    exact? NO for all
+│   │    parent-child? walk 8 hops UP from Q2 and each topic CUI:
+│   │      C0187960 is parent of Q2 → YES
+│   │      credit = IC(C0187960)/IC(C0188146) = 12.8/14.8 = 0.865 → STOP Q2
+│   │
+│   │  Q3 (C5688901, robotic) vs topic_14:
+│   │    exact? NO
+│   │    parent-child? NO
+│   │    MICA:
+│   │      Q3 vs C0187960: MICA = Arthroplasty of knee (IC=9.7)
+│   │        Lin = 2×9.7/(14.8+12.8) = 19.4/27.6 = 0.703 ← best
+│   │      Q3 vs C0845658: MICA = Arthroplasty of knee (IC=9.7)
+│   │        Lin = 2×9.7/(14.8+13.5) = 19.4/28.3 = 0.686
+│   │      Q3 vs C0375841: MICA = Operation on knee (IC=6.4)
+│   │        Lin = 2×6.4/(14.8+11.2) = 12.8/26.0 = 0.492
+│   │    credit = 0.703 → STOP Q3
+│   │
+│   │  Q4 (C3873937, prosthesis [Device]) vs topic_14:
+│   │    exact? NO
+│   │    parent-child? NO (Device vs Procedure branches)
+│   │    MICA:
+│   │      Q4 vs C0845658: MICA = Knee procedure (IC=5.5)
+│   │        Lin = 2×5.5/(14.8+13.5) = 11.0/28.3 = 0.389 ← best
+│   │    credit = 0.389 → STOP Q4
+│   │
+│   │  Q5 (C5568443, planned) vs topic_14:
+│   │    exact? NO
+│   │    parent-child? C0086511 is ancestor of Q5 at hop 2 → YES
+│   │      credit = IC(C0086511)/IC(C5568443) = 10.5/14.8 = 0.709 → STOP Q5
+│   │
+│   │  cui_ratio = (1.000 + 0.865 + 0.703 + 0.389 + 0.709) / 5 = 0.733
+│   │
+│   │  ── SIGNAL 2: vec_sim ──
+│   │
+│   │  dot(query centroid, topic_14 centroid) = 0.82
+│   │  (both are knee arthroplasty embeddings → high similarity)
+│   │
+│   │  ── SIGNAL 3: lin_avg ──
+│   │
+│   │  Q1: exact → skip
+│   │  Q2: parent-child → skip
+│   │  Q3: MICA match → Lin = 0.703
+│   │  Q4: MICA match → Lin = 0.389
+│   │  Q5: parent-child → skip
+│   │
+│   │  lin_avg = (0.703 + 0.389) / 2 = 0.546
+│   │
+│   │  → topic_14: cui_ratio=0.733  vec_sim=0.82  lin_avg=0.546
+│   │
+├── PASS 2: score topic_71 (case_1 asthma group with shared CUI)
+│   │
+│   │  Q1 (C5768203): exact? NO. parent-child? NO. MICA → Lin=0.12
+│   │  Q2 (C0188146): no match → 0
+│   │  Q3 (C5688901): no match → 0
+│   │  Q4 (C3873937): EXACT MATCH with shared CUI → credit=1.000
+│   │  Q5 (C5568443): no match → 0
+│   │
+│   │  cui_ratio = (0.12 + 0 + 0 + 1.000 + 0) / 5 = 0.224
+│   │  vec_sim = 0.15 (asthma centroid far from knee centroid)
+│   │  lin_avg = average(0.12, 0, 0, 0) = 0.03
+│   │
+│   │  → topic_71: cui_ratio=0.224  vec_sim=0.15  lin_avg=0.03
+│   │
+├── PASS 3: z-score normalize
+│   │
+│   │              cui_ratio    vec_sim    lin_avg
+│   │  topic_14      0.733       0.82       0.546
+│   │  topic_71      0.224       0.15       0.030
+│   │
+│   │  mean:         0.479       0.485      0.288
+│   │  std:          0.360       0.474      0.365
+│   │
+│   │  z-scores:
+│   │  topic_14: z_cui=(0.733-0.479)/0.360 = +0.71
+│   │            z_vec=(0.82-0.485)/0.474  = +0.71
+│   │            z_lin=(0.546-0.288)/0.365 = +0.71
+│   │            sum = +2.13
+│   │
+│   │  topic_71: z_cui=(0.224-0.479)/0.360 = -0.71
+│   │            z_vec=(0.15-0.485)/0.474  = -0.71
+│   │            z_lin=(0.030-0.288)/0.365 = -0.71
+│   │            sum = -2.13
+│   │
+│   │  normalize to [0,1]:
+│   │    topic_14: (2.13-(-2.13)) / 4.26 = 1.000
+│   │    topic_71: (-2.13-(-2.13)) / 4.26 = 0.000
+│   │
+├── PASS 4: relative threshold
+│   │
+│   │  best = 1.000 (topic_14)
+│   │  threshold = 1.000 × 0.40 = 0.400
+│   │
+│   │  topic_14: 1.000 ≥ 0.400 → ✓ RETURNED
+│   │  topic_71: 0.000 < 0.400 → ✗ dropped
+│   │
+│   │  zero-evidence guard: topic_71 has cui_ratio=0.224 (not all zero) → not suppressed
+│   │                       dropped by threshold, not by guard
+│   │
+└── RESULT:
+    │
+    │  #1  case_2  score=1.000
+    │      matched CUIs: C5768203 (exact), C0188146 (parent-child), C5688901 (MICA)
+    │      chunk text: "Patient underwent total knee arthroplasty of right knee..."
+    │
+    │  
