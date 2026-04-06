@@ -1,9 +1,9 @@
 # cui_summarizer.py
 # Reduces a CUI set to the most specific non-redundant subset.
-# Uses stages 2-5 from cui_core (SAB filter, hierarchy, embedding dedup).
 
-import time, pickle, logging
+import time, logging
 from google.cloud import bigquery
+from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed
 
 from cui_core import (
     MetadataFetcher, ICComputer, SABFilter, HierarchyReducer,
@@ -17,27 +17,21 @@ log = logging.getLogger(__name__)
 
 class CUISummarizer:
 
-    def __init__(self, project_id, dataset_id, hier_path, ic_path,
-                 emb_table="cui_embeddings"):
-        with open(hier_path, "rb") as f:
-            self._graph = pickle.load(f)
-        with open(ic_path, "rb") as f:
-            self._ic_pre = pickle.load(f)
-
-        self._bq = bigquery.Client(project=project_id,
-                                    default_query_job_config=bigquery.QueryJobConfig(use_legacy_sql=False))
-        self._pid, self._did = project_id, dataset_id
-        self._meta = MetadataFetcher(self._bq, project_id, dataset_id)
+    def __init__(self):
+        self._graph = hierarchy
+        self._ic_pre = ic_precomputed
+        self._bq = bigquery.Client(project=PROJECT_ID)
+        self._pid, self._did = PROJECT_ID, DATASET_ID
+        self._meta = MetadataFetcher(self._bq, PROJECT_ID, DATASET_ID)
         self._ic = ICComputer(self._graph, self._ic_pre)
         self._hier = HierarchyReducer(self._graph)
-        self._emb = EmbeddingFetcher(self._bq, project_id, dataset_id, emb_table)
+        self._emb = EmbeddingFetcher(self._bq, PROJECT_ID, DATASET_ID, EMBEDDING_TABLE)
         self._depth = _compute_ancestor_depth(self._graph)
 
     def summarize(self, cuis, sources=None, return_network_object=False):
         t0 = time.perf_counter()
         _clear_ancestor_cache()
 
-        # empty in, empty out
         if not cuis:
             return self._empty_result(return_network_object)
 
@@ -45,12 +39,10 @@ class CUISummarizer:
         n_in = len(cuis)
         audit = []
 
-        # metadata + IC + preferred terms for everything upfront
         meta = self._meta.fetch(cuis)
         ic = self._ic.compute(cuis, meta)
         terms = fetch_preferred_terms(self._bq, self._pid, self._did, cuis)
 
-        # optional source vocab filter
         if sources:
             after_src, aud = SABFilter(set(sources)).run(cuis, meta)
             audit += aud
@@ -64,7 +56,6 @@ class CUISummarizer:
             return self._pack(cuis, [], audit, meta, ic, terms, set(),
                               return_network_object, n_src, 0, 0, self._elapsed(t0))
 
-        # hierarchy: drop parents when child exists
         after_hier, aud, edges = self._hier.run(after_src, ic, meta)
         audit += aud
         n_hier = len(after_hier)
@@ -73,7 +64,6 @@ class CUISummarizer:
             return self._pack(cuis, after_hier, audit, meta, ic, terms, edges,
                               return_network_object, n_src, n_hier, n_hier, self._elapsed(t0))
 
-        # embedding dedup: Otsu + guards
         embs = self._emb.fetch(after_hier)
         n_emb_ok = sum(1 for c in after_hier if c in embs)
         if n_emb_ok <= 1:
@@ -89,8 +79,6 @@ class CUISummarizer:
 
         return self._pack(cuis, after_emb, audit, meta, ic, terms, edges,
                           return_network_object, n_src, n_hier, n_emb, ms)
-
-    # -- result packing --
 
     def _pack(self, inp, out, audit, meta, ic, terms, edges,
               want_net, n_src, n_hier, n_emb, ms):
@@ -109,7 +97,6 @@ class CUISummarizer:
                 r["retained_by"] = a.kept_cui or ""
                 removed.append(r)
 
-        # IC-weighted retention score
         total_ic = sum(ic.get(c, 0.0) for c in inp)
         kept_by = {a.removed_cui: a.kept_cui for a in audit if a.removed_cui and a.kept_cui}
         ret_ic = 0.0
@@ -149,8 +136,6 @@ class CUISummarizer:
              "processing_time_ms": 0.0}
         net = {"nodes": [], "edges": [], "node_count": 0, "edge_count": 0} if want_net else None
         return {"surviving_cuis": [], "removed_cuis": [], "metrics": z, "network_object": net}
-
-    # -- helpers --
 
     @staticmethod
     def _cui_row(cui, meta, ic, terms):
