@@ -1,64 +1,116 @@
-As a data scientist, I want to wrap the CUI summarization logic into a self-contained, reusable module, So that the LLM-based definition generation process is encapsulated, consistently invokable, and ready to be integrated into the broader CUI Definition API and vector database pipeline.
+from config import (PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH,
+                    EMBEDDING_TABLE, API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED)
+from cui_core import CUIExtractor
+from cui_summarizer import CUISummarizer
+from cui_topics import CUITopics
 
-Acceptance Criteria
+extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P, cluster_set=CLUSTER_SET, combined=COMBINED)
+summarizer = CUISummarizer(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
+topics_mod = CUITopics(PROJECT_ID, DATASET_ID, HIERARCHY_PATH, IC_PATH, EMBEDDING_TABLE)
 
 
-Core Summarization Logic:
+# --- AC1: core summarization + AC2: metrics ---
 
-Given: A set of input codes containing hierarchical relationships (e.g., {"Glioblastoma", "Brain Tumor", "Malignant Neoplasm"}).
+print("=" * 60)
+print("AC1+AC2: Summarize + Metrics")
+print("=" * 60)
 
-When: The module processes the set.
+raw = extractor.extract(["severe persistent asthma with allergic rhinitis"],
+                         ["severe persistent asthma with allergic rhinitis"])
+cuis = [c for d in raw.values() for c in d["cuis"]]
+print(f"\nExtracted: {len(cuis)} raw CUIs")
 
-Then: The module MUST return a concise set containing only the most specific codes (e.g., {"Glioblastoma"}).
+s = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
+m = s["metrics"]
 
-Information Retention Metrics:
+print(f"\nMetrics:")
+print(f"  input_code_count:            {m['input_code_count']}")
+print(f"  output_code_count:           {m['output_code_count']}")
+print(f"  information_retention_score: {m['information_retention_score']}")
 
-Given: Any set of input codes.
+print(f"\nKept ({len(s['concise_cuis'])}):")
+for c in s["concise_cuis"]:
+    print(f"  {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
 
-When: The summarization is complete.
+if s["removed_cuis"]:
+    print(f"\nRemoved ({len(s['removed_cuis'])}):")
+    for c in s["removed_cuis"]:
+        print(f"  {c['cui']}  {c['preferred_term']}  <- {c['reason']} (by {c['retained_by']})")
 
-Then: The module MUST return a set of metrics alongside the concise code set, including at a minimum:
+surviving = [c["cui"] for c in s["concise_cuis"]]
+t = topics_mod.build_topics(surviving)
+print(f"\nTopics ({t['metrics']['topic_count']}):")
+for topic in t["topics"]:
+    print(f"\n  [{topic['topic_id']}] {topic['topic_label']}")
+    for mem in topic["members"]:
+        print(f"      {mem['cui']}  {mem['preferred_term']}  IC={mem['ic']}")
+    for st in topic["subtopics"]:
+        print(f"    subtopic: {st['subtopic_label']}")
+        for sm in st["members"]:
+            print(f"      {sm['cui']}  {sm['preferred_term']}  IC={sm['ic']}")
 
-input_code_count: The number of codes provided as input.
 
-output_code_count: The number of codes in the final concise set.
+# --- AC3: source filtering ---
 
-information_retention_score: A calculated metric (e.g., percentage) representing the degree of semantic information retained after summarization.
+print("\n" + "=" * 60)
+print("AC3: Source Filtering")
+print("=" * 60)
 
-Code Source Filtering Option:
+r_filtered = summarizer.summarize(cuis, sources=["SNOMEDCT_US"])
+r_all = summarizer.summarize(cuis)
+print(f"\n  sources=['SNOMEDCT_US']: {r_filtered['metrics']['input_code_count']} -> {r_filtered['metrics']['output_code_count']}")
+print(f"  sources=None (all):      {r_all['metrics']['input_code_count']} -> {r_all['metrics']['output_code_count']}")
 
-Given: An optional parameter specifying one or more code sources (e.g., sources=['SNOMED-CT', 'ICD-10']).
 
-When: The module processes the codes.
+# --- AC4: network object ---
 
-Then: The summarization logic MUST only use the ontologies and hierarchical relationships from the specified sources to determine which codes to keep. If no sources are specified, it should use all available ontologies.
+print("\n" + "=" * 60)
+print("AC4: Network Object")
+print("=" * 60)
 
-Network Object Output Option:
+s_net = summarizer.summarize(cuis, sources=["SNOMEDCT_US"], return_network_object=True)
+net = s_net["network_object"]
+print(f"\n  nodes: {net['node_count']}  edges: {net['edge_count']}")
+for n in net["nodes"]:
+    status = "SELECTED" if n["is_selected"] else f"REMOVED ({n.get('removal_reason', '')})"
+    print(f"    {n['cui']}  {n['preferred_term']}  {status}")
+for e in net["edges"]:
+    print(f"    edge: {e['source']} -> {e['target']}  ({e['relationship']})")
 
-Given: A boolean optional parameter return_network_object=True.
 
-When: The module processes the codes.
+# --- AC5: non-hierarchical codes ---
 
-Then: The module MUST also return a network object (e.g., a NetworkX graph or a JSON structure representing nodes and edges) where:
+print("\n" + "=" * 60)
+print("AC5: Non-Hierarchical Codes")
+print("=" * 60)
 
-Each node represents one of the original input codes.
+raw_nh = extractor.extract(["headache", "glioblastoma"], ["headache", "glioblastoma"])
+cuis_nh = [c for d in raw_nh.values() for c in d["cuis"]]
+s_nh = summarizer.summarize(cuis_nh, sources=["SNOMEDCT_US"])
+print(f"\n  Input: headache + glioblastoma (unrelated)")
+print(f"  In: {s_nh['metrics']['input_code_count']}  Out: {s_nh['metrics']['output_code_count']}")
+for c in s_nh["concise_cuis"]:
+    print(f"    {c['cui']}  {c['preferred_term']}")
 
-Each node contains an attribute (e.g., is_selected: True/False) indicating if it was kept in the final concise set.
 
-(Optional) Edges can represent the hierarchical relationships discovered between the input codes.
+# --- AC6: empty input ---
 
-Handling of Non-Hierarchical Codes:
+print("\n" + "=" * 60)
+print("AC6: Empty Input")
+print("=" * 60)
 
-Given: A set of input codes with no direct hierarchical relationship (e.g., {"Headache", "Glioblastoma"}).
+s_empty = summarizer.summarize([])
+print(f"\n  concise_cuis: {s_empty['concise_cuis']}")
+print(f"  input_code_count:            {s_empty['metrics']['input_code_count']}")
+print(f"  output_code_count:           {s_empty['metrics']['output_code_count']}")
+print(f"  information_retention_score: {s_empty['metrics']['information_retention_score']}")
 
-When: The module processes the set.
 
-Then: The module MUST retain all codes in the output, as there is no basis for summarization.
+# --- done ---
 
-Edge Case: Empty Input:
+print("\n" + "=" * 60)
+print("All acceptance criteria demonstrated.")
+print("=" * 60)
 
-Given: An empty set of input codes.
-
-When: The module is called.
-
-Then: The module MUST return an empty set of codes and metrics with zero values.
+summarizer.close()
+topics_mod.close()
