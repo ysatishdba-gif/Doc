@@ -3,6 +3,7 @@
 
 import time, logging
 import numpy as np
+import networkx
 from google.cloud import bigquery
 from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed, medlineplus
 
@@ -78,31 +79,50 @@ class CUITopics:
         for tid in sorted(h):
             t = h[tid]
             tc = t.get("topic_cui", "")
+            members_list = t.get("members", [])
 
             members = []
-            for c in t.get("members", []):
+            for c in members_list:
                 m = meta.get(c)
                 members.append({"cui": c, "preferred_term": terms.get(c, c),
                                 "ic": round(ic.get(c, 0.0), 4),
                                 "semantic_types": list(m.semantic_types) if m and m.semantic_types else []})
 
-            topic_label, topic_label_source = self._pick_label(tc, terms)
+            walker_tc = tc
+            walker_label = terms.get(tc, tc) if tc else ""
+            swapped_tc = self._swap_to_medlineplus(tc, members_list)
+            if swapped_tc and swapped_tc != tc and swapped_tc not in terms:
+                terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [swapped_tc]))
+            topic_label, topic_label_source = self._pick_label(swapped_tc or tc, terms)
+            final_tc = swapped_tc or tc
 
             subtopics = []
             for sid in sorted(t.get("subtopics", {})):
                 st = t["subtopics"][sid]
                 sc = st.get("subtopic_cui", "")
+                st_members = st.get("members", [])
                 st_mem = [{"cui": c, "preferred_term": terms.get(c, c),
-                           "ic": round(ic.get(c, 0.0), 4)} for c in st.get("members", [])]
-                st_label, st_source = self._pick_label(sc, terms)
-                subtopics.append({"subtopic_id": sid, "subtopic_cui": sc,
+                           "ic": round(ic.get(c, 0.0), 4)} for c in st_members]
+                walker_sc = sc
+                walker_st_label = terms.get(sc, sc) if sc else ""
+                swapped_sc = self._swap_to_medlineplus(sc, st_members)
+                if swapped_sc and swapped_sc != sc and swapped_sc not in terms:
+                    terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [swapped_sc]))
+                st_label, st_source = self._pick_label(swapped_sc or sc, terms)
+                subtopics.append({"subtopic_id": sid,
+                                  "subtopic_cui": swapped_sc or sc,
                                   "subtopic_label": st_label,
                                   "label_source": st_source,
+                                  "walker_subtopic_cui": walker_sc,
+                                  "walker_subtopic_label": walker_st_label,
                                   "members": st_mem})
 
-            topics_out.append({"topic_id": tid, "topic_cui": tc,
+            topics_out.append({"topic_id": tid,
+                               "topic_cui": final_tc,
                                "topic_label": topic_label,
                                "label_source": topic_label_source,
+                               "walker_topic_cui": walker_tc,
+                               "walker_topic_label": walker_label,
                                "members": members, "subtopics": subtopics,
                                "centroid": centroids.get(tid)})
 
@@ -128,6 +148,40 @@ class CUITopics:
         if cui in medlineplus:
             return medlineplus[cui], "medlineplus"
         return terms.get(cui, cui), "hierarchy"
+
+    def _swap_to_medlineplus(self, walker_cui, member_cuis):
+        """If a descendant of walker_cui is in MedlinePlus AND is an ancestor of
+        all member_cuis, return that descendant. Otherwise return None."""
+        if not walker_cui or not member_cuis:
+            return None
+        if walker_cui in medlineplus:
+            return None  # walker already picked a MedlinePlus CUI
+
+        # find descendants of walker_cui that are in MedlinePlus
+        try:
+            walker_descendants = networkx.descendants(self._graph, walker_cui)
+        except Exception:
+            return None
+        candidates = walker_descendants & set(medlineplus.keys())
+        if not candidates:
+            return None
+
+        # among candidates, find one that is an ancestor of every member
+        member_set = set(member_cuis)
+        best = None
+        best_ic = -1.0
+        for cand in candidates:
+            try:
+                cand_descendants = networkx.descendants(self._graph, cand) | {cand}
+            except Exception:
+                continue
+            if member_set.issubset(cand_descendants):
+                # prefer the most specific (highest IC) candidate
+                cand_ic = self._ic_pre.get(cand, 0.0)
+                if cand_ic > best_ic:
+                    best_ic = cand_ic
+                    best = cand
+        return best
 
     def close(self):
         self._emb.close()
