@@ -20,6 +20,7 @@ class CUITopics:
     def __init__(self):
         self._graph = hierarchy
         self._ic_pre = ic_precomputed
+        self._mp_keys = set(medlineplus.keys())
         self._bq = bigquery.Client(project=PROJECT_ID)
         self._pid, self._did = PROJECT_ID, DATASET_ID
         self._meta = MetadataFetcher(self._bq, PROJECT_ID, DATASET_ID)
@@ -90,11 +91,11 @@ class CUITopics:
 
             walker_tc = tc
             walker_label = terms.get(tc, tc) if tc else ""
-            swapped_tc = self._swap_to_medlineplus(tc, members_list)
-            if swapped_tc and swapped_tc != tc and swapped_tc not in terms:
-                terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [swapped_tc]))
-            topic_label, topic_label_source = self._pick_label(swapped_tc or tc, terms)
-            final_tc = swapped_tc or tc
+            mp_cui, mp_votes = self._vote_medlineplus_label(members_list)
+            if mp_cui and mp_cui not in terms:
+                terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [mp_cui]))
+            topic_label, topic_label_source = self._pick_label(mp_cui or tc, terms)
+            final_tc = mp_cui or tc
 
             subtopics = []
             for sid in sorted(t.get("subtopics", {})):
@@ -105,16 +106,17 @@ class CUITopics:
                            "ic": round(ic.get(c, 0.0), 4)} for c in st_members]
                 walker_sc = sc
                 walker_st_label = terms.get(sc, sc) if sc else ""
-                swapped_sc = self._swap_to_medlineplus(sc, st_members)
-                if swapped_sc and swapped_sc != sc and swapped_sc not in terms:
-                    terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [swapped_sc]))
-                st_label, st_source = self._pick_label(swapped_sc or sc, terms)
+                mp_sc, mp_st_votes = self._vote_medlineplus_label(st_members)
+                if mp_sc and mp_sc not in terms:
+                    terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [mp_sc]))
+                st_label, st_source = self._pick_label(mp_sc or sc, terms)
                 subtopics.append({"subtopic_id": sid,
-                                  "subtopic_cui": swapped_sc or sc,
+                                  "subtopic_cui": mp_sc or sc,
                                   "subtopic_label": st_label,
                                   "label_source": st_source,
                                   "walker_subtopic_cui": walker_sc,
                                   "walker_subtopic_label": walker_st_label,
+                                  "medlineplus_votes": mp_st_votes,
                                   "members": st_mem})
 
             topics_out.append({"topic_id": tid,
@@ -123,6 +125,7 @@ class CUITopics:
                                "label_source": topic_label_source,
                                "walker_topic_cui": walker_tc,
                                "walker_topic_label": walker_label,
+                               "medlineplus_votes": mp_votes,
                                "members": members, "subtopics": subtopics,
                                "centroid": centroids.get(tid)})
 
@@ -134,6 +137,7 @@ class CUITopics:
         n_hier = n_topics - n_mtp
         log.info(f"{n_in} CUIs -> {n_topics} topics ({n_sing} singletons) "
                  f"labels: {n_mtp} medlineplus, {n_hier} hierarchy "
+                 f"(swap: {swap_time*1000:.0f}ms) "
                  f"{ms:.0f}ms")
 
         return {"topics": topics_out,
@@ -149,53 +153,40 @@ class CUITopics:
             return medlineplus[cui], "medlineplus"
         return terms.get(cui, cui), "hierarchy"
 
-    def _swap_to_medlineplus(self, walker_cui, member_cuis):
-        """If there's a MedlinePlus CUI that is:
-        - an ancestor of ALL members
-        - a descendant of walker_cui (i.e. more specific than walker_cui)
-        return it. Otherwise return None.
+    def _vote_medlineplus_label(self, member_cuis):
+        """Each member votes for its nearest MedlinePlus ancestor.
+        Returns (winning_cui, vote_counts) or (None, {}) if no majority."""
+        if not member_cuis:
+            return None, {}
 
-        Strategy: walk UP from the first member, intersect with MedlinePlus,
-        keep only those that are also ancestors of all other members.
-        Much faster than walking descendants from walker_cui.
-        """
-        if not walker_cui or not member_cuis:
-            return None
-        if walker_cui in medlineplus:
-            return None  # walker already picked a MedlinePlus CUI
+        votes = {}
+        for member in member_cuis:
+            hit = self._nearest_mp_ancestor(member)
+            if hit:
+                votes[hit] = votes.get(hit, 0) + 1
 
-        members = list(member_cuis)
+        if not votes:
+            return None, {}
+
+        # winner needs > 50% of members
+        winner = max(votes, key=votes.get)
+        if votes[winner] * 2 > len(member_cuis):
+            return winner, votes
+        return None, votes
+
+    def _nearest_mp_ancestor(self, cui):
+        """Walk up from cui, return the first MedlinePlus CUI hit (including cui itself)."""
+        if cui in self._mp_keys:
+            return cui
         try:
-            first_ancestors = networkx.ancestors(self._graph, members[0])
+            ancestors = networkx.ancestors(self._graph, cui)
         except Exception:
             return None
-
-        # candidates: ancestors of member 0 that are in MedlinePlus
-        candidates = first_ancestors & set(medlineplus.keys())
-        if not candidates:
+        hits = ancestors & self._mp_keys
+        if not hits:
             return None
-
-        # keep only candidates that are ancestors of every other member
-        for m in members[1:]:
-            try:
-                m_ancestors = networkx.ancestors(self._graph, m)
-            except Exception:
-                return None
-            candidates &= m_ancestors
-            if not candidates:
-                return None
-
-        # must also be more specific than walker_cui (i.e. walker is an ancestor of candidate)
-        try:
-            walker_descendants = networkx.descendants(self._graph, walker_cui)
-        except Exception:
-            walker_descendants = set()
-        candidates &= walker_descendants
-        if not candidates:
-            return None
-
-        # pick the most specific (highest IC) candidate
-        return max(candidates, key=lambda c: self._ic_pre.get(c, 0.0))
+        # pick the most specific (highest IC) among the hits
+        return max(hits, key=lambda c: self._ic_pre.get(c, 0.0))
 
     def close(self):
         self._emb.close()
