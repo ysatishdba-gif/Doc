@@ -4,7 +4,7 @@
 import time, logging
 import numpy as np
 from google.cloud import bigquery
-from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed
+from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed, medlineplus
 
 from cui_core import (
     MetadataFetcher, ICComputer, EmbeddingFetcher,
@@ -59,9 +59,6 @@ class CUITopics:
                 if st.get("subtopic_cui"):
                     label_cuis.add(st["subtopic_cui"])
 
-        # fetch MedlinePlus + MedGen labels for all label CUIs
-        curated = self._fetch_curated_labels(label_cuis)
-
         # fill in MRCONSO preferred terms for any label CUIs not already in terms
         missing = label_cuis - set(terms)
         if missing:
@@ -89,7 +86,7 @@ class CUITopics:
                                 "ic": round(ic.get(c, 0.0), 4),
                                 "semantic_types": list(m.semantic_types) if m and m.semantic_types else []})
 
-            topic_label, topic_label_source = self._pick_label(tc, curated, terms)
+            topic_label, topic_label_source = self._pick_label(tc, terms)
 
             subtopics = []
             for sid in sorted(t.get("subtopics", {})):
@@ -97,7 +94,7 @@ class CUITopics:
                 sc = st.get("subtopic_cui", "")
                 st_mem = [{"cui": c, "preferred_term": terms.get(c, c),
                            "ic": round(ic.get(c, 0.0), 4)} for c in st.get("members", [])]
-                st_label, st_source = self._pick_label(sc, curated, terms)
+                st_label, st_source = self._pick_label(sc, terms)
                 subtopics.append({"subtopic_id": sid, "subtopic_cui": sc,
                                   "subtopic_label": st_label,
                                   "label_source": st_source,
@@ -114,55 +111,22 @@ class CUITopics:
         n_sing = sum(1 for t in topics_out if len(t["members"]) == 1)
 
         n_mtp = sum(1 for t in topics_out if t["label_source"] == "medlineplus")
-        n_mgn = sum(1 for t in topics_out if t["label_source"] == "medgen")
-        n_hier = n_topics - n_mtp - n_mgn
+        n_hier = n_topics - n_mtp
         log.info(f"{n_in} CUIs -> {n_topics} topics ({n_sing} singletons) "
-                 f"labels: {n_mtp} medlineplus, {n_mgn} medgen, {n_hier} hierarchy "
+                 f"labels: {n_mtp} medlineplus, {n_hier} hierarchy "
                  f"{ms:.0f}ms")
 
         return {"topics": topics_out,
                 "metrics": {"input_cui_count": n_in, "topic_count": n_topics,
                             "singleton_count": n_sing, "processing_time_ms": round(ms, 1)}}
 
-    def _fetch_curated_labels(self, cuis):
-        """Query MRCONSO for MedlinePlus (MTH/HT) and MedGen labels.
-        Returns {cui: {"medlineplus": str, "medgen": str}} with whichever source matched."""
-        if not cuis:
-            return {}
-
-        cui_list = list(cuis)
-        result = {}
-        batch_size = 500
-
-        for i in range(0, len(cui_list), batch_size):
-            batch = cui_list[i:i + batch_size]
-            query = f"""
-            SELECT CUI, STR, SAB
-            FROM `{self._pid}.{self._did}.MRCONSO`
-            WHERE CUI IN UNNEST(@cuis)
-              AND SAB IN ('MTH', 'MEDGEN')
-              AND LAT = 'ENG'
-              AND TS = 'P'
-              AND STT = 'PF'
-              AND ISPREF = 'Y'
-            """
-            jc = bigquery.QueryJobConfig(use_legacy_sql=False, query_parameters=[
-                bigquery.ArrayQueryParameter("cuis", "STRING", batch)])
-            for row in self._bq.query(query, job_config=jc).result():
-                key = "medlineplus" if row.SAB == "MTH" else "medgen"
-                result.setdefault(row.CUI, {})[key] = row.STR
-        return result
-
     @staticmethod
-    def _pick_label(cui, curated, terms):
-        """Priority: MedlinePlus -> MedGen -> hierarchy (MRCONSO preferred_term)."""
+    def _pick_label(cui, terms):
+        """MedlinePlus if available, else MRCONSO preferred term."""
         if not cui:
             return "", "hierarchy"
-        entry = curated.get(cui, {})
-        if "medlineplus" in entry:
-            return entry["medlineplus"], "medlineplus"
-        if "medgen" in entry:
-            return entry["medgen"], "medgen"
+        if cui in medlineplus:
+            return medlineplus[cui], "medlineplus"
         return terms.get(cui, cui), "hierarchy"
 
     def close(self):
