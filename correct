@@ -1,82 +1,50 @@
 """
-Build medlineplus.pkl — a {CUI: topic_title} lookup.
-
-Run once:
-    python3 build_medlineplus.py mplus_topics_2026-04-07.xml
-
-Output:
-    medlineplus.pkl in the current directory
-
-After this, cui_topics.py loads the pickle at startup and uses it for labels.
+CUI Pipeline — Configuration
 """
 
-import sys, os, pickle
-import xml.etree.ElementTree as ET
-from google.cloud import bigquery
-from config import PROJECT_ID, DATASET_ID
+import os, sys, pickle
+import networkx
 
-if len(sys.argv) != 2:
-    print("usage: python3 build_medlineplus.py <mplus_topics_xml_file>")
-    sys.exit(1)
+PROJECT_ID      = "your-project-id"
+DATASET_ID      = "your-dataset-id"
+EMBEDDING_TABLE = "cui_embeddings"
 
-xml_path = sys.argv[1]
-if not os.path.exists(xml_path):
-    print(f"file not found: {xml_path}")
-    sys.exit(1)
+API_URL         = "your-extraction-api-url"
+TOP_K           = 6
+TOP_P           = 5000
+CLUSTER_SET     = "umls"
+COMBINED        = True
 
-# parse MedlinePlus XML: extract {mesh_id: topic_title}
-print(f"parsing {xml_path}...")
-tree = ET.parse(xml_path)
-root = tree.getroot()
+OUTPUT_DIR       = "output/"
+HIERARCHY_PATH   = "umls_hierarchy.pkl"
+IC_PATH          = "ic_precomputed.pkl"
+MEDLINEPLUS_PATH = "medlineplus.pkl"
 
-mesh_to_title = {}
-for topic in root.findall(".//health-topic"):
-    title = topic.get("title")
-    if not title:
-        continue
-    for desc in topic.findall(".//mesh-heading/descriptor"):
-        mesh_id = desc.get("id")
-        if mesh_id:
-            # keep the shortest title if multiple topics share a mesh id
-            if mesh_id not in mesh_to_title or len(title) < len(mesh_to_title[mesh_id]):
-                mesh_to_title[mesh_id] = title
+ALLOWED_SABS    = {"SNOMEDCT_US"}
 
-print(f"parsed {len(mesh_to_title)} MeSH -> title mappings")
+LLM_PROJECT_ID  = PROJECT_ID
+LLM_LOCATION    = "us-central1"
+LLM_MODEL       = "gemini-2.0-flash"
+LLM_MAX_TOKENS  = 1500
 
-# query MRCONSO: map MeSH IDs to CUIs
-print(f"querying MRCONSO for CUI mappings...")
-bq = bigquery.Client(project=PROJECT_ID)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-cui_to_title = {}
-mesh_ids = list(mesh_to_title.keys())
-batch_size = 500
+if not os.path.exists(HIERARCHY_PATH):
+    print(f"ERROR: {HIERARCHY_PATH} not found"); sys.exit(1)
+with open(HIERARCHY_PATH, "rb") as f:
+    hierarchy = pickle.load(f)
+assert isinstance(hierarchy, networkx.DiGraph)
 
-for i in range(0, len(mesh_ids), batch_size):
-    batch = mesh_ids[i:i + batch_size]
-    query = f"""
-    SELECT DISTINCT CUI, CODE
-    FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
-    WHERE SAB = 'MSH'
-      AND CODE IN UNNEST(@codes)
-      AND LAT = 'ENG'
-    """
-    jc = bigquery.QueryJobConfig(use_legacy_sql=False, query_parameters=[
-        bigquery.ArrayQueryParameter("codes", "STRING", batch)])
-    for row in bq.query(query, job_config=jc).result():
-        title = mesh_to_title.get(row.CODE)
-        if title and row.CUI not in cui_to_title:
-            cui_to_title[row.CUI] = title
-    print(f"  batch {i//batch_size + 1}: {len(cui_to_title)} CUI mappings so far")
+if not os.path.exists(IC_PATH):
+    print(f"ERROR: {IC_PATH} not found. Run ic_precompute.py first."); sys.exit(1)
+with open(IC_PATH, "rb") as f:
+    ic_precomputed = pickle.load(f)
+assert isinstance(ic_precomputed, dict) and len(ic_precomputed) > 0
 
-print(f"\nfinal: {len(cui_to_title)} CUI -> MedlinePlus topic mappings")
-
-# save
-with open("medlineplus.pkl", "wb") as f:
-    pickle.dump(cui_to_title, f)
-
-print("saved: medlineplus.pkl")
-
-# show a few samples
-print("\nsample entries:")
-for cui, title in list(cui_to_title.items())[:10]:
-    print(f"  {cui} -> {title}")
+medlineplus = {}
+if os.path.exists(MEDLINEPLUS_PATH):
+    with open(MEDLINEPLUS_PATH, "rb") as f:
+        medlineplus = pickle.load(f)
+    print(f"Config: {hierarchy.number_of_nodes()} nodes, {len(ic_precomputed)} IC scores, {len(medlineplus)} MedlinePlus topics")
+else:
+    print(f"Config: {hierarchy.number_of_nodes()} nodes, {len(ic_precomputed)} IC scores (no MedlinePlus)")
