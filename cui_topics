@@ -3,7 +3,6 @@
 
 import time, logging
 import numpy as np
-import networkx
 from google.cloud import bigquery
 from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed, medlineplus
 
@@ -20,7 +19,6 @@ class CUITopics:
     def __init__(self):
         self._graph = hierarchy
         self._ic_pre = ic_precomputed
-        self._mp_keys = set(medlineplus.keys())
         self._bq = bigquery.Client(project=PROJECT_ID)
         self._pid, self._did = PROJECT_ID, DATASET_ID
         self._meta = MetadataFetcher(self._bq, PROJECT_ID, DATASET_ID)
@@ -89,13 +87,7 @@ class CUITopics:
                                 "ic": round(ic.get(c, 0.0), 4),
                                 "semantic_types": list(m.semantic_types) if m and m.semantic_types else []})
 
-            walker_tc = tc
-            walker_label = terms.get(tc, tc) if tc else ""
-            mp_cui, mp_votes = self._vote_medlineplus_label(members_list)
-            if mp_cui and mp_cui not in terms:
-                terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [mp_cui]))
-            topic_label, topic_label_source = self._pick_label(mp_cui or tc, terms)
-            final_tc = mp_cui or tc
+            topic_label, topic_label_source = self._pick_label(tc, terms)
 
             subtopics = []
             for sid in sorted(t.get("subtopics", {})):
@@ -104,28 +96,17 @@ class CUITopics:
                 st_members = st.get("members", [])
                 st_mem = [{"cui": c, "preferred_term": terms.get(c, c),
                            "ic": round(ic.get(c, 0.0), 4)} for c in st_members]
-                walker_sc = sc
-                walker_st_label = terms.get(sc, sc) if sc else ""
-                mp_sc, mp_st_votes = self._vote_medlineplus_label(st_members)
-                if mp_sc and mp_sc not in terms:
-                    terms.update(fetch_preferred_terms(self._bq, self._pid, self._did, [mp_sc]))
-                st_label, st_source = self._pick_label(mp_sc or sc, terms)
+                st_label, st_source = self._pick_label(sc, terms)
                 subtopics.append({"subtopic_id": sid,
-                                  "subtopic_cui": mp_sc or sc,
+                                  "subtopic_cui": sc,
                                   "subtopic_label": st_label,
                                   "label_source": st_source,
-                                  "walker_subtopic_cui": walker_sc,
-                                  "walker_subtopic_label": walker_st_label,
-                                  "medlineplus_votes": mp_st_votes,
                                   "members": st_mem})
 
             topics_out.append({"topic_id": tid,
-                               "topic_cui": final_tc,
+                               "topic_cui": tc,
                                "topic_label": topic_label,
                                "label_source": topic_label_source,
-                               "walker_topic_cui": walker_tc,
-                               "walker_topic_label": walker_label,
-                               "medlineplus_votes": mp_votes,
                                "members": members, "subtopics": subtopics,
                                "centroid": centroids.get(tid)})
 
@@ -151,52 +132,6 @@ class CUITopics:
         if cui in medlineplus:
             return medlineplus[cui], "medlineplus"
         return terms.get(cui, cui), "hierarchy"
-
-    def _vote_medlineplus_label(self, member_cuis):
-        """Each member votes for its nearest MedlinePlus ancestor.
-        Returns (winning_cui, vote_counts) or (None, {}) if no majority."""
-        if not member_cuis:
-            return None, {}
-
-        votes = {}
-        for member in member_cuis:
-            hit = self._nearest_mp_ancestor(member)
-            if hit:
-                votes[hit] = votes.get(hit, 0) + 1
-
-        if not votes:
-            return None, {}
-
-        # winner needs > 50% of members
-        winner = max(votes, key=votes.get)
-        if votes[winner] * 2 > len(member_cuis):
-            return winner, votes
-        return None, votes
-
-    def _nearest_mp_ancestor(self, cui):
-        """BFS walk UP from cui. Return first MedlinePlus hit within 3 hops.
-        Beyond 3 hops the ancestor is too broad to be clinically meaningful."""
-        if cui in self._mp_keys:
-            return cui
-        if cui not in self._graph:
-            return None
-        visited = {cui}
-        frontier = [cui]
-        max_hops = 3
-        for _ in range(max_hops):
-            next_frontier = []
-            for node in frontier:
-                for parent in self._graph.predecessors(node):
-                    if parent in visited:
-                        continue
-                    if parent in self._mp_keys:
-                        return parent
-                    visited.add(parent)
-                    next_frontier.append(parent)
-            if not next_frontier:
-                return None
-            frontier = next_frontier
-        return None
 
     def close(self):
         self._emb.close()
