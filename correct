@@ -1,15 +1,82 @@
-python3 -c "
+"""
+Build medlineplus.pkl — a {CUI: topic_title} lookup.
+
+Run once:
+    python3 build_medlineplus.py mplus_topics_2026-04-07.xml
+
+Output:
+    medlineplus.pkl in the current directory
+
+After this, cui_topics.py loads the pickle at startup and uses it for labels.
+"""
+
+import sys, os, pickle
+import xml.etree.ElementTree as ET
 from google.cloud import bigquery
 from config import PROJECT_ID, DATASET_ID
+
+if len(sys.argv) != 2:
+    print("usage: python3 build_medlineplus.py <mplus_topics_xml_file>")
+    sys.exit(1)
+
+xml_path = sys.argv[1]
+if not os.path.exists(xml_path):
+    print(f"file not found: {xml_path}")
+    sys.exit(1)
+
+# parse MedlinePlus XML: extract {mesh_id: topic_title}
+print(f"parsing {xml_path}...")
+tree = ET.parse(xml_path)
+root = tree.getroot()
+
+mesh_to_title = {}
+for topic in root.findall(".//health-topic"):
+    title = topic.get("title")
+    if not title:
+        continue
+    for desc in topic.findall(".//mesh-heading/descriptor"):
+        mesh_id = desc.get("id")
+        if mesh_id:
+            # keep the shortest title if multiple topics share a mesh id
+            if mesh_id not in mesh_to_title or len(title) < len(mesh_to_title[mesh_id]):
+                mesh_to_title[mesh_id] = title
+
+print(f"parsed {len(mesh_to_title)} MeSH -> title mappings")
+
+# query MRCONSO: map MeSH IDs to CUIs
+print(f"querying MRCONSO for CUI mappings...")
 bq = bigquery.Client(project=PROJECT_ID)
-q = f'''
-SELECT DISTINCT TTY, COUNT(*) as n
-FROM \`{PROJECT_ID}.{DATASET_ID}.MRCONSO\`
-WHERE SAB = 'MTH'
-GROUP BY TTY
-ORDER BY n DESC
-LIMIT 20
-'''
-for row in bq.query(q).result():
-    print(f'{row.TTY}: {row.n}')
-"
+
+cui_to_title = {}
+mesh_ids = list(mesh_to_title.keys())
+batch_size = 500
+
+for i in range(0, len(mesh_ids), batch_size):
+    batch = mesh_ids[i:i + batch_size]
+    query = f"""
+    SELECT DISTINCT CUI, CODE
+    FROM `{PROJECT_ID}.{DATASET_ID}.MRCONSO`
+    WHERE SAB = 'MSH'
+      AND CODE IN UNNEST(@codes)
+      AND LAT = 'ENG'
+    """
+    jc = bigquery.QueryJobConfig(use_legacy_sql=False, query_parameters=[
+        bigquery.ArrayQueryParameter("codes", "STRING", batch)])
+    for row in bq.query(query, job_config=jc).result():
+        title = mesh_to_title.get(row.CODE)
+        if title and row.CUI not in cui_to_title:
+            cui_to_title[row.CUI] = title
+    print(f"  batch {i//batch_size + 1}: {len(cui_to_title)} CUI mappings so far")
+
+print(f"\nfinal: {len(cui_to_title)} CUI -> MedlinePlus topic mappings")
+
+# save
+with open("medlineplus.pkl", "wb") as f:
+    pickle.dump(cui_to_title, f)
+
+print("saved: medlineplus.pkl")
+
+# show a few samples
+print("\nsample entries:")
+for cui, title in list(cui_to_title.items())[:10]:
+    print(f"  {cui} -> {title}")
