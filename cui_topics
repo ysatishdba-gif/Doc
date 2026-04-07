@@ -150,38 +150,52 @@ class CUITopics:
         return terms.get(cui, cui), "hierarchy"
 
     def _swap_to_medlineplus(self, walker_cui, member_cuis):
-        """If a descendant of walker_cui is in MedlinePlus AND is an ancestor of
-        all member_cuis, return that descendant. Otherwise return None."""
+        """If there's a MedlinePlus CUI that is:
+        - an ancestor of ALL members
+        - a descendant of walker_cui (i.e. more specific than walker_cui)
+        return it. Otherwise return None.
+
+        Strategy: walk UP from the first member, intersect with MedlinePlus,
+        keep only those that are also ancestors of all other members.
+        Much faster than walking descendants from walker_cui.
+        """
         if not walker_cui or not member_cuis:
             return None
         if walker_cui in medlineplus:
             return None  # walker already picked a MedlinePlus CUI
 
-        # find descendants of walker_cui that are in MedlinePlus
+        members = list(member_cuis)
         try:
-            walker_descendants = networkx.descendants(self._graph, walker_cui)
+            first_ancestors = networkx.ancestors(self._graph, members[0])
         except Exception:
             return None
-        candidates = walker_descendants & set(medlineplus.keys())
+
+        # candidates: ancestors of member 0 that are in MedlinePlus
+        candidates = first_ancestors & set(medlineplus.keys())
         if not candidates:
             return None
 
-        # among candidates, find one that is an ancestor of every member
-        member_set = set(member_cuis)
-        best = None
-        best_ic = -1.0
-        for cand in candidates:
+        # keep only candidates that are ancestors of every other member
+        for m in members[1:]:
             try:
-                cand_descendants = networkx.descendants(self._graph, cand) | {cand}
+                m_ancestors = networkx.ancestors(self._graph, m)
             except Exception:
-                continue
-            if member_set.issubset(cand_descendants):
-                # prefer the most specific (highest IC) candidate
-                cand_ic = self._ic_pre.get(cand, 0.0)
-                if cand_ic > best_ic:
-                    best_ic = cand_ic
-                    best = cand
-        return best
+                return None
+            candidates &= m_ancestors
+            if not candidates:
+                return None
+
+        # must also be more specific than walker_cui (i.e. walker is an ancestor of candidate)
+        try:
+            walker_descendants = networkx.descendants(self._graph, walker_cui)
+        except Exception:
+            walker_descendants = set()
+        candidates &= walker_descendants
+        if not candidates:
+            return None
+
+        # pick the most specific (highest IC) candidate
+        return max(candidates, key=lambda c: self._ic_pre.get(c, 0.0))
 
     def close(self):
         self._emb.close()
