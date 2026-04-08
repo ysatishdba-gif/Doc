@@ -502,17 +502,21 @@ class TopicBuilder:
         # ── Step 1: cosine k-NN ───────────────────────────────────────────
         neighbors, sim_scores = _cosine_knn(matrix, k)
 
-        # ── Step 2: adaptive edge threshold ──────────────────────────────
-        # threshold = mean of each CUI's k-th (weakest) neighbor distance
-        # measures average "reach" of a CUI's neighborhood
-        kth_dists = []
+        # ── Step 2: adaptive edge threshold (Otsu on k-NN distances) ─────
+        # Collect all k-NN distances (not k-th only) — gives a richer
+        # distribution for Otsu to find the natural cluster/non-cluster split.
+        # Tighter threshold = more selective graph = better-defined communities.
+        all_dists = []
         for i in range(n):
-            valid = sim_scores[i][sim_scores[i] > -1e30]
-            if len(valid) > 0:
-                kth_dists.append(1.0 - float(valid[-1]))
+            for j_pos in range(len(sim_scores[i])):
+                s = float(sim_scores[i][j_pos])
+                if s > -1e30:
+                    all_dists.append(1.0 - s)
 
-        if kth_dists:
-            threshold = float(np.mean(kth_dists))
+        if len(all_dists) >= 4 and len(set(all_dists)) >= 2:
+            threshold = _otsu_threshold(all_dists)
+        elif all_dists:
+            threshold = float(np.mean(all_dists))
         else:
             # fallback: mean of all pairwise similarities
             all_sims = matrix @ matrix.T
@@ -739,15 +743,14 @@ class HierarchicalTopicBuilder:
         # p10 of surviving CUI ICs. Prevents 'Disease' (IC ~1-2) and similar
         # root-adjacent concepts from becoming grouping anchors even when the
         # gradient check would otherwise allow them.
-        if ic_scores and surviving:
-            surv_ics = [ic_scores.get(c, 0.0) for c in surviving
-                        if ic_scores.get(c, 0.0) > 0]
-            if surv_ics:
-                ic_floor = float(np.percentile(surv_ics, 10))
-            else:
-                ic_floor = 0.0
-        else:
-            ic_floor = 0.0
+        # IC floor: absolute minimum for convergence ancestors.
+        # Fixed at 3.0 to exclude root-level concepts like "Disease" (IC ~1-2)
+        # and "Clinical finding" (IC ~2) while allowing mid-level clinical
+        # concepts like "Asthma" (IC ~7-8) and "Diabetes" (IC ~6) to serve
+        # as grouping anchors. Previously used p10 of surviving CUI ICs,
+        # which failed when all members were leaf nodes (all IC ≈ 14.8)
+        # because the floor would reject any ancestor lower than the leaves.
+        ic_floor = 3.0
 
         def _bfs_up(node):
             """BFS ancestors with IC floor + adaptive depth.
@@ -797,16 +800,11 @@ class HierarchicalTopicBuilder:
                 ancestor_coverage[anc].add(cui)
 
         # convergence points: ancestors covering 2+ CUIs.
-        # Max coverage scales with corpus size: 1/sqrt(n_surviving).
-        # Small stores (n=5): max_cover = int(5 / sqrt(5)) = 2
-        # Large stores (n=100): max_cover = int(100 / sqrt(100)) = 10
-        # This prevents very broad ancestors from dominating small stores
-        # while allowing appropriate grouping in larger stores.
-        # Reference: IDF literature — document frequency threshold for
-        # 'too common' scales as sqrt(N) in information retrieval.
-        max_cover = max(2, int(len(surviving) / max(len(surviving) ** 0.5, 1)))
+        # No upper cap — if an ancestor covers many members, that's a strong
+        # grouping signal. Previously capped at sqrt(N), which split legitimate
+        # groups like "Asthma" when many variants shared it as a common parent.
         convergence = {anc: members for anc, members in ancestor_coverage.items()
-                       if 2 <= len(members) <= max_cover and anc not in surviving}
+                       if len(members) >= 2 and anc not in surviving}
 
         if not convergence:
             return {0: {"topic_cui": None, "members": sorted(surviving),
