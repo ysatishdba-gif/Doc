@@ -6,6 +6,7 @@
 #   "embedding" — Louvain on cosine k-NN graph of CUI embeddings (semantic clustering)
 
 import time, logging
+from collections import defaultdict
 import numpy as np
 from google.cloud import bigquery
 from config import PROJECT_ID, DATASET_ID, EMBEDDING_TABLE, hierarchy, ic_precomputed, medlineplus
@@ -48,7 +49,7 @@ class CUITopics:
         terms = fetch_preferred_terms(self._bq, self._pid, self._did, cuis)
 
         if strategy == "embedding":
-            h = self._form_embedding(cuis, embs, ic)
+            h = self._form_embedding(cuis, embs, ic, meta)
         elif strategy == "hierarchy":
             h = self._form_hierarchy(cuis, ic)
         else:
@@ -150,32 +151,61 @@ class CUITopics:
         """UMLS ancestor convergence via HierarchicalTopicBuilder."""
         return HierarchicalTopicBuilder.build(cuis, self._graph, ic)
 
-    def _form_embedding(self, cuis, embs, ic):
-        """Louvain on cosine k-NN of CUI embeddings via TopicBuilder.
-        Returns the same dict shape as HierarchicalTopicBuilder.build().
+    def _form_embedding(self, cuis, embs, ic, metadata):
+        """Phase 1: stratify by dominant semantic type, then cluster within each group.
+
+        Each CUI is assigned to its first (primary) semantic type. CUIs with no
+        type form their own group. Within each type group, TopicBuilder runs
+        independently, so Disease CUIs never cluster with Procedure CUIs etc.
         """
         cuis_with_emb = [c for c in cuis if c in embs]
         if not cuis_with_emb:
             return {}
 
-        groups = TopicBuilder.build(cuis_with_emb, embs)
-        if not groups:
-            return {}
+        # Group CUIs by primary semantic type
+        by_type = defaultdict(list)
+        for cui in cuis_with_emb:
+            m = metadata.get(cui)
+            types = m.semantic_types if (m and m.semantic_types) else []
+            primary = types[0] if types else "__untyped__"
+            by_type[primary].append(cui)
 
-        # convert flat groups -> HierarchicalTopicBuilder shape
+        # Cluster within each type group independently
         h = {}
-        for tid, members in groups.items():
-            if not members:
+        next_tid = 0
+        for sem_type, group_cuis in sorted(by_type.items()):
+            if len(group_cuis) < 2:
+                # singleton CUI in its own topic
+                cui = group_cuis[0]
+                h[next_tid] = {
+                    "topic_cui": cui,
+                    "members": [cui],
+                    "subtopics": {},
+                    "ungrouped": [cui],
+                    "_grouping_cui": cui,
+                    "_semantic_type": sem_type,
+                }
+                next_tid += 1
                 continue
-            members_sorted = sorted(members)
-            topic_cui = max(members_sorted, key=lambda c: ic.get(c, 0.0))
-            h[tid] = {
-                "topic_cui": topic_cui,
-                "members": members_sorted,
-                "subtopics": {},
-                "ungrouped": members_sorted,
-                "_grouping_cui": topic_cui,
-            }
+
+            groups = TopicBuilder.build(group_cuis, embs)
+            if not groups:
+                continue
+
+            for _, members in groups.items():
+                if not members:
+                    continue
+                members_sorted = sorted(members)
+                topic_cui = max(members_sorted, key=lambda c: ic.get(c, 0.0))
+                h[next_tid] = {
+                    "topic_cui": topic_cui,
+                    "members": members_sorted,
+                    "subtopics": {},
+                    "ungrouped": members_sorted,
+                    "_grouping_cui": topic_cui,
+                    "_semantic_type": sem_type,
+                }
+                next_tid += 1
         return h
 
     # ── Helpers ──────────────────────────────────────────────────────────────
