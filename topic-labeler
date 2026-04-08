@@ -2,11 +2,11 @@
 # Standalone topic label assignment. Zero hardcoded thresholds.
 #
 # Three tiers:
-#   1. medlineplus: topic_cui directly in MedlinePlus dict
+#   1. medlineplus: topic_cui or best ancestor is in MedlinePlus dict
 #   2. ancestor:    unbounded BFS up from members, Otsu threshold on coverage,
-#                   semantic-type match with members (data-driven, no category list),
-#                   closest ancestor wins (lowest avg hop distance)
-#   3. member:      fallback to the topic's highest-IC member preferred term
+#                   weighted semantic-type match, closest ancestor wins.
+#                   Quality gate: only replace member label if match is meaningful.
+#   3. member:      fallback to the topic's own member label
 #
 # Usage:
 #   from topic_labeler import TopicLabeler
@@ -37,54 +37,43 @@ class TopicLabeler:
         if not topics_result or "topics" not in topics_result:
             return topics_result
 
-        # Pass 1: collect member CUIs to fetch their semantic types
-        # (members may not have types in the input dict, so fetch fresh)
+        # Pass 1: collect candidate ancestors per topic/subtopic
         all_member_cuis = set()
-        for topic in topics_result["topics"]:
-            for m in topic.get("members", []):
-                all_member_cuis.add(m["cui"])
-            for st in topic.get("subtopics", []):
-                for m in st.get("members", []):
-                    all_member_cuis.add(m["cui"])
-
-        # Pass 2: for each topic/subtopic, find candidate ancestors via Otsu BFS
-        # We need to batch-fetch semantic types for all candidates in one go.
-        topic_candidates = {}       # tid -> list of candidate CUIs
-        subtopic_candidates = {}    # (tid, sid) -> list of candidate CUIs
-
+        topic_candidates = {}       # tid -> (winners, coverage, hops)
+        subtopic_candidates = {}    # (tid, sid) -> (winners, coverage, hops)
         all_candidates = set()
-        # store (candidates, coverage, hops) per topic so _best_ancestor can reuse
-        topic_data = {}
-        subtopic_data = {}
 
         for topic in topics_result["topics"]:
             tid = topic.get("topic_id")
             member_cuis = [m["cui"] for m in topic.get("members", [])]
+            for c in member_cuis:
+                all_member_cuis.add(c)
+
             cands, cov, hops = self._candidate_ancestors(member_cuis)
-            topic_candidates[tid] = cands
-            topic_data[tid] = (cov, hops)
+            topic_candidates[tid] = (cands, cov, hops)
             all_candidates.update(cands)
 
             for st in topic.get("subtopics", []):
                 sid = st.get("subtopic_id")
                 sub_members = [m["cui"] for m in st.get("members", [])]
+                for c in sub_members:
+                    all_member_cuis.add(c)
                 cands, cov, hops = self._candidate_ancestors(sub_members)
-                subtopic_candidates[(tid, sid)] = cands
-                subtopic_data[(tid, sid)] = (cov, hops)
+                subtopic_candidates[(tid, sid)] = (cands, cov, hops)
                 all_candidates.update(cands)
 
-        # Batch BQ call: fetch semantic types for members + candidates in ONE query
+        # Pass 2: one BQ batch for metadata (members + all candidate ancestors)
         cuis_for_metadata = list(all_member_cuis | all_candidates)
         metadata = self._meta.fetch(cuis_for_metadata) if cuis_for_metadata else {}
 
-        # Pass 3: pick the best candidate per topic using semantic type match
+        # Pass 3: pick best ancestor per topic using weighted type match
         topic_ancestors = {}
         for topic in topics_result["topics"]:
             tid = topic.get("topic_id")
             member_cuis = [m["cui"] for m in topic.get("members", [])]
-            cov, hops = topic_data[tid]
+            cands, cov, hops = topic_candidates[tid]
             topic_ancestors[tid] = self._best_ancestor(
-                member_cuis, topic_candidates[tid], cov, hops, metadata, ic_map)
+                member_cuis, cands, cov, hops, metadata, ic_map)
 
         subtopic_ancestors = {}
         for topic in topics_result["topics"]:
@@ -92,17 +81,17 @@ class TopicLabeler:
             for st in topic.get("subtopics", []):
                 sid = st.get("subtopic_id")
                 sub_members = [m["cui"] for m in st.get("members", [])]
-                cov, hops = subtopic_data[(tid, sid)]
+                cands, cov, hops = subtopic_candidates[(tid, sid)]
                 subtopic_ancestors[(tid, sid)] = self._best_ancestor(
-                    sub_members, subtopic_candidates[(tid, sid)], cov, hops, metadata, ic_map)
+                    sub_members, cands, cov, hops, metadata, ic_map)
 
-        # Batch BQ call: fetch preferred terms for all chosen ancestors
+        # Pass 4: batch BQ for preferred terms of chosen ancestors
         all_ancs = {a for a in topic_ancestors.values() if a} | \
                    {a for a in subtopic_ancestors.values() if a}
         anc_terms = fetch_preferred_terms(
             self._bq, self._pid, self._did, list(all_ancs)) if all_ancs else {}
 
-        # Pass 4: build relabeled output
+        # Pass 5: build relabeled output
         out = dict(topics_result)
         out["topics"] = []
         counts = {"medlineplus": 0, "ancestor": 0, "member": 0}
@@ -141,7 +130,7 @@ class TopicLabeler:
                  f"{counts['ancestor']} ancestor, {counts['member']} member")
         return out
 
-    # ── Label selection ────────────────────────────────────────────────────
+    # ── Tier logic ──────────────────────────────────────────────────────────
 
     def _pick_label(self, topic_cui, member_label, ancestor_cui, anc_terms):
         """Tier priority: medlineplus > ancestor > member."""
@@ -157,19 +146,30 @@ class TopicLabeler:
 
         return topic_cui, member_label, "member"
 
+    # ── BFS + Otsu candidate discovery ──────────────────────────────────────
+
     def _candidate_ancestors(self, member_cuis):
-        """Walk UP from each member unbounded. Apply Otsu on coverage counts.
-        Returns (winners, coverage_dict, hops_dict)."""
-        if not member_cuis or len(member_cuis) < 2:
+        """Walk UP from each member unbounded. Record MIN hop distance per
+        (ancestor, member) pair (handles multi-parent DAG paths).
+
+        For small topics (<=3 members): require coverage of ALL members.
+        For larger topics: apply Otsu threshold on coverage counts.
+
+        Returns (winners, coverage_dict, hops_dict).
+        """
+        n_members = len(member_cuis)
+        if n_members < 2:
             return [], {}, {}
 
         coverage = defaultdict(set)
-        hops = defaultdict(list)
+        # hops[anc][member] = shortest hop distance from that member to anc
+        hops_by_member = defaultdict(dict)
 
         for member in member_cuis:
             if member not in self._graph:
                 continue
-            visited = {member}
+            # BFS from this member to root; record shortest distance to each ancestor
+            visited = {member: 0}
             frontier = [(member, 0)]
             while frontier:
                 next_frontier = []
@@ -177,34 +177,56 @@ class TopicLabeler:
                     for parent in self._graph.predecessors(node):
                         if parent in visited:
                             continue
-                        visited.add(parent)
+                        visited[parent] = dist + 1
                         coverage[parent].add(member)
-                        hops[parent].append(dist + 1)
+                        hops_by_member[parent][member] = dist + 1
                         next_frontier.append((parent, dist + 1))
                 frontier = next_frontier
 
         if not coverage:
             return [], {}, {}
 
-        counts_only = [len(m) for m in coverage.values()]
-        unique_counts = set(counts_only)
-
-        if len(unique_counts) < 2:
-            winners = list(coverage.keys())
+        # determine threshold
+        if n_members <= 3:
+            # small topic: require ALL members covered
+            winners = [a for a, m in coverage.items() if len(m) == n_members]
         else:
-            threshold = _otsu_threshold(counts_only)
-            winners = [a for a, m in coverage.items() if len(m) >= threshold]
+            counts_only = [len(m) for m in coverage.values()]
+            unique_counts = set(counts_only)
+            if len(unique_counts) < 2:
+                winners = list(coverage.keys())
+            else:
+                threshold = _otsu_threshold(counts_only)
+                winners = [a for a, m in coverage.items() if len(m) >= threshold]
 
+        # exclude any winner that is itself a member, require coverage >= 2
         member_set = set(member_cuis)
         winners = [a for a in winners if a not in member_set and len(coverage[a]) >= 2]
+
+        # flatten hops for scoring: hops[anc] = list of per-member min distances
+        hops = {a: list(m.values()) for a, m in hops_by_member.items()}
+
         return winners, coverage, hops
 
+    # ── Scoring ─────────────────────────────────────────────────────────────
+
     def _best_ancestor(self, member_cuis, candidates, coverage, hops, metadata, ic_map):
-        """Pick the best candidate using semantic type match with members."""
+        """Pick the best candidate ancestor.
+
+        Scoring:
+          1. weighted type match:
+             for each semantic type the candidate has, add (fraction of members
+             with that type) to its score. Untyped candidates get neutral score.
+          2. quality gate: coverage >= 50% of members AND type_score > 0
+             otherwise reject the candidate entirely
+          3. sort by: type_score desc, avg_hops asc, coverage desc, ic asc
+        """
         if not candidates:
             return None
 
-        # determine dominant semantic types of the members (data-driven)
+        n_members = len(member_cuis)
+
+        # build member type distribution
         type_counter = Counter()
         n_typed = 0
         for mc in member_cuis:
@@ -214,30 +236,42 @@ class TopicLabeler:
                 for t in m.semantic_types:
                     type_counter[t] += 1
 
-        dominant_types = set()
-        if n_typed > 0:
-            threshold_count = n_typed * 0.5
-            dominant_types = {t for t, c in type_counter.items() if c >= threshold_count}
-            if not dominant_types:
-                dominant_types = set(type_counter.keys())
+        # neutral score for candidates with missing metadata
+        neutral_score = 0.5 if n_typed > 0 else 1.0
+        min_coverage = max(2, n_members // 2)  # at least half, at least 2
 
         scored = []
         for cand in candidates:
+            cov = len(coverage.get(cand, []))
+            if cov < min_coverage:
+                continue  # quality gate: coverage
+
             cand_meta = metadata.get(cand)
             cand_types = set(cand_meta.semantic_types) if cand_meta and cand_meta.semantic_types else set()
-            type_match = 1 if (cand_types & dominant_types) else 0
 
-            cov = len(coverage.get(cand, []))
+            if not cand_types:
+                type_score = neutral_score
+            else:
+                # weighted sum: how well the candidate's types match member distribution
+                type_score = 0.0
+                if n_typed > 0:
+                    for t in cand_types:
+                        type_score += type_counter.get(t, 0) / n_typed
+
+            # quality gate: if members are typed, candidate must score above 0
+            if n_typed > 0 and type_score <= 0:
+                continue
+
             h = hops.get(cand, [])
             avg_hop = sum(h) / len(h) if h else float("inf")
             cand_ic = (ic_map or {}).get(cand, 0.0)
 
-            scored.append((cand, type_match, avg_hop, cov, cand_ic))
+            scored.append((cand, type_score, avg_hop, cov, cand_ic))
 
         if not scored:
             return None
 
-        # sort: type_match desc, avg_hops asc, coverage desc, ic asc
+        # sort: type_score desc, avg_hops asc, coverage desc, ic asc
         scored.sort(key=lambda x: (-x[1], x[2], -x[3], x[4]))
         return scored[0][0]
 
