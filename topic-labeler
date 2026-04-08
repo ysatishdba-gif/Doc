@@ -1,0 +1,191 @@
+# topic_labeler.py
+# Standalone topic label assignment. Does not modify existing code.
+#
+# Usage:
+#   from cui_topics import CUITopics
+#   from topic_labeler import TopicLabeler
+#
+#   topics_mod = CUITopics()
+#   result = topics_mod.build_topics(cuis, strategy="embedding")
+#
+#   labeler = TopicLabeler()
+#   labeled = labeler.relabel(result)   # returns new dict with updated labels
+#
+# Layered label tiers:
+#   1. MedlinePlus direct  (topic_cui is in MedlinePlus dict)
+#   2. Ancestor vote       (most-frequent ancestor, 3-hop BFS, 50% coverage, IC >= 3.0,
+#                           tie-break by LOWER IC — more general wins)
+#   3. Member fallback     (highest-IC member's preferred term — what the module returned)
+
+import logging
+from google.cloud import bigquery
+from config import PROJECT_ID, DATASET_ID, hierarchy, medlineplus
+from cui_core import fetch_preferred_terms
+
+log = logging.getLogger(__name__)
+
+MAX_HOPS = 3
+MIN_COVERAGE = 0.5
+IC_FLOOR = 3.0
+
+
+class TopicLabeler:
+
+    def __init__(self):
+        self._graph = hierarchy
+        self._mp_keys = set(medlineplus.keys())
+        self._bq = bigquery.Client(project=PROJECT_ID)
+        self._pid, self._did = PROJECT_ID, DATASET_ID
+
+    def relabel(self, topics_result, ic_map=None):
+        """
+        Takes the full result dict from CUITopics.build_topics() and returns
+        a NEW dict with updated topic_label and label_source fields.
+
+        The original dict is not modified.
+
+        ic_map is optional — if provided, uses IC scores for tie-breaking and
+        floor filtering. If not, tiers 1 and 3 still work but tier 2 is skipped.
+        """
+        if not topics_result or "topics" not in topics_result:
+            return topics_result
+
+        out = dict(topics_result)
+        out["topics"] = []
+
+        # collect all ancestor CUIs we'll need preferred terms for
+        ancestor_candidates = set()
+        for topic in topics_result["topics"]:
+            member_cuis = [m["cui"] for m in topic.get("members", [])]
+            if ic_map:
+                anc = self._tier2_ancestor(member_cuis, ic_map)
+                if anc:
+                    ancestor_candidates.add(anc)
+            for st in topic.get("subtopics", []):
+                sub_members = [m["cui"] for m in st.get("members", [])]
+                if ic_map:
+                    anc = self._tier2_ancestor(sub_members, ic_map)
+                    if anc:
+                        ancestor_candidates.add(anc)
+
+        # batch-fetch preferred terms for all tier-2 ancestors (one BQ call)
+        anc_terms = {}
+        if ancestor_candidates:
+            anc_terms = fetch_preferred_terms(
+                self._bq, self._pid, self._did, list(ancestor_candidates))
+
+        # relabel each topic
+        counts = {"medlineplus": 0, "ancestor": 0, "member": 0}
+        for topic in topics_result["topics"]:
+            new_topic = dict(topic)
+            tc = topic.get("topic_cui", "")
+            member_cuis = [m["cui"] for m in topic.get("members", [])]
+            member_term = topic.get("topic_label", "")  # tier 3 fallback
+
+            new_tc, new_label, source = self._pick_label(
+                tc, member_cuis, member_term, ic_map, anc_terms)
+
+            new_topic["topic_cui"] = new_tc
+            new_topic["topic_label"] = new_label
+            new_topic["label_source"] = source
+            counts[source] = counts.get(source, 0) + 1
+
+            new_subs = []
+            for st in topic.get("subtopics", []):
+                new_st = dict(st)
+                sc = st.get("subtopic_cui", "")
+                sub_members = [m["cui"] for m in st.get("members", [])]
+                sub_term = st.get("subtopic_label", "")
+                new_sc, new_st_label, st_source = self._pick_label(
+                    sc, sub_members, sub_term, ic_map, anc_terms)
+                new_st["subtopic_cui"] = new_sc
+                new_st["subtopic_label"] = new_st_label
+                new_st["label_source"] = st_source
+                new_subs.append(new_st)
+            new_topic["subtopics"] = new_subs
+
+            out["topics"].append(new_topic)
+
+        log.info(f"TopicLabeler: {counts['medlineplus']} medlineplus, "
+                 f"{counts['ancestor']} ancestor, {counts['member']} member")
+        return out
+
+    # ── Label selection ──────────────────────────────────────────────────────
+
+    def _pick_label(self, topic_cui, member_cuis, member_term, ic_map, anc_terms):
+        """Returns (final_cui, final_label, source)."""
+
+        # Tier 1: MedlinePlus direct lookup on topic_cui
+        if topic_cui and topic_cui in self._mp_keys:
+            return topic_cui, medlineplus[topic_cui], "medlineplus"
+
+        # Tier 2: Ancestor vote
+        if ic_map:
+            anc = self._tier2_ancestor(member_cuis, ic_map)
+            if anc:
+                # check MedlinePlus on the ancestor too (best of both)
+                if anc in self._mp_keys:
+                    return anc, medlineplus[anc], "medlineplus"
+                label = anc_terms.get(anc, "")
+                if label:
+                    return anc, label, "ancestor"
+
+        # Tier 3: Member fallback
+        return topic_cui, member_term, "member"
+
+    def _tier2_ancestor(self, member_cuis, ic_map):
+        """Most-frequent ancestor within MAX_HOPS meeting coverage + IC floor.
+        Tie-break: lower IC wins (more general = better topic anchor)."""
+        if not member_cuis:
+            return None
+        n_members = len(member_cuis)
+        required = max(1, int(n_members * MIN_COVERAGE + 0.999))  # ceil
+
+        # each ancestor -> set of members that reached it
+        coverage = {}
+        for m in member_cuis:
+            reached = self._bfs_ancestors(m, MAX_HOPS)
+            for a in reached:
+                coverage.setdefault(a, set()).add(m)
+
+        if not coverage:
+            return None
+
+        # candidates meeting coverage + IC floor
+        candidates = []
+        for anc, members_reached in coverage.items():
+            if len(members_reached) < required:
+                continue
+            anc_ic = ic_map.get(anc, 0.0)
+            if anc_ic < IC_FLOOR:
+                continue
+            candidates.append((anc, len(members_reached), anc_ic))
+
+        if not candidates:
+            return None
+
+        # sort: most coverage first, then LOWER IC (more general)
+        candidates.sort(key=lambda x: (-x[1], x[2]))
+        return candidates[0][0]
+
+    def _bfs_ancestors(self, cui, max_hops):
+        """BFS up from cui, return set of all ancestors within max_hops."""
+        if cui not in self._graph:
+            return set()
+        visited = set()
+        frontier = [cui]
+        for _ in range(max_hops):
+            next_frontier = []
+            for node in frontier:
+                for parent in self._graph.predecessors(node):
+                    if parent in visited:
+                        continue
+                    visited.add(parent)
+                    next_frontier.append(parent)
+            if not next_frontier:
+                break
+            frontier = next_frontier
+        return visited
+
+    def close(self):
+        pass
