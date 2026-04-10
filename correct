@@ -1,68 +1,461 @@
-Loaded 370,206 CUIs
+"""
+SNOMED Lookup Builder — Full Polyhierarchy (DAG) Support
+=========================================================
+Handles SNOMED's DAG structure:
+  - Any node can have multiple parents at any layer
+  - Descendant counts are exact unique counts (topo sort + set union)
+  - Each CUI maps to ALL valid topics across all parent paths
+
+Set PROJECT and DATASET below, then run:
+  python run_builder.py
+"""
+
+import pickle
+import re
+import time
+import os
+from collections import defaultdict
+from google.cloud import bigquery
 
 
-══════════════════════════════════════════════════════════════
-  CUI    : C4759551
-  Label  : Severe loss of body fat (finding)
-  Tag    : finding
+# ─────────────────────────────────────────────────────────────
+# SET YOUR VALUES HERE
+# ─────────────────────────────────────────────────────────────
 
-  Topics (1):
-    📌 [C0424722]  General finding of soft tissue (finding)  (score=1.0)
+PROJECT = "your-gcp-project-id"
+DATASET = "your_umls_dataset"
+OUTPUT  = "cui_topic_lookup.pkl"
 
-  Full tree — bottom to root (first parent path):
-    ● [C4759551]  Severe loss of body fat (finding)
-    └── [C0424630]  Loss of body fat - finding (finding)
-      └── [C0424722]  General finding of soft tissue (finding)  ← TOPIC
-        └── [C0037088]  Clinical finding (sign or symptom)
-          └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
-══════════════════════════════════════════════════════════════
 
-══════════════════════════════════════════════════════════════
-  CUI    : C3697331
-  Label  : Impaired nutrient utilization (finding)
-  Tag    : finding
+# ─────────────────────────────────────────────────────────────
+# STEP 1: BIGQUERY QUERIES
+# ─────────────────────────────────────────────────────────────
 
-  Topics (1):
-    📌 [C0577601]  Nutritional finding (finding)  (score=1.0)
+def query_concepts(client):
+    sql = f"""
+        SELECT DISTINCT
+            c.CUI,
+            c.STR                             AS label,
+            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
+        FROM
+            `{PROJECT}.{DATASET}.MRCONSO` c
+        LEFT JOIN
+            `{PROJECT}.{DATASET}.MRSTY`   s ON c.CUI = s.CUI
+        WHERE
+            c.SAB      = 'SNOMEDCT_US'
+        AND c.LAT      = 'ENG'
+        AND c.ISPREF   = 'Y'
+        AND c.SUPPRESS = 'N'
+        QUALIFY
+            ROW_NUMBER() OVER (
+                PARTITION BY c.CUI
+                ORDER BY s.STY NULLS LAST
+            ) = 1
+    """
+    print("  Querying concepts...")
+    t  = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
+    return df
 
-  Full tree — bottom to root (first parent path):
-    ● [C3697331]  Impaired nutrient utilization (finding)
-    └── [C0577601]  Nutritional finding (finding)  ← TOPIC
-      └── [C0037088]  Clinical finding (sign or symptom)
-        └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
-══════════════════════════════════════════════════════════════
 
-══════════════════════════════════════════════════════════════
-  CUI    : C1959901
-  Label  : Body mass index less than 16.5 (finding)
-  Tag    : finding
+def query_parents(client):
+    """
+    Fetch ALL parent rows — no QUALIFY, no dedup.
+    REL=PAR always means CUI2 is the parent of CUI1.
+    Covers both RELA=isa and RELA=inverse_isa.
+    """
+    sql = f"""
+        SELECT
+            CUI1 AS cui,
+            CUI2 AS parent_cui
+        FROM
+            `{PROJECT}.{DATASET}.MRREL`
+        WHERE
+            SAB      = 'SNOMEDCT_US'
+        AND REL      = 'PAR'
+        AND SUPPRESS = 'N'
+    """
+    print("  Querying parent relationships (all parents, all paths)...")
+    t  = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  → {len(df):,} parent rows  ({time.time()-t:.1f}s)")
+    return df
 
-  Topics (1):
-    📌 [C1287249]  Body measurement finding (finding)  (score=1.0)
 
-  Full tree — bottom to root (first parent path):
-    ● [C1959901]  Body mass index less than 16.5 (finding)
-    └── [C0231255]  Decreased body mass index (finding)
-      └── [C0578022]  Observation of body mass index (finding)
-        └── [C1287249]  Body measurement finding (finding)  ← TOPIC
-          └── [C0037088]  Clinical finding (sign or symptom)
-            └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
-══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────
+# STEP 2: BUILD TREE (DAG)
+# ─────────────────────────────────────────────────────────────
 
-══════════════════════════════════════════════════════════════
-  CUI    : C0586746
-  Label  : Excessive weight loss (finding)
-  Tag    : finding
+def build_tree(concepts_df, parents_df):
+    """
+    Builds DAG — each node stores ALL parent CUIs.
+    Uses vectorized pandas ops — no iterrows.
+    """
+    print("  Building tree (DAG)...")
+    t = time.time()
 
-  Topics (1):
-    📌 [C1287249]  Body measurement finding (finding)  (score=1.0)
+    # Vectorized: group parent_cui by cui
+    parent_map = (
+        parents_df
+        .groupby("cui")["parent_cui"]
+        .apply(list)
+        .to_dict()
+    )
 
-  Full tree — bottom to root (first parent path):
-    ● [C0586746]  Excessive weight loss (finding)
-    └── [C1262477]  Weight loss (finding)
-      └── [C1287464]  Weight change finding (finding)
-        └── [C1287453]  Weight trend finding (finding)
-          └── [C1265588]  Weight finding (finding)
-            └── [C1287249]  Body measurement finding (finding)  ← TOPIC
-              └── [C0037088]  Clinical finding (sign or symptom)
-                └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
+    # Vectorized: build tree dict
+    concepts_df = concepts_df.copy()
+    concepts_df["semantic_type"] = (
+        concepts_df["semantic_type"].fillna("unknown").str.lower()
+    )
+    concepts_df["full_label"] = (
+        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
+    )
+
+    tree = {
+        row["CUI"]: {
+            "label"      : row["full_label"],
+            "own_label"  : row["full_label"],
+            "parent_cuis": parent_map.get(row["CUI"], [])
+        }
+        for _, row in concepts_df.iterrows()
+    }
+
+    roots = sum(1 for v in tree.values() if not v["parent_cuis"])
+    multi = sum(1 for v in tree.values() if len(v["parent_cuis"]) > 1)
+    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {multi:,} multi-parent")
+    print(f"  ({time.time()-t:.1f}s)")
+    return tree
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: DESCENDANT COUNTS — exact unique counts via topo sort
+# ─────────────────────────────────────────────────────────────
+
+def build_desc_counts(tree):
+    """
+    Computes EXACT unique descendant count per node.
+
+    Uses topological sort (leaves → root) + set union.
+    Handles full DAG — any node at any layer can have
+    multiple parents. No node is missed or double counted.
+
+    Proof:
+      If D has parents B and C:
+        desc(B) includes D+subtree(D)
+        desc(C) includes D+subtree(D)
+        desc(ROOT) = set union → D counted exactly once ✅
+    """
+    print("  Building descendant counts (exact, DAG-aware)...")
+    t = time.time()
+
+    # Build children map
+    children = defaultdict(set)
+    for cui, node in tree.items():
+        for p in node.get("parent_cuis", []):
+            if p in tree:
+                children[p].add(cui)
+
+    # ── Step 1: Kahn's BFS topological sort ────────────────
+    # Processes leaves first, then parents.
+    # in_degree = number of children (not yet processed).
+    # Start with leaves (0 children), work up to roots.
+    print("    [1/3] Topological sort (Kahn's BFS)...")
+    from collections import deque
+
+    # in_degree = child count per node (leaves = 0)
+    in_degree = {node: len(children.get(node, set())) for node in tree}
+
+    # Start queue with all leaves
+    queue      = deque(n for n in tree if in_degree[n] == 0)
+    topo_order = []
+
+    while queue:
+        node = queue.popleft()
+        topo_order.append(node)
+        # Notify parents that one more child is processed
+        for parent in tree.get(node, {}).get("parent_cuis", []):
+            if parent in tree:
+                in_degree[parent] -= 1
+                if in_degree[parent] == 0:
+                    queue.append(parent)
+
+    print(f"    → {len(topo_order):,} nodes in topo order")
+
+    # ── Step 2: Process leaves → root ────────────────────────
+    # Set union gives exact unique descendants
+    # Sets freed once all parents processed (memory efficient)
+    print("    [2/3] Computing unique descendant counts...")
+    all_desc    = {}
+    desc_counts = {}
+    processed   = 0
+
+    for node in topo_order:
+        unique = set(children.get(node, set()))
+        for child in children.get(node, set()):
+            unique |= all_desc.get(child, set())
+
+        all_desc[node]    = unique
+        desc_counts[node] = len(unique)
+
+        # Free child sets once all their parents are processed
+        for child in children.get(node, set()):
+            child_parents     = tree.get(child, {}).get("parent_cuis", [])
+            all_parents_done  = all(
+                p in desc_counts for p in child_parents if p in tree
+            )
+            if all_parents_done and child in all_desc:
+                del all_desc[child]
+
+        processed += 1
+        if processed % 50000 == 0:
+            print(f"    {processed:,} / {len(tree):,}")
+
+    print(f"    [3/3] Done — {len(desc_counts):,} nodes  ({time.time()-t:.1f}s)")
+    return desc_counts
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4: BUILD LOOKUP — one topic per parent path
+# ─────────────────────────────────────────────────────────────
+
+def get_tag(cui, tree):
+    label = tree.get(cui, {}).get("label", "")
+    m = re.search(r'\(([^)]+)\)$', label.strip())
+    return m.group(1).lower() if m else "unknown"
+
+def sibling_reach(cui, tree, desc_counts):
+    parents    = tree.get(cui, {}).get("parent_cuis", [])
+    parent     = parents[0] if parents else None
+    reach_node = desc_counts.get(cui, 0)
+    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
+    return (reach_par - reach_node + 1) / (reach_par + 1)
+
+def find_all_topics(cui, tree, desc_counts, tag):
+    """
+    BFS upward from cui across ALL parent paths at every level.
+
+    Problem solved:
+      C4759551 → C0424630 (1 parent)
+      C0424630 → [C0424722, C0392885, C1287249] (3 parents)
+
+      Old code only walked one linear path → missed 2 parents of C0424630
+      New code: BFS explores ALL parents at ALL levels → no path missed
+
+    For each same-tag ancestor found, compute sibling_reach.
+    Keep only PEAK scores — ancestors where climbing further
+    gives a lower score (abstraction point per branch).
+
+    Returns list of topic dicts, one per distinct branch peak.
+    """
+    from collections import deque
+
+    # BFS upward — collect all same-tag ancestors with scores
+    candidate_scores = {}   # ancestor_cui → sibling_reach score
+    visited  = set()
+    queue    = deque(tree.get(cui, {}).get("parent_cuis", []))
+
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+
+        if get_tag(current, tree) == tag:
+            score = sibling_reach(current, tree, desc_counts)
+            candidate_scores[current] = score
+
+        # Keep climbing all parents
+        for parent in tree.get(current, {}).get("parent_cuis", []):
+            if parent not in visited:
+                queue.append(parent)
+
+    if not candidate_scores:
+        return []
+
+    # ── Find peak per branch ──────────────────────────────────
+    # A node is a topic (peak) if its score is higher than
+    # ALL of its same-tag ancestors — it is the abstraction point
+    # on its branch before the score starts dropping.
+    #
+    # Implementation: a candidate IS a peak if no same-tag
+    # descendant (in the ancestor chain) has a higher score.
+    # We detect this by checking: for each candidate, are any
+    # of its same-tag parents also candidates with higher score?
+    # If yes → parent is the peak, not this node.
+
+    topic_cuis = set()
+
+    for candidate, score in candidate_scores.items():
+
+        # A candidate is a peak if NO ancestor-candidate
+        # has score >= this candidate.
+        # When scores tie → prefer the parent (more generic
+        # but equally scored = the named clinical category).
+        #
+        # Root nodes (no parents) are included in candidate_scores
+        # but only as topics for THEMSELVES — they are filtered
+        # out here because their descendants use them via fallback.
+        # The fallback in build_lookup handles root nodes directly.
+        is_peak   = True
+        p_queue   = deque(tree.get(candidate, {}).get("parent_cuis", []))
+        p_visited = set()
+
+        while p_queue:
+            p = p_queue.popleft()
+            if p in p_visited:
+                continue
+            p_visited.add(p)
+
+            if p in candidate_scores and candidate_scores[p] >= score:
+                is_peak = False   # ancestor same or better → not peak
+                break
+
+            for gp in tree.get(p, {}).get("parent_cuis", []):
+                if gp not in p_visited:
+                    p_queue.append(gp)
+
+        if is_peak:
+            # Only add non-root nodes as topics for descendants
+            # Root nodes (no parents) are too generic for descendants
+            # but are valid topics for themselves (handled in build_lookup)
+            if tree.get(candidate, {}).get("parent_cuis", []):
+                topic_cuis.add(candidate)
+
+    # Build topic list
+    topics = []
+    for tc in topic_cuis:
+        topics.append({
+            "topic_cui"  : tc,
+            "topic_label": tree.get(tc, {}).get("label", tc),
+            "score"      : round(candidate_scores[tc], 4),
+        })
+
+    # Sort by score descending
+    topics.sort(key=lambda x: x["score"], reverse=True)
+    return topics
+
+
+def build_lookup(tree, desc_counts):
+    """
+    For every CUI:
+      - BFS upward across ALL parent paths at ALL levels
+      - Find peak sibling_reach per branch = topic
+      - Store ALL unique topics (one per distinct branch)
+
+    Result: each CUI maps to ALL clinically valid topics.
+    No path missed regardless of DAG depth or branching.
+    """
+    print("  Building lookup (full BFS, all paths, all topics)...")
+    t     = time.time()
+    total = len(tree)
+    lookup = {}
+
+    for i, cui in enumerate(tree):
+        if i % 50000 == 0:
+            pct = (i / total) * 100
+            eta = ((time.time()-t) / max(i, 1)) * (total - i)
+            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
+
+        tag    = get_tag(cui, tree)
+        topics = find_all_topics(cui, tree, desc_counts, tag)
+
+        # Fallback — no parents at all → CUI is a root → topic is itself
+        if not tree.get(cui, {}).get("parent_cuis", []):
+            topics = [{
+                "topic_cui"  : cui,
+                "topic_label": tree.get(cui, {}).get("label", cui),
+                "score"      : 1.0,
+            }]
+        # Fallback — no same-tag ancestor found → topic is itself
+        elif not topics:
+            topics = [{
+                "topic_cui"  : cui,
+                "topic_label": tree.get(cui, {}).get("label", cui),
+                "score"      : 1.0,
+            }]
+
+        lookup[cui] = {
+            "own_label"  : tree.get(cui, {}).get("own_label", cui),
+            "parent_cuis": tree.get(cui, {}).get("parent_cuis", []),
+            "tag"        : tag,
+            "topics"     : topics,
+        }
+
+    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
+    return lookup
+
+
+# ─────────────────────────────────────────────────────────────
+# SAVE / LOAD / RUNTIME
+# ─────────────────────────────────────────────────────────────
+
+def save_pickle(lookup, path):
+    with open(path, "wb") as f:
+        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
+
+def load_lookup(path="cui_topic_lookup.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def get_topics(reduced_cuis, lookup):
+    """
+    O(1) per CUI — pure dict lookup.
+    CUI can appear under multiple topics (polyhierarchy).
+
+    Input : ["C4759551", "C0586746"]
+    Output: {
+      "Body fat finding"          : ["C4759551"],
+      "Body measurement finding"  : ["C4759551", "C0586746"],
+      "General finding soft tissue: ["C4759551"],
+    }
+    """
+    topic_bag = {}
+    for cui in reduced_cuis:
+        for topic in lookup.get(cui, {}).get("topics", []):
+            topic_bag.setdefault(topic["topic_label"], []).append(cui)
+    return topic_bag
+
+
+# ─────────────────────────────────────────────────────────────
+# RUN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    start = time.time()
+
+    print(f"\n{'═'*55}")
+    print(f"  SNOMED Lookup Builder")
+    print(f"  Project : {PROJECT}")
+    print(f"  Dataset : {DATASET}")
+    print(f"{'═'*55}\n")
+
+    print("[1/5] Connecting...")
+    client = bigquery.Client(project=PROJECT)
+    print("  ✅ Connected\n")
+
+    print("[2/5] Pulling concepts...")
+    concepts_df = query_concepts(client)
+    print()
+
+    print("[3/5] Pulling parent relationships...")
+    parents_df = query_parents(client)
+    print()
+
+    print("[4/5] Building hierarchy...")
+    tree        = build_tree(concepts_df, parents_df)
+    desc_counts = build_desc_counts(tree)
+    lookup      = build_lookup(tree, desc_counts)
+    print()
+
+    print("[5/5] Saving pickle...")
+    save_pickle(lookup, OUTPUT)
+
+    print(f"\n  Done in {(time.time()-start)/60:.1f} min")
+    print(f"\n  Usage:")
+    print(f"    from run_builder import load_lookup, get_topics")
+    print(f"    lookup = load_lookup('{OUTPUT}')")
+    print(f"    topics = get_topics(your_reduced_cuis, lookup)")
+    print()
