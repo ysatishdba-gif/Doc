@@ -1,85 +1,43 @@
 """
-UMLS Hierarchy Builder from GCP BigQuery
-=========================================
-Pulls UMLS tables from BigQuery, builds a concept hierarchy,
-and saves a CUI → Topic lookup as a pickle file.
-
-Features:
-  - Filter by any SAB (SNOMEDCT_US, ICD10CM, RXNORM, etc.)
-  - Memory-efficient descendant count index
-  - Iterative DFS (no recursion limit on large trees)
-  - Progress reporting throughout
-  - Saves final lookup as pickle
-
-Usage:
-  # SNOMED (default)
-  python umls_hierarchy_builder.py \
-    --project  my-gcp-project \
-    --dataset  umls_dataset \
-    --output   cui_topic_lookup.pkl
-
-  # Different SAB
-  python umls_hierarchy_builder.py \
-    --project  my-gcp-project \
-    --dataset  umls_dataset \
-    --sab      ICD10CM \
-    --output   icd10_lookup.pkl
-
-  # Custom table names
-  python umls_hierarchy_builder.py \
-    --project   my-gcp-project \
-    --dataset   umls_dataset \
-    --sab       SNOMEDCT_US \
-    --mrconso   my_mrconso_table \
-    --mrrel     my_mrrel_table \
-    --mrsty     my_mrsty_table \
-    --output    cui_topic_lookup.pkl
+UMLS Hierarchy Builder — Simple Version
+========================================
+Just set your PROJECT and DATASET below and run:
+  python run_builder.py
 """
 
-import argparse
 import pickle
 import re
 import time
 import os
 from collections import defaultdict
-
 from google.cloud import bigquery
 
 
 # ─────────────────────────────────────────────────────────────
-# CONFIG
+# SET YOUR VALUES HERE
 # ─────────────────────────────────────────────────────────────
 
-# Default table names — override via CLI args
-DEFAULT_MRCONSO = "MRCONSO"
-DEFAULT_MRREL   = "MRREL"
-DEFAULT_MRSTY   = "MRSTY"
-
-# SABs that use "isa" as the parent relationship in MRREL
-# Most vocabularies use "isa" — add exceptions here if needed
-PARENT_RELA = "isa"
+PROJECT  = "your-gcp-project-id"       # ← change this
+DATASET  = "your_umls_dataset"         # ← change this
+OUTPUT   = "cui_topic_lookup.pkl"      # output pickle file
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 1: BIGQUERY QUERIES
+# QUERIES
 # ─────────────────────────────────────────────────────────────
 
-def query_concepts(client, project, dataset, mrconso, mrsty, sab):
-    """
-    Pull concept labels + semantic types for the given SAB.
-    One preferred English term per CUI.
-    """
+def query_concepts(client):
     sql = f"""
         SELECT DISTINCT
             c.CUI,
-            c.STR                        AS label,
+            c.STR                             AS label,
             LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
         FROM
-            `{project}.{dataset}.{mrconso}` c
+            `{PROJECT}.{DATASET}.MRCONSO` c
         LEFT JOIN
-            `{project}.{dataset}.{mrsty}`   s ON c.CUI = s.CUI
+            `{PROJECT}.{DATASET}.MRSTY`   s ON c.CUI = s.CUI
         WHERE
-            c.SAB      = '{sab}'
+            c.SAB      = 'SNOMEDCT_US'
         AND c.LAT      = 'ENG'
         AND c.ISPREF   = 'Y'
         AND c.SUPPRESS = 'N'
@@ -89,27 +47,23 @@ def query_concepts(client, project, dataset, mrconso, mrsty, sab):
                 ORDER BY s.STY NULLS LAST
             ) = 1
     """
-    print(f"    SQL:\n{sql}")
-    t = time.time()
+    print("  Querying concepts...")
+    t  = time.time()
     df = client.query(sql).to_dataframe()
-    print(f"    → {len(df):,} concepts  ({time.time()-t:.1f}s)")
+    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
     return df
 
 
-def query_parents(client, project, dataset, mrrel, sab):
-    """
-    Pull IS-A parent relationships for the given SAB.
-    CUI1 IS-A CUI2 → CUI1's parent is CUI2.
-    """
+def query_parents(client):
     sql = f"""
         SELECT DISTINCT
-            CUI1  AS cui,
-            CUI2  AS parent_cui
+            CUI1 AS cui,
+            CUI2 AS parent_cui
         FROM
-            `{project}.{dataset}.{mrrel}`
+            `{PROJECT}.{DATASET}.MRREL`
         WHERE
-            SAB      = '{sab}'
-        AND RELA     = '{PARENT_RELA}'
+            SAB      = 'SNOMEDCT_US'
+        AND RELA     = 'isa'
         AND SUPPRESS = 'N'
         QUALIFY
             ROW_NUMBER() OVER (
@@ -117,32 +71,20 @@ def query_parents(client, project, dataset, mrrel, sab):
                 ORDER BY CUI2
             ) = 1
     """
-    print(f"    SQL:\n{sql}")
-    t = time.time()
+    print("  Querying IS-A relationships...")
+    t  = time.time()
     df = client.query(sql).to_dataframe()
-    print(f"    → {len(df):,} IS-A relationships  ({time.time()-t:.1f}s)")
+    print(f"  → {len(df):,} relationships  ({time.time()-t:.1f}s)")
     return df
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 2: BUILD TREE DICT
+# BUILD TREE
 # ─────────────────────────────────────────────────────────────
 
-def build_tree(concepts_df, parents_df) -> dict:
-    """
-    Merges concepts + parents into:
-    {
-      cui: {
-        "label"     : "Knee pain (finding)",
-        "parent_cui": "C0022742"   ← None if root
-      }
-    }
-    """
-    print("  Building tree dict...")
-    t = time.time()
-
+def build_tree(concepts_df, parents_df):
+    print("  Building tree...")
     parent_map = dict(zip(parents_df["cui"], parents_df["parent_cui"]))
-
     tree = {}
     for _, row in concepts_df.iterrows():
         cui = row["CUI"]
@@ -151,45 +93,26 @@ def build_tree(concepts_df, parents_df) -> dict:
             "label"     : f"{row['label']} ({tag})",
             "parent_cui": parent_map.get(cui)
         }
-
-    roots    = sum(1 for v in tree.values() if not v["parent_cui"])
-    orphans  = sum(
-        1 for v in tree.values()
-        if v["parent_cui"] and v["parent_cui"] not in tree
-    )
-
-    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {orphans} orphan parents")
-    print(f"  ({time.time()-t:.1f}s)")
+    print(f"  → {len(tree):,} nodes")
     return tree
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3: BUILD DESCENDANT COUNT INDEX
-# Memory-efficient: stores counts not full sets (~5 MB vs ~800 MB)
-# Iterative DFS: avoids Python recursion limit on large trees
+# BUILD DESCENDANT COUNTS
 # ─────────────────────────────────────────────────────────────
 
-def build_desc_counts(tree: dict) -> dict:
-    """
-    For every node count ALL descendants (not just direct children).
-    Uses iterative post-order DFS.
-
-    desc_counts[cui] = total number of descendants
-    """
+def build_desc_counts(tree):
     print("  Building descendant counts...")
     t = time.time()
 
-    # Build children map
     children = defaultdict(list)
     for cui, node in tree.items():
         p = node.get("parent_cui")
         if p and p in tree:
             children[p].append(cui)
 
-    # Find roots
-    roots = [c for c in tree if not tree[c].get("parent_cui")
-             or tree[c]["parent_cui"] not in tree]
-
+    roots       = [c for c in tree if not tree[c].get("parent_cui")
+                   or tree[c]["parent_cui"] not in tree]
     desc_counts = {}
     processed   = 0
 
@@ -210,86 +133,57 @@ def build_desc_counts(tree: dict) -> dict:
                 for child in children[node]:
                     stack.append((child, False))
 
-    print(f"  → {len(desc_counts):,} counts built  ({time.time()-t:.1f}s)")
+    print(f"  → done  ({time.time()-t:.1f}s)")
     return desc_counts
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 4: BUILD LOOKUP TABLE
-# CUI → best topic anchor via sibling_reach
+# BUILD LOOKUP
 # ─────────────────────────────────────────────────────────────
 
-def _get_tag(cui, tree):
+def get_tag(cui, tree):
     label = tree.get(cui, {}).get("label", "")
     m = re.search(r'\(([^)]+)\)$', label.strip())
     return m.group(1).lower() if m else "unknown"
 
-
-def _ancestor_chain(cui, tree):
+def ancestor_chain(cui, tree):
     chain, visited, current = [], set(), cui
     while current:
-        if current in visited:
-            break
+        if current in visited: break
         chain.append(current)
         visited.add(current)
         current = tree.get(current, {}).get("parent_cui")
     return chain
 
-
-def _sibling_reach_norm(cui, tree, desc_counts):
-    """
-    (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
-
-    High = this node has many siblings = distinct meaningful branch
-    Low  = funnel node = not a good stopping point
-    """
+def sibling_reach(cui, tree, desc_counts):
     parent     = tree.get(cui, {}).get("parent_cui")
     reach_node = desc_counts.get(cui, 0)
     reach_par  = desc_counts.get(parent, 0) if parent else reach_node
     return (reach_par - reach_node + 1) / (reach_par + 1)
 
-
-def build_lookup(tree: dict, desc_counts: dict) -> dict:
-    """
-    For every CUI in the tree:
-      Walk up ancestor chain.
-      Score each ancestor by sibling_reach.
-      Best scoring ancestor = natural topic for this CUI.
-
-    Returns:
-    {
-      cui: {
-        "topic_cui"  : "C0022742",
-        "topic_label": "Knee pain (finding)",
-        "tag"        : "finding"
-      }
-    }
-    """
-    print("  Building lookup table...")
-    t = time.time()
-
+def build_lookup(tree, desc_counts):
+    print("  Building lookup...")
+    t     = time.time()
+    total = len(tree)
     lookup = {}
-    total  = len(tree)
 
     for i, cui in enumerate(tree):
         if i % 50000 == 0:
-            elapsed = time.time() - t
-            pct     = (i / total) * 100
-            eta     = (elapsed / max(i,1)) * (total - i)
+            pct = (i / total) * 100
+            eta = ((time.time()-t) / max(i,1)) * (total - i)
             print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
 
-        chain = _ancestor_chain(cui, tree)
-        tag   = _get_tag(cui, tree)
-
+        chain     = ancestor_chain(cui, tree)
+        tag       = get_tag(cui, tree)
         best_score = -1
         best_cui   = chain[1] if len(chain) > 1 else cui
 
         for ancestor in chain[1:]:
-            if _get_tag(ancestor, tree) != tag:
+            if get_tag(ancestor, tree) != tag:
                 continue
-            sib = _sibling_reach_norm(ancestor, tree, desc_counts)
-            if sib > best_score:
-                best_score = sib
+            score = sibling_reach(ancestor, tree, desc_counts)
+            if score > best_score:
+                best_score = score
                 best_cui   = ancestor
 
         lookup[cui] = {
@@ -298,131 +192,70 @@ def build_lookup(tree: dict, desc_counts: dict) -> dict:
             "tag"        : tag,
         }
 
-    print(f"  → {len(lookup):,} entries built  ({time.time()-t:.1f}s)")
+    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
     return lookup
 
 
 # ─────────────────────────────────────────────────────────────
-# STEP 5: SAVE / LOAD PICKLE
+# SAVE / LOAD
 # ─────────────────────────────────────────────────────────────
 
-def save_pickle(lookup: dict, path: str):
+def save_pickle(lookup, path):
     with open(path, "wb") as f:
         pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
     size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
+    print(f"  ✅ Saved → {path}  ({size_mb} MB)")
 
-
-def load_lookup(path: str) -> dict:
-    """Call once at app startup."""
+def load_lookup(path):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-
-# ─────────────────────────────────────────────────────────────
-# RUNTIME: O(1) LOOKUP
-# ─────────────────────────────────────────────────────────────
-
-def get_topics(reduced_cuis: list, lookup: dict) -> dict:
-    """
-    Convert reduced CUIs to topic bag.
-    Pure dictionary lookup — O(1) per CUI.
-
-    Input : ["C0231749", "C0029408", "C0003504"]
-    Output: {
-      "Knee pain (finding)"            : ["C0231749"],
-      "Disorder of knee (disorder)"    : ["C0029408"],
-      "NSAID (substance)"              : ["C0003504"]
-    }
-    """
+def get_topics(reduced_cuis, lookup):
     topic_bag = {}
     for cui in reduced_cuis:
-        entry = lookup.get(cui)
-        if entry:
-            topic = entry["topic_label"]
-        else:
-            topic = "Uncategorized"
+        topic = lookup.get(cui, {}).get("topic_label", "Uncategorized")
         topic_bag.setdefault(topic, []).append(cui)
     return topic_bag
 
 
 # ─────────────────────────────────────────────────────────────
-# MAIN
+# RUN
 # ─────────────────────────────────────────────────────────────
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Build UMLS hierarchy lookup from BigQuery"
-    )
-    parser.add_argument("--project",  required=True,
-                        help="GCP project ID")
-    parser.add_argument("--dataset",  required=True,
-                        help="BigQuery dataset containing UMLS tables")
-    parser.add_argument("--sab",      default="SNOMEDCT_US",
-                        help="Vocabulary filter e.g. SNOMEDCT_US, ICD10CM, RXNORM (default: SNOMEDCT_US)")
-    parser.add_argument("--mrconso",  default=DEFAULT_MRCONSO,
-                        help=f"MRCONSO table name (default: {DEFAULT_MRCONSO})")
-    parser.add_argument("--mrrel",    default=DEFAULT_MRREL,
-                        help=f"MRREL table name (default: {DEFAULT_MRREL})")
-    parser.add_argument("--mrsty",    default=DEFAULT_MRSTY,
-                        help=f"MRSTY table name (default: {DEFAULT_MRSTY})")
-    parser.add_argument("--output",   default="cui_topic_lookup.pkl",
-                        help="Output pickle file path (default: cui_topic_lookup.pkl)")
-    args = parser.parse_args()
+if __name__ == "__main__":
 
-    total_start = time.time()
+    start = time.time()
 
-    print(f"\n{'═'*60}")
-    print(f"  UMLS Hierarchy Builder")
-    print(f"{'─'*60}")
-    print(f"  Project  : {args.project}")
-    print(f"  Dataset  : {args.dataset}")
-    print(f"  SAB      : {args.sab}")
-    print(f"  Tables   : {args.mrconso}, {args.mrrel}, {args.mrsty}")
-    print(f"  Output   : {args.output}")
-    print(f"{'═'*60}\n")
+    print(f"\n{'═'*50}")
+    print(f"  SNOMED Lookup Builder")
+    print(f"  Project : {PROJECT}")
+    print(f"  Dataset : {DATASET}")
+    print(f"{'═'*50}\n")
 
-    # ── 1. Connect to BigQuery ────────────────────────────────
-    print("[1/5] Connecting to BigQuery...")
-    client = bigquery.Client(project=args.project)
+    print("[1/5] Connecting...")
+    client = bigquery.Client(project=PROJECT)
     print("  ✅ Connected\n")
 
-    # ── 2. Pull concepts ──────────────────────────────────────
-    print("[2/5] Querying concepts + semantic types...")
-    concepts_df = query_concepts(
-        client, args.project, args.dataset,
-        args.mrconso, args.mrsty, args.sab
-    )
+    print("[2/5] Pulling concepts...")
+    concepts_df = query_concepts(client)
     print()
 
-    # ── 3. Pull parent relationships ──────────────────────────
-    print("[3/5] Querying IS-A relationships...")
-    parents_df = query_parents(
-        client, args.project, args.dataset,
-        args.mrrel, args.sab
-    )
+    print("[3/5] Pulling relationships...")
+    parents_df = query_parents(client)
     print()
 
-    # ── 4. Build tree ─────────────────────────────────────────
     print("[4/5] Building hierarchy...")
     tree        = build_tree(concepts_df, parents_df)
     desc_counts = build_desc_counts(tree)
     lookup      = build_lookup(tree, desc_counts)
     print()
 
-    # ── 5. Save ───────────────────────────────────────────────
     print("[5/5] Saving pickle...")
-    save_pickle(lookup, args.output)
+    save_pickle(lookup, OUTPUT)
 
-    total_mins = (time.time() - total_start) / 60
-    print(f"\n{'─'*60}")
-    print(f"  ✅ Done in {total_mins:.1f} min")
-    print(f"  Load with:")
-    print(f"    from umls_hierarchy_builder import load_lookup, get_topics")
-    print(f"    lookup = load_lookup('{args.output}')")
-    print(f"    topics = get_topics(reduced_cuis, lookup)")
-    print(f"{'─'*60}\n")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"\n  Done in {(time.time()-start)/60:.1f} min")
+    print(f"\n  Usage:")
+    print(f"    from run_builder import load_lookup, get_topics")
+    print(f"    lookup = load_lookup('{OUTPUT}')")
+    print(f"    topics = get_topics(your_reduced_cuis, lookup)")
+    print()
