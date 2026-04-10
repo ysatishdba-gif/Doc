@@ -1,263 +1,49 @@
-"""
-UMLS Hierarchy Builder — Simple Version
-========================================
-Just set your PROJECT and DATASET below and run:
-  python run_builder.py
-"""
-
 import pickle
-import re
-import time
-import os
-from collections import defaultdict
-from google.cloud import bigquery
 
+# ── Set your CUI here ──────────────────────────────────────
+CUI = "C_LKPAIN"
+# ──────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# SET YOUR VALUES HERE
-# ─────────────────────────────────────────────────────────────
-
-PROJECT  = "your-gcp-project-id"       # ← change this
-DATASET  = "your_umls_dataset"         # ← change this
-OUTPUT   = "cui_topic_lookup.pkl"      # output pickle file
-
-
-# ─────────────────────────────────────────────────────────────
-# QUERIES
-# ─────────────────────────────────────────────────────────────
-
-def query_concepts(client):
-    sql = f"""
-        SELECT DISTINCT
-            c.CUI,
-            c.STR                             AS label,
-            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
-        FROM
-            `{PROJECT}.{DATASET}.MRCONSO` c
-        LEFT JOIN
-            `{PROJECT}.{DATASET}.MRSTY`   s ON c.CUI = s.CUI
-        WHERE
-            c.SAB      = 'SNOMEDCT_US'
-        AND c.LAT      = 'ENG'
-        AND c.ISPREF   = 'Y'
-        AND c.SUPPRESS = 'N'
-        QUALIFY
-            ROW_NUMBER() OVER (
-                PARTITION BY c.CUI
-                ORDER BY s.STY NULLS LAST
-            ) = 1
-    """
-    print("  Querying concepts...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
-    return df
-
-
-def query_parents(client):
-    sql = f"""
-        SELECT DISTINCT
-            CUI1 AS cui,
-            CUI2 AS parent_cui
-        FROM
-            `{PROJECT}.{DATASET}.MRREL`
-        WHERE
-            SAB      = 'SNOMEDCT_US'
-        AND RELA     = 'isa'
-        AND SUPPRESS = 'N'
-        QUALIFY
-            ROW_NUMBER() OVER (
-                PARTITION BY CUI1
-                ORDER BY CUI2
-            ) = 1
-    """
-    print("  Querying IS-A relationships...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} relationships  ({time.time()-t:.1f}s)")
-    return df
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD TREE
-# ─────────────────────────────────────────────────────────────
-
-def build_tree(concepts_df, parents_df):
-    print("  Building tree...")
-    parent_map = dict(zip(parents_df["cui"], parents_df["parent_cui"]))
-    tree = {}
-    for _, row in concepts_df.iterrows():
-        cui = row["CUI"]
-        tag = str(row.get("semantic_type") or "unknown").lower()
-        tree[cui] = {
-            "label"     : f"{row['label']} ({tag})",
-            "parent_cui": parent_map.get(cui)
-        }
-    print(f"  → {len(tree):,} nodes")
-    return tree
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD DESCENDANT COUNTS
-# ─────────────────────────────────────────────────────────────
-
-def build_desc_counts(tree):
-    print("  Building descendant counts...")
-    t = time.time()
-
-    children = defaultdict(list)
-    for cui, node in tree.items():
-        p = node.get("parent_cui")
-        if p and p in tree:
-            children[p].append(cui)
-
-    roots       = [c for c in tree if not tree[c].get("parent_cui")
-                   or tree[c]["parent_cui"] not in tree]
-    desc_counts = {}
-    processed   = 0
-
-    for root in roots:
-        stack = [(root, False)]
-        while stack:
-            node, done = stack.pop()
-            if done:
-                count = len(children[node])
-                for child in children[node]:
-                    count += desc_counts.get(child, 0)
-                desc_counts[node] = count
-                processed += 1
-                if processed % 50000 == 0:
-                    print(f"    {processed:,} / {len(tree):,}")
-            else:
-                stack.append((node, True))
-                for child in children[node]:
-                    stack.append((child, False))
-
-    print(f"  → done  ({time.time()-t:.1f}s)")
-    return desc_counts
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD LOOKUP
-# ─────────────────────────────────────────────────────────────
-
-def get_tag(cui, tree):
-    label = tree.get(cui, {}).get("label", "")
-    m = re.search(r'\(([^)]+)\)$', label.strip())
-    return m.group(1).lower() if m else "unknown"
-
-def ancestor_chain(cui, tree):
-    chain, visited, current = [], set(), cui
-    while current:
-        if current in visited: break
-        chain.append(current)
-        visited.add(current)
-        current = tree.get(current, {}).get("parent_cui")
-    return chain
-
-def sibling_reach(cui, tree, desc_counts):
-    parent     = tree.get(cui, {}).get("parent_cui")
-    reach_node = desc_counts.get(cui, 0)
-    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
-    return (reach_par - reach_node + 1) / (reach_par + 1)
-
-def build_lookup(tree, desc_counts):
-    print("  Building lookup...")
-    t     = time.time()
-    total = len(tree)
-    lookup = {}
-
-    for i, cui in enumerate(tree):
-        if i % 50000 == 0:
-            pct = (i / total) * 100
-            eta = ((time.time()-t) / max(i,1)) * (total - i)
-            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
-
-        chain     = ancestor_chain(cui, tree)
-        tag       = get_tag(cui, tree)
-        best_score = -1
-        best_cui   = chain[1] if len(chain) > 1 else cui
-
-        for ancestor in chain[1:]:
-            if get_tag(ancestor, tree) != tag:
-                continue
-            score = sibling_reach(ancestor, tree, desc_counts)
-            if score > best_score:
-                best_score = score
-                best_cui   = ancestor
-
-        lookup[cui] = {
-            "own_label"  : tree.get(cui, {}).get("label", cui),
-            "parent_cui" : tree.get(cui, {}).get("parent_cui"),
-            "topic_cui"  : best_cui,
-            "topic_label": tree.get(best_cui, {}).get("label", best_cui),
-            "tag"        : tag,
-        }
-
-    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
-    return lookup
-
-
-# ─────────────────────────────────────────────────────────────
-# SAVE / LOAD
-# ─────────────────────────────────────────────────────────────
-
-def save_pickle(lookup, path):
-    with open(path, "wb") as f:
-        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  ✅ Saved → {path}  ({size_mb} MB)")
-
-def load_lookup(path):
+def load_lookup(path="cui_topic_lookup.pkl"):
     with open(path, "rb") as f:
         return pickle.load(f)
 
-def get_topics(reduced_cuis, lookup):
-    topic_bag = {}
-    for cui in reduced_cuis:
-        topic = lookup.get(cui, {}).get("topic_label", "Uncategorized")
-        topic_bag.setdefault(topic, []).append(cui)
-    return topic_bag
+def get_full_chain(cui, lookup):
+    """
+    Walk every parent via parent_cui all the way to root.
+    Shows each node's OWN label — not the topic label.
+    """
+    chain, visited, current = [], set(), cui
+    while current:
+        if current in visited: break
+        entry = lookup.get(current)
+        if not entry: break
+        chain.append({
+            "cui"      : current,
+            "label"    : entry.get("own_label", current),
+            "is_topic" : current == lookup[cui]["topic_cui"]
+        })
+        visited.add(current)
+        parent = entry.get("parent_cui")
+        if not parent: break
+        current = parent
+    return chain
 
+lookup = load_lookup()
+entry  = lookup.get(CUI)
 
-# ─────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-
-    start = time.time()
-
-    print(f"\n{'═'*50}")
-    print(f"  SNOMED Lookup Builder")
-    print(f"  Project : {PROJECT}")
-    print(f"  Dataset : {DATASET}")
-    print(f"{'═'*50}\n")
-
-    print("[1/5] Connecting...")
-    client = bigquery.Client(project=PROJECT)
-    print("  ✅ Connected\n")
-
-    print("[2/5] Pulling concepts...")
-    concepts_df = query_concepts(client)
-    print()
-
-    print("[3/5] Pulling relationships...")
-    parents_df = query_parents(client)
-    print()
-
-    print("[4/5] Building hierarchy...")
-    tree        = build_tree(concepts_df, parents_df)
-    desc_counts = build_desc_counts(tree)
-    lookup      = build_lookup(tree, desc_counts)
-    print()
-
-    print("[5/5] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-
-    print(f"\n  Done in {(time.time()-start)/60:.1f} min")
-    print(f"\n  Usage:")
-    print(f"    from run_builder import load_lookup, get_topics")
-    print(f"    lookup = load_lookup('{OUTPUT}')")
-    print(f"    topics = get_topics(your_reduced_cuis, lookup)")
-    print()
+if not entry:
+    print(f"CUI '{CUI}' not found")
+else:
+    print(f"\nCUI          : {CUI}")
+    print(f"Label        : {entry.get('own_label', CUI)}")
+    print(f"Tag          : {entry['tag']}")
+    print(f"Topic Label  : {entry['topic_label']}")
+    print(f"Topic CUI    : {entry['topic_cui']}")
+    print(f"\nFull tree (bottom → root):")
+    chain = get_full_chain(CUI, lookup)
+    for i, node in enumerate(chain):
+        indent = "  " * i
+        prefix = "└── " if i > 0 else "● "
+        marker = "  ← TOPIC" if node["is_topic"] else ""
+        print(f"{indent}{prefix}[{node['cui']}]  {node['label']}{marker}")
