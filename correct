@@ -1,379 +1,138 @@
 """
-SNOMED Lookup Builder — Full Polyhierarchy (DAG) Support
+Validate run_builder.py — DAG correctness at every layer
 =========================================================
-Handles SNOMED's DAG structure:
-  - Any node can have multiple parents at any layer
-  - Descendant counts are exact unique counts (topo sort + set union)
-  - Each CUI maps to ALL valid topics across all parent paths
+Tests:
+  1. Simple tree (single parents)
+  2. Leaf with multiple parents
+  3. Mid-layer node with multiple parents
+  4. Complex DAG (multiple levels of polyhierarchy)
+  5. Topic formation across all paths
 
-Set PROJECT and DATASET below, then run:
-  python run_builder.py
+Run: python validate_builder.py
 """
 
-import pickle
 import re
-import time
-import os
-from collections import defaultdict
-from google.cloud import bigquery
+import pandas as pd
+from run_builder import build_tree, build_desc_counts, build_lookup
 
 
-# ─────────────────────────────────────────────────────────────
-# SET YOUR VALUES HERE
-# ─────────────────────────────────────────────────────────────
-
-PROJECT = "your-gcp-project-id"
-DATASET = "your_umls_dataset"
-OUTPUT  = "cui_topic_lookup.pkl"
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 1: BIGQUERY QUERIES
-# ─────────────────────────────────────────────────────────────
-
-def query_concepts(client):
-    sql = f"""
-        SELECT DISTINCT
-            c.CUI,
-            c.STR                             AS label,
-            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
-        FROM
-            `{PROJECT}.{DATASET}.MRCONSO` c
-        LEFT JOIN
-            `{PROJECT}.{DATASET}.MRSTY`   s ON c.CUI = s.CUI
-        WHERE
-            c.SAB      = 'SNOMEDCT_US'
-        AND c.LAT      = 'ENG'
-        AND c.ISPREF   = 'Y'
-        AND c.SUPPRESS = 'N'
-        QUALIFY
-            ROW_NUMBER() OVER (
-                PARTITION BY c.CUI
-                ORDER BY s.STY NULLS LAST
-            ) = 1
-    """
-    print("  Querying concepts...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
-    return df
+def make_tree(nodes, edges):
+    """Helper — builds concepts_df and parents_df from simple dicts."""
+    rows        = [{"CUI": n, "label": n, "semantic_type": "finding"}
+                   for n in nodes]
+    parent_rows = [{"cui": c, "parent_cui": p} for c, p in edges]
+    return pd.DataFrame(rows), pd.DataFrame(parent_rows)
 
 
-def query_parents(client):
-    """
-    Fetch ALL parent rows — no QUALIFY, no dedup.
-    REL=PAR always means CUI2 is the parent of CUI1.
-    Covers both RELA=isa and RELA=inverse_isa.
-    """
-    sql = f"""
-        SELECT
-            CUI1 AS cui,
-            CUI2 AS parent_cui
-        FROM
-            `{PROJECT}.{DATASET}.MRREL`
-        WHERE
-            SAB      = 'SNOMEDCT_US'
-        AND REL      = 'PAR'
-        AND SUPPRESS = 'N'
-    """
-    print("  Querying parent relationships (all parents, all paths)...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} parent rows  ({time.time()-t:.1f}s)")
-    return df
+def check(label, got, expected):
+    status = "✅" if got == expected else "❌"
+    if got != expected:
+        print(f"  {status} {label}: expected={expected}  got={got}")
+    else:
+        print(f"  {status} {label}: {got}")
+    return got == expected
 
 
-# ─────────────────────────────────────────────────────────────
-# STEP 2: BUILD TREE (DAG)
-# ─────────────────────────────────────────────────────────────
+def run_all():
+    all_pass = True
+    print(f"\n{'═'*60}")
+    print(f"  VALIDATION SUITE — DAG Descendant Counts + Topics")
+    print(f"{'═'*60}")
 
-def build_tree(concepts_df, parents_df):
-    """
-    Builds DAG — each node stores ALL parent CUIs.
-    {
-      cui: {
-        label        : "Knee pain (finding)",
-        own_label    : "Knee pain (finding)",
-        parent_cuis  : ["C0022742", "C0029408"]  ← list, not single
-      }
-    }
-    """
-    print("  Building tree (DAG)...")
-    t = time.time()
+    # ── Test 1: Simple linear chain ──────────────────────────
+    print("\n[1] Simple chain: ROOT → A → B → C (leaf)")
+    nodes = ["ROOT","A","B","C"]
+    edges = [("A","ROOT"),("B","A"),("C","B")]
+    concepts_df, parents_df = make_tree(nodes, edges)
+    tree = build_tree(concepts_df, parents_df)
+    dc   = build_desc_counts(tree)
+    all_pass &= check("ROOT", dc["ROOT"], 3)
+    all_pass &= check("A",    dc["A"],    2)
+    all_pass &= check("B",    dc["B"],    1)
+    all_pass &= check("C",    dc["C"],    0)
 
-    parent_map = defaultdict(list)
-    for _, row in parents_df.iterrows():
-        parent_map[row["cui"]].append(row["parent_cui"])
+    # ── Test 2: Leaf with 2 parents ──────────────────────────
+    print("\n[2] Leaf D has 2 parents (B and C)")
+    print("    ROOT → A → B → D")
+    print("               C → D")
+    nodes = ["ROOT","A","B","C","D"]
+    edges = [("A","ROOT"),("B","A"),("C","A"),
+             ("D","B"),("D","C")]          # D has 2 parents
+    concepts_df, parents_df = make_tree(nodes, edges)
+    tree = build_tree(concepts_df, parents_df)
+    dc   = build_desc_counts(tree)
+    all_pass &= check("ROOT", dc["ROOT"], 4)  # A,B,C,D
+    all_pass &= check("A",    dc["A"],    3)  # B,C,D
+    all_pass &= check("B",    dc["B"],    1)  # D
+    all_pass &= check("C",    dc["C"],    1)  # D
+    all_pass &= check("D",    dc["D"],    0)  # leaf
 
-    tree = {}
-    for _, row in concepts_df.iterrows():
-        cui = row["CUI"]
-        tag = str(row.get("semantic_type") or "unknown").lower()
-        tree[cui] = {
-            "label"      : f"{row['label']} ({tag})",
-            "own_label"  : f"{row['label']} ({tag})",
-            "parent_cuis": parent_map.get(cui, [])
-        }
+    # ── Test 3: Mid-layer with 2 parents ─────────────────────
+    print("\n[3] Mid-layer G has 2 parents (C and D), G has child I")
+    print("    ROOT → A → C → G → I")
+    print("               D → G")
+    nodes = ["ROOT","A","B","C","D","E","F","G","H","I"]
+    edges = [
+        ("A","ROOT"),("B","ROOT"),
+        ("C","A"),("D","A"),("D","B"),
+        ("E","B"),("F","C"),
+        ("G","C"),("G","D"),             # G has 2 parents
+        ("H","D"),("I","G"),
+    ]
+    concepts_df, parents_df = make_tree(nodes, edges)
+    tree = build_tree(concepts_df, parents_df)
+    dc   = build_desc_counts(tree)
+    all_pass &= check("ROOT", dc["ROOT"], 9)  # all 9 others
+    all_pass &= check("A",    dc["A"],    6)  # C,D,F,G,H,I
+    all_pass &= check("B",    dc["B"],    5)  # D,E,G,H,I
+    all_pass &= check("C",    dc["C"],    3)  # F,G,I
+    all_pass &= check("D",    dc["D"],    3)  # G,H,I
+    all_pass &= check("G",    dc["G"],    1)  # I only
+    all_pass &= check("I",    dc["I"],    0)  # leaf
 
-    roots = sum(1 for v in tree.values() if not v["parent_cuis"])
-    multi = sum(1 for v in tree.values() if len(v["parent_cuis"]) > 1)
-    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {multi:,} multi-parent")
-    print(f"  ({time.time()-t:.1f}s)")
-    return tree
+    # ── Test 4: Diamond pattern ───────────────────────────────
+    print("\n[4] Diamond: ROOT → A,B → C (C has parents A and B)")
+    nodes = ["ROOT","A","B","C"]
+    edges = [("A","ROOT"),("B","ROOT"),
+             ("C","A"),("C","B")]        # diamond
+    concepts_df, parents_df = make_tree(nodes, edges)
+    tree = build_tree(concepts_df, parents_df)
+    dc   = build_desc_counts(tree)
+    all_pass &= check("ROOT", dc["ROOT"], 3)  # A,B,C
+    all_pass &= check("A",    dc["A"],    1)  # C
+    all_pass &= check("B",    dc["B"],    1)  # C
+    all_pass &= check("C",    dc["C"],    0)  # leaf
 
+    # ── Test 5: Topic formation — multiple topics ─────────────
+    print("\n[5] Topic formation — polyhierarchy gives multiple topics")
+    print("    Leaf L has 2 parents P1 and P2 → should get 2 topics")
+    nodes = ["ROOT","P1","P2","L"]
+    edges = [("P1","ROOT"),("P2","ROOT"),
+             ("L","P1"),("L","P2")]
+    concepts_df, parents_df = make_tree(nodes, edges)
+    tree = build_tree(concepts_df, parents_df)
+    dc   = build_desc_counts(tree)
+    lookup = build_lookup(tree, dc)
 
-# ─────────────────────────────────────────────────────────────
-# STEP 3: DESCENDANT COUNTS — exact unique counts via topo sort
-# ─────────────────────────────────────────────────────────────
+    l_topics = lookup["L"]["topics"]
+    topic_cuis = {t["topic_cui"] for t in l_topics}
+    print(f"  L topics: {[t['topic_label'] for t in l_topics]}")
+    all_pass &= check("L has 2 topics", len(l_topics), 2)
+    all_pass &= check("P1 is a topic",  "P1" in topic_cuis, True)
+    all_pass &= check("P2 is a topic",  "P2" in topic_cuis, True)
 
-def build_desc_counts(tree):
-    """
-    Computes EXACT unique descendant count per node.
+    # ── Summary ───────────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    if all_pass:
+        print(f"  ✅ ALL TESTS PASSED")
+        print(f"     Exact unique counts at every layer")
+        print(f"     No paths missed in DAG traversal")
+        print(f"     Multiple topics correctly formed")
+    else:
+        print(f"  ❌ SOME TESTS FAILED")
+    print(f"{'═'*60}\n")
+    return all_pass
 
-    Uses topological sort (leaves → root) + set union.
-    Handles full DAG — any node at any layer can have
-    multiple parents. No node is missed or double counted.
-
-    Proof:
-      If D has parents B and C:
-        desc(B) includes D+subtree(D)
-        desc(C) includes D+subtree(D)
-        desc(ROOT) = set union → D counted exactly once ✅
-    """
-    print("  Building descendant counts (exact, DAG-aware)...")
-    t = time.time()
-
-    # Build children map
-    children = defaultdict(set)
-    for cui, node in tree.items():
-        for p in node.get("parent_cuis", []):
-            if p in tree:
-                children[p].add(cui)
-
-    # ── Step 1: Topological sort (iterative) ─────────────────
-    print("    [1/3] Topological sort...")
-    topo_order = []
-    visited    = set()
-
-    for start in tree:
-        if start in visited:
-            continue
-        stack = [(start, False)]
-        while stack:
-            node, done = stack.pop()
-            if done:
-                if node not in visited:
-                    visited.add(node)
-                    topo_order.append(node)
-            else:
-                if node not in visited:
-                    stack.append((node, True))
-                    for child in children.get(node, set()):
-                        if child not in visited:
-                            stack.append((child, False))
-
-    print(f"    → {len(topo_order):,} nodes in topo order")
-
-    # ── Step 2: Process leaves → root ────────────────────────
-    # Set union gives exact unique descendants
-    # Sets freed once all parents processed (memory efficient)
-    print("    [2/3] Computing unique descendant counts...")
-    all_desc    = {}
-    desc_counts = {}
-    processed   = 0
-
-    for node in topo_order:
-        unique = set(children.get(node, set()))
-        for child in children.get(node, set()):
-            unique |= all_desc.get(child, set())
-
-        all_desc[node]    = unique
-        desc_counts[node] = len(unique)
-
-        # Free child sets once all their parents are processed
-        for child in children.get(node, set()):
-            child_parents     = tree.get(child, {}).get("parent_cuis", [])
-            all_parents_done  = all(
-                p in desc_counts for p in child_parents if p in tree
-            )
-            if all_parents_done and child in all_desc:
-                del all_desc[child]
-
-        processed += 1
-        if processed % 50000 == 0:
-            print(f"    {processed:,} / {len(tree):,}")
-
-    print(f"    [3/3] Done — {len(desc_counts):,} nodes  ({time.time()-t:.1f}s)")
-    return desc_counts
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 4: BUILD LOOKUP — one topic per parent path
-# ─────────────────────────────────────────────────────────────
-
-def get_tag(cui, tree):
-    label = tree.get(cui, {}).get("label", "")
-    m = re.search(r'\(([^)]+)\)$', label.strip())
-    return m.group(1).lower() if m else "unknown"
-
-def sibling_reach(cui, tree, desc_counts):
-    parents    = tree.get(cui, {}).get("parent_cuis", [])
-    parent     = parents[0] if parents else None
-    reach_node = desc_counts.get(cui, 0)
-    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
-    return (reach_par - reach_node + 1) / (reach_par + 1)
-
-def best_topic_on_path(start, tree, desc_counts, tag):
-    """
-    Walk one parent path from start to root.
-    Return the ancestor with highest sibling_reach
-    that shares the same semantic tag.
-    """
-    best_score = -1
-    best_cui   = None
-    visited    = set()
-    current    = start
-
-    while current:
-        if current in visited:
-            break
-        visited.add(current)
-        if get_tag(current, tree) == tag:
-            score = sibling_reach(current, tree, desc_counts)
-            if score > best_score:
-                best_score = score
-                best_cui   = current
-        parents = tree.get(current, {}).get("parent_cuis", [])
-        current = parents[0] if parents else None
-
-    return best_cui, best_score
-
-
-def build_lookup(tree, desc_counts):
-    """
-    For every CUI:
-      - Walk each parent path independently to root
-      - Find best-scoring same-tag ancestor per path
-      - Store ALL unique topics (one per distinct path)
-
-    Result: each CUI maps to ALL clinically valid topics.
-    """
-    print("  Building lookup (all paths, all topics)...")
-    t     = time.time()
-    total = len(tree)
-    lookup = {}
-
-    for i, cui in enumerate(tree):
-        if i % 50000 == 0:
-            pct = (i / total) * 100
-            eta = ((time.time()-t) / max(i, 1)) * (total - i)
-            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
-
-        tag    = get_tag(cui, tree)
-        topics = []
-        seen   = set()
-
-        for parent in tree.get(cui, {}).get("parent_cuis", []):
-            topic_cui, score = best_topic_on_path(
-                parent, tree, desc_counts, tag
-            )
-            if topic_cui and topic_cui not in seen:
-                seen.add(topic_cui)
-                topics.append({
-                    "topic_cui"  : topic_cui,
-                    "topic_label": tree.get(topic_cui, {}).get("label", topic_cui),
-                    "score"      : round(score, 4),
-                })
-
-        # Fallback — no parents or no same-tag ancestor
-        if not topics:
-            topics = [{
-                "topic_cui"  : cui,
-                "topic_label": tree.get(cui, {}).get("label", cui),
-                "score"      : 1.0,
-            }]
-
-        lookup[cui] = {
-            "own_label"  : tree.get(cui, {}).get("own_label", cui),
-            "parent_cuis": tree.get(cui, {}).get("parent_cuis", []),
-            "tag"        : tag,
-            "topics"     : topics,
-        }
-
-    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
-    return lookup
-
-
-# ─────────────────────────────────────────────────────────────
-# SAVE / LOAD / RUNTIME
-# ─────────────────────────────────────────────────────────────
-
-def save_pickle(lookup, path):
-    with open(path, "wb") as f:
-        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
-
-def load_lookup(path="cui_topic_lookup.pkl"):
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-def get_topics(reduced_cuis, lookup):
-    """
-    O(1) per CUI — pure dict lookup.
-    CUI can appear under multiple topics (polyhierarchy).
-
-    Input : ["C4759551", "C0586746"]
-    Output: {
-      "Body fat finding"          : ["C4759551"],
-      "Body measurement finding"  : ["C4759551", "C0586746"],
-      "General finding soft tissue: ["C4759551"],
-    }
-    """
-    topic_bag = {}
-    for cui in reduced_cuis:
-        for topic in lookup.get(cui, {}).get("topics", []):
-            topic_bag.setdefault(topic["topic_label"], []).append(cui)
-    return topic_bag
-
-
-# ─────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    start = time.time()
-
-    print(f"\n{'═'*55}")
-    print(f"  SNOMED Lookup Builder")
-    print(f"  Project : {PROJECT}")
-    print(f"  Dataset : {DATASET}")
-    print(f"{'═'*55}\n")
-
-    print("[1/5] Connecting...")
-    client = bigquery.Client(project=PROJECT)
-    print("  ✅ Connected\n")
-
-    print("[2/5] Pulling concepts...")
-    concepts_df = query_concepts(client)
-    print()
-
-    print("[3/5] Pulling parent relationships...")
-    parents_df = query_parents(client)
-    print()
-
-    print("[4/5] Building hierarchy...")
-    tree        = build_tree(concepts_df, parents_df)
-    desc_counts = build_desc_counts(tree)
-    lookup      = build_lookup(tree, desc_counts)
-    print()
-
-    print("[5/5] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-
-    print(f"\n  Done in {(time.time()-start)/60:.1f} min")
-    print(f"\n  Usage:")
-    print(f"    from run_builder import load_lookup, get_topics")
-    print(f"    lookup = load_lookup('{OUTPUT}')")
-    print(f"    topics = get_topics(your_reduced_cuis, lookup)")
-    print()
+    run_all()
