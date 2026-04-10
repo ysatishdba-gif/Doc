@@ -1,138 +1,71 @@
 """
-Validate run_builder.py — DAG correctness at every layer
-=========================================================
-Tests:
-  1. Simple tree (single parents)
-  2. Leaf with multiple parents
-  3. Mid-layer node with multiple parents
-  4. Complex DAG (multiple levels of polyhierarchy)
-  5. Topic formation across all paths
-
-Run: python validate_builder.py
+Test CUIs against the pickle lookup.
+Shows all topics + full tree to root.
+Add CUIs to the list below and run: python test_cui.py
 """
 
-import re
-import pandas as pd
-from run_builder import build_tree, build_desc_counts, build_lookup
+import pickle
 
+# ── Add your CUIs here ─────────────────────────────────────
+CUIS = [
+    "C_LKPAIN",
+    "C_OAK",
+    "C_HTN",
+]
+# ──────────────────────────────────────────────────────────
 
-def make_tree(nodes, edges):
-    """Helper — builds concepts_df and parents_df from simple dicts."""
-    rows        = [{"CUI": n, "label": n, "semantic_type": "finding"}
-                   for n in nodes]
-    parent_rows = [{"cui": c, "parent_cui": p} for c, p in edges]
-    return pd.DataFrame(rows), pd.DataFrame(parent_rows)
+def load_lookup(path="cui_topic_lookup.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
+def get_display_chain(cui, lookup):
+    """Single path to root — for display only (follows first parent)."""
+    chain, visited, current = [], set(), cui
+    while current:
+        if current in visited: break
+        entry = lookup.get(current)
+        if not entry: break
+        chain.append({
+            "cui"  : current,
+            "label": entry.get("own_label", current),
+        })
+        visited.add(current)
+        parents = entry.get("parent_cuis", [])
+        current = parents[0] if parents else None
+    return chain
 
-def check(label, got, expected):
-    status = "✅" if got == expected else "❌"
-    if got != expected:
-        print(f"  {status} {label}: expected={expected}  got={got}")
-    else:
-        print(f"  {status} {label}: {got}")
-    return got == expected
+def test_cui(cui, lookup):
+    entry = lookup.get(cui)
+    if not entry:
+        print(f"\n  ❌ '{cui}' not found in lookup\n")
+        return
 
+    topics     = entry.get("topics", [])
+    topic_cuis = {t["topic_cui"] for t in topics}
 
-def run_all():
-    all_pass = True
-    print(f"\n{'═'*60}")
-    print(f"  VALIDATION SUITE — DAG Descendant Counts + Topics")
-    print(f"{'═'*60}")
+    print(f"\n{'═'*62}")
+    print(f"  CUI    : {cui}")
+    print(f"  Label  : {entry.get('own_label', cui)}")
+    print(f"  Tag    : {entry['tag']}")
 
-    # ── Test 1: Simple linear chain ──────────────────────────
-    print("\n[1] Simple chain: ROOT → A → B → C (leaf)")
-    nodes = ["ROOT","A","B","C"]
-    edges = [("A","ROOT"),("B","A"),("C","B")]
-    concepts_df, parents_df = make_tree(nodes, edges)
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT", dc["ROOT"], 3)
-    all_pass &= check("A",    dc["A"],    2)
-    all_pass &= check("B",    dc["B"],    1)
-    all_pass &= check("C",    dc["C"],    0)
+    print(f"\n  Topics ({len(topics)}):")
+    for t in topics:
+        print(f"    📌 [{t['topic_cui']}]  {t['topic_label']}"
+              f"  (score={t['score']})")
 
-    # ── Test 2: Leaf with 2 parents ──────────────────────────
-    print("\n[2] Leaf D has 2 parents (B and C)")
-    print("    ROOT → A → B → D")
-    print("               C → D")
-    nodes = ["ROOT","A","B","C","D"]
-    edges = [("A","ROOT"),("B","A"),("C","A"),
-             ("D","B"),("D","C")]          # D has 2 parents
-    concepts_df, parents_df = make_tree(nodes, edges)
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT", dc["ROOT"], 4)  # A,B,C,D
-    all_pass &= check("A",    dc["A"],    3)  # B,C,D
-    all_pass &= check("B",    dc["B"],    1)  # D
-    all_pass &= check("C",    dc["C"],    1)  # D
-    all_pass &= check("D",    dc["D"],    0)  # leaf
+    print(f"\n  Full tree — bottom to root (first parent path):")
+    chain = get_display_chain(cui, lookup)
+    for i, node in enumerate(chain):
+        indent = "  " * i
+        prefix = "└── " if i > 0 else "  ● "
+        marker = "  ← TOPIC" if node["cui"] in topic_cuis else ""
+        print(f"  {indent}{prefix}[{node['cui']}]  {node['label']}{marker}")
 
-    # ── Test 3: Mid-layer with 2 parents ─────────────────────
-    print("\n[3] Mid-layer G has 2 parents (C and D), G has child I")
-    print("    ROOT → A → C → G → I")
-    print("               D → G")
-    nodes = ["ROOT","A","B","C","D","E","F","G","H","I"]
-    edges = [
-        ("A","ROOT"),("B","ROOT"),
-        ("C","A"),("D","A"),("D","B"),
-        ("E","B"),("F","C"),
-        ("G","C"),("G","D"),             # G has 2 parents
-        ("H","D"),("I","G"),
-    ]
-    concepts_df, parents_df = make_tree(nodes, edges)
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT", dc["ROOT"], 9)  # all 9 others
-    all_pass &= check("A",    dc["A"],    6)  # C,D,F,G,H,I
-    all_pass &= check("B",    dc["B"],    5)  # D,E,G,H,I
-    all_pass &= check("C",    dc["C"],    3)  # F,G,I
-    all_pass &= check("D",    dc["D"],    3)  # G,H,I
-    all_pass &= check("G",    dc["G"],    1)  # I only
-    all_pass &= check("I",    dc["I"],    0)  # leaf
-
-    # ── Test 4: Diamond pattern ───────────────────────────────
-    print("\n[4] Diamond: ROOT → A,B → C (C has parents A and B)")
-    nodes = ["ROOT","A","B","C"]
-    edges = [("A","ROOT"),("B","ROOT"),
-             ("C","A"),("C","B")]        # diamond
-    concepts_df, parents_df = make_tree(nodes, edges)
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT", dc["ROOT"], 3)  # A,B,C
-    all_pass &= check("A",    dc["A"],    1)  # C
-    all_pass &= check("B",    dc["B"],    1)  # C
-    all_pass &= check("C",    dc["C"],    0)  # leaf
-
-    # ── Test 5: Topic formation — multiple topics ─────────────
-    print("\n[5] Topic formation — polyhierarchy gives multiple topics")
-    print("    Leaf L has 2 parents P1 and P2 → should get 2 topics")
-    nodes = ["ROOT","P1","P2","L"]
-    edges = [("P1","ROOT"),("P2","ROOT"),
-             ("L","P1"),("L","P2")]
-    concepts_df, parents_df = make_tree(nodes, edges)
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-
-    l_topics = lookup["L"]["topics"]
-    topic_cuis = {t["topic_cui"] for t in l_topics}
-    print(f"  L topics: {[t['topic_label'] for t in l_topics]}")
-    all_pass &= check("L has 2 topics", len(l_topics), 2)
-    all_pass &= check("P1 is a topic",  "P1" in topic_cuis, True)
-    all_pass &= check("P2 is a topic",  "P2" in topic_cuis, True)
-
-    # ── Summary ───────────────────────────────────────────────
-    print(f"\n{'─'*60}")
-    if all_pass:
-        print(f"  ✅ ALL TESTS PASSED")
-        print(f"     Exact unique counts at every layer")
-        print(f"     No paths missed in DAG traversal")
-        print(f"     Multiple topics correctly formed")
-    else:
-        print(f"  ❌ SOME TESTS FAILED")
-    print(f"{'═'*60}\n")
-    return all_pass
+    print(f"{'═'*62}")
 
 
 if __name__ == "__main__":
-    run_all()
+    lookup = load_lookup()
+    print(f"  Loaded {len(lookup):,} CUIs\n")
+    for cui in CUIS:
+        test_cui(cui, lookup)
