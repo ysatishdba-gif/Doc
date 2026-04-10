@@ -1,85 +1,160 @@
-Step 1: CUI Extraction from Multiple Sources
-For each atomic concept (e.g., 8 candidates for "current medication"):
-    cuis = cui_api(atomic_concept.text)
-    for cui in cuis:
-        cui.source_type = "atomic_concept"
-        cui.source_id = atomic_concept.id  # e.g., "fc_001"
-    add to merged pool
+Approach 1: CUI Extraction from Everything
+User Query
+    │
+    ▼
+Nature Breakdown
+    │   intents → sub-natures → atomic concepts
+    │   context retrieval (5 dims) on each atomic concept
+    │
+    ▼
+CUI Extraction (from 3 sources)
+    │   atomic concept text → CUIs
+    │   sub-nature category paths → CUIs
+    │   nature strings → CUIs
+    │
+    ▼
+Merged CUI Pool
+    │   mixed CUIs from all 3 source types
+    │
+    ▼
+Summarizer
+    │
+    ▼
+Topic Formation
+    │
+    ▼
+Enrichment with Context Retrieval (broken)
+    │   atomic-concept CUIs → have 5 context dims
+    │   sub-nature CUIs → no context retrieval (orphans)
+    │   nature CUIs → no context retrieval (orphans)
+    │   consolidation is incomplete or fabricated
+    │
+    │   per topic, attach:
+    │     - document_types (partial union)
+    │     - author_roles (partial union)
+    │     - temporal_signals (partial union)
+    │     - content_signals (partial union)
+    │     - clinical_setting (partial union)
+    │     - sub_nature_paths (multiple)
+    │     - intent_ids (possibly multiple)
+    │
+    ▼
+Search Adapter Cascade
+    Stage 0: section scoping using document_types 
+             (incoherent due to partial consolidation)
+    Stage 1: embedding similarity
+    Stage 2: sub-topic CUI matching
+    Stage 3: ranking using author_roles, temporal_signals, 
+             content_signals, clinical_setting
+             (same incoherence problem)
+    │
+    ▼
+Combiner
+Problem: Sub-nature and nature CUIs have no native context retrieval. Enrichment breaks for those orphan CUIs, so the consolidated 5 dimensions are partial or fabricated. Every cascade stage inherits that incoherence.
 
-For each sub-nature (e.g., 5 sub-natures for "current medication"):
-    cuis = cui_api(sub_nature.category_path)  
-    # e.g., "Medication >> Drug Name >> Active"
-    for cui in cuis:
-        cui.source_type = "sub_nature"
-        cui.source_id = sub_nature.id
-    add to merged pool
+Approach 2: Merged Pool with Source Tagging
+User Query
+    │
+    ▼
+Nature Breakdown
+    │   intents → sub-natures → atomic concepts
+    │   context retrieval (5 dims) on each atomic concept
+    │
+    ▼
+CUI Extraction (atomic concepts only)
+    │   each CUI tagged with source atomic concept ID
+    │
+    ▼
+Merged CUI Pool
+    │   source tags attached to every CUI
+    │
+    ▼
+Summarizer
+    │   source tags preserved through reduction
+    │
+    ▼
+Topic Formation
+    │   topics inherit source tags from constituent CUIs
+    │   topics may span sub-natures and intents
+    │
+    ▼
+Enrichment with Context Retrieval via Source Tag Lookup
+    │   for each topic, look up source atomic concepts via tags
+    │   union the 5 context dimensions across ALL contributing 
+    │   atomic concepts (global union)
+    │
+    │   per topic, attach:
+    │     - document_types (broad union across sub-natures)
+    │     - author_roles (broad union across sub-natures)
+    │     - temporal_signals (broad union)
+    │     - content_signals (broad union)
+    │     - clinical_setting (broad union)
+    │     - sub_nature_paths (multiple possible)
+    │     - intent_ids (multiple possible)
+    │
+    ▼
+Search Adapter Cascade
+    Stage 0: section scoping using document_types 
+             (broad → less precise)
+    Stage 1: embedding similarity
+    Stage 2: sub-topic CUI matching
+    Stage 3: ranking using author_roles, temporal_signals, 
+             content_signals, clinical_setting
+             (broad unions → diluted ranking signal)
+    │
+    ▼
+Combiner
+    │   has to handle cross-sub-nature topics
+    │   has to handle cross-intent topics
+Problem: Topics can span sub-natures and intents. Context retrieval consolidation is broad because unions cross dimensional boundaries. Stage 0 scoping casts a wide net. Stage 3 ranking signals are diluted because they union across unrelated atomic concepts.
 
-For each intent (e.g., 2 intents):
-    cuis = cui_api(intent.nature)  
-    # e.g., "Medication History / Active Status Assessment"
-    for cui in cuis:
-        cui.source_type = "nature"
-        cui.source_id = intent.id
-    add to merged pool
-The merged pool now contains CUIs from three different source types. A typical "current medication" query might produce 30-50 atomic-concept CUIs, 15-25 sub-nature CUIs, and 5-10 nature CUIs — roughly 50-85 CUIs total.
-Step 2: Summarization on the Enriched Pool
-reduced_pool = summarizer(merged_pool)
-# Source tags travel with surviving CUIs
-# Some abstract CUIs (from nature/sub-nature) likely become 
-# cluster representatives because they sit higher in the 
-# UMLS hierarchy
-Step 3: Topic Formation
-topics = topic_formation(reduced_pool)
-# Each topic is a cluster of semantically related CUIs
-# Topics inherit source tags from their constituent CUIs
-A typical topic now contains a mix of source types. For example, Topic A might contain:
-
-C0013227 (Pharmaceutical Preparations) — from nature "Medication History"
-C0025598 (Metformin-related) — from atomic concept fc_002 "brand name medication"
-C0020616 (Hypoglycemic Agents) — from sub-nature "Medication >> Classification >> Type"
-C0086093 (Operative Procedure) — from atomic concept fc_005 "medication dose"
-
-The topic's CUIs come from heterogeneous sources, and there's no clean way to identify which source "owns" the topic.
-Step 4: Metadata Consolidation (THE BREAKING POINT)
-This is where Possibility A becomes incoherent. For each topic, you'd want to look up source items and union their context retrieval. But the source types behave differently:
-For Topic A with mixed sources:
-
-For atomic-concept-derived CUIs:
-    Look up the atomic concept in Nature Breakdown output
-    Grab its 5 context retrieval dimensions
-    These are well-defined.
-
-For sub-nature-derived CUIs:
-    Sub-natures DO NOT have their own context retrieval.
-    The 5 dimensions live at the atomic concept level only.
-    These CUIs have NO context retrieval to contribute.
-
-For nature-derived CUIs:
-    Nature strings are even higher up.
-    They have NO context retrieval.
-You're left with two bad options:
-Option A1 — Skip nature/sub-nature CUIs in metadata consolidation:
-The topic's metadata is built only from atomic-concept-derived CUIs in the topic. But the topic exists partly because of nature/sub-nature CUIs that pulled it together — its semantic shape doesn't match its metadata. The Stage 0 scoping based on this partial metadata might miss what the user actually wanted.
-Option A2 — Fabricate context retrieval for orphan CUIs:
-Inherit context retrieval from sibling atomic-concept CUIs in the same topic. If no atomic-concept CUIs are in the topic, invent a default. This is fabricated metadata that doesn't trace back to anything Nature Breakdown actually produced.
-Step 5: Send Enriched Topics to Adapter
-For each topic, attach (incoherently) consolidated metadata:
-    Topic.consolidated_document_types = union from atomic-concept 
-        sources only (or fabricated if none)
-    Topic.consolidated_author_roles = same problem
-    Topic.consolidated_temporal_signals = same problem
-    Topic.consolidated_content_signals = same problem
-    Topic.consolidated_clinical_setting = same problem
-    Topic.sub_nature_paths = whichever sub-natures any 
-        contributing CUI traces back to (could be many)
-    Topic.intent_ids = whichever intents any contributing 
-        CUI traces back to (could be multiple)
-What Goes Wrong
-
-Orphan CUIs: Nature-derived and sub-nature-derived CUIs have no context retrieval. The enrichment is partial or fabricated.
-Precision dilution: Abstract CUIs from nature and sub-nature ("medication," "clinical assessment") match almost any clinical record and dominate topic clusters.
-Topic spanning: Abstract CUIs glue together topics that should stay clinically distinct, causing topics to span sub-natures and intents.
-Stage 0 scoping diluted: Consolidated document_types becomes broad and incoherent.
-Contradicts Nature Breakdown's design: Nature and sub-nature paths are organizational labels, not CUI-ready text. The Nature Breakdown prompt explicitly engineers atomic concepts to be CUI-resolvable; nature and sub-nature paths are not given this treatment.
-
-Verdict: Rejected. The enrichment mechanics break because nature and sub-nature don't carry context retrieval. The metadata consolidation is incoherent.
+Approach 3: Sub-Nature as Query Topic (Recommended)
+User Query
+    │
+    ▼
+Nature Breakdown
+    │   intents → sub-natures → atomic concepts
+    │   context retrieval (5 dims) on each atomic concept
+    │
+    ▼
+CUI Extraction (atomic concepts only)
+    │   no source tagging needed
+    │
+    ▼
+Aggregation by Sub-Nature
+    │   for each sub-nature:
+    │     collect CUIs from its atomic concepts
+    │     compute average embedding from those CUIs
+    │     the sub-nature IS a query topic
+    │
+    ▼
+Direct Enrichment with Context Retrieval
+    │   for each topic (= sub-nature):
+    │     - cuis (from its atomic concepts)
+    │     - avg embedding
+    │     - sub_nature_path (single value)
+    │     - intent_id (single value)
+    │     - nature (from parent intent)
+    │   
+    │   5 context dimensions, unioned across atomic 
+    │   concepts under THIS sub-nature only:
+    │     - document_types (tight union, clinically coherent)
+    │     - author_roles (tight union)
+    │     - temporal_signals (tight union)
+    │     - content_signals (tight union)
+    │     - clinical_setting (tight union)
+    │
+    ▼
+Search Adapter Cascade
+    Stage 0: section scoping using document_types 
+             (tight → sharper scoping)
+    Stage 1: embedding similarity
+    Stage 2: sub-topic CUI matching
+    Stage 3: ranking using author_roles, temporal_signals, 
+             content_signals, clinical_setting
+             (tight unions → clearer ranking signal)
+    │
+    ▼
+Combiner
+    │   trivial: one intent and one sub-nature per topic
+Why recommended: Every atomic concept under a sub-nature contributes cleanly. All 5 context dimensions are unioned within a small, clinically coherent set. Every cascade stage gets sharper scoping and ranking signals because the consolidated context retrieval isn't diluted by cross-sub-nature mixing.
