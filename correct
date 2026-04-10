@@ -1,160 +1,428 @@
-Approach 1: CUI Extraction from Everything
-User Query
-    │
-    ▼
-Nature Breakdown
-    │   intents → sub-natures → atomic concepts
-    │   context retrieval (5 dims) on each atomic concept
-    │
-    ▼
-CUI Extraction (from 3 sources)
-    │   atomic concept text → CUIs
-    │   sub-nature category paths → CUIs
-    │   nature strings → CUIs
-    │
-    ▼
-Merged CUI Pool
-    │   mixed CUIs from all 3 source types
-    │
-    ▼
-Summarizer
-    │
-    ▼
-Topic Formation
-    │
-    ▼
-Enrichment with Context Retrieval (broken)
-    │   atomic-concept CUIs → have 5 context dims
-    │   sub-nature CUIs → no context retrieval (orphans)
-    │   nature CUIs → no context retrieval (orphans)
-    │   consolidation is incomplete or fabricated
-    │
-    │   per topic, attach:
-    │     - document_types (partial union)
-    │     - author_roles (partial union)
-    │     - temporal_signals (partial union)
-    │     - content_signals (partial union)
-    │     - clinical_setting (partial union)
-    │     - sub_nature_paths (multiple)
-    │     - intent_ids (possibly multiple)
-    │
-    ▼
-Search Adapter Cascade
-    Stage 0: section scoping using document_types 
-             (incoherent due to partial consolidation)
-    Stage 1: embedding similarity
-    Stage 2: sub-topic CUI matching
-    Stage 3: ranking using author_roles, temporal_signals, 
-             content_signals, clinical_setting
-             (same incoherence problem)
-    │
-    ▼
-Combiner
-Problem: Sub-nature and nature CUIs have no native context retrieval. Enrichment breaks for those orphan CUIs, so the consolidated 5 dimensions are partial or fabricated. Every cascade stage inherits that incoherence.
+"""
+UMLS Hierarchy Builder from GCP BigQuery
+=========================================
+Pulls UMLS tables from BigQuery, builds a concept hierarchy,
+and saves a CUI → Topic lookup as a pickle file.
 
-Approach 2: Merged Pool with Source Tagging
-User Query
-    │
-    ▼
-Nature Breakdown
-    │   intents → sub-natures → atomic concepts
-    │   context retrieval (5 dims) on each atomic concept
-    │
-    ▼
-CUI Extraction (atomic concepts only)
-    │   each CUI tagged with source atomic concept ID
-    │
-    ▼
-Merged CUI Pool
-    │   source tags attached to every CUI
-    │
-    ▼
-Summarizer
-    │   source tags preserved through reduction
-    │
-    ▼
-Topic Formation
-    │   topics inherit source tags from constituent CUIs
-    │   topics may span sub-natures and intents
-    │
-    ▼
-Enrichment with Context Retrieval via Source Tag Lookup
-    │   for each topic, look up source atomic concepts via tags
-    │   union the 5 context dimensions across ALL contributing 
-    │   atomic concepts (global union)
-    │
-    │   per topic, attach:
-    │     - document_types (broad union across sub-natures)
-    │     - author_roles (broad union across sub-natures)
-    │     - temporal_signals (broad union)
-    │     - content_signals (broad union)
-    │     - clinical_setting (broad union)
-    │     - sub_nature_paths (multiple possible)
-    │     - intent_ids (multiple possible)
-    │
-    ▼
-Search Adapter Cascade
-    Stage 0: section scoping using document_types 
-             (broad → less precise)
-    Stage 1: embedding similarity
-    Stage 2: sub-topic CUI matching
-    Stage 3: ranking using author_roles, temporal_signals, 
-             content_signals, clinical_setting
-             (broad unions → diluted ranking signal)
-    │
-    ▼
-Combiner
-    │   has to handle cross-sub-nature topics
-    │   has to handle cross-intent topics
-Problem: Topics can span sub-natures and intents. Context retrieval consolidation is broad because unions cross dimensional boundaries. Stage 0 scoping casts a wide net. Stage 3 ranking signals are diluted because they union across unrelated atomic concepts.
+Features:
+  - Filter by any SAB (SNOMEDCT_US, ICD10CM, RXNORM, etc.)
+  - Memory-efficient descendant count index
+  - Iterative DFS (no recursion limit on large trees)
+  - Progress reporting throughout
+  - Saves final lookup as pickle
 
-Approach 3: Sub-Nature as Query Topic (Recommended)
-User Query
-    │
-    ▼
-Nature Breakdown
-    │   intents → sub-natures → atomic concepts
-    │   context retrieval (5 dims) on each atomic concept
-    │
-    ▼
-CUI Extraction (atomic concepts only)
-    │   no source tagging needed
-    │
-    ▼
-Aggregation by Sub-Nature
-    │   for each sub-nature:
-    │     collect CUIs from its atomic concepts
-    │     compute average embedding from those CUIs
-    │     the sub-nature IS a query topic
-    │
-    ▼
-Direct Enrichment with Context Retrieval
-    │   for each topic (= sub-nature):
-    │     - cuis (from its atomic concepts)
-    │     - avg embedding
-    │     - sub_nature_path (single value)
-    │     - intent_id (single value)
-    │     - nature (from parent intent)
-    │   
-    │   5 context dimensions, unioned across atomic 
-    │   concepts under THIS sub-nature only:
-    │     - document_types (tight union, clinically coherent)
-    │     - author_roles (tight union)
-    │     - temporal_signals (tight union)
-    │     - content_signals (tight union)
-    │     - clinical_setting (tight union)
-    │
-    ▼
-Search Adapter Cascade
-    Stage 0: section scoping using document_types 
-             (tight → sharper scoping)
-    Stage 1: embedding similarity
-    Stage 2: sub-topic CUI matching
-    Stage 3: ranking using author_roles, temporal_signals, 
-             content_signals, clinical_setting
-             (tight unions → clearer ranking signal)
-    │
-    ▼
-Combiner
-    │   trivial: one intent and one sub-nature per topic
-Why recommended: Every atomic concept under a sub-nature contributes cleanly. All 5 context dimensions are unioned within a small, clinically coherent set. Every cascade stage gets sharper scoping and ranking signals because the consolidated context retrieval isn't diluted by cross-sub-nature mixing.
+Usage:
+  # SNOMED (default)
+  python umls_hierarchy_builder.py \
+    --project  my-gcp-project \
+    --dataset  umls_dataset \
+    --output   cui_topic_lookup.pkl
+
+  # Different SAB
+  python umls_hierarchy_builder.py \
+    --project  my-gcp-project \
+    --dataset  umls_dataset \
+    --sab      ICD10CM \
+    --output   icd10_lookup.pkl
+
+  # Custom table names
+  python umls_hierarchy_builder.py \
+    --project   my-gcp-project \
+    --dataset   umls_dataset \
+    --sab       SNOMEDCT_US \
+    --mrconso   my_mrconso_table \
+    --mrrel     my_mrrel_table \
+    --mrsty     my_mrsty_table \
+    --output    cui_topic_lookup.pkl
+"""
+
+import argparse
+import pickle
+import re
+import time
+import os
+from collections import defaultdict
+
+from google.cloud import bigquery
+
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+# Default table names — override via CLI args
+DEFAULT_MRCONSO = "MRCONSO"
+DEFAULT_MRREL   = "MRREL"
+DEFAULT_MRSTY   = "MRSTY"
+
+# SABs that use "isa" as the parent relationship in MRREL
+# Most vocabularies use "isa" — add exceptions here if needed
+PARENT_RELA = "isa"
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 1: BIGQUERY QUERIES
+# ─────────────────────────────────────────────────────────────
+
+def query_concepts(client, project, dataset, mrconso, mrsty, sab):
+    """
+    Pull concept labels + semantic types for the given SAB.
+    One preferred English term per CUI.
+    """
+    sql = f"""
+        SELECT DISTINCT
+            c.CUI,
+            c.STR                        AS label,
+            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
+        FROM
+            `{project}.{dataset}.{mrconso}` c
+        LEFT JOIN
+            `{project}.{dataset}.{mrsty}`   s ON c.CUI = s.CUI
+        WHERE
+            c.SAB      = '{sab}'
+        AND c.LAT      = 'ENG'
+        AND c.ISPREF   = 'Y'
+        AND c.SUPPRESS = 'N'
+        QUALIFY
+            ROW_NUMBER() OVER (
+                PARTITION BY c.CUI
+                ORDER BY s.STY NULLS LAST
+            ) = 1
+    """
+    print(f"    SQL:\n{sql}")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"    → {len(df):,} concepts  ({time.time()-t:.1f}s)")
+    return df
+
+
+def query_parents(client, project, dataset, mrrel, sab):
+    """
+    Pull IS-A parent relationships for the given SAB.
+    CUI1 IS-A CUI2 → CUI1's parent is CUI2.
+    """
+    sql = f"""
+        SELECT DISTINCT
+            CUI1  AS cui,
+            CUI2  AS parent_cui
+        FROM
+            `{project}.{dataset}.{mrrel}`
+        WHERE
+            SAB      = '{sab}'
+        AND RELA     = '{PARENT_RELA}'
+        AND SUPPRESS = 'N'
+        QUALIFY
+            ROW_NUMBER() OVER (
+                PARTITION BY CUI1
+                ORDER BY CUI2
+            ) = 1
+    """
+    print(f"    SQL:\n{sql}")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"    → {len(df):,} IS-A relationships  ({time.time()-t:.1f}s)")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 2: BUILD TREE DICT
+# ─────────────────────────────────────────────────────────────
+
+def build_tree(concepts_df, parents_df) -> dict:
+    """
+    Merges concepts + parents into:
+    {
+      cui: {
+        "label"     : "Knee pain (finding)",
+        "parent_cui": "C0022742"   ← None if root
+      }
+    }
+    """
+    print("  Building tree dict...")
+    t = time.time()
+
+    parent_map = dict(zip(parents_df["cui"], parents_df["parent_cui"]))
+
+    tree = {}
+    for _, row in concepts_df.iterrows():
+        cui = row["CUI"]
+        tag = str(row.get("semantic_type") or "unknown").lower()
+        tree[cui] = {
+            "label"     : f"{row['label']} ({tag})",
+            "parent_cui": parent_map.get(cui)
+        }
+
+    roots    = sum(1 for v in tree.values() if not v["parent_cui"])
+    orphans  = sum(
+        1 for v in tree.values()
+        if v["parent_cui"] and v["parent_cui"] not in tree
+    )
+
+    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {orphans} orphan parents")
+    print(f"  ({time.time()-t:.1f}s)")
+    return tree
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 3: BUILD DESCENDANT COUNT INDEX
+# Memory-efficient: stores counts not full sets (~5 MB vs ~800 MB)
+# Iterative DFS: avoids Python recursion limit on large trees
+# ─────────────────────────────────────────────────────────────
+
+def build_desc_counts(tree: dict) -> dict:
+    """
+    For every node count ALL descendants (not just direct children).
+    Uses iterative post-order DFS.
+
+    desc_counts[cui] = total number of descendants
+    """
+    print("  Building descendant counts...")
+    t = time.time()
+
+    # Build children map
+    children = defaultdict(list)
+    for cui, node in tree.items():
+        p = node.get("parent_cui")
+        if p and p in tree:
+            children[p].append(cui)
+
+    # Find roots
+    roots = [c for c in tree if not tree[c].get("parent_cui")
+             or tree[c]["parent_cui"] not in tree]
+
+    desc_counts = {}
+    processed   = 0
+
+    for root in roots:
+        stack = [(root, False)]
+        while stack:
+            node, done = stack.pop()
+            if done:
+                count = len(children[node])
+                for child in children[node]:
+                    count += desc_counts.get(child, 0)
+                desc_counts[node] = count
+                processed += 1
+                if processed % 50000 == 0:
+                    print(f"    {processed:,} / {len(tree):,}")
+            else:
+                stack.append((node, True))
+                for child in children[node]:
+                    stack.append((child, False))
+
+    print(f"  → {len(desc_counts):,} counts built  ({time.time()-t:.1f}s)")
+    return desc_counts
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4: BUILD LOOKUP TABLE
+# CUI → best topic anchor via sibling_reach
+# ─────────────────────────────────────────────────────────────
+
+def _get_tag(cui, tree):
+    label = tree.get(cui, {}).get("label", "")
+    m = re.search(r'\(([^)]+)\)$', label.strip())
+    return m.group(1).lower() if m else "unknown"
+
+
+def _ancestor_chain(cui, tree):
+    chain, visited, current = [], set(), cui
+    while current:
+        if current in visited:
+            break
+        chain.append(current)
+        visited.add(current)
+        current = tree.get(current, {}).get("parent_cui")
+    return chain
+
+
+def _sibling_reach_norm(cui, tree, desc_counts):
+    """
+    (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
+
+    High = this node has many siblings = distinct meaningful branch
+    Low  = funnel node = not a good stopping point
+    """
+    parent     = tree.get(cui, {}).get("parent_cui")
+    reach_node = desc_counts.get(cui, 0)
+    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
+    return (reach_par - reach_node + 1) / (reach_par + 1)
+
+
+def build_lookup(tree: dict, desc_counts: dict) -> dict:
+    """
+    For every CUI in the tree:
+      Walk up ancestor chain.
+      Score each ancestor by sibling_reach.
+      Best scoring ancestor = natural topic for this CUI.
+
+    Returns:
+    {
+      cui: {
+        "topic_cui"  : "C0022742",
+        "topic_label": "Knee pain (finding)",
+        "tag"        : "finding"
+      }
+    }
+    """
+    print("  Building lookup table...")
+    t = time.time()
+
+    lookup = {}
+    total  = len(tree)
+
+    for i, cui in enumerate(tree):
+        if i % 50000 == 0:
+            elapsed = time.time() - t
+            pct     = (i / total) * 100
+            eta     = (elapsed / max(i,1)) * (total - i)
+            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
+
+        chain = _ancestor_chain(cui, tree)
+        tag   = _get_tag(cui, tree)
+
+        best_score = -1
+        best_cui   = chain[1] if len(chain) > 1 else cui
+
+        for ancestor in chain[1:]:
+            if _get_tag(ancestor, tree) != tag:
+                continue
+            sib = _sibling_reach_norm(ancestor, tree, desc_counts)
+            if sib > best_score:
+                best_score = sib
+                best_cui   = ancestor
+
+        lookup[cui] = {
+            "topic_cui"  : best_cui,
+            "topic_label": tree.get(best_cui, {}).get("label", best_cui),
+            "tag"        : tag,
+        }
+
+    print(f"  → {len(lookup):,} entries built  ({time.time()-t:.1f}s)")
+    return lookup
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 5: SAVE / LOAD PICKLE
+# ─────────────────────────────────────────────────────────────
+
+def save_pickle(lookup: dict, path: str):
+    with open(path, "wb") as f:
+        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
+
+
+def load_lookup(path: str) -> dict:
+    """Call once at app startup."""
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ─────────────────────────────────────────────────────────────
+# RUNTIME: O(1) LOOKUP
+# ─────────────────────────────────────────────────────────────
+
+def get_topics(reduced_cuis: list, lookup: dict) -> dict:
+    """
+    Convert reduced CUIs to topic bag.
+    Pure dictionary lookup — O(1) per CUI.
+
+    Input : ["C0231749", "C0029408", "C0003504"]
+    Output: {
+      "Knee pain (finding)"            : ["C0231749"],
+      "Disorder of knee (disorder)"    : ["C0029408"],
+      "NSAID (substance)"              : ["C0003504"]
+    }
+    """
+    topic_bag = {}
+    for cui in reduced_cuis:
+        entry = lookup.get(cui)
+        if entry:
+            topic = entry["topic_label"]
+        else:
+            topic = "Uncategorized"
+        topic_bag.setdefault(topic, []).append(cui)
+    return topic_bag
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Build UMLS hierarchy lookup from BigQuery"
+    )
+    parser.add_argument("--project",  required=True,
+                        help="GCP project ID")
+    parser.add_argument("--dataset",  required=True,
+                        help="BigQuery dataset containing UMLS tables")
+    parser.add_argument("--sab",      default="SNOMEDCT_US",
+                        help="Vocabulary filter e.g. SNOMEDCT_US, ICD10CM, RXNORM (default: SNOMEDCT_US)")
+    parser.add_argument("--mrconso",  default=DEFAULT_MRCONSO,
+                        help=f"MRCONSO table name (default: {DEFAULT_MRCONSO})")
+    parser.add_argument("--mrrel",    default=DEFAULT_MRREL,
+                        help=f"MRREL table name (default: {DEFAULT_MRREL})")
+    parser.add_argument("--mrsty",    default=DEFAULT_MRSTY,
+                        help=f"MRSTY table name (default: {DEFAULT_MRSTY})")
+    parser.add_argument("--output",   default="cui_topic_lookup.pkl",
+                        help="Output pickle file path (default: cui_topic_lookup.pkl)")
+    args = parser.parse_args()
+
+    total_start = time.time()
+
+    print(f"\n{'═'*60}")
+    print(f"  UMLS Hierarchy Builder")
+    print(f"{'─'*60}")
+    print(f"  Project  : {args.project}")
+    print(f"  Dataset  : {args.dataset}")
+    print(f"  SAB      : {args.sab}")
+    print(f"  Tables   : {args.mrconso}, {args.mrrel}, {args.mrsty}")
+    print(f"  Output   : {args.output}")
+    print(f"{'═'*60}\n")
+
+    # ── 1. Connect to BigQuery ────────────────────────────────
+    print("[1/5] Connecting to BigQuery...")
+    client = bigquery.Client(project=args.project)
+    print("  ✅ Connected\n")
+
+    # ── 2. Pull concepts ──────────────────────────────────────
+    print("[2/5] Querying concepts + semantic types...")
+    concepts_df = query_concepts(
+        client, args.project, args.dataset,
+        args.mrconso, args.mrsty, args.sab
+    )
+    print()
+
+    # ── 3. Pull parent relationships ──────────────────────────
+    print("[3/5] Querying IS-A relationships...")
+    parents_df = query_parents(
+        client, args.project, args.dataset,
+        args.mrrel, args.sab
+    )
+    print()
+
+    # ── 4. Build tree ─────────────────────────────────────────
+    print("[4/5] Building hierarchy...")
+    tree        = build_tree(concepts_df, parents_df)
+    desc_counts = build_desc_counts(tree)
+    lookup      = build_lookup(tree, desc_counts)
+    print()
+
+    # ── 5. Save ───────────────────────────────────────────────
+    print("[5/5] Saving pickle...")
+    save_pickle(lookup, args.output)
+
+    total_mins = (time.time() - total_start) / 60
+    print(f"\n{'─'*60}")
+    print(f"  ✅ Done in {total_mins:.1f} min")
+    print(f"  Load with:")
+    print(f"    from umls_hierarchy_builder import load_lookup, get_topics")
+    print(f"    lookup = load_lookup('{args.output}')")
+    print(f"    topics = get_topics(reduced_cuis, lookup)")
+    print(f"{'─'*60}\n")
+
+
+if __name__ == "__main__":
+    main()
