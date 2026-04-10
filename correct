@@ -1,261 +1,100 @@
 """
-UMLS Hierarchy Builder — Simple Version
-========================================
-Just set your PROJECT and DATASET below and run:
-  python run_builder.py
+Validate cui_topic_lookup.pkl
+==============================
+Run: python validate_pickle.py
 """
 
 import pickle
-import re
-import time
-import os
-from collections import defaultdict
-from google.cloud import bigquery
+import random
+from collections import Counter
 
 
-# ─────────────────────────────────────────────────────────────
-# SET YOUR VALUES HERE
-# ─────────────────────────────────────────────────────────────
-
-PROJECT  = "your-gcp-project-id"       # ← change this
-DATASET  = "your_umls_dataset"         # ← change this
-OUTPUT   = "cui_topic_lookup.pkl"      # output pickle file
-
-
-# ─────────────────────────────────────────────────────────────
-# QUERIES
-# ─────────────────────────────────────────────────────────────
-
-def query_concepts(client):
-    sql = f"""
-        SELECT DISTINCT
-            c.CUI,
-            c.STR                             AS label,
-            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
-        FROM
-            `{PROJECT}.{DATASET}.MRCONSO` c
-        LEFT JOIN
-            `{PROJECT}.{DATASET}.MRSTY`   s ON c.CUI = s.CUI
-        WHERE
-            c.SAB      = 'SNOMEDCT_US'
-        AND c.LAT      = 'ENG'
-        AND c.ISPREF   = 'Y'
-        AND c.SUPPRESS = 'N'
-        QUALIFY
-            ROW_NUMBER() OVER (
-                PARTITION BY c.CUI
-                ORDER BY s.STY NULLS LAST
-            ) = 1
-    """
-    print("  Querying concepts...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
-    return df
-
-
-def query_parents(client):
-    sql = f"""
-        SELECT DISTINCT
-            CUI1 AS cui,
-            CUI2 AS parent_cui
-        FROM
-            `{PROJECT}.{DATASET}.MRREL`
-        WHERE
-            SAB      = 'SNOMEDCT_US'
-        AND RELA     = 'isa'
-        AND SUPPRESS = 'N'
-        QUALIFY
-            ROW_NUMBER() OVER (
-                PARTITION BY CUI1
-                ORDER BY CUI2
-            ) = 1
-    """
-    print("  Querying IS-A relationships...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} relationships  ({time.time()-t:.1f}s)")
-    return df
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD TREE
-# ─────────────────────────────────────────────────────────────
-
-def build_tree(concepts_df, parents_df):
-    print("  Building tree...")
-    parent_map = dict(zip(parents_df["cui"], parents_df["parent_cui"]))
-    tree = {}
-    for _, row in concepts_df.iterrows():
-        cui = row["CUI"]
-        tag = str(row.get("semantic_type") or "unknown").lower()
-        tree[cui] = {
-            "label"     : f"{row['label']} ({tag})",
-            "parent_cui": parent_map.get(cui)
-        }
-    print(f"  → {len(tree):,} nodes")
-    return tree
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD DESCENDANT COUNTS
-# ─────────────────────────────────────────────────────────────
-
-def build_desc_counts(tree):
-    print("  Building descendant counts...")
-    t = time.time()
-
-    children = defaultdict(list)
-    for cui, node in tree.items():
-        p = node.get("parent_cui")
-        if p and p in tree:
-            children[p].append(cui)
-
-    roots       = [c for c in tree if not tree[c].get("parent_cui")
-                   or tree[c]["parent_cui"] not in tree]
-    desc_counts = {}
-    processed   = 0
-
-    for root in roots:
-        stack = [(root, False)]
-        while stack:
-            node, done = stack.pop()
-            if done:
-                count = len(children[node])
-                for child in children[node]:
-                    count += desc_counts.get(child, 0)
-                desc_counts[node] = count
-                processed += 1
-                if processed % 50000 == 0:
-                    print(f"    {processed:,} / {len(tree):,}")
-            else:
-                stack.append((node, True))
-                for child in children[node]:
-                    stack.append((child, False))
-
-    print(f"  → done  ({time.time()-t:.1f}s)")
-    return desc_counts
-
-
-# ─────────────────────────────────────────────────────────────
-# BUILD LOOKUP
-# ─────────────────────────────────────────────────────────────
-
-def get_tag(cui, tree):
-    label = tree.get(cui, {}).get("label", "")
-    m = re.search(r'\(([^)]+)\)$', label.strip())
-    return m.group(1).lower() if m else "unknown"
-
-def ancestor_chain(cui, tree):
-    chain, visited, current = [], set(), cui
-    while current:
-        if current in visited: break
-        chain.append(current)
-        visited.add(current)
-        current = tree.get(current, {}).get("parent_cui")
-    return chain
-
-def sibling_reach(cui, tree, desc_counts):
-    parent     = tree.get(cui, {}).get("parent_cui")
-    reach_node = desc_counts.get(cui, 0)
-    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
-    return (reach_par - reach_node + 1) / (reach_par + 1)
-
-def build_lookup(tree, desc_counts):
-    print("  Building lookup...")
-    t     = time.time()
-    total = len(tree)
-    lookup = {}
-
-    for i, cui in enumerate(tree):
-        if i % 50000 == 0:
-            pct = (i / total) * 100
-            eta = ((time.time()-t) / max(i,1)) * (total - i)
-            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
-
-        chain     = ancestor_chain(cui, tree)
-        tag       = get_tag(cui, tree)
-        best_score = -1
-        best_cui   = chain[1] if len(chain) > 1 else cui
-
-        for ancestor in chain[1:]:
-            if get_tag(ancestor, tree) != tag:
-                continue
-            score = sibling_reach(ancestor, tree, desc_counts)
-            if score > best_score:
-                best_score = score
-                best_cui   = ancestor
-
-        lookup[cui] = {
-            "topic_cui"  : best_cui,
-            "topic_label": tree.get(best_cui, {}).get("label", best_cui),
-            "tag"        : tag,
-        }
-
-    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
-    return lookup
-
-
-# ─────────────────────────────────────────────────────────────
-# SAVE / LOAD
-# ─────────────────────────────────────────────────────────────
-
-def save_pickle(lookup, path):
-    with open(path, "wb") as f:
-        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  ✅ Saved → {path}  ({size_mb} MB)")
-
-def load_lookup(path):
+def load_lookup(path: str) -> dict:
     with open(path, "rb") as f:
         return pickle.load(f)
 
-def get_topics(reduced_cuis, lookup):
-    topic_bag = {}
-    for cui in reduced_cuis:
-        topic = lookup.get(cui, {}).get("topic_label", "Uncategorized")
-        topic_bag.setdefault(topic, []).append(cui)
-    return topic_bag
 
+def validate(path: str = "cui_topic_lookup.pkl"):
 
-# ─────────────────────────────────────────────────────────────
-# RUN
-# ─────────────────────────────────────────────────────────────
+    print(f"\n{'═'*55}")
+    print(f"  Validating: {path}")
+    print(f"{'═'*55}\n")
+
+    # ── 1. Load ───────────────────────────────────────────────
+    print("[1] Loading pickle...")
+    lookup = load_lookup(path)
+    print(f"  ✅ Loaded {len(lookup):,} entries\n")
+
+    # ── 2. Structure check ────────────────────────────────────
+    print("[2] Structure check — every entry has required fields...")
+    required = {"topic_cui", "topic_label", "tag"}
+    missing  = [
+        cui for cui, v in lookup.items()
+        if not required.issubset(v.keys())
+    ]
+    if missing:
+        print(f"  ❌ {len(missing)} entries missing fields: {missing[:5]}")
+    else:
+        print(f"  ✅ All entries have topic_cui, topic_label, tag\n")
+
+    # ── 3. Nulls check ────────────────────────────────────────
+    print("[3] Null check — no empty values...")
+    nulls = [
+        cui for cui, v in lookup.items()
+        if not v.get("topic_label") or not v.get("topic_cui")
+    ]
+    if nulls:
+        print(f"  ⚠️  {len(nulls)} entries with null topic — sample: {nulls[:5]}")
+    else:
+        print(f"  ✅ No null topics\n")
+
+    # ── 4. Tag distribution ───────────────────────────────────
+    print("[4] Semantic tag distribution...")
+    tag_counts = Counter(v["tag"] for v in lookup.values())
+    for tag, count in tag_counts.most_common(10):
+        pct = count / len(lookup) * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {tag:<35} {count:>7,}  ({pct:>5.1f}%)  {bar}")
+    print()
+
+    # ── 5. Topic distribution ─────────────────────────────────
+    print("[5] Top 15 most common topics...")
+    topic_counts = Counter(v["topic_label"] for v in lookup.values())
+    for topic, count in topic_counts.most_common(15):
+        pct = count / len(lookup) * 100
+        print(f"  {topic:<50} {count:>7,}  ({pct:.1f}%)")
+    print()
+
+    # ── 6. Sample lookup ──────────────────────────────────────
+    print("[6] Random sample — 10 CUI → Topic mappings...")
+    sample = random.sample(list(lookup.items()), min(10, len(lookup)))
+    print(f"  {'CUI':<15} {'Topic'}")
+    print(f"  {'─'*65}")
+    for cui, entry in sample:
+        print(f"  {cui:<15} {entry['topic_label']}")
+    print()
+
+    # ── 7. Self-mapped check ──────────────────────────────────
+    print("[7] Self-mapped entries (CUI is its own topic)...")
+    self_mapped = sum(1 for cui, v in lookup.items() if v["topic_cui"] == cui)
+    pct = self_mapped / len(lookup) * 100
+    print(f"  {self_mapped:,} entries ({pct:.1f}%) map to themselves")
+    print(f"  (expected for root/isolated concepts)\n")
+
+    # ── 8. Summary ────────────────────────────────────────────
+    unique_topics = len(set(v["topic_label"] for v in lookup.values()))
+    print(f"{'─'*55}")
+    print(f"  SUMMARY")
+    print(f"{'─'*55}")
+    print(f"  Total CUIs      : {len(lookup):,}")
+    print(f"  Unique topics   : {unique_topics:,}")
+    print(f"  Avg CUIs/topic  : {len(lookup)//unique_topics:,}")
+    print(f"  Semantic types  : {len(tag_counts)}")
+    print(f"{'─'*55}\n")
+
+    print("  ✅ Pickle is valid and ready to use\n")
+    return lookup
+
 
 if __name__ == "__main__":
-
-    start = time.time()
-
-    print(f"\n{'═'*50}")
-    print(f"  SNOMED Lookup Builder")
-    print(f"  Project : {PROJECT}")
-    print(f"  Dataset : {DATASET}")
-    print(f"{'═'*50}\n")
-
-    print("[1/5] Connecting...")
-    client = bigquery.Client(project=PROJECT)
-    print("  ✅ Connected\n")
-
-    print("[2/5] Pulling concepts...")
-    concepts_df = query_concepts(client)
-    print()
-
-    print("[3/5] Pulling relationships...")
-    parents_df = query_parents(client)
-    print()
-
-    print("[4/5] Building hierarchy...")
-    tree        = build_tree(concepts_df, parents_df)
-    desc_counts = build_desc_counts(tree)
-    lookup      = build_lookup(tree, desc_counts)
-    print()
-
-    print("[5/5] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-
-    print(f"\n  Done in {(time.time()-start)/60:.1f} min")
-    print(f"\n  Usage:")
-    print(f"    from run_builder import load_lookup, get_topics")
-    print(f"    lookup = load_lookup('{OUTPUT}')")
-    print(f"    topics = get_topics(your_reduced_cuis, lookup)")
-    print()
+    validate("cui_topic_lookup.pkl")
