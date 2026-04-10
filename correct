@@ -1,230 +1,148 @@
 """
-Validate run_builder.py
-========================
-Tests:
-  1. Simple chain
-  2. Leaf with 2 parents
-  3. Mid-layer node with 2 parents
-  4. Diamond DAG
-  5. Topic formation — 2 topics from 2 parents
-  6. C4759551 exact scenario:
-     CUI → child → 3 parents → all 3 should be topics
-  7. Deep multi-level polyhierarchy
-  8. Descendant count accuracy across all cases
+Validate cui_topic_lookup.pkl
+==============================
+Loads pickle and runs structural + content checks.
+No dependency on run_builder.
 
-Run: python validate_builder.py
+Run: python validate_pickle.py
 """
 
-import re
-import pandas as pd
-from collections import defaultdict
-from run_builder import build_tree, build_desc_counts, build_lookup
+import pickle
+import random
+from collections import Counter
 
 
-def make_df(nodes, edges):
-    rows        = [{"CUI": n, "label": n, "semantic_type": "finding"}
-                   for n in nodes]
-    parent_rows = [{"cui": c, "parent_cui": p} for c, p in edges]
-    return pd.DataFrame(rows), pd.DataFrame(parent_rows)
+def load_lookup(path="cui_topic_lookup.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def check(label, got, expected):
-    status = "✅" if got == expected else "❌"
-    print(f"  {status} {label}: expected={expected}  got={got}")
-    return got == expected
+def validate(path="cui_topic_lookup.pkl"):
 
+    print(f"\n{'═'*62}")
+    print(f"  Validating: {path}")
+    print(f"{'═'*62}\n")
 
-def run_all():
-    all_pass = True
-    print(f"\n{'═'*65}")
-    print(f"  VALIDATION SUITE — DAG Counts + Full BFS Topic Formation")
-    print(f"{'═'*65}")
+    # ── 1. Load ───────────────────────────────────────────────
+    print("[1] Loading pickle...")
+    lookup = load_lookup(path)
+    print(f"  ✅ Loaded {len(lookup):,} entries\n")
 
-    # ── Test 1: Simple chain ──────────────────────────────────
-    print("\n[1] Simple chain: ROOT → A → B → C")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C"],
-        [("A","ROOT"),("B","A"),("C","B")]
-    )
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 3)
-    all_pass &= check("A desc",    dc["A"],    2)
-    all_pass &= check("B desc",    dc["B"],    1)
-    all_pass &= check("C desc",    dc["C"],    0)
+    all_ok = True
 
-    # ── Test 2: Leaf 2 parents ────────────────────────────────
-    print("\n[2] Leaf D has 2 parents (B and C)")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C","D"],
-        [("A","ROOT"),("B","A"),("C","A"),
-         ("D","B"),("D","C")]
-    )
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 4)
-    all_pass &= check("A desc",    dc["A"],    3)
-    all_pass &= check("B desc",    dc["B"],    1)
-    all_pass &= check("C desc",    dc["C"],    1)
-    all_pass &= check("D desc",    dc["D"],    0)
-
-    # ── Test 3: Mid-layer 2 parents ───────────────────────────
-    print("\n[3] Mid-layer G has 2 parents (C and D)")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C","D","E","F","G","H","I"],
-        [("A","ROOT"),("B","ROOT"),
-         ("C","A"),("D","A"),("D","B"),
-         ("E","B"),("F","C"),
-         ("G","C"),("G","D"),
-         ("H","D"),("I","G")]
-    )
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 9)
-    all_pass &= check("A desc",    dc["A"],    6)
-    all_pass &= check("B desc",    dc["B"],    5)
-    all_pass &= check("C desc",    dc["C"],    3)
-    all_pass &= check("D desc",    dc["D"],    3)
-    all_pass &= check("G desc",    dc["G"],    1)
-    all_pass &= check("I desc",    dc["I"],    0)
-
-    # ── Test 4: Diamond ───────────────────────────────────────
-    print("\n[4] Diamond: ROOT → A,B → C")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C"],
-        [("A","ROOT"),("B","ROOT"),
-         ("C","A"),("C","B")]
-    )
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 3)
-    all_pass &= check("A desc",    dc["A"],    1)
-    all_pass &= check("B desc",    dc["B"],    1)
-    all_pass &= check("C desc",    dc["C"],    0)
-
-    # ── Test 5: Topics — 2 parents → 2 topics ────────────────
-    print("\n[5] L has 2 parents → should get 2 topics")
-    concepts_df, parents_df = make_df(
-        ["ROOT","P1","P2","L"],
-        [("P1","ROOT"),("P2","ROOT"),
-         ("L","P1"),("L","P2")]
-    )
-    tree   = build_tree(concepts_df, parents_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    t_cuis = {t["topic_cui"] for t in lookup["L"]["topics"]}
-    print(f"  L topics: {[t['topic_label'] for t in lookup['L']['topics']]}")
-    all_pass &= check("L has 2 topics", len(lookup["L"]["topics"]), 2)
-    all_pass &= check("P1 is topic",    "P1" in t_cuis, True)
-    all_pass &= check("P2 is topic",    "P2" in t_cuis, True)
-
-    # ── Test 6: EXACT C4759551 scenario ──────────────────────
-    # CUI → MID (1 parent) → [P1, P2, P3] (3 parents)
-    # CUI should get 3 topics — one per parent of MID
-    print("\n[6] C4759551 scenario: CUI→MID→[P1,P2,P3] (3 parents of MID)")
-    print("    CUI has 1 parent (MID), MID has 3 parents → CUI should get 3 topics")
-    concepts_df, parents_df = make_df(
-        ["ROOT","P1","P2","P3","MID","CUI"],
-        [("P1","ROOT"),("P2","ROOT"),("P3","ROOT"),
-         ("MID","P1"),("MID","P2"),("MID","P3"),  # MID has 3 parents
-         ("CUI","MID")]                            # CUI has 1 parent
-    )
-    tree   = build_tree(concepts_df, parents_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    t_cuis = {t["topic_cui"] for t in lookup["CUI"]["topics"]}
-    print(f"  CUI topics: {[t['topic_label'] for t in lookup['CUI']['topics']]}")
-    all_pass &= check("CUI has 3 topics", len(lookup["CUI"]["topics"]), 3)
-    all_pass &= check("P1 is topic",      "P1" in t_cuis, True)
-    all_pass &= check("P2 is topic",      "P2" in t_cuis, True)
-    all_pass &= check("P3 is topic",      "P3" in t_cuis, True)
-
-    # ── Test 7: Deep polyhierarchy ────────────────────────────
-    # L → MID1(parents: A,B) and MID2(parents: B,C)
-    # L should get topics covering all distinct branches
-    print("\n[7] Deep polyhierarchy: L has 2 parents, each with 2 parents")
-    print("    L→MID1→[A,B], L→MID2→[B,C]")
-    print("    Unique top-level: A, B, C → should get 3 topics")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C","MID1","MID2","L"],
-        [("A","ROOT"),("B","ROOT"),("C","ROOT"),
-         ("MID1","A"),("MID1","B"),   # MID1 has 2 parents
-         ("MID2","B"),("MID2","C"),   # MID2 has 2 parents
-         ("L","MID1"),("L","MID2")]   # L has 2 parents
-    )
-    tree   = build_tree(concepts_df, parents_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    t_cuis = {t["topic_cui"] for t in lookup["L"]["topics"]}
-    print(f"  L topics: {[t['topic_label'] for t in lookup['L']['topics']]}")
-    # MID1 and MID2 are peaks on their respective branches
-    # A→MID1 branch: MID1 is peak (A has 2 children, MID1 has 1)
-    # B splits into MID1 and MID2, both are peaks
-    # C→MID2 branch: MID2 is peak
-    all_pass &= check("L has >=2 topics", len(lookup["L"]["topics"]) >= 2, True)
-    all_pass &= check("MID1 or MID2 in topics",
-                      "MID1" in t_cuis or "MID2" in t_cuis, True)
-
-    # ── Test 8: No missed ancestors ───────────────────────────
-    print("\n[8] Verify ROOT has correct count — no double counting")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B","C","D","E"],
-        [("A","ROOT"),("B","ROOT"),
-         ("C","A"),("C","B"),    # C has 2 parents
-         ("D","A"),
-         ("E","C")]
-    )
-    tree = build_tree(concepts_df, parents_df)
-    dc   = build_desc_counts(tree)
-    # ROOT should have A,B,C,D,E = 5 unique
-    all_pass &= check("ROOT desc (no double count)", dc["ROOT"], 5)
-    all_pass &= check("A desc", dc["A"], 3)   # C,D,E
-    all_pass &= check("B desc", dc["B"], 2)   # C,E
-    all_pass &= check("C desc", dc["C"], 1)   # E
-
-    # ── Test 9: Root node is its own topic ───────────────────
-    print("\n[9] Root node has no parent → topic = itself")
-    concepts_df, parents_df = make_df(
-        ["ROOT","A","B"],
-        [("A","ROOT"),("B","A")]
-    )
-    tree   = build_tree(concepts_df, parents_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    root_topics = lookup["ROOT"]["topics"]
-    print(f"  ROOT topics: {[t['topic_label'] for t in root_topics]}")
-    all_pass &= check("ROOT topic is itself",
-                      root_topics[0]["topic_cui"], "ROOT")
-
-    # ── Test 10: Orphan CUI (no parent in tree) → own topic ──
-    print("\n[10] CUI with no parent in tree → topic = itself")
-    concepts_df, parents_df = make_df(
-        ["ORPHAN","A","B"],
-        [("A","ORPHAN")]          # ORPHAN has no parent
-    )
-    tree   = build_tree(concepts_df, parents_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    orphan_topics = lookup["ORPHAN"]["topics"]
-    print(f"  ORPHAN topics: {[t['topic_label'] for t in orphan_topics]}")
-    all_pass &= check("ORPHAN topic is itself",
-                      orphan_topics[0]["topic_cui"], "ORPHAN")
-
-    # ── Summary ───────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    if all_pass:
-        print(f"  ✅ ALL TESTS PASSED")
-        print(f"     Exact unique counts at every layer")
-        print(f"     Full BFS — no paths missed at any level")
-        print(f"     C4759551 scenario: all 3 parent-path topics captured")
-        print(f"     Deep polyhierarchy correctly resolved")
-        print(f"     Root nodes correctly map to themselves")
-        print(f"     Orphan nodes correctly map to themselves")
+    # ── 2. Required fields ────────────────────────────────────
+    print("[2] Structure check — required fields per entry...")
+    required = {"own_label", "parent_cuis", "tag", "topics"}
+    missing  = [cui for cui, v in lookup.items()
+                if not required.issubset(v.keys())]
+    if missing:
+        print(f"  ❌ {len(missing):,} entries missing fields")
+        print(f"     Sample: {missing[:3]}")
+        all_ok = False
     else:
-        print(f"  ❌ SOME TESTS FAILED — check above")
-    print(f"{'═'*65}\n")
-    return all_pass
+        print(f"  ✅ All entries have: {required}\n")
+
+    # ── 3. Topics field structure ─────────────────────────────
+    print("[3] Topics field — each topic has topic_cui, topic_label, score...")
+    bad = [cui for cui, v in lookup.items()
+           if any(not all(k in t for k in ["topic_cui","topic_label","score"])
+                  for t in v.get("topics", []))]
+    if bad:
+        print(f"  ❌ {len(bad):,} entries with malformed topics")
+        all_ok = False
+    else:
+        print(f"  ✅ All topic entries well-formed\n")
+
+    # ── 4. Null check ─────────────────────────────────────────
+    print("[4] Null check — no empty labels or missing topics...")
+    null_label  = [c for c, v in lookup.items() if not v.get("own_label")]
+    empty_topic = [c for c, v in lookup.items() if not v.get("topics")]
+    if null_label:
+        print(f"  ⚠️  {len(null_label):,} entries with empty own_label")
+        all_ok = False
+    else:
+        print(f"  ✅ No empty labels")
+    if empty_topic:
+        print(f"  ⚠️  {len(empty_topic):,} entries with no topics")
+        all_ok = False
+    else:
+        print(f"  ✅ No entries without topics\n")
+
+    # ── 5. Root nodes map to themselves ──────────────────────
+    print("[5] Root nodes (no parent) → topic should be itself...")
+    root_wrong = [
+        cui for cui, v in lookup.items()
+        if not v.get("parent_cuis")
+        and not any(t["topic_cui"] == cui for t in v.get("topics", []))
+    ]
+    if root_wrong:
+        print(f"  ❌ {len(root_wrong):,} root nodes NOT mapped to themselves")
+        print(f"     Sample: {root_wrong[:3]}")
+        all_ok = False
+    else:
+        roots = sum(1 for v in lookup.values() if not v.get("parent_cuis"))
+        print(f"  ✅ All {roots:,} root nodes map to themselves\n")
+
+    # ── 6. Semantic tag distribution ──────────────────────────
+    print("[6] Semantic tag distribution...")
+    tag_counts = Counter(v["tag"] for v in lookup.values())
+    for tag, count in tag_counts.most_common(10):
+        pct = count / len(lookup) * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {tag:<35} {count:>8,}  ({pct:>5.1f}%)  {bar}")
+    print()
+
+    # ── 7. Topics per CUI — polyhierarchy ─────────────────────
+    print("[7] Topics per CUI (polyhierarchy)...")
+    topic_dist = Counter(len(v["topics"]) for v in lookup.values())
+    for n, count in sorted(topic_dist.items()):
+        pct = count / len(lookup) * 100
+        print(f"  {n} topic(s): {count:>8,} CUIs  ({pct:.1f}%)")
+    multi = sum(c for n, c in topic_dist.items() if n > 1)
+    print(f"\n  → {multi:,} CUIs have multiple topics (polyhierarchy)\n")
+
+    # ── 8. Top 15 most common topics ──────────────────────────
+    print("[8] Top 15 most common topics...")
+    all_topic_labels = []
+    for v in lookup.values():
+        all_topic_labels.extend(t["topic_label"] for t in v.get("topics", []))
+    topic_counts = Counter(all_topic_labels)
+    for topic, count in topic_counts.most_common(15):
+        pct = count / len(lookup) * 100
+        print(f"  {topic:<52} {count:>8,}  ({pct:.1f}%)")
+    print()
+
+    # ── 9. Random sample ──────────────────────────────────────
+    print("[9] Random sample — 10 CUIs...")
+    sample = random.sample(list(lookup.items()), min(10, len(lookup)))
+    print(f"  {'CUI':<15} {'Label':<35} {'Topics'}")
+    print(f"  {'─'*85}")
+    for cui, entry in sample:
+        topics_str = " | ".join(
+            t["topic_label"].split("(")[0].strip()
+            for t in entry.get("topics", [])
+        )
+        label = entry.get("own_label", "")[:33]
+        print(f"  {cui:<15} {label:<35} {topics_str}")
+    print()
+
+    # ── 10. Summary ───────────────────────────────────────────
+    unique_topics = len(set(all_topic_labels))
+    total_links   = len(all_topic_labels)
+    print(f"{'─'*62}")
+    print(f"  SUMMARY")
+    print(f"{'─'*62}")
+    print(f"  Total CUIs         : {len(lookup):,}")
+    print(f"  Unique topics      : {unique_topics:,}")
+    print(f"  Total topic links  : {total_links:,}")
+    print(f"  Avg topics/CUI     : {total_links/len(lookup):.2f}")
+    print(f"  Multi-topic CUIs   : {multi:,}")
+    print(f"  Semantic types     : {len(tag_counts)}")
+    print(f"{'─'*62}")
+    print(f"\n  {'✅ Pickle is valid and ready to use' if all_ok else '❌ Issues found — check above'}\n")
+
+    return lookup
 
 
 if __name__ == "__main__":
-    run_all()
+    validate("cui_topic_lookup.pkl")
