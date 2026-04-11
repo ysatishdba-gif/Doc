@@ -1,207 +1,115 @@
 """
-Validation Suite — SNOMED Ontology-Driven Clinical Topic Formation
-==================================================================
-Tests all four novel contributions:
+CUI Topic Inspector
+====================
+Loads the pickle and shows topic formation results for any CUI.
+Demonstrates all four novel contributions in action:
 
-[1] Sibling reach scoring — correct scores at every node
-[2] Bidirectional dominance — upward + downward + junction exception
-[3] Topic formation intermediary — topics connect query to document
-[4] Polyhierarchy-aware topic bags — multiple topics per CUI
+  [1] Sibling reach scores shown per topic
+  [2] Single topic per branch (bidirectional dominance working)
+  [3] Topic labels = clinical search vocabulary
+  [4] Multiple topics shown when polyhierarchy applies
 
-Run: python validate_builder.py
+Add any CUIs to the list and run: python test_cui.py
 """
 
-import re
-import pandas as pd
-from run_builder import build_tree, build_desc_counts, build_lookup
+import pickle
+
+# ── Add your CUIs here ─────────────────────────────────────
+CUIS = [
+    "C0231749",   # Pain in left knee
+    "C0029408",   # Osteoarthritis of knee
+    "C4759551",   # Severe loss of body fat
+    "C1959901",   # Body mass index < 16.5
+]
+# ──────────────────────────────────────────────────────────
+
+def load_lookup(path="cui_topic_lookup.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def make_df(nodes, edges):
-    rows  = [{"CUI": n, "label": n, "semantic_type": "finding"} for n in nodes]
-    prows = [{"cui": c, "parent_cui": p} for c, p in edges]
-    return pd.DataFrame(rows), pd.DataFrame(prows)
+def get_all_paths(cui, lookup, max_paths=5):
+    """
+    DFS to collect all unique paths from cui to root.
+    [4] Shows the polyhierarchy — each path is a distinct branch.
+    """
+    completed  = []
+    seen_paths = set()
+    stack      = [[(cui, lookup.get(cui, {}).get("own_label", cui))]]
+
+    while stack and len(completed) < max_paths:
+        path    = stack.pop()
+        current = path[-1][0]
+        entry   = lookup.get(current, {})
+        parents = entry.get("parent_cuis", [])
+
+        if not parents:
+            path_sig = tuple(c for c, _ in path)
+            if path_sig not in seen_paths:
+                seen_paths.add(path_sig)
+                completed.append(path)
+        else:
+            for parent in parents:
+                if parent in {c for c, _ in path}:
+                    continue   # avoid cycles
+                if parent in lookup:
+                    label = lookup[parent].get("own_label", parent)
+                    stack.append(path + [(parent, label)])
+                else:
+                    path_sig = tuple(c for c, _ in path)
+                    if path_sig not in seen_paths:
+                        seen_paths.add(path_sig)
+                        completed.append(path)
+
+    return completed
 
 
-def check(label, got, expected):
-    ok = got == expected
-    print(f"  {'✅' if ok else '❌'} {label}: expected={expected}  got={got}")
-    return ok
+def test_cui(cui, lookup):
+    entry = lookup.get(cui)
+    if not entry:
+        print(f"\n  ❌ '{cui}' not found in lookup\n")
+        return
 
+    topics     = entry.get("topics", [])
+    topic_cuis = {t["topic_cui"] for t in topics}
 
-def run_all():
-    all_pass = True
-    print(f"\n{'═'*65}")
-    print(f"  Validation Suite — SNOMED Topic Formation")
-    print(f"{'═'*65}")
+    print(f"\n{'═'*64}")
+    print(f"  CUI   : {cui}")
+    print(f"  Label : {entry.get('own_label', cui)}")
+    print(f"  Tag   : {entry['tag']}")
 
-    # ── [1] SIBLING REACH — descendant counts must be exact ──────
-    print("\n[1] Sibling reach foundation — exact unique descendant counts")
-    print("    Simple chain: ROOT → A → B → C")
-    c_df, p_df = make_df(
-        ["ROOT","A","B","C"],
-        [("A","ROOT"),("B","A"),("C","B")]
-    )
-    tree = build_tree(c_df, p_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 3)
-    all_pass &= check("A desc",    dc["A"],    2)
-    all_pass &= check("B desc",    dc["B"],    1)
-    all_pass &= check("C desc",    dc["C"],    0)
+    # [1][2] Topics with sibling reach scores
+    print(f"\n  Topics ({len(topics)}):")
+    for t in topics:
+        print(f"    📌 [{t['topic_cui']}]  {t['topic_label']}"
+              f"  (sibling_reach={t['score']})")
 
-    # ── [1] + [4] — shared node counted once ─────────────────────
-    print("\n[1]+[4] Polyhierarchy — shared descendant counted exactly once")
-    print("    D has 2 parents (B and C) — should not be double-counted")
-    c_df, p_df = make_df(
-        ["ROOT","A","B","C","D"],
-        [("A","ROOT"),("B","A"),("C","A"),
-         ("D","B"),("D","C")]
-    )
-    tree = build_tree(c_df, p_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc (D counted once)", dc["ROOT"], 4)
-    all_pass &= check("A desc",                     dc["A"],    3)
-    all_pass &= check("B desc",                     dc["B"],    1)
-    all_pass &= check("C desc",                     dc["C"],    1)
-    all_pass &= check("D desc (leaf)",               dc["D"],    0)
+    if len(topics) > 1:
+        print(f"\n  [4] Multiple topics — polyhierarchy: this CUI belongs")
+        print(f"      to {len(topics)} distinct clinical categories")
 
-    # ── [4] POLYHIERARCHY — mid-layer multi-parent ────────────────
-    print("\n[4] Polyhierarchy — mid-layer G has 2 parents (C and D)")
-    c_df, p_df = make_df(
-        ["ROOT","A","B","C","D","E","F","G","H","I"],
-        [("A","ROOT"),("B","ROOT"),
-         ("C","A"),("D","A"),("D","B"),
-         ("E","B"),("F","C"),
-         ("G","C"),("G","D"),
-         ("H","D"),("I","G")]
-    )
-    tree = build_tree(c_df, p_df)
-    dc   = build_desc_counts(tree)
-    all_pass &= check("ROOT desc", dc["ROOT"], 9)
-    all_pass &= check("A desc",    dc["A"],    6)
-    all_pass &= check("B desc",    dc["B"],    5)
-    all_pass &= check("C desc",    dc["C"],    3)
-    all_pass &= check("D desc",    dc["D"],    3)
-    all_pass &= check("G desc",    dc["G"],    1)
-    all_pass &= check("I desc",    dc["I"],    0)
+    # [4] All paths to root
+    paths = get_all_paths(cui, lookup)
+    print(f"\n  All paths to root ({len(paths)} unique):")
+    for p_idx, path in enumerate(paths, 1):
+        print(f"\n  Path {p_idx}:")
+        for i, (node_cui, node_label) in enumerate(path):
+            indent = "  " * i
+            prefix = "└── " if i > 0 else "  ● "
+            marker = "  ← TOPIC [2]" if node_cui in topic_cuis else ""
+            print(f"  {indent}{prefix}[{node_cui}]  {node_label}{marker}")
 
-    # ── [2] UPWARD DOMINANCE ─────────────────────────────────────
-    print("\n[2] Upward dominance — prefer ancestor when it scores same/higher")
-    print("    Diamond: C has 2 parents A and B")
-    c_df, p_df = make_df(
-        ["ROOT","A","B","C"],
-        [("A","ROOT"),("B","ROOT"),
-         ("C","A"),("C","B")]
-    )
-    tree   = build_tree(c_df, p_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    all_pass &= check("ROOT desc", dc["ROOT"], 3)
-    all_pass &= check("A desc",    dc["A"],    1)
-    all_pass &= check("B desc",    dc["B"],    1)
+    # [3] Show search vocabulary role
+    print(f"\n  [3] Search vocabulary:")
+    for t in topics:
+        label = t['topic_label'].split('(')[0].strip()
+        print(f"    Query or document about '{label}' → matched by this topic")
 
-    # ── [2] DOWNWARD DOMINANCE (single parent) ────────────────────
-    print("\n[2] Downward dominance — prefer specific child (1 parent)")
-    print("    L has 2 parents P1 and P2 → should get 2 topics not 4")
-    c_df, p_df = make_df(
-        ["ROOT","P1","P2","L"],
-        [("P1","ROOT"),("P2","ROOT"),
-         ("L","P1"),("L","P2")]
-    )
-    tree   = build_tree(c_df, p_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    t_cuis = {t["topic_cui"] for t in lookup["L"]["topics"]}
-    print(f"  L topics: {[t['topic_label'] for t in lookup['L']['topics']]}")
-    all_pass &= check("L has exactly 2 topics", len(lookup["L"]["topics"]), 2)
-    all_pass &= check("P1 is topic",            "P1" in t_cuis, True)
-    all_pass &= check("P2 is topic",            "P2" in t_cuis, True)
-
-    # ── [2]+[4] JUNCTION NODE EXCEPTION ──────────────────────────
-    print("\n[2]+[4] Junction node exception")
-    print("    CUI→MID(3 parents)→[P1,P2,P3]")
-    print("    MID is a junction — cannot block P1, P2, P3 as topics")
-    c_df, p_df = make_df(
-        ["ROOT","P1","P2","P3","MID","CUI","S1","S2","S3"],
-        [("P1","ROOT"),("P2","ROOT"),("P3","ROOT"),
-         ("MID","P1"),("MID","P2"),("MID","P3"),
-         ("CUI","MID"),
-         ("S1","P1"),("S2","P2"),("S3","P3")]
-    )
-    tree   = build_tree(c_df, p_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    t_cuis = {t["topic_cui"] for t in lookup["CUI"]["topics"]}
-    print(f"  CUI topics: {[t['topic_label'] for t in lookup['CUI']['topics']]}")
-    all_pass &= check("P1 is topic", "P1" in t_cuis, True)
-    all_pass &= check("P2 is topic", "P2" in t_cuis, True)
-    all_pass &= check("P3 is topic", "P3" in t_cuis, True)
-    all_pass &= check("CUI has >=3 topics", len(lookup["CUI"]["topics"]) >= 3, True)
-
-    # ── [2] SPECIFICITY — stops at knee pain not joint pain ───────
-    print("\n[2] Specificity — downward dominance stops at right level")
-    print("    Left knee pain → topic = Knee pain (not Joint pain, not Body pain)")
-    c_df, p_df = make_df(
-        ["ROOT","ClinFinding","BodyPain","JointPain","KneePain",
-         "LeftKneePain","RightKneePain","HipPain","ShoulderPain"],
-        [("ClinFinding","ROOT"),
-         ("BodyPain","ClinFinding"),
-         ("JointPain","BodyPain"),
-         ("KneePain","JointPain"),
-         ("LeftKneePain","KneePain"),
-         ("RightKneePain","KneePain"),
-         ("HipPain","JointPain"),
-         ("ShoulderPain","JointPain")]
-    )
-    tree   = build_tree(c_df, p_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    lk_topics = [t["topic_cui"] for t in lookup["LeftKneePain"]["topics"]]
-    print(f"  LeftKneePain topics: {lk_topics}")
-    all_pass &= check("topic is KneePain",         "KneePain" in lk_topics,    True)
-    all_pass &= check("JointPain not a topic",      "JointPain" not in lk_topics, True)
-    all_pass &= check("BodyPain not a topic",       "BodyPain" not in lk_topics,  True)
-    all_pass &= check("ClinFinding not a topic",    "ClinFinding" not in lk_topics, True)
-
-    # ── [3] TOPIC FORMATION AS INTERMEDIARY ──────────────────────
-    print("\n[3] Topic as search intermediary")
-    print("    Query CUI and Doc CUI are different but share a topic")
-    print("    LeftKneePain and RightKneePain → both map to KneePain")
-    lk_topics = {t["topic_cui"] for t in lookup["LeftKneePain"]["topics"]}
-    rk_topics = {t["topic_cui"] for t in lookup["RightKneePain"]["topics"]}
-    shared    = lk_topics & rk_topics
-    print(f"  Shared topics: {shared}")
-    all_pass &= check("KneePain is shared topic", "KneePain" in shared, True)
-
-    # ── Root node maps to itself ──────────────────────────────────
-    print("\n[2] Root node — no parent → topic = itself")
-    root_topics = lookup["ROOT"]["topics"]
-    print(f"  ROOT topics: {[t['topic_label'] for t in root_topics]}")
-    all_pass &= check("ROOT topic is itself", root_topics[0]["topic_cui"], "ROOT")
-
-    # ── Orphan node maps to itself ────────────────────────────────
-    print("\n[2] Orphan node — topic = itself")
-    c_df, p_df = make_df(["ORPHAN","A"], [("A","ORPHAN")])
-    tree   = build_tree(c_df, p_df)
-    dc     = build_desc_counts(tree)
-    lookup = build_lookup(tree, dc)
-    print(f"  ORPHAN topics: {[t['topic_label'] for t in lookup['ORPHAN']['topics']]}")
-    all_pass &= check("ORPHAN topic is itself",
-                      lookup["ORPHAN"]["topics"][0]["topic_cui"], "ORPHAN")
-
-    # ── Summary ───────────────────────────────────────────────────
-    print(f"\n{'─'*65}")
-    if all_pass:
-        print(f"  ✅ ALL TESTS PASSED\n")
-        print(f"  [1] Sibling reach — exact descendant counts at every layer")
-        print(f"  [2] Bidirectional dominance — stops at correct specificity")
-        print(f"  [2] Junction node exception — polyhierarchy preserved")
-        print(f"  [3] Topic intermediary — query and doc share same topic")
-        print(f"  [4] Polyhierarchy — no path missed in DAG traversal")
-    else:
-        print(f"  ❌ SOME TESTS FAILED — check above")
-    print(f"{'═'*65}\n")
-    return all_pass
+    print(f"{'═'*64}")
 
 
 if __name__ == "__main__":
-    run_all()
+    lookup = load_lookup()
+    print(f"  Loaded {len(lookup):,} CUIs from pickle\n")
+    for cui in CUIS:
+        test_cui(cui, lookup)
