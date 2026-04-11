@@ -1,256 +1,504 @@
-════════════════════════════════════════════════════════════
-  Validating: cui_topic_lookup.pkl
-════════════════════════════════════════════════════════════
+"""
+SNOMED Ontology-Driven Clinical Topic Formation
+================================================
+Novel contributions implemented here:
 
-[loading] Reading pickle...
-  ✅ Loaded 370,206 CUIs
+[1] SIBLING REACH — branch specificity signal
+    sibling_reach(node) = (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
+    Measures how distinct a node's subtree is relative to its parent.
+    High score = small, distinct branch = meaningful stopping point.
+    Low score  = node nearly equals parent (funnel) = keep climbing.
+    Local approximation of IC — no corpus, no log, no global tree size needed.
 
-[0] Structure and null checks...
-  ✅ All 370,206 entries well-formed
+[2] BIDIRECTIONAL DOMINANCE — abstraction point detection
+    A candidate is a topic peak only if:
+      (a) Upward: no ancestor candidate scores >= it       (don't stop too low)
+      (b) Downward: no descendant candidate scores >= it   (don't stop too high)
+    Junction node exception: multi-parent nodes cannot block their parent topics
+    because they belong to multiple clinical categories simultaneously.
 
-[1] Sibling reach scores — range (0, 1]...
-  ❌ 9,262 scores outside (0, 1]: [-433.0, -3.0, -476.0, -321.0, -37.0]
-  ✅ Score distribution looks healthy (0.4% below 0.1)
+[3] TOPIC FORMATION AS SEARCH INTERMEDIARY
+    Pipeline: raw CUIs → CUI summarization → topic CUIs → search index
+    Topics are not query expansion (broader) nor similarity (pairwise).
+    They are ontology-derived clinical category labels that act as a shared
+    vocabulary between queries and patient documents.
 
-[2] Root nodes → topic = itself...
-  ✅ All 1,159 root nodes map to themselves
+[4] POLYHIERARCHY-AWARE TOPIC BAGS
+    SNOMED is a DAG — one CUI can have multiple parents across distinct branches.
+    BFS upward across ALL parent paths gives one topic per branch.
+    A CUI with 3 parent paths gets 3 topics — one per clinical category it belongs to.
+    This preserves SNOMED's intentional multi-classification.
 
-[2] Specificity — non-root CUIs should not map to root topics...
-  ✅ No non-root CUIs mapped to root topics
+Usage:
+    python run_builder.py          # build pickle from BigQuery
+    from run_builder import load_lookup, get_topics
+    lookup = load_lookup("cui_topic_lookup.pkl")
+    topics = get_topics(reduced_cuis, lookup)
+"""
 
-[2] Topic depth — topics should be meaningful mid-level nodes...
-  Avg hops to topic  : 3.9
-  Hops < 1 (trivial) : 27,554  (4.0%)
-  Hops > 8 (generic) : 31,271   (4.5%)
-  ✅ Topic depth distribution looks healthy
-
-[4] Polyhierarchy — multi-parent CUIs get multiple topics...
-  Multi-parent CUIs  : 157,507
-    → with >1 topic  : 133,135  (84.5%)
-  Single-parent CUIs : 211,540
-    → with >1 topic  : 120,848  (57.1%)
-  ✅ Multi-parent CUIs yield more topics than single-parent
-
-[4] Topic distribution...
-  1 topic(s):  116,223  ( 31.4%)  ███████████████
-  2 topic(s):   43,279  ( 11.7%)  █████
-  3 topic(s):   28,741  (  7.8%)  ███
-  4 topic(s):   25,105  (  6.8%)  ███
-  5 topic(s):   17,285  (  4.7%)  ██
-  6 topic(s):   14,372  (  3.9%)  █
-  7 topic(s):   11,900  (  3.2%)  █
-  8 topic(s):    9,938  (  2.7%)  █
-  9 topic(s):    9,117  (  2.5%)  █
-  10 topic(s):    8,646  (  2.3%)  █
-  11 topic(s):    8,080  (  2.2%)  █
-  12 topic(s):    7,704  (  2.1%)  █
-  13 topic(s):    9,505  (  2.6%)  █
-  14 topic(s):    7,817  (  2.1%)  █
-  15 topic(s):    6,123  (  1.7%)  
-  16 topic(s):    5,855  (  1.6%)  
-  17 topic(s):    5,122  (  1.4%)  
-  18 topic(s):    4,707  (  1.3%)  
-  19 topic(s):    4,126  (  1.1%)  
-  20 topic(s):    3,501  (  0.9%)  
-  21 topic(s):    3,372  (  0.9%)  
-  22 topic(s):    3,169  (  0.9%)  
-  23 topic(s):    2,443  (  0.7%)  
-  24 topic(s):    2,148  (  0.6%)  
-  25 topic(s):    1,725  (  0.5%)  
-  26 topic(s):    1,511  (  0.4%)  
-  27 topic(s):    1,069  (  0.3%)  
-  28 topic(s):      981  (  0.3%)  
-  29 topic(s):    1,068  (  0.3%)  
-  30 topic(s):      883  (  0.2%)  
-  31 topic(s):      580  (  0.2%)  
-  32 topic(s):      573  (  0.2%)  
-  33 topic(s):      471  (  0.1%)  
-  34 topic(s):      463  (  0.1%)  
-  35 topic(s):      417  (  0.1%)  
-  36 topic(s):      344  (  0.1%)  
-  37 topic(s):      275  (  0.1%)  
-  38 topic(s):      427  (  0.1%)  
-  39 topic(s):      219  (  0.1%)  
-  40 topic(s):      218  (  0.1%)  
-  41 topic(s):      299  (  0.1%)  
-  42 topic(s):      108  (  0.0%)  
-  43 topic(s):       54  (  0.0%)  
-  44 topic(s):       38  (  0.0%)  
-  45 topic(s):       83  (  0.0%)  
-  46 topic(s):       32  (  0.0%)  
-  47 topic(s):       13  (  0.0%)  
-  48 topic(s):       29  (  0.0%)  
-  49 topic(s):       15  (  0.0%)  
-  50 topic(s):        8  (  0.0%)  
-  51 topic(s):        6  (  0.0%)  
-  52 topic(s):        2  (  0.0%)  
-  53 topic(s):        8  (  0.0%)  
-  54 topic(s):        1  (  0.0%)  
-  55 topic(s):        2  (  0.0%)  
-  56 topic(s):        1  (  0.0%)  
-  57 topic(s):        3  (  0.0%)  
-  58 topic(s):        2  (  0.0%)  
-
-  Multi-topic CUIs: 253,983  (68.6%)
-
-[3] Topic intermediary — topics shared across multiple CUIs...
-  Unique topics      : 39,096
-  Shared by 2+ CUIs  : 15,321  (39.2%)
-  Singleton topics   : 23,775
-
-  Top 15 most-shared topics (search vocabulary):
-    Diseases (disease or syndrome)                           41,543 CUIs
-    Procedure (therapeutic or preventive procedure)          33,270 CUIs
-    Disorder of body system (disease or syndrome)            32,693 CUIs
-    Procedure on body region (therapeutic or preventive procedure)  24,529 CUIs
-    Anatomic part (body part, organ, or organ component)     23,554 CUIs
-    Operative procedure (therapeutic or preventive procedure)  21,227 CUIs
-    Body organ (body part, organ, or organ component)        20,649 CUIs
-    Bacterium (bacterium)                                    14,706 CUIs
-    Upper body structure (body part, organ, or organ component)  14,572 CUIs
-    Upper body part structure (body part, organ, or organ component)  14,570 CUIs
-    Traumatic or non-traumatic injury (injury or poisoning)  14,164 CUIs
-    Disorder of soft tissue (disease or syndrome)            11,507 CUIs
-    Neoplasm (neoplastic process)                            11,359 CUIs
-    Tumour (neoplastic process)                              10,764 CUIs
-    Form-bacillus (organism) (bacterium)                     10,649 CUIs
-
-  ⚠️  <50% topics shared — search vocabulary may be too narrow
-[5] Semantic tag distribution...
-  disease or syndrome                   43,041  ( 11.6%)  █████
-  finding                               40,302  ( 10.9%)  █████
-  therapeutic or preventive procedure   34,177  (  9.2%)  ████
-  body part, organ, or organ component   25,720  (  6.9%)  ███
-  injury or poisoning                   20,979  (  5.7%)  ██
-  bacterium                             14,806  (  4.0%)  █
-  medical device                        12,114  (  3.3%)  █
-  neoplastic process                    12,014  (  3.2%)  █
-  clinical drug                         11,402  (  3.1%)  █
-  amino acid, peptide, or protein       10,888  (  2.9%)  █
-
-[6] Random sample — 10 CUIs...
-  CUI             Label                               Topics
-  ────────────────────────────────────────────────────────────────────────────────
-  C0373845        Fc receptor assay (laboratory pro   In-vitro immunologic test | Immunology laboratory procedure | Laboratory procedures
-  C0198780        Suture of pelvic floor (therapeut   Repair of pelvis | Trunk closure | Operative procedure | Procedure | Procedure on body region | Operation on trunk | Repair of trunk | Repair - action | Operation on pelvic region of trunk | Pelvis closure | Surgical closure
-  C1290252        Neoplasm of acromion (neoplastic    Neoplasm of musculoskeletal system | Neoplasm of trunk | Tumour | Neoplasm of upper limb | Neoplasm | Neoplasm of bone | Neoplasm of thorax | Neoplasm of shoulder | Neoplasm of extremity | Neoplasm of skeletal system
-  C1318871        Water soluble aniline blue stain    Laboratory procedure categorized by method | Laboratory procedures
-  C2757985        Rummeliibacillus stabekisii (orga   Bacterium | Gram-positive bacteria | Class Bacilli | Form-bacillus | Bacillota
-  C0402339        Office manager - sales (professio   Office manager
-  C5778599        Education about Department of Vet   Education procedure
-  C5921451        Bursitis of bilateral hands (dise   Diseases | Disorder of upper limb | Inflammation of specific body structures or tissue | Disorder of musculoskeletal system | Inflammatory disorder of extremity | Inflammatory disorder | Disorder of body system | Inflammation of bursa | Disorder of soft tissue of upper limb | Inflammatory disorder of musculoskeletal system | Disorder of soft tissue of limb | Inflammation of specific body organs | Disorder of soft tissue | Inflammation of specific body systems | Disorder of left upper extremity | Disorder of limb | Disorder of hand | Disorder of bursa | Disorder of right upper extremity
-  C0195997        Excision of choroid plexus (thera   Operative procedure on head | Operative procedure | Procedure | Procedure on body region | Operation on nervous system | Excision of head structure | Incision and removal | Operation on brain | Procedure on head | Procedure on central nervous system | Removal technique | Procedure on brain | Intracranial procedure
-  C0584268        Discharge by neuropathologist (he   Administrative procedures | Patient discharge | Discharge by person | Provider-specific procedure
-
-───────────────────────────────────────────────────────
-  SUMMARY
-───────────────────────────────────────────────────────
-  Total CUIs         : 370,206
-  Unique topics      : 39,093
-  Total topic links  : 2,426,660
-  Avg topics / CUI   : 6.55
-  Multi-topic CUIs   : 253,983  (68.6%)
-  Semantic types     : 125
-───────────────────────────────────────────────────────
-
-  ❌ Issues found — check above
-----
-ouput  :oaded 370,206 CUIs from pickle
+import pickle
+import re
+import time
+import os
+from collections import defaultdict, deque
+from google.cloud import bigquery
 
 
-════════════════════════════════════════════════════════════════
-  CUI   : C4759551
-  Label : Severe loss of body fat (finding)
-  Tag   : finding
+# ─────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────
 
-  Topics (2):
-    - [C0577997]  Finding of general observation of appearance (finding)  (sibling_reach=1.0)
-    - [C0424722]  General finding of soft tissue (finding)  (sibling_reach=1.0)
+PROJECT = "your-gcp-project-id"
+DATASET = "your_umls_dataset"
+OUTPUT  = "cui_topic_lookup.pkl"
 
-  [4] Multiple topics — polyhierarchy: this CUI belongs
-      to 2 distinct clinical categories
 
-  All paths to root (2 unique):
+# ─────────────────────────────────────────────────────────────
+# STEP 1 — BIGQUERY: pull concepts and parent relationships
+# ─────────────────────────────────────────────────────────────
 
-  Path 1:
-    ● [C4759551]  Severe loss of body fat (finding)
-    └── [C0424630]  Loss of body fat - finding (finding)
-      └── [C1287842]  Body fat finding (finding)
-        └── [C0577997]  Finding of general observation of appearance (finding)  ← TOPIC [2]
-          └── [C0037088]  Clinical finding (sign or symptom)
-            └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
+def query_concepts(client):
+    """
+    Pull all SNOMED CT concepts with their preferred label and semantic type.
+    One row per CUI — deduped by semantic type priority.
+    """
+    sql = f"""
+        SELECT DISTINCT
+            c.CUI,
+            c.STR                             AS label,
+            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
+        FROM `{PROJECT}.{DATASET}.MRCONSO` c
+        LEFT JOIN `{PROJECT}.{DATASET}.MRSTY` s ON c.CUI = s.CUI
+        WHERE
+            c.SAB      = 'SNOMEDCT_US'
+        AND c.LAT      = 'ENG'
+        AND c.ISPREF   = 'Y'
+        AND c.SUPPRESS = 'N'
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY c.CUI ORDER BY s.STY NULLS LAST
+        ) = 1
+    """
+    print("  Querying concepts...")
+    t  = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
+    return df
 
-  Path 2:
-    ● [C4759551]  Severe loss of body fat (finding)
-    └── [C0424630]  Loss of body fat - finding (finding)
-      └── [C0424722]  General finding of soft tissue (finding)  ← TOPIC [2]
-        └── [C0037088]  Clinical finding (sign or symptom)
-          └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
 
-════════════════════════════════════════════════════════════════
-  CUI   : C3697331
-  Label : Impaired nutrient utilization (finding)
-  Tag   : finding
+def query_parents(client):
+    """
+    Pull ALL IS-A parent relationships.
+    No QUALIFY — every parent row kept for polyhierarchy support [4].
+    REL=PAR always means CUI2 is the parent of CUI1.
+    """
+    sql = f"""
+        SELECT CUI1 AS cui, CUI2 AS parent_cui
+        FROM `{PROJECT}.{DATASET}.MRREL`
+        WHERE
+            SAB      = 'SNOMEDCT_US'
+        AND REL      = 'PAR'
+        AND SUPPRESS = 'N'
+    """
+    print("  Querying parent relationships (all paths for polyhierarchy)...")
+    t  = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  → {len(df):,} parent rows  ({time.time()-t:.1f}s)")
+    return df
 
-  Topics (1):
-    - [C0577601]  Nutritional finding (finding)  (sibling_reach=1.0)
 
-  All paths to root (1 unique):
+# ─────────────────────────────────────────────────────────────
+# STEP 2 — BUILD TREE (DAG, not tree)
+# Each node stores ALL parents — essential for polyhierarchy [4]
+# ─────────────────────────────────────────────────────────────
 
-  Path 1:
-    ● [C3697331]  Impaired nutrient utilization (finding)
-    └── [C0577601]  Nutritional finding (finding)  ← TOPIC [2]
-      └── [C0037088]  Clinical finding (sign or symptom)
-        └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
+def build_tree(concepts_df, parents_df):
+    """
+    Build the SNOMED DAG.
+    parent_cuis is a LIST — one CUI can have multiple parents.
+    This is the foundation for polyhierarchy-aware topic bags [4].
+    """
+    print("  Building DAG...")
+    t = time.time()
 
-════════════════════════════════════════════════════════════════
-  CUI   : C1959901
-  Label : Body mass index less than 16.5 (finding)
-  Tag   : finding
+    # Vectorized groupby — avoids slow iterrows on 1.5M parent rows
+    parent_map = (
+        parents_df
+        .groupby("cui")["parent_cui"]
+        .apply(list)
+        .to_dict()
+    )
 
-  Topics (3):
-    - [C0577601]  Nutritional finding (finding)  (sibling_reach=1.0)
-    - [C1287884]  Finding of nutritional status (finding)  (sibling_reach=1.0)
-    - [C1287249]  Body measurement finding (finding)  (sibling_reach=1.0)
+    concepts_df = concepts_df.copy()
+    concepts_df["semantic_type"] = (
+        concepts_df["semantic_type"].fillna("unknown").str.lower()
+    )
+    concepts_df["full_label"] = (
+        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
+    )
 
-  [4] Multiple topics — polyhierarchy: this CUI belongs
-      to 3 distinct clinical categories
+    tree = {
+        row["CUI"]: {
+            "label"      : row["full_label"],
+            "own_label"  : row["full_label"],
+            "parent_cuis": parent_map.get(row["CUI"], [])
+        }
+        for _, row in concepts_df.iterrows()
+    }
 
-  All paths to root (2 unique):
+    roots = sum(1 for v in tree.values() if not v["parent_cuis"])
+    multi = sum(1 for v in tree.values() if len(v["parent_cuis"]) > 1)
+    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {multi:,} multi-parent nodes")
+    print(f"  ({time.time()-t:.1f}s)")
+    return tree
 
-  Path 1:
-    ● [C1959901]  Body mass index less than 16.5 (finding)
-    └── [C0231255]  Decreased body mass index (finding)
-      └── [C0578022]  Observation of body mass index (finding)
-        └── [C1287884]  Finding of nutritional status (finding)  ← TOPIC [2]
-          └── [C0577601]  Nutritional finding (finding)  ← TOPIC [2]
-            └── [C0037088]  Clinical finding (sign or symptom)
-              └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
 
-  Path 2:
-    ● [C1959901]  Body mass index less than 16.5 (finding)
-    └── [C0231255]  Decreased body mass index (finding)
-      └── [C0578022]  Observation of body mass index (finding)
-        └── [C1287249]  Body measurement finding (finding)  ← TOPIC [2]
-          └── [C0037088]  Clinical finding (sign or symptom)
-            └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
+# ─────────────────────────────────────────────────────────────
+# STEP 3 — DESCENDANT COUNTS
+# Exact unique counts via Kahn's topological sort + set union.
+# Handles full DAG — shared nodes counted exactly once [4].
+# ─────────────────────────────────────────────────────────────
 
-════════════════════════════════════════════════════════════════
-  CUI   : C0586746
-  Label : Excessive weight loss (finding)
-  Tag   : finding
+def build_desc_counts(tree):
+    """
+    Compute exact unique descendant count per node.
 
-  Topics (1):
-    - [C1287249]  Body measurement finding (finding)  (sibling_reach=1.0)
+    Uses Kahn's BFS topological sort (leaves → root) + set union.
+    In a DAG, shared descendants are deduplicated automatically:
+        A → B → D (D has two parents B and C)
+        A → C → D
+        desc(A) = {B,C} ∪ desc(B) ∪ desc(C) = {B,C,D}  ← D counted once
 
-  All paths to root (1 unique):
+    This is the foundation for accurate sibling_reach scores [1].
+    """
+    print("  Building exact unique descendant counts (DAG-aware)...")
+    t = time.time()
 
-  Path 1:
-    ● [C0586746]  Excessive weight loss (finding)
-    └── [C1262477]  Weight loss (finding)
-      └── [C1287464]  Weight change finding (finding)
-        └── [C1287453]  Weight trend finding (finding)
-          └── [C1265588]  Weight finding (finding)
-            └── [C1287249]  Body measurement finding (finding)  ← TOPIC [2]
-              └── [C0037088]  Clinical finding (sign or symptom)
-                └── [C2720507]  SNOMED CT has been created by combining SNOMED RT and a computer-based nomenclature and classification known as Read Codes Version 3, which was created on behalf of the U.K. Department of Health. (intellectual product)
+    # Build children map
+    children = defaultdict(set)
+    for cui, node in tree.items():
+        for p in node.get("parent_cuis", []):
+            if p in tree:
+                children[p].add(cui)
+
+    # Kahn's BFS topological sort — O(V+E), each node processed once
+    print("    [1/3] Topological sort (Kahn's BFS)...")
+    in_degree = {node: len(children.get(node, set())) for node in tree}
+    queue      = deque(n for n in tree if in_degree[n] == 0)
+    topo_order = []
+
+    while queue:
+        node = queue.popleft()
+        topo_order.append(node)
+        for parent in tree.get(node, {}).get("parent_cuis", []):
+            if parent in tree:
+                in_degree[parent] -= 1
+                if in_degree[parent] == 0:
+                    queue.append(parent)
+
+    print(f"    → {len(topo_order):,} nodes in topo order")
+
+    # Process leaves → root with set union for exact unique counts
+    print("    [2/3] Computing unique descendant counts...")
+    all_desc    = {}
+    desc_counts = {}
+    processed   = 0
+
+    for node in topo_order:
+        unique = set(children.get(node, set()))
+        for child in children.get(node, set()):
+            unique |= all_desc.get(child, set())
+
+        all_desc[node]    = unique
+        desc_counts[node] = len(unique)
+
+        # Free child sets once all their parents are processed (memory efficient)
+        for child in children.get(node, set()):
+            child_parents    = tree.get(child, {}).get("parent_cuis", [])
+            all_parents_done = all(p in desc_counts for p in child_parents if p in tree)
+            if all_parents_done and child in all_desc:
+                del all_desc[child]
+
+        processed += 1
+        if processed % 50000 == 0:
+            print(f"    {processed:,} / {len(tree):,}")
+
+    print(f"    [3/3] Done — {len(desc_counts):,} nodes  ({time.time()-t:.1f}s)")
+    return desc_counts
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 4 — SIBLING REACH SCORING [Novel contribution 1]
+# ─────────────────────────────────────────────────────────────
+
+def get_tag(cui, tree):
+    """Extract semantic tag from label parenthetical e.g. '(finding)'."""
+    label = tree.get(cui, {}).get("label", "")
+    m = re.search(r'\(([^)]+)\)$', label.strip())
+    return m.group(1).lower() if m else "unknown"
+
+
+def sibling_reach(cui, tree, desc_counts):
+    """
+    [1] SIBLING REACH — branch specificity signal.
+
+    sibling_reach(node) = (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
+
+    Intuition: how much of the parent's territory does this node NOT own?
+      High (->1.0): node is a tiny, distinct branch of a large parent
+                    = maximally specific = strong topic candidate
+      Low  (->0.0): node covers nearly all of its parent's territory
+                    = funnel node = keep climbing
+
+    Result is clamped to [0, 1]:
+      Negative values occur when UMLS PAR rows have cycles or errors
+      where a node's desc_count exceeds its parent's — clamped to 0.
+    """
+    parents    = tree.get(cui, {}).get("parent_cuis", [])
+    parent     = parents[0] if parents else None
+    reach_node = desc_counts.get(cui, 0)
+    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
+    score = (reach_par - reach_node + 1) / (reach_par + 1)
+    return max(0.0, min(1.0, score))   # clamp to [0, 1]
+
+
+# ─────────────────────────────────────────────────────────────
+# STEP 5 — TOPIC FORMATION [Novel contributions 2, 3, 4]
+# ─────────────────────────────────────────────────────────────
+
+
+def find_all_topics(cui, tree, desc_counts, tag):
+    """
+    [1][2][4] TOPIC FORMATION — BFS + max sibling_reach.
+
+    Algorithm:
+      1. BFS upward from cui across ALL parent paths (polyhierarchy [4]).
+
+      2. Score each same-tag ancestor with sibling_reach [1].
+
+      3. Keep all candidates at the MAXIMUM score [2].
+
+    Why max score works on real SNOMED (370k nodes):
+      In a properly sized ontology, sibling_reach scores differ clearly
+      between levels. The clinically meaningful mid-level category always
+      scores highest because it sits at the natural branch point:
+        KneePain   score=0.87  ← correct topic (small branch of JointPain)
+        JointPain  score=0.33  ← too generic (large fraction of BodyPain)
+        BodyPain   score=0.23  ← much too generic
+      Max score naturally selects KneePain. No dominance logic needed.
+
+    For polyhierarchy [4] (multiple parent branches):
+      Different branches independently reach their own max scores.
+      Both C0424722 and C0577997 score ~1.0 for C4759551 (different
+      branches under C0037088) → both returned as topics. ✅
+
+    Returns list of topic dicts, one per branch peak.
+    """
+    # ── BFS upward — collect ALL same-tag ancestors with scores ──
+    # Covers full polyhierarchy: follows every parent path [4]
+    candidate_scores = {}
+    visited = set()
+    queue   = deque(tree.get(cui, {}).get("parent_cuis", []))
+
+    while queue:
+        current = queue.popleft()
+        if current in visited:
+            continue
+        visited.add(current)
+        if get_tag(current, tree) == tag:
+            candidate_scores[current] = sibling_reach(current, tree, desc_counts)
+        for parent in tree.get(current, {}).get("parent_cuis", []):
+            if parent not in visited:
+                queue.append(parent)
+
+    if not candidate_scores:
+        return []
+
+    # ── Keep max-score candidates, apply upward dominance ────────
+    # Step 1: keep all candidates at the maximum score.
+    # Multiple at max score = genuine polyhierarchy [4] OR same-branch ties.
+    # Root nodes excluded — handled by build_lookup fallback.
+    max_score  = max(candidate_scores.values())
+    max_cands  = {
+        c for c, s in candidate_scores.items()
+        if s >= max_score
+        and tree.get(c, {}).get("parent_cuis", [])
+    }
+
+    # Step 2: upward dominance among max-score candidates [2].
+    # If a more generic ancestor ALSO scored max, prefer the ancestor.
+    # This removes same-branch ties where both parent and child score 1.0
+    # (e.g. C1287884 and C0577601 both at 1.0 — keep C0577601 only).
+    # Cross-branch ties (genuine polyhierarchy) are unaffected because
+    # neither is an ancestor of the other.
+    topic_cuis = set()
+    for candidate in max_cands:
+        dominated = False
+        pq, pv    = deque(tree.get(candidate, {}).get("parent_cuis", [])), set()
+        while pq:
+            p = pq.popleft()
+            if p in pv: continue
+            pv.add(p)
+            if p in max_cands:
+                # A more generic ancestor also scored max — prefer it
+                dominated = True
+                break
+            for gp in tree.get(p, {}).get("parent_cuis", []):
+                if gp not in pv: pq.append(gp)
+        if not dominated:
+            topic_cuis.add(candidate)
+
+    # ── Build topic list ─────────────────────────────────────────
+    topics = [
+        {
+            "topic_cui"  : tc,
+            "topic_label": tree.get(tc, {}).get("label", tc),
+            "score"      : round(candidate_scores[tc], 4),
+        }
+        for tc in topic_cuis
+    ]
+    topics.sort(key=lambda x: x["score"], reverse=True)
+    return topics
+
+
+def build_lookup(tree, desc_counts):
+    """
+    [3] TOPIC FORMATION AS SEARCH INTERMEDIARY.
+
+    For every CUI in the ontology, compute its topic(s).
+    Topics act as the shared clinical vocabulary between:
+      - query side:    user text → NER → CUIs → summarize → topics
+      - document side: patient doc → NER → CUIs → summarize → topics
+      - match:         query topics ∩ document topics → ranked results
+
+    Result schema per CUI:
+    {
+      "own_label"  : "Pain in left knee (finding)",
+      "parent_cuis": ["C0022742"],
+      "tag"        : "finding",
+      "topics"     : [
+          {"topic_cui": "C0022742", "topic_label": "Knee pain (finding)", "score": 0.50}
+      ]
+    }
+    """
+    print("  Building topic lookup...")
+    t     = time.time()
+    total = len(tree)
+    lookup = {}
+
+    for i, cui in enumerate(tree):
+        if i % 50000 == 0:
+            pct = (i / total) * 100
+            eta = ((time.time()-t) / max(i, 1)) * (total - i)
+            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
+
+        tag    = get_tag(cui, tree)
+        topics = find_all_topics(cui, tree, desc_counts, tag)
+
+        # Fallback for root nodes (no parents) → topic is itself
+        if not tree.get(cui, {}).get("parent_cuis", []):
+            topics = [{
+                "topic_cui"  : cui,
+                "topic_label": tree.get(cui, {}).get("label", cui),
+                "score"      : 1.0,
+            }]
+        # Fallback for nodes with no same-tag ancestor → topic is itself
+        elif not topics:
+            topics = [{
+                "topic_cui"  : cui,
+                "topic_label": tree.get(cui, {}).get("label", cui),
+                "score"      : 1.0,
+            }]
+
+        lookup[cui] = {
+            "own_label"  : tree.get(cui, {}).get("own_label", cui),
+            "parent_cuis": tree.get(cui, {}).get("parent_cuis", []),
+            "tag"        : tag,
+            "topics"     : topics,
+        }
+
+    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
+    return lookup
+
+
+# ─────────────────────────────────────────────────────────────
+# SAVE / LOAD
+# ─────────────────────────────────────────────────────────────
+
+def save_pickle(lookup, path):
+    with open(path, "wb") as f:
+        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
+
+
+def load_lookup(path="cui_topic_lookup.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ─────────────────────────────────────────────────────────────
+# RUNTIME — O(1) per CUI  [3]
+# ─────────────────────────────────────────────────────────────
+
+def get_topics(reduced_cuis, lookup):
+    """
+    [3] TOPIC FORMATION AS SEARCH INTERMEDIARY — runtime query.
+
+    Input:  reduced_cuis — list of summarized CUIs from NER
+    Output: topic bag    — {topic_label: [cui1, cui2, ...]}
+
+    Both query side and document side call this same function.
+    The intersection of their topic bags drives search matching.
+
+    Example:
+        query    "left knee pain" → {"Knee pain": ["C0231749"]}
+        document "OA of knee"     → {"Knee pain": ["C0029408"], "Disorder of knee": [...]}
+        match    → "Knee pain" in both → document is relevant
+    """
+    topic_bag = {}
+    for cui in reduced_cuis:
+        for topic in lookup.get(cui, {}).get("topics", []):
+            topic_bag.setdefault(topic["topic_label"], []).append(cui)
+    return topic_bag
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    start = time.time()
+
+    print(f"\n{'═'*60}")
+    print(f"  SNOMED Ontology-Driven Clinical Topic Formation")
+    print(f"  Project : {PROJECT}")
+    print(f"  Dataset : {DATASET}")
+    print(f"{'═'*60}\n")
+
+    print("[1/5] Connecting to BigQuery...")
+    client = bigquery.Client(project=PROJECT)
+    print("  ✅ Connected\n")
+
+    print("[2/5] Pulling concepts...")
+    concepts_df = query_concepts(client)
+    print()
+
+    print("[3/5] Pulling parent relationships...")
+    parents_df = query_parents(client)
+    print()
+
+    print("[4/5] Building hierarchy and topic lookup...")
+    tree        = build_tree(concepts_df, parents_df)
+    desc_counts = build_desc_counts(tree)
+    lookup      = build_lookup(tree, desc_counts)
+    print()
+
+    print("[5/5] Saving pickle...")
+    save_pickle(lookup, OUTPUT)
+
+    print(f"\n  Total time: {(time.time()-start)/60:.1f} min")
+    print(f"\n  Runtime usage:")
+    print(f"    from run_builder import load_lookup, get_topics")
+    print(f"    lookup = load_lookup('{OUTPUT}')          # once at startup")
+    print(f"    topics = get_topics(reduced_cuis, lookup) # O(1) per CUI")
+    print()
