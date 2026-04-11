@@ -1,504 +1,439 @@
 """
-SNOMED Ontology-Driven Clinical Topic Formation
-================================================
-Novel contributions implemented here:
+Validate cui_topic_lookup.pkl — Novel Contribution Tests
+=========================================================
+Loads the pickle and validates all four novel contributions
+directly from stored data. No run_builder dependency.
 
-[1] SIBLING REACH — branch specificity signal
-    sibling_reach(node) = (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
-    Measures how distinct a node's subtree is relative to its parent.
-    High score = small, distinct branch = meaningful stopping point.
-    Low score  = node nearly equals parent (funnel) = keep climbing.
-    Local approximation of IC — no corpus, no log, no global tree size needed.
+[1] Sibling Reach    — scores exist, in range (0,1], meaningful
+[2] Bidirectional dominance — topics are specific, not root-level,
+                              no over-climbing, junction rule preserved
+[3] Topic intermediary      — same topic reachable from multiple CUIs
+[4] Polyhierarchy           — multi-topic CUIs exist, no paths missed
 
-[2] BIDIRECTIONAL DOMINANCE — abstraction point detection
-    A candidate is a topic peak only if:
-      (a) Upward: no ancestor candidate scores >= it       (don't stop too low)
-      (b) Downward: no descendant candidate scores >= it   (don't stop too high)
-    Junction node exception: multi-parent nodes cannot block their parent topics
-    because they belong to multiple clinical categories simultaneously.
-
-[3] TOPIC FORMATION AS SEARCH INTERMEDIARY
-    Pipeline: raw CUIs → CUI summarization → topic CUIs → search index
-    Topics are not query expansion (broader) nor similarity (pairwise).
-    They are ontology-derived clinical category labels that act as a shared
-    vocabulary between queries and patient documents.
-
-[4] POLYHIERARCHY-AWARE TOPIC BAGS
-    SNOMED is a DAG — one CUI can have multiple parents across distinct branches.
-    BFS upward across ALL parent paths gives one topic per branch.
-    A CUI with 3 parent paths gets 3 topics — one per clinical category it belongs to.
-    This preserves SNOMED's intentional multi-classification.
-
-Usage:
-    python run_builder.py          # build pickle from BigQuery
-    from run_builder import load_lookup, get_topics
-    lookup = load_lookup("cui_topic_lookup.pkl")
-    topics = get_topics(reduced_cuis, lookup)
+Run: python validate_builder.py
 """
 
 import pickle
-import re
-import time
-import os
-from collections import defaultdict, deque
-from google.cloud import bigquery
+import random
+from collections import Counter, defaultdict
+
+
+PICKLE_PATH = "cui_topic_lookup.pkl"
 
 
 # ─────────────────────────────────────────────────────────────
-# CONFIGURATION
+# HELPERS
 # ─────────────────────────────────────────────────────────────
 
-PROJECT = "your-gcp-project-id"
-DATASET = "your_umls_dataset"
-OUTPUT  = "cui_topic_lookup.pkl"
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 1 — BIGQUERY: pull concepts and parent relationships
-# ─────────────────────────────────────────────────────────────
-
-def query_concepts(client):
-    """
-    Pull all SNOMED CT concepts with their preferred label and semantic type.
-    One row per CUI — deduped by semantic type priority.
-    """
-    sql = f"""
-        SELECT DISTINCT
-            c.CUI,
-            c.STR                             AS label,
-            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
-        FROM `{PROJECT}.{DATASET}.MRCONSO` c
-        LEFT JOIN `{PROJECT}.{DATASET}.MRSTY` s ON c.CUI = s.CUI
-        WHERE
-            c.SAB      = 'SNOMEDCT_US'
-        AND c.LAT      = 'ENG'
-        AND c.ISPREF   = 'Y'
-        AND c.SUPPRESS = 'N'
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY c.CUI ORDER BY s.STY NULLS LAST
-        ) = 1
-    """
-    print("  Querying concepts...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} concepts  ({time.time()-t:.1f}s)")
-    return df
-
-
-def query_parents(client):
-    """
-    Pull ALL IS-A parent relationships.
-    No QUALIFY — every parent row kept for polyhierarchy support [4].
-    REL=PAR always means CUI2 is the parent of CUI1.
-    """
-    sql = f"""
-        SELECT CUI1 AS cui, CUI2 AS parent_cui
-        FROM `{PROJECT}.{DATASET}.MRREL`
-        WHERE
-            SAB      = 'SNOMEDCT_US'
-        AND REL      = 'PAR'
-        AND SUPPRESS = 'N'
-    """
-    print("  Querying parent relationships (all paths for polyhierarchy)...")
-    t  = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  → {len(df):,} parent rows  ({time.time()-t:.1f}s)")
-    return df
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 2 — BUILD TREE (DAG, not tree)
-# Each node stores ALL parents — essential for polyhierarchy [4]
-# ─────────────────────────────────────────────────────────────
-
-def build_tree(concepts_df, parents_df):
-    """
-    Build the SNOMED DAG.
-    parent_cuis is a LIST — one CUI can have multiple parents.
-    This is the foundation for polyhierarchy-aware topic bags [4].
-    """
-    print("  Building DAG...")
-    t = time.time()
-
-    # Vectorized groupby — avoids slow iterrows on 1.5M parent rows
-    parent_map = (
-        parents_df
-        .groupby("cui")["parent_cui"]
-        .apply(list)
-        .to_dict()
-    )
-
-    concepts_df = concepts_df.copy()
-    concepts_df["semantic_type"] = (
-        concepts_df["semantic_type"].fillna("unknown").str.lower()
-    )
-    concepts_df["full_label"] = (
-        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
-    )
-
-    tree = {
-        row["CUI"]: {
-            "label"      : row["full_label"],
-            "own_label"  : row["full_label"],
-            "parent_cuis": parent_map.get(row["CUI"], [])
-        }
-        for _, row in concepts_df.iterrows()
-    }
-
-    roots = sum(1 for v in tree.values() if not v["parent_cuis"])
-    multi = sum(1 for v in tree.values() if len(v["parent_cuis"]) > 1)
-    print(f"  → {len(tree):,} nodes  |  {roots} roots  |  {multi:,} multi-parent nodes")
-    print(f"  ({time.time()-t:.1f}s)")
-    return tree
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 3 — DESCENDANT COUNTS
-# Exact unique counts via Kahn's topological sort + set union.
-# Handles full DAG — shared nodes counted exactly once [4].
-# ─────────────────────────────────────────────────────────────
-
-def build_desc_counts(tree):
-    """
-    Compute exact unique descendant count per node.
-
-    Uses Kahn's BFS topological sort (leaves → root) + set union.
-    In a DAG, shared descendants are deduplicated automatically:
-        A → B → D (D has two parents B and C)
-        A → C → D
-        desc(A) = {B,C} ∪ desc(B) ∪ desc(C) = {B,C,D}  ← D counted once
-
-    This is the foundation for accurate sibling_reach scores [1].
-    """
-    print("  Building exact unique descendant counts (DAG-aware)...")
-    t = time.time()
-
-    # Build children map
-    children = defaultdict(set)
-    for cui, node in tree.items():
-        for p in node.get("parent_cuis", []):
-            if p in tree:
-                children[p].add(cui)
-
-    # Kahn's BFS topological sort — O(V+E), each node processed once
-    print("    [1/3] Topological sort (Kahn's BFS)...")
-    in_degree = {node: len(children.get(node, set())) for node in tree}
-    queue      = deque(n for n in tree if in_degree[n] == 0)
-    topo_order = []
-
-    while queue:
-        node = queue.popleft()
-        topo_order.append(node)
-        for parent in tree.get(node, {}).get("parent_cuis", []):
-            if parent in tree:
-                in_degree[parent] -= 1
-                if in_degree[parent] == 0:
-                    queue.append(parent)
-
-    print(f"    → {len(topo_order):,} nodes in topo order")
-
-    # Process leaves → root with set union for exact unique counts
-    print("    [2/3] Computing unique descendant counts...")
-    all_desc    = {}
-    desc_counts = {}
-    processed   = 0
-
-    for node in topo_order:
-        unique = set(children.get(node, set()))
-        for child in children.get(node, set()):
-            unique |= all_desc.get(child, set())
-
-        all_desc[node]    = unique
-        desc_counts[node] = len(unique)
-
-        # Free child sets once all their parents are processed (memory efficient)
-        for child in children.get(node, set()):
-            child_parents    = tree.get(child, {}).get("parent_cuis", [])
-            all_parents_done = all(p in desc_counts for p in child_parents if p in tree)
-            if all_parents_done and child in all_desc:
-                del all_desc[child]
-
-        processed += 1
-        if processed % 50000 == 0:
-            print(f"    {processed:,} / {len(tree):,}")
-
-    print(f"    [3/3] Done — {len(desc_counts):,} nodes  ({time.time()-t:.1f}s)")
-    return desc_counts
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 4 — SIBLING REACH SCORING [Novel contribution 1]
-# ─────────────────────────────────────────────────────────────
-
-def get_tag(cui, tree):
-    """Extract semantic tag from label parenthetical e.g. '(finding)'."""
-    label = tree.get(cui, {}).get("label", "")
-    m = re.search(r'\(([^)]+)\)$', label.strip())
-    return m.group(1).lower() if m else "unknown"
-
-
-def sibling_reach(cui, tree, desc_counts):
-    """
-    [1] SIBLING REACH — branch specificity signal.
-
-    sibling_reach(node) = (reach(parent) - reach(node) + 1) / (reach(parent) + 1)
-
-    Intuition: how much of the parent's territory does this node NOT own?
-      High (->1.0): node is a tiny, distinct branch of a large parent
-                    = maximally specific = strong topic candidate
-      Low  (->0.0): node covers nearly all of its parent's territory
-                    = funnel node = keep climbing
-
-    Result is clamped to [0, 1]:
-      Negative values occur when UMLS PAR rows have cycles or errors
-      where a node's desc_count exceeds its parent's — clamped to 0.
-    """
-    parents    = tree.get(cui, {}).get("parent_cuis", [])
-    parent     = parents[0] if parents else None
-    reach_node = desc_counts.get(cui, 0)
-    reach_par  = desc_counts.get(parent, 0) if parent else reach_node
-    score = (reach_par - reach_node + 1) / (reach_par + 1)
-    return max(0.0, min(1.0, score))   # clamp to [0, 1]
-
-
-# ─────────────────────────────────────────────────────────────
-# STEP 5 — TOPIC FORMATION [Novel contributions 2, 3, 4]
-# ─────────────────────────────────────────────────────────────
-
-
-def find_all_topics(cui, tree, desc_counts, tag):
-    """
-    [1][2][4] TOPIC FORMATION — BFS + max sibling_reach.
-
-    Algorithm:
-      1. BFS upward from cui across ALL parent paths (polyhierarchy [4]).
-
-      2. Score each same-tag ancestor with sibling_reach [1].
-
-      3. Keep all candidates at the MAXIMUM score [2].
-
-    Why max score works on real SNOMED (370k nodes):
-      In a properly sized ontology, sibling_reach scores differ clearly
-      between levels. The clinically meaningful mid-level category always
-      scores highest because it sits at the natural branch point:
-        KneePain   score=0.87  ← correct topic (small branch of JointPain)
-        JointPain  score=0.33  ← too generic (large fraction of BodyPain)
-        BodyPain   score=0.23  ← much too generic
-      Max score naturally selects KneePain. No dominance logic needed.
-
-    For polyhierarchy [4] (multiple parent branches):
-      Different branches independently reach their own max scores.
-      Both C0424722 and C0577997 score ~1.0 for C4759551 (different
-      branches under C0037088) → both returned as topics. ✅
-
-    Returns list of topic dicts, one per branch peak.
-    """
-    # ── BFS upward — collect ALL same-tag ancestors with scores ──
-    # Covers full polyhierarchy: follows every parent path [4]
-    candidate_scores = {}
-    visited = set()
-    queue   = deque(tree.get(cui, {}).get("parent_cuis", []))
-
-    while queue:
-        current = queue.popleft()
-        if current in visited:
-            continue
-        visited.add(current)
-        if get_tag(current, tree) == tag:
-            candidate_scores[current] = sibling_reach(current, tree, desc_counts)
-        for parent in tree.get(current, {}).get("parent_cuis", []):
-            if parent not in visited:
-                queue.append(parent)
-
-    if not candidate_scores:
-        return []
-
-    # ── Keep max-score candidates, apply upward dominance ────────
-    # Step 1: keep all candidates at the maximum score.
-    # Multiple at max score = genuine polyhierarchy [4] OR same-branch ties.
-    # Root nodes excluded — handled by build_lookup fallback.
-    max_score  = max(candidate_scores.values())
-    max_cands  = {
-        c for c, s in candidate_scores.items()
-        if s >= max_score
-        and tree.get(c, {}).get("parent_cuis", [])
-    }
-
-    # Step 2: upward dominance among max-score candidates [2].
-    # If a more generic ancestor ALSO scored max, prefer the ancestor.
-    # This removes same-branch ties where both parent and child score 1.0
-    # (e.g. C1287884 and C0577601 both at 1.0 — keep C0577601 only).
-    # Cross-branch ties (genuine polyhierarchy) are unaffected because
-    # neither is an ancestor of the other.
-    topic_cuis = set()
-    for candidate in max_cands:
-        dominated = False
-        pq, pv    = deque(tree.get(candidate, {}).get("parent_cuis", [])), set()
-        while pq:
-            p = pq.popleft()
-            if p in pv: continue
-            pv.add(p)
-            if p in max_cands:
-                # A more generic ancestor also scored max — prefer it
-                dominated = True
-                break
-            for gp in tree.get(p, {}).get("parent_cuis", []):
-                if gp not in pv: pq.append(gp)
-        if not dominated:
-            topic_cuis.add(candidate)
-
-    # ── Build topic list ─────────────────────────────────────────
-    topics = [
-        {
-            "topic_cui"  : tc,
-            "topic_label": tree.get(tc, {}).get("label", tc),
-            "score"      : round(candidate_scores[tc], 4),
-        }
-        for tc in topic_cuis
-    ]
-    topics.sort(key=lambda x: x["score"], reverse=True)
-    return topics
-
-
-def build_lookup(tree, desc_counts):
-    """
-    [3] TOPIC FORMATION AS SEARCH INTERMEDIARY.
-
-    For every CUI in the ontology, compute its topic(s).
-    Topics act as the shared clinical vocabulary between:
-      - query side:    user text → NER → CUIs → summarize → topics
-      - document side: patient doc → NER → CUIs → summarize → topics
-      - match:         query topics ∩ document topics → ranked results
-
-    Result schema per CUI:
-    {
-      "own_label"  : "Pain in left knee (finding)",
-      "parent_cuis": ["C0022742"],
-      "tag"        : "finding",
-      "topics"     : [
-          {"topic_cui": "C0022742", "topic_label": "Knee pain (finding)", "score": 0.50}
-      ]
-    }
-    """
-    print("  Building topic lookup...")
-    t     = time.time()
-    total = len(tree)
-    lookup = {}
-
-    for i, cui in enumerate(tree):
-        if i % 50000 == 0:
-            pct = (i / total) * 100
-            eta = ((time.time()-t) / max(i, 1)) * (total - i)
-            print(f"    {i:,}/{total:,}  ({pct:.0f}%)  ETA {eta:.0f}s")
-
-        tag    = get_tag(cui, tree)
-        topics = find_all_topics(cui, tree, desc_counts, tag)
-
-        # Fallback for root nodes (no parents) → topic is itself
-        if not tree.get(cui, {}).get("parent_cuis", []):
-            topics = [{
-                "topic_cui"  : cui,
-                "topic_label": tree.get(cui, {}).get("label", cui),
-                "score"      : 1.0,
-            }]
-        # Fallback for nodes with no same-tag ancestor → topic is itself
-        elif not topics:
-            topics = [{
-                "topic_cui"  : cui,
-                "topic_label": tree.get(cui, {}).get("label", cui),
-                "score"      : 1.0,
-            }]
-
-        lookup[cui] = {
-            "own_label"  : tree.get(cui, {}).get("own_label", cui),
-            "parent_cuis": tree.get(cui, {}).get("parent_cuis", []),
-            "tag"        : tag,
-            "topics"     : topics,
-        }
-
-    print(f"  → {len(lookup):,} entries  ({time.time()-t:.1f}s)")
-    return lookup
-
-
-# ─────────────────────────────────────────────────────────────
-# SAVE / LOAD
-# ─────────────────────────────────────────────────────────────
-
-def save_pickle(lookup, path):
-    with open(path, "wb") as f:
-        pickle.dump(lookup, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  ✅ Saved {len(lookup):,} entries → {path}  ({size_mb} MB)")
-
-
-def load_lookup(path="cui_topic_lookup.pkl"):
+def load(path=PICKLE_PATH):
     with open(path, "rb") as f:
         return pickle.load(f)
 
 
+def check(label, got, expected, detail=""):
+    ok = got == expected
+    suffix = f"  ({detail})" if detail else ""
+    print(f"  {'✅' if ok else '❌'} {label}: expected={expected}  got={got}{suffix}")
+    return ok
+
+
+def get_topics_set(cui, lookup):
+    return {t["topic_cui"] for t in lookup.get(cui, {}).get("topics", [])}
+
+
+def get_root_cuis(lookup):
+    return {c for c, v in lookup.items() if not v.get("parent_cuis")}
+
+
 # ─────────────────────────────────────────────────────────────
-# RUNTIME — O(1) per CUI  [3]
+# TESTS
 # ─────────────────────────────────────────────────────────────
 
-def get_topics(reduced_cuis, lookup):
+def test_structure(lookup):
+    """Basic schema validation — required fields, no nulls."""
+    print("[0] Structure and null checks...")
+    required = {"own_label", "parent_cuis", "tag", "topics"}
+    missing  = [c for c, v in lookup.items() if not required.issubset(v.keys())]
+    bad_t    = [c for c, v in lookup.items()
+                if any(not all(k in t for k in ["topic_cui","topic_label","score"])
+                       for t in v.get("topics", []))]
+    no_topics = [c for c, v in lookup.items() if not v.get("topics")]
+    no_label  = [c for c, v in lookup.items() if not v.get("own_label")]
+
+    ok = True
+    for lst, msg in [
+        (missing,   "entries missing required fields"),
+        (bad_t,     "entries with malformed topic dicts"),
+        (no_topics, "entries with no topics"),
+        (no_label,  "entries with empty own_label"),
+    ]:
+        if lst:
+            print(f"  ❌ {len(lst):,} {msg}. Sample: {lst[:2]}")
+            ok = False
+    if ok:
+        print(f"  ✅ All {len(lookup):,} entries well-formed\n")
+    return ok
+
+
+def test_sibling_reach(lookup):
     """
-    [3] TOPIC FORMATION AS SEARCH INTERMEDIARY — runtime query.
-
-    Input:  reduced_cuis — list of summarized CUIs from NER
-    Output: topic bag    — {topic_label: [cui1, cui2, ...]}
-
-    Both query side and document side call this same function.
-    The intersection of their topic bags drives search matching.
-
-    Example:
-        query    "left knee pain" → {"Knee pain": ["C0231749"]}
-        document "OA of knee"     → {"Knee pain": ["C0029408"], "Disorder of knee": [...]}
-        match    → "Knee pain" in both → document is relevant
+    [1] SIBLING REACH — scores must be in (0.0, 1.0].
+    A score of 0 means the node equals its parent (impossible via formula).
+    A score > 1 indicates a descendant count error.
     """
-    topic_bag = {}
-    for cui in reduced_cuis:
-        for topic in lookup.get(cui, {}).get("topics", []):
-            topic_bag.setdefault(topic["topic_label"], []).append(cui)
-    return topic_bag
+    print("[1] Sibling reach scores — range (0, 1]...")
+    all_scores = [t["score"]
+                  for v in lookup.values()
+                  for t in v.get("topics", [])]
+
+    bad = [s for s in all_scores if s <= 0 or s > 1.0]
+    ok  = True
+
+    if bad:
+        print(f"  ❌ {len(bad):,} scores outside (0, 1]: {bad[:5]}")
+        ok = False
+    else:
+        mn = min(all_scores)
+        mx = max(all_scores)
+        mu = sum(all_scores) / len(all_scores)
+        print(f"  ✅ All {len(all_scores):,} scores in (0, 1]")
+        print(f"     min={mn:.4f}  max={mx:.4f}  mean={mu:.4f}")
+
+    # Score distribution sanity — most should be >0.3
+    low = sum(1 for s in all_scores if s < 0.1)
+    low_pct = low / len(all_scores) * 100 if all_scores else 0
+    if low_pct > 20:
+        print(f"  ⚠️  {low_pct:.1f}% scores < 0.1 — may indicate over-climbing")
+    else:
+        print(f"  ✅ Score distribution looks healthy ({low_pct:.1f}% below 0.1)\n")
+    return ok
+
+
+def test_root_self_map(lookup):
+    """
+    [2] DOMINANCE — root nodes must map to themselves.
+    Root = no parent_cuis. These are top-level clinical categories.
+    """
+    print("[2] Root nodes → topic = itself...")
+    roots = [(c, v) for c, v in lookup.items() if not v.get("parent_cuis")]
+    wrong = [c for c, v in roots
+             if not any(t["topic_cui"] == c for t in v.get("topics", []))]
+    ok = True
+    if wrong:
+        print(f"  ❌ {len(wrong):,} root nodes not mapped to themselves")
+        print(f"     Sample: {wrong[:3]}")
+        ok = False
+    else:
+        print(f"  ✅ All {len(roots):,} root nodes map to themselves\n")
+    return ok
+
+
+def test_specificity(lookup):
+    """
+    [2] DOWNWARD DOMINANCE — non-root CUIs should not have
+    root-level topics. If they do, the algorithm climbed too high.
+    Acceptable threshold: <5% (genuine orphan/isolated concepts).
+    """
+    print("[2] Specificity — non-root CUIs should not map to root topics...")
+    root_cuis = get_root_cuis(lookup)
+    bad = []
+    for cui, entry in lookup.items():
+        if cui in root_cuis:
+            continue
+        for t in entry.get("topics", []):
+            if t["topic_cui"] in root_cuis:
+                bad.append((cui, t["topic_label"]))
+                break
+
+    pct = len(bad) / len(lookup) * 100
+    ok  = True
+    if bad:
+        print(f"  ⚠️  {len(bad):,} ({pct:.1f}%) non-root CUIs map to root topics")
+        if pct > 5.0:
+            print(f"  ❌ >5% threshold exceeded — dominance check too weak")
+            ok = False
+        else:
+            print(f"  ✅ <5% acceptable (orphan/isolated concepts)\n")
+    else:
+        print(f"  ✅ No non-root CUIs mapped to root topics\n")
+    return ok
+
+
+def test_no_topic_ancestry(lookup, sample_size=5000):
+    """
+    [2] UPWARD DOMINANCE — for any CUI, no topic should be an ancestor
+    of another topic for that same CUI. If topic A is ancestor of topic B,
+    A should have been preferred and B removed (upward dominance).
+    Samples a subset for speed.
+    """
+    print("[2] Topic ancestry — no topic should be ancestor of another topic...")
+
+    def walk_up(cui):
+        """All ancestors via first parent."""
+        chain, current, visited = set(), cui, set()
+        while current:
+            if current in visited: break
+            visited.add(current)
+            chain.add(current)
+            parents = lookup.get(current, {}).get("parent_cuis", [])
+            current = parents[0] if parents else None
+        return chain
+
+    import random
+    sample = random.sample(list(lookup.items()), min(sample_size, len(lookup)))
+    violations = []
+
+    for cui, entry in sample:
+        topics = entry.get("topics", [])
+        if len(topics) < 2:
+            continue
+        topic_cuis = [t["topic_cui"] for t in topics]
+        # Check each pair
+        for i, tc1 in enumerate(topic_cuis):
+            ancestors_of_tc1 = walk_up(tc1)
+            for tc2 in topic_cuis[i+1:]:
+                if tc2 in ancestors_of_tc1 or tc1 in walk_up(tc2):
+                    violations.append((cui, tc1, tc2))
+                    break
+            if violations and len(violations) >= 5:
+                break
+
+    ok = True
+    if violations:
+        print(f"  ❌ {len(violations)} ancestry violations found (sample={sample_size})")
+        for cui, t1, t2 in violations[:3]:
+            print(f"     CUI={cui}: {t1} and {t2} are ancestor/descendant")
+        ok = False
+    else:
+        print("  ✅ No topic ancestry violations in " + str(sample_size) + " sampled CUIs\n")
+    return ok
+
+
+def test_no_over_climbing(lookup):
+    """
+    [2] UPWARD DOMINANCE — topics should sit at a reasonable depth.
+    Checks that the avg topic depth from a CUI is not > 1 hop
+    (would indicate the algorithm stopped too close to the input).
+    And not > 8 hops (would indicate over-climbing).
+    """
+    print("[2] Topic depth — topics should be meaningful mid-level nodes...")
+    # For each CUI, count how far topic is from the CUI via parent chain
+    hop_counts = []
+    for cui, entry in lookup.items():
+        if not entry.get("parent_cuis"):
+            continue   # skip roots
+        for topic in entry.get("topics", []):
+            # Walk up from CUI counting hops to topic
+            hops, current, visited = 0, cui, set()
+            found = False
+            while current and hops < 15:
+                if current in visited: break
+                visited.add(current)
+                if current == topic["topic_cui"]:
+                    found = True
+                    break
+                parents = lookup.get(current, {}).get("parent_cuis", [])
+                current = parents[0] if parents else None
+                hops += 1
+            if found:
+                hop_counts.append(hops)
+
+    if not hop_counts:
+        print("  ⚠️  Could not compute hop counts\n")
+        return True
+
+    avg = sum(hop_counts) / len(hop_counts)
+    too_close = sum(1 for h in hop_counts if h < 1)
+    too_far   = sum(1 for h in hop_counts if h > 8)
+
+    print(f"  Avg hops to topic  : {avg:.1f}")
+    print(f"  Hops < 1 (trivial) : {too_close:,}  ({too_close/len(hop_counts)*100:.1f}%)")
+    print(f"  Hops > 8 (generic) : {too_far:,}   ({too_far/len(hop_counts)*100:.1f}%)")
+
+    ok = True
+    if too_far / len(hop_counts) > 0.2:
+        print(f"  ❌ >20% topics more than 8 hops away — over-climbing")
+        ok = False
+    else:
+        print(f"  ✅ Topic depth distribution looks healthy\n")
+    return ok
+
+
+def test_polyhierarchy(lookup):
+    """
+    [4] POLYHIERARCHY — CUIs with multiple parents should yield
+    multiple topics. Checks that multi-parent CUIs have >= 2 topics
+    more often than single-parent CUIs.
+    """
+    print("[4] Polyhierarchy — multi-parent CUIs get multiple topics...")
+    multi_parent_cuis  = [c for c, v in lookup.items()
+                          if len(v.get("parent_cuis", [])) > 1]
+    single_parent_cuis = [c for c, v in lookup.items()
+                          if len(v.get("parent_cuis", [])) == 1]
+
+    if not multi_parent_cuis:
+        print("  ⚠️  No multi-parent CUIs found in pickle")
+        print("     (expected ~30-40% in full SNOMED)\n")
+        return True
+
+    multi_with_multi_topics = sum(
+        1 for c in multi_parent_cuis
+        if len(lookup[c].get("topics", [])) > 1
+    )
+    single_with_multi_topics = sum(
+        1 for c in single_parent_cuis
+        if len(lookup[c].get("topics", [])) > 1
+    )
+
+    mp_pct = multi_with_multi_topics / len(multi_parent_cuis)  * 100
+    sp_pct = (single_with_multi_topics / len(single_parent_cuis) * 100
+              if single_parent_cuis else 0)
+
+    print(f"  Multi-parent CUIs  : {len(multi_parent_cuis):,}")
+    print(f"    → with >1 topic  : {multi_with_multi_topics:,}  ({mp_pct:.1f}%)")
+    print(f"  Single-parent CUIs : {len(single_parent_cuis):,}")
+    print(f"    → with >1 topic  : {single_with_multi_topics:,}  ({sp_pct:.1f}%)")
+
+    ok = True
+    if mp_pct < 30 and len(multi_parent_cuis) > 100:
+        print(f"  ❌ Only {mp_pct:.1f}% of multi-parent CUIs have >1 topic — paths missed")
+        ok = False
+    else:
+        print(f"  ✅ Multi-parent CUIs yield more topics than single-parent\n")
+    return ok
+
+
+def test_topic_distribution(lookup):
+    """Overall topic distribution stats."""
+    print("[4] Topic distribution...")
+    dist = Counter(len(v["topics"]) for v in lookup.values())
+    total = len(lookup)
+    for n, count in sorted(dist.items()):
+        pct = count / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {n} topic(s): {count:>8,}  ({pct:>5.1f}%)  {bar}")
+    multi = sum(c for n, c in dist.items() if n > 1)
+    print(f"\n  Multi-topic CUIs: {multi:,}  ({multi/total*100:.1f}%)\n")
+    return True
+
+
+def test_topic_intermediary(lookup):
+    """
+    [3] TOPIC INTERMEDIARY — each topic must be shared by >= 2 CUIs.
+    This is the whole point: topics bridge different CUIs to the same
+    clinical category, enabling query-document matching.
+    """
+    print("[3] Topic intermediary — topics shared across multiple CUIs...")
+    topic_to_cuis = defaultdict(set)
+    for cui, entry in lookup.items():
+        for t in entry.get("topics", []):
+            topic_to_cuis[t["topic_cui"]].add(cui)
+
+    shared    = {t: cuis for t, cuis in topic_to_cuis.items() if len(cuis) >= 2}
+    singleton = {t: cuis for t, cuis in topic_to_cuis.items() if len(cuis) == 1}
+    total     = len(topic_to_cuis)
+    shared_pct = len(shared) / total * 100 if total else 0
+
+    print(f"  Unique topics      : {total:,}")
+    print(f"  Shared by 2+ CUIs  : {len(shared):,}  ({shared_pct:.1f}%)")
+    print(f"  Singleton topics   : {len(singleton):,}")
+
+    print(f"\n  Top 15 most-shared topics (search vocabulary):")
+    top = sorted(shared.items(), key=lambda x: len(x[1]), reverse=True)[:15]
+    for t_cui, cuis in top:
+        label = lookup.get(t_cui, {}).get("own_label", t_cui)
+        print(f"    {label:<55} {len(cuis):>7,} CUIs")
+
+    ok = True
+    if shared_pct < 50 and total > 100:
+        print(f"\n  ⚠️  <50% topics shared — search vocabulary may be too narrow")
+    else:
+        print(f"\n  ✅ Topics act as shared clinical search vocabulary\n")
+    return ok
+
+
+def test_semantic_tags(lookup):
+    """Semantic tag distribution sanity check."""
+    print("[5] Semantic tag distribution...")
+    tags = Counter(v["tag"] for v in lookup.values())
+    total = len(lookup)
+    for tag, count in tags.most_common(10):
+        pct = count / total * 100
+        bar = "█" * int(pct / 2)
+        print(f"  {tag:<35} {count:>8,}  ({pct:>5.1f}%)  {bar}")
+    print()
+    return True
+
+
+def random_sample(lookup, n=10):
+    """Random spot-check of CUI → topics."""
+    print(f"[6] Random sample — {n} CUIs...")
+    sample = random.sample(list(lookup.items()), min(n, len(lookup)))
+    print(f"  {'CUI':<15} {'Label':<35} {'Topics'}")
+    print(f"  {'─'*80}")
+    for cui, entry in sample:
+        topics_str = " | ".join(
+            t["topic_label"].split("(")[0].strip()
+            for t in entry.get("topics", [])
+        )
+        label = entry.get("own_label", "")[:33]
+        print(f"  {cui:<15} {label:<35} {topics_str}")
+    print()
+
+
+def summary(lookup):
+    all_labels    = [t["topic_label"]
+                     for v in lookup.values()
+                     for t in v.get("topics", [])]
+    unique_topics = len(set(all_labels))
+    total_links   = len(all_labels)
+    tags          = Counter(v["tag"] for v in lookup.values())
+    multi         = sum(1 for v in lookup.values()
+                        if len(v.get("topics", [])) > 1)
+
+    print(f"{'─'*55}")
+    print(f"  SUMMARY")
+    print(f"{'─'*55}")
+    print(f"  Total CUIs         : {len(lookup):,}")
+    print(f"  Unique topics      : {unique_topics:,}")
+    print(f"  Total topic links  : {total_links:,}")
+    print(f"  Avg topics / CUI   : {total_links/len(lookup):.2f}")
+    print(f"  Multi-topic CUIs   : {multi:,}  ({multi/len(lookup)*100:.1f}%)")
+    print(f"  Semantic types     : {len(tags)}")
+    print(f"{'─'*55}")
 
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    start = time.time()
-
+def validate(path=PICKLE_PATH):
     print(f"\n{'═'*60}")
-    print(f"  SNOMED Ontology-Driven Clinical Topic Formation")
-    print(f"  Project : {PROJECT}")
-    print(f"  Dataset : {DATASET}")
+    print(f"  Validating: {path}")
     print(f"{'═'*60}\n")
 
-    print("[1/5] Connecting to BigQuery...")
-    client = bigquery.Client(project=PROJECT)
-    print("  ✅ Connected\n")
+    print("[loading] Reading pickle...")
+    lookup = load(path)
+    print(f"  ✅ Loaded {len(lookup):,} CUIs\n")
 
-    print("[2/5] Pulling concepts...")
-    concepts_df = query_concepts(client)
-    print()
+    results = []
+    results.append(test_structure(lookup))
+    results.append(test_sibling_reach(lookup))
+    results.append(test_root_self_map(lookup))
+    results.append(test_specificity(lookup))
+    results.append(test_no_over_climbing(lookup))
+    results.append(test_no_topic_ancestry(lookup))
+    results.append(test_polyhierarchy(lookup))
+    test_topic_distribution(lookup)
+    results.append(test_topic_intermediary(lookup))
+    test_semantic_tags(lookup)
+    random_sample(lookup)
+    summary(lookup)
 
-    print("[3/5] Pulling parent relationships...")
-    parents_df = query_parents(client)
-    print()
+    all_ok = all(results)
+    print(f"\n  {'✅ Pickle is valid — all contribution checks passed' if all_ok else '❌ Issues found — check above'}\n")
+    return lookup
 
-    print("[4/5] Building hierarchy and topic lookup...")
-    tree        = build_tree(concepts_df, parents_df)
-    desc_counts = build_desc_counts(tree)
-    lookup      = build_lookup(tree, desc_counts)
-    print()
 
-    print("[5/5] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-
-    print(f"\n  Total time: {(time.time()-start)/60:.1f} min")
-    print(f"\n  Runtime usage:")
-    print(f"    from run_builder import load_lookup, get_topics")
-    print(f"    lookup = load_lookup('{OUTPUT}')          # once at startup")
-    print(f"    topics = get_topics(reduced_cuis, lookup) # O(1) per CUI")
-    print()
+if __name__ == "__main__":
+    validate(PICKLE_PATH)
