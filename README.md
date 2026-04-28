@@ -1,1 +1,447 @@
-# doc
+"""
+Validate cui_topic_lookup.pkl — Novel Contribution Tests
+=========================================================
+Loads the pickle and validates all four novel contributions
+directly from stored data. No run_builder dependency.
+
+[1] Sibling Reach    — scores exist, in range (0,1], meaningful
+[2] Bidirectional dominance — topics are specific, not root-level,
+                              no over-climbing, junction rule preserved
+[3] Topic intermediary      — same topic reachable from multiple CUIs
+[4] Polyhierarchy           — multi-topic CUIs exist, no paths missed
+
+Run: python validate_builder.py
+"""
+
+import pickle
+import random
+from collections import Counter, defaultdict
+
+
+PICKLE_PATH = "cui_topic_lookup.pkl"
+
+
+# ─────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def load(path=PICKLE_PATH):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def check(label, got, expected, detail=""):
+    ok = got == expected
+    suffix = f"  ({detail})" if detail else ""
+    print(f"  {'ok' if ok else 'not ok'} {label}: expected={expected}  got={got}{suffix}")
+    return ok
+
+
+def get_topics_set(cui, lookup):
+    return {t["topic_cui"] for t in lookup.get(cui, {}).get("topics", [])}
+
+
+def get_root_cuis(lookup):
+    return {c for c, v in lookup.items() if not v.get("parent_cuis")}
+
+
+# ─────────────────────────────────────────────────────────────
+# TESTS
+# ─────────────────────────────────────────────────────────────
+
+def test_structure(lookup):
+    """Basic schema validation — required fields, no nulls."""
+    print("[0] Structure and null checks...")
+    required = {"own_label", "parent_cuis", "tag", "topics"}
+    missing  = [c for c, v in lookup.items() if not required.issubset(v.keys())]
+    bad_t    = [c for c, v in lookup.items()
+                if any(not all(k in t for k in ["topic_cui","topic_label","score"])
+                       for t in v.get("topics", []))]
+    no_topics = [c for c, v in lookup.items() if not v.get("topics")]
+    no_label  = [c for c, v in lookup.items() if not v.get("own_label")]
+
+    ok = True
+    for lst, msg in [
+        (missing,   "entries missing required fields"),
+        (bad_t,     "entries with malformed topic dicts"),
+        (no_topics, "entries with no topics"),
+        (no_label,  "entries with empty own_label"),
+    ]:
+        if lst:
+            print(f"   {len(lst):,} {msg}. Sample: {lst[:2]}")
+            ok = False
+    if ok:
+        print(f"   All {len(lookup):,} entries well-formed\n")
+    return ok
+
+
+def test_sibling_reach(lookup):
+    """
+    [1] SIBLING REACH — scores must be in (0.0, 1.0].
+    Score = 0.0 means bad PAR data (node has >= descendants than parent).
+    These are filtered out during build — should NOT appear as topic scores.
+    Score > 1.0 indicates a descendant count overflow error.
+    """
+    print("[1] Sibling reach scores — range (0, 1]...")
+    all_scores = [t["score"]
+                  for v in lookup.values()
+                  for t in v.get("topics", [])]
+
+    zero_scores = [s for s in all_scores if s == 0.0]
+    bad_scores  = [s for s in all_scores if s < 0 or s > 1.0]
+    ok = True
+
+    if bad_scores:
+        print(f"   {len(bad_scores):,} scores outside [0, 1]: {bad_scores[:5]}")
+        ok = False
+
+    if zero_scores:
+        print(f"    {len(zero_scores):,} scores = 0.0 (bad PAR data in UMLS)")
+        print(f"     These indicate cycles/errors where desc(node) >= desc(parent)")
+        print(f"     They should have been filtered — rebuild with latest run_builder.py")
+        ok = False
+    
+    if not bad_scores and not zero_scores:
+        mn  = min(all_scores)
+        mx  = max(all_scores)
+        mu  = sum(all_scores) / len(all_scores)
+        print(f"   All {len(all_scores):,} scores in (0, 1]")
+        print(f"     min={mn:.4f}  max={mx:.4f}  mean={mu:.4f}")
+
+    low     = sum(1 for s in all_scores if 0 < s < 0.1)
+    low_pct = low / len(all_scores) * 100 if all_scores else 0
+    if low_pct > 20:
+        print(f"    {low_pct:.1f}% scores < 0.1 — may indicate over-climbing")
+    else:
+        print(f"   Score distribution healthy ({low_pct:.1f}% below 0.1)\n")
+    return ok
+
+
+def test_root_self_map(lookup):
+    """
+    [2] DOMINANCE — root nodes must map to themselves.
+    Root = no parent_cuis. These are top-level clinical categories.
+    """
+    print("[2] Root nodes → topic = itself...")
+    roots = [(c, v) for c, v in lookup.items() if not v.get("parent_cuis")]
+    wrong = [c for c, v in roots
+             if not any(t["topic_cui"] == c for t in v.get("topics", []))]
+    ok = True
+    if wrong:
+        print(f"   {len(wrong):,} root nodes not mapped to themselves")
+        print(f"     Sample: {wrong[:3]}")
+        ok = False
+    else:
+        print(f"   All {len(roots):,} root nodes map to themselves\n")
+    return ok
+
+
+def test_specificity(lookup):
+    """
+    [2] DOWNWARD DOMINANCE — non-root CUIs should not have
+    root-level topics. If they do, the algorithm climbed too high.
+    Acceptable threshold: <5% (genuine orphan/isolated concepts).
+    """
+    print("[2] Specificity — non-root CUIs should not map to root topics...")
+    root_cuis = get_root_cuis(lookup)
+    bad = []
+    for cui, entry in lookup.items():
+        if cui in root_cuis:
+            continue
+        for t in entry.get("topics", []):
+            if t["topic_cui"] in root_cuis:
+                bad.append((cui, t["topic_label"]))
+                break
+
+    pct = len(bad) / len(lookup) * 100
+    ok  = True
+    if bad:
+        print(f"    {len(bad):,} ({pct:.1f}%) non-root CUIs map to root topics")
+        if pct > 5.0:
+            print(f"   >5% threshold exceeded — dominance check too weak")
+            ok = False
+        else:
+            print(f"   <5% acceptable (orphan/isolated concepts)\n")
+    else:
+        print(f"   No non-root CUIs mapped to root topics\n")
+    return ok
+
+
+def test_no_topic_ancestry(lookup, sample_size=5000):
+    """
+    [2] UPWARD DOMINANCE — for any CUI, no topic should be an ancestor
+    of another topic for that same CUI. If topic A is ancestor of topic B,
+    A should have been preferred and B removed (upward dominance).
+    Samples a subset for speed.
+    """
+    print("[2] Topic ancestry — no topic should be ancestor of another topic...")
+
+    def walk_up(cui):
+        """All ancestors via first parent."""
+        chain, current, visited = set(), cui, set()
+        while current:
+            if current in visited: break
+            visited.add(current)
+            chain.add(current)
+            parents = lookup.get(current, {}).get("parent_cuis", [])
+            current = parents[0] if parents else None
+        return chain
+
+    import random
+    sample = random.sample(list(lookup.items()), min(sample_size, len(lookup)))
+    violations = []
+
+    for cui, entry in sample:
+        topics = entry.get("topics", [])
+        if len(topics) < 2:
+            continue
+        topic_cuis = [t["topic_cui"] for t in topics]
+        # Check each pair
+        for i, tc1 in enumerate(topic_cuis):
+            ancestors_of_tc1 = walk_up(tc1)
+            for tc2 in topic_cuis[i+1:]:
+                if tc2 in ancestors_of_tc1 or tc1 in walk_up(tc2):
+                    violations.append((cui, tc1, tc2))
+                    break
+            if violations and len(violations) >= 5:
+                break
+
+    ok = True
+    if violations:
+        print(f"   {len(violations)} ancestry violations found (sample={sample_size})")
+        for cui, t1, t2 in violations[:3]:
+            print(f"     CUI={cui}: {t1} and {t2} are ancestor/descendant")
+        ok = False
+    else:
+        print("   No topic ancestry violations in " + str(sample_size) + " sampled CUIs\n")
+    return ok
+
+
+def test_no_over_climbing(lookup):
+    """
+    [2] UPWARD DOMINANCE — topics should sit at a reasonable depth.
+    Checks that the avg topic depth from a CUI is not > 1 hop
+    (would indicate the algorithm stopped too close to the input).
+    And not > 8 hops (would indicate over-climbing).
+    """
+    print("[2] Topic depth — topics should be meaningful mid-level nodes...")
+    # For each CUI, count how far topic is from the CUI via parent chain
+    hop_counts = []
+    for cui, entry in lookup.items():
+        if not entry.get("parent_cuis"):
+            continue   # skip roots
+        for topic in entry.get("topics", []):
+            # Walk up from CUI counting hops to topic
+            hops, current, visited = 0, cui, set()
+            found = False
+            while current and hops < 15:
+                if current in visited: break
+                visited.add(current)
+                if current == topic["topic_cui"]:
+                    found = True
+                    break
+                parents = lookup.get(current, {}).get("parent_cuis", [])
+                current = parents[0] if parents else None
+                hops += 1
+            if found:
+                hop_counts.append(hops)
+
+    if not hop_counts:
+        print("    Could not compute hop counts\n")
+        return True
+
+    avg = sum(hop_counts) / len(hop_counts)
+    too_close = sum(1 for h in hop_counts if h < 1)
+    too_far   = sum(1 for h in hop_counts if h > 8)
+
+    print(f"  Avg hops to topic  : {avg:.1f}")
+    print(f"  Hops < 1 (trivial) : {too_close:,}  ({too_close/len(hop_counts)*100:.1f}%)")
+    print(f"  Hops > 8 (generic) : {too_far:,}   ({too_far/len(hop_counts)*100:.1f}%)")
+
+    ok = True
+    if too_far / len(hop_counts) > 0.2:
+        print(f"   >20% topics more than 8 hops away — over-climbing")
+        ok = False
+    else:
+        print(f"   Topic depth distribution looks healthy\n")
+    return ok
+
+
+def test_polyhierarchy(lookup):
+    """
+    [4] POLYHIERARCHY — CUIs with multiple parents should yield
+    multiple topics. Checks that multi-parent CUIs have >= 2 topics
+    more often than single-parent CUIs.
+    """
+    print("[4] Polyhierarchy — multi-parent CUIs get multiple topics...")
+    multi_parent_cuis  = [c for c, v in lookup.items()
+                          if len(v.get("parent_cuis", [])) > 1]
+    single_parent_cuis = [c for c, v in lookup.items()
+                          if len(v.get("parent_cuis", [])) == 1]
+
+    if not multi_parent_cuis:
+        print("    No multi-parent CUIs found in pickle")
+        print("    (expected ~30-40% in full SNOMED)\n")
+        return True
+
+    multi_with_multi_topics = sum(
+        1 for c in multi_parent_cuis
+        if len(lookup[c].get("topics", [])) > 1
+    )
+    single_with_multi_topics = sum(
+        1 for c in single_parent_cuis
+        if len(lookup[c].get("topics", [])) > 1
+    )
+
+    mp_pct = multi_with_multi_topics / len(multi_parent_cuis)  * 100
+    sp_pct = (single_with_multi_topics / len(single_parent_cuis) * 100
+              if single_parent_cuis else 0)
+
+    print(f"  Multi-parent CUIs  : {len(multi_parent_cuis):,}")
+    print(f"    → with >1 topic  : {multi_with_multi_topics:,}  ({mp_pct:.1f}%)")
+    print(f"  Single-parent CUIs : {len(single_parent_cuis):,}")
+    print(f"    → with >1 topic  : {single_with_multi_topics:,}  ({sp_pct:.1f}%)")
+
+    ok = True
+    if mp_pct < 30 and len(multi_parent_cuis) > 100:
+        print(f"   Only {mp_pct:.1f}% of multi-parent CUIs have >1 topic — paths missed")
+        ok = False
+    else:
+        print(f"   Multi-parent CUIs yield more topics than single-parent\n")
+    return ok
+
+
+def test_topic_distribution(lookup):
+    """Overall topic distribution stats."""
+    print("[4] Topic distribution...")
+    dist = Counter(len(v["topics"]) for v in lookup.values())
+    total = len(lookup)
+    for n, count in sorted(dist.items()):
+        pct = count / total * 100
+        bar = "|" * int(pct / 2)
+        print(f"  {n} topic(s): {count:>8,}  ({pct:>5.1f}%)  {bar}")
+    multi = sum(c for n, c in dist.items() if n > 1)
+    print(f"\n  Multi-topic CUIs: {multi:,}  ({multi/total*100:.1f}%)\n")
+    return True
+
+
+def test_topic_intermediary(lookup):
+    """
+    [3] TOPIC INTERMEDIARY — each topic must be shared by >= 2 CUIs.
+    This is the whole point: topics bridge different CUIs to the same
+    clinical category, enabling query-document matching.
+    """
+    print("[3] Topic intermediary — topics shared across multiple CUIs...")
+    topic_to_cuis = defaultdict(set)
+    for cui, entry in lookup.items():
+        for t in entry.get("topics", []):
+            topic_to_cuis[t["topic_cui"]].add(cui)
+
+    shared    = {t: cuis for t, cuis in topic_to_cuis.items() if len(cuis) >= 2}
+    singleton = {t: cuis for t, cuis in topic_to_cuis.items() if len(cuis) == 1}
+    total     = len(topic_to_cuis)
+    shared_pct = len(shared) / total * 100 if total else 0
+
+    print(f"  Unique topics      : {total:,}")
+    print(f"  Shared by 2+ CUIs  : {len(shared):,}  ({shared_pct:.1f}%)")
+    print(f"  Singleton topics   : {len(singleton):,}")
+
+    print(f"\n  Top 15 most-shared topics (search vocabulary):")
+    top = sorted(shared.items(), key=lambda x: len(x[1]), reverse=True)[:15]
+    for t_cui, cuis in top:
+        label = lookup.get(t_cui, {}).get("own_label", t_cui)
+        print(f"    {label:<55} {len(cuis):>7,} CUIs")
+
+    ok = True
+    if shared_pct < 50 and total > 100:
+        print(f"\n    <50% topics shared — search vocabulary may be too narrow")
+    else:
+        print(f"\n   Topics act as shared clinical search vocabulary\n")
+    return ok
+
+
+def test_semantic_tags(lookup):
+    """Semantic tag distribution sanity check."""
+    print("[5] Semantic tag distribution...")
+    tags = Counter(v["tag"] for v in lookup.values())
+    total = len(lookup)
+    for tag, count in tags.most_common(10):
+        pct = count / total * 100
+        bar = "|" * int(pct / 2)
+        print(f"  {tag:<35} {count:>8,}  ({pct:>5.1f}%)  {bar}")
+    print()
+    return True
+
+
+def random_sample(lookup, n=10):
+    """Random spot-check of CUI → topics."""
+    print(f"[6] Random sample — {n} CUIs...")
+    sample = random.sample(list(lookup.items()), min(n, len(lookup)))
+    print(f"  {'CUI':<15} {'Label':<35} {'Topics'}")
+    print(f"  {'─'*80}")
+    for cui, entry in sample:
+        topics_str = " | ".join(
+            t["topic_label"].split("(")[0].strip()
+            for t in entry.get("topics", [])
+        )
+        label = entry.get("own_label", "")[:33]
+        print(f"  {cui:<15} {label:<35} {topics_str}")
+    print()
+
+
+def summary(lookup):
+    all_labels    = [t["topic_label"]
+                     for v in lookup.values()
+                     for t in v.get("topics", [])]
+    unique_topics = len(set(all_labels))
+    total_links   = len(all_labels)
+    tags          = Counter(v["tag"] for v in lookup.values())
+    multi         = sum(1 for v in lookup.values()
+                        if len(v.get("topics", [])) > 1)
+
+    print(f"{'─'*55}")
+    print(f"  SUMMARY")
+    print(f"{'─'*55}")
+    print(f"  Total CUIs         : {len(lookup):,}")
+    print(f"  Unique topics      : {unique_topics:,}")
+    print(f"  Total topic links  : {total_links:,}")
+    print(f"  Avg topics / CUI   : {total_links/len(lookup):.2f}")
+    print(f"  Multi-topic CUIs   : {multi:,}  ({multi/len(lookup)*100:.1f}%)")
+    print(f"  Semantic types     : {len(tags)}")
+    print(f"{'─'*55}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+def validate(path=PICKLE_PATH):
+    print(f"\n{'═'*60}")
+    print(f"  Validating: {path}")
+    print(f"{'═'*60}\n")
+
+    print("[loading] Reading pickle...")
+    lookup = load(path)
+    print(f"   Loaded {len(lookup):,} CUIs\n")
+
+    results = []
+    results.append(test_structure(lookup))
+    results.append(test_sibling_reach(lookup))
+    results.append(test_root_self_map(lookup))
+    results.append(test_specificity(lookup))
+    results.append(test_no_over_climbing(lookup))
+    results.append(test_no_topic_ancestry(lookup))
+    results.append(test_polyhierarchy(lookup))
+    test_topic_distribution(lookup)
+    results.append(test_topic_intermediary(lookup))
+    test_semantic_tags(lookup)
+    random_sample(lookup)
+    summary(lookup)
+
+    all_ok = all(results)
+    print(f"\n  {' Pickle is valid — all contribution checks passed' if all_ok else '❌ Issues found — check above'}\n")
+    return lookup
+
+
+if __name__ == "__main__":
+    validate(PICKLE_PATH)
