@@ -1,40 +1,36 @@
 """
-Build per-CUI expansion lookup using ALL MRREL relations,
-restricted to within the same semantic type as the source.
+Stage 2 of 2: form topics on top of the expansion pickle.
 
-Stage 1 of 2: produces cui_expansion_lookup.pkl.
-Stage 2 (run_topics.py) consumes that pickle and adds topic IDs.
-Splitting the steps means we can re-run topic clustering with different
-parameters without rebuilding the expensive expansion data.
+Reads:  cui_expansion_lookup.pkl   (built by run_builder.py)
+Writes: cui_topic_lookup.pkl       (same data + topic_id_overlap + topic_id_louvain)
 
-For each CUI:
-  - centrality = -log(reach / total), where reach is the number of unique
-    same-semantic-type CUIs reachable via any MRREL relation.
-  - expansion = list of same-semantic-type CUIs reachable from the source,
-    sorted by hop distance, stopping past any neighbor whose centrality is
-    more than CENTRALITY_DROP lower than the source.
+The original expansion pickle is not modified, so this stage can be re-run
+with different clustering parameters without rebuilding from BigQuery.
 
-Output pickle structure:
-  {
-    cui: {
-      "own_label":     str,
-      "semantic_type": str,
-      "centrality":    float,
-      "expansion": [
-        {"cui": str, "label": str, "centrality": float, "rel": str},
-        ...
-      ]
-    }
-  }
+Per semantic type, runs both clustering approaches:
+  Interpretation 1 (overlap threshold):
+    - Edge between two CUIs if Jaccard(expansion_a, expansion_b) >= JACCARD_THRESHOLD
+    - Topic = connected component
+    - Explainable, threshold-sensitive
+
+  Interpretation 2 (Louvain community detection):
+    - Weighted edge with Jaccard as weight (no thresholding)
+    - Topic = Louvain community (modularity-maximizing)
+    - Automated, robust, deterministic with seed
+
+Both topic IDs are scoped per semantic type. Format:
+    "<semantic_type>::<int>"           (multi-CUI topic)
+    "<semantic_type>::singleton::<cui>" (CUI alone in its topic)
 """
 
-import math
 import os
 import pickle
 import sys
 import time
-from collections import defaultdict, deque
-from google.cloud import bigquery
+from collections import defaultdict
+
+import networkx as nx
+from networkx.algorithms.community import louvain_communities
 
 try:
     sys.stdout.reconfigure(line_buffering=True)
@@ -42,275 +38,161 @@ except AttributeError:
     pass
 
 
-PROJECT = "your-gcp-project-id"
-DATASET = "your-bigquery-dataset"
-OUTPUT  = "cui_expansion_lookup.pkl"
+INPUT  = "cui_expansion_lookup.pkl"
+OUTPUT = "cui_topic_lookup.pkl"
 
-# Stop expanding past neighbors whose centrality is more than this much
-# lower than the source (means destination's reach is much larger).
-CENTRALITY_DROP = 1.0
+JACCARD_THRESHOLD  = 0.3   # Interpretation 1 minimum overlap to connect
+LOUVAIN_RESOLUTION = 1.0   # Interpretation 2 granularity (1.0 = default)
+LOUVAIN_SEED       = 42
 
 
 # ─────────────────────────────────────────────────────────────
-# BIGQUERY
+# CLUSTERING
 # ─────────────────────────────────────────────────────────────
 
-def query_concepts(client):
-    sql = f"""
-        SELECT DISTINCT
-            c.CUI,
-            c.STR AS label,
-            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
-        FROM `{PROJECT}.{DATASET}.MRCONSO` c
-        LEFT JOIN `{PROJECT}.{DATASET}.MRSTY` s ON c.CUI = s.CUI
-        WHERE c.SAB='SNOMEDCT_US'
-          AND c.LAT='ENG'
-          AND c.ISPREF='Y'
-          AND c.SUPPRESS='N'
-        QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY c.CUI ORDER BY s.STY NULLS LAST
-        ) = 1
+def assign_topics(lookup, jaccard_threshold, louvain_resolution, louvain_seed):
+    """Run BOTH clustering approaches per semantic type and write topic
+    IDs back into the lookup. Returns the same lookup dict, mutated.
     """
-    print("  Querying concepts...")
-    t = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  -> {len(df):,} concepts ({time.time()-t:.1f}s)")
-    return df
-
-
-def query_relations(client):
-    sql = f"""
-        SELECT
-            CUI1 AS cui_a,
-            CUI2 AS cui_b,
-            REL  AS rel
-        FROM `{PROJECT}.{DATASET}.MRREL`
-        WHERE SAB='SNOMEDCT_US'
-          AND SUPPRESS='N'
-    """
-    print("  Querying ALL relations (no REL filter)...")
-    t = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  -> {len(df):,} relation rows ({time.time()-t:.1f}s)")
-    return df
-
-
-# ─────────────────────────────────────────────────────────────
-# GRAPH
-# ─────────────────────────────────────────────────────────────
-
-def build_graph(concepts_df, relations_df):
-    """Multi-relation graph: cui -> {neighbor_cui: rel_type}.
-
-    All relations included. Auto-symmetric (each row produces edges in
-    both directions) so expansion catches parents and children, broader
-    and narrower, etc.
-    """
-    print("  Building multi-relation graph...")
+    print(f"  Forming topics (jaccard>={jaccard_threshold}, "
+          f"louvain res={louvain_resolution}, seed={louvain_seed})...")
     t = time.time()
 
-    concepts_df = concepts_df.copy()
-    concepts_df["semantic_type"] = (
-        concepts_df["semantic_type"].fillna("unknown").str.lower()
-    )
-    concepts_df["full_label"] = (
-        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
-    )
+    # Bucket CUIs by semantic type
+    by_type = defaultdict(list)
+    for cui, entry in lookup.items():
+        by_type[entry["semantic_type"]].append(cui)
 
-    nodes = {}
-    for r in concepts_df[["CUI", "full_label", "semantic_type"]].to_dict("records"):
-        nodes[r["CUI"]] = {
-            "label":         r["full_label"],
-            "semantic_type": r["semantic_type"],
-        }
+    # Pre-extract expansion as a set of CUI strings (drops label/centrality
+    # which aren't needed for overlap)
+    expansion_set = {
+        cui: {e["cui"] for e in lookup[cui]["expansion"]}
+        for cui in lookup
+    }
 
-    adj = defaultdict(dict)
-    skipped = 0
-    for r in relations_df.to_dict("records"):
-        a, b, rel = r["cui_a"], r["cui_b"], r["rel"]
-        if a not in nodes or b not in nodes:
-            skipped += 1
-            continue
-        if a == b:
-            continue
-        if b not in adj[a]:
-            adj[a][b] = rel
-        if a not in adj[b]:
-            adj[b][a] = rel
+    overlap_assignments = {}
+    louvain_assignments = {}
 
-    print(f"  -> {len(nodes):,} nodes, "
-          f"{sum(len(v) for v in adj.values()):,} directed edges  "
-          f"(skipped {skipped:,} edges to non-SNOMED CUIs)  "
-          f"({time.time()-t:.1f}s)")
-    return nodes, adj
+    n_types = len(by_type)
+    for type_idx, (sem_type, cuis_in_type) in enumerate(by_type.items(), 1):
+        n_cuis = len(cuis_in_type)
+        if type_idx % 20 == 0 or type_idx == 1 or type_idx == n_types:
+            print(f"    [{type_idx}/{n_types}] semantic_type={sem_type!r}  "
+                  f"CUIs={n_cuis:,}", flush=True)
 
+        # Inverted index: expansion_member -> CUIs that have it
+        # Lets us iterate only pairs that share a member, instead of all-pairs.
+        member_index = defaultdict(list)
+        for cui in cuis_in_type:
+            for m in expansion_set[cui]:
+                member_index[m].append(cui)
 
-# ─────────────────────────────────────────────────────────────
-# CENTRALITY (same-semantic-type reach)
-# ─────────────────────────────────────────────────────────────
+        # For each pair sharing a member, compute Jaccard once.
+        seen_pairs = set()
+        edges_threshold = []
+        edges_louvain = []
+        for member, sharers in member_index.items():
+            if len(sharers) < 2:
+                continue
+            for i in range(len(sharers)):
+                for j in range(i + 1, len(sharers)):
+                    a, b = sharers[i], sharers[j]
+                    pair = (a, b) if a < b else (b, a)
+                    if pair in seen_pairs:
+                        continue
+                    seen_pairs.add(pair)
+                    sa = expansion_set[a]
+                    sb = expansion_set[b]
+                    union = len(sa | sb)
+                    if union == 0:
+                        continue
+                    inter = len(sa & sb)
+                    jac = inter / union
+                    if jac > 0:
+                        edges_louvain.append((a, b, jac))
+                    if jac >= jaccard_threshold:
+                        edges_threshold.append((a, b))
 
-def compute_centrality(nodes, adj):
-    """Reach is computed within the source's own semantic type only.
+        # ── Interpretation 1: connected components on threshold graph ──
+        g_thresh = nx.Graph()
+        g_thresh.add_nodes_from(cuis_in_type)
+        g_thresh.add_edges_from(edges_threshold)
 
-    BFS from each CUI, only following edges to neighbors of the same
-    semantic type. centrality = -log(reach / total_same_type).
+        for comp_idx, component in enumerate(nx.connected_components(g_thresh)):
+            comp_list = list(component)
+            if len(comp_list) == 1:
+                cui = comp_list[0]
+                overlap_assignments[cui] = f"{sem_type}::singleton::{cui}"
+            else:
+                tid = f"{sem_type}::{comp_idx}"
+                for cui in comp_list:
+                    overlap_assignments[cui] = tid
 
-    This means a CUI's centrality reflects how peripheral it is within
-    its own type, which is what we want since expansion is type-bounded.
-    """
-    print("  Computing same-type reach + centrality...")
-    t = time.time()
+        # ── Interpretation 2: Louvain on weighted-overlap graph ──
+        g_louvain = nx.Graph()
+        g_louvain.add_nodes_from(cuis_in_type)
+        for a, b, w in edges_louvain:
+            g_louvain.add_edge(a, b, weight=w)
 
-    # Count CUIs per semantic type — used as the denominator for centrality
-    type_counts = defaultdict(int)
-    for n in nodes:
-        type_counts[nodes[n]["semantic_type"]] += 1
+        try:
+            communities = louvain_communities(
+                g_louvain, weight="weight",
+                resolution=louvain_resolution, seed=louvain_seed,
+            )
+        except Exception as e:
+            print(f"      Louvain failed for {sem_type}: {e}")
+            communities = [{cui} for cui in cuis_in_type]
 
-    total = len(nodes)
-    centrality = {}
-    reach = {}
+        for comm_idx, community in enumerate(communities):
+            comm_list = list(community)
+            if len(comm_list) == 1:
+                cui = comm_list[0]
+                louvain_assignments[cui] = f"{sem_type}::singleton::{cui}"
+            else:
+                tid = f"{sem_type}::{comm_idx}"
+                for cui in comm_list:
+                    louvain_assignments[cui] = tid
 
-    for i, cui in enumerate(nodes):
-        if i % 25000 == 0:
-            eta = ((time.time()-t) / max(i, 1)) * (total - i)
-            print(f"    {i:,}/{total:,}  ETA {eta:.0f}s", flush=True)
+    # Write topic IDs back into the lookup
+    for cui, entry in lookup.items():
+        entry["topic_id_overlap"] = overlap_assignments.get(
+            cui, f"{entry['semantic_type']}::unassigned"
+        )
+        entry["topic_id_louvain"] = louvain_assignments.get(
+            cui, f"{entry['semantic_type']}::unassigned"
+        )
 
-        src_type = nodes[cui]["semantic_type"]
-
-        # BFS within the same semantic type
-        seen = {cui}
-        q = deque([cui])
-        while q:
-            n = q.popleft()
-            for nb in adj.get(n, {}):
-                if nb in seen:
-                    continue
-                if nodes.get(nb, {}).get("semantic_type") != src_type:
-                    continue
-                seen.add(nb)
-                q.append(nb)
-
-        r = len(seen)
-        reach[cui] = r
-        # Denominator is count of CUIs in this semantic type, not total
-        denom = type_counts.get(src_type, total)
-        centrality[cui] = -math.log(r / denom)
+    overlap_topics = set(overlap_assignments.values())
+    louvain_topics = set(louvain_assignments.values())
+    overlap_singletons = sum(1 for x in overlap_topics if "::singleton::" in x)
+    louvain_singletons = sum(1 for x in louvain_topics if "::singleton::" in x)
 
     print(f"  -> done ({time.time()-t:.1f}s)")
-    return centrality, reach
-
-
-# ─────────────────────────────────────────────────────────────
-# EXPANSION
-# ─────────────────────────────────────────────────────────────
-
-def expand_cui(cui, nodes, adj, centrality, drop):
-    """BFS within same semantic type, sorted by hop distance.
-
-    Each neighbor is checked: must be same semantic type AND have
-    centrality >= source_centrality - drop. Otherwise rejected (and
-    not walked through).
-    """
-    src_type = nodes[cui]["semantic_type"]
-    src_centrality = centrality.get(cui)
-    if src_centrality is None:
-        return []
-
-    threshold = src_centrality - drop
-
-    # BFS tracking hop distance. Each node visited at most once.
-    seen = {cui}
-    accepted = []  # list of (hop, neighbor, rel)
-
-    # First hop neighbors
-    current_layer = []
-    for nb, rel in adj.get(cui, {}).items():
-        if nb == cui or nb in seen:
-            continue
-        if nodes.get(nb, {}).get("semantic_type") != src_type:
-            continue
-        nb_centrality = centrality.get(nb)
-        if nb_centrality is None or nb_centrality < threshold:
-            continue
-        seen.add(nb)
-        accepted.append((1, nb, rel))
-        current_layer.append(nb)
-
-    hop = 1
-    while current_layer:
-        next_layer = []
-        for n in current_layer:
-            for nb, rel in adj.get(n, {}).items():
-                if nb in seen:
-                    continue
-                if nodes.get(nb, {}).get("semantic_type") != src_type:
-                    continue
-                nb_centrality = centrality.get(nb)
-                if nb_centrality is None or nb_centrality < threshold:
-                    continue
-                seen.add(nb)
-                accepted.append((hop + 1, nb, rel))
-                next_layer.append(nb)
-        current_layer = next_layer
-        hop += 1
-
-    # already in hop order from BFS, but be explicit for clarity
-    accepted.sort(key=lambda x: x[0])
-    return accepted
-
-
-def build_expansion_lookup(nodes, adj, centrality, drop):
-    print(f"  Building expansion lookup (drop={drop}, same-type only)...")
-    t = time.time()
-    total = len(nodes)
-    lookup = {}
-    sizes = []
-
-    for i, cui in enumerate(nodes):
-        if i % 25000 == 0:
-            eta = ((time.time()-t) / max(i, 1)) * (total - i)
-            avg = sum(sizes[-1000:]) / max(len(sizes[-1000:]), 1) if sizes else 0
-            print(f"    {i:,}/{total:,}  ETA {eta:.0f}s  "
-                  f"avg expansion last 1k: {avg:.0f}", flush=True)
-
-        accepted = expand_cui(cui, nodes, adj, centrality, drop)
-        expansion = [
-            {
-                "cui":        nb_cui,
-                "label":      nodes.get(nb_cui, {}).get("label", nb_cui),
-                "centrality": round(centrality[nb_cui], 4),
-                "rel":        rel,
-            }
-            for _hop, nb_cui, rel in accepted
-        ]
-        sizes.append(len(expansion))
-
-        lookup[cui] = {
-            "own_label":     nodes[cui]["label"],
-            "semantic_type": nodes[cui]["semantic_type"],
-            "centrality":    round(centrality[cui], 4),
-            "expansion":     expansion,
-        }
-
-    print(f"  -> done ({time.time()-t:.1f}s)")
-    if sizes:
-        sizes_sorted = sorted(sizes)
-        print(f"    expansion size stats:")
-        print(f"      min:    {sizes_sorted[0]:,}")
-        print(f"      median: {sizes_sorted[len(sizes_sorted)//2]:,}")
-        print(f"      mean:   {sum(sizes)/len(sizes):.0f}")
-        print(f"      p95:    {sizes_sorted[int(len(sizes_sorted)*0.95)]:,}")
-        print(f"      max:    {sizes_sorted[-1]:,}")
-        n_empty = sum(1 for s in sizes if s == 0)
-        print(f"    empty expansions: {n_empty:,} ({n_empty/total*100:.1f}%)")
+    print(f"    Interpretation 1 (overlap): "
+          f"{len(overlap_topics):,} distinct topics "
+          f"({overlap_singletons:,} singletons, "
+          f"{len(overlap_topics) - overlap_singletons:,} multi-CUI)")
+    print(f"    Interpretation 2 (Louvain): "
+          f"{len(louvain_topics):,} distinct topics "
+          f"({louvain_singletons:,} singletons, "
+          f"{len(louvain_topics) - louvain_singletons:,} multi-CUI)")
 
     return lookup
 
 
+# ─────────────────────────────────────────────────────────────
+# IO
+# ─────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# SAVE
-# ─────────────────────────────────────────────────────────────
+def load_pickle(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found. Run run_builder.py first to produce the "
+            f"expansion pickle."
+        )
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
 
 def save_pickle(obj, path):
     with open(path, "wb") as f:
@@ -327,32 +209,28 @@ if __name__ == "__main__":
     start = time.time()
 
     print(f"\n{'='*60}")
-    print(f"  Multi-relation expansion builder (same-semantic-type)")
-    print(f"  Project : {PROJECT}")
-    print(f"  Dataset : {DATASET}")
-    print(f"  Drop    : {CENTRALITY_DROP}")
+    print(f"  Topic clustering (Stage 2)")
+    print(f"  Input    : {INPUT}")
+    print(f"  Output   : {OUTPUT}")
+    print(f"  Jaccard  : {JACCARD_THRESHOLD}")
+    print(f"  Louvain  : resolution={LOUVAIN_RESOLUTION}, seed={LOUVAIN_SEED}")
     print(f"{'='*60}\n")
 
-    client = bigquery.Client(project=PROJECT)
-
-    print("[1/4] Pulling concepts...")
-    concepts_df = query_concepts(client)
+    print("[1/3] Loading expansion pickle...")
+    t = time.time()
+    lookup = load_pickle(INPUT)
+    print(f"  -> {len(lookup):,} entries  ({time.time()-t:.1f}s)")
     print()
 
-    print("[2/4] Pulling relations...")
-    relations_df = query_relations(client)
+    print("[2/3] Forming topics (both interpretations)...")
+    lookup = assign_topics(
+        lookup,
+        jaccard_threshold=JACCARD_THRESHOLD,
+        louvain_resolution=LOUVAIN_RESOLUTION,
+        louvain_seed=LOUVAIN_SEED,
+    )
     print()
 
-    print("[3/4] Building graph + centrality...")
-    nodes, adj = build_graph(concepts_df, relations_df)
-    centrality, reach = compute_centrality(nodes, adj)
-    print()
-
-    print("[4/4] Building expansion lookup...")
-    lookup = build_expansion_lookup(nodes, adj, centrality, CENTRALITY_DROP)
-    print()
-
-    print("Saving pickle...")
+    print("[3/3] Saving pickle...")
     save_pickle(lookup, OUTPUT)
     print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
-    print(f"\nNext: run `python run_topics.py` to add topic IDs.")
