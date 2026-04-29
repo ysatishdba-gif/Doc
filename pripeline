@@ -1,6 +1,31 @@
+"""
+Build per-CUI expansion lookup using ALL MRREL relations,
+restricted to within the same semantic type as the source.
+
+For each CUI:
+  - centrality = -log(reach / total), where reach is the number of unique
+    same-semantic-type CUIs reachable via any MRREL relation.
+  - expansion = list of same-semantic-type CUIs reachable from the source,
+    sorted by hop distance, stopping past any neighbor whose centrality is
+    more than CENTRALITY_DROP lower than the source.
+
+Output pickle structure:
+  {
+    cui: {
+      "own_label":     str,
+      "semantic_type": str,
+      "centrality":    float,
+      "expansion": [
+        {"cui": str, "label": str, "centrality": float, "rel": str},
+        ...
+      ]
+    }
+  }
+"""
+
+import math
 import os
 import pickle
-import re
 import sys
 import time
 from collections import defaultdict, deque
@@ -11,19 +36,18 @@ try:
 except AttributeError:
     pass
 
-# ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
 
-PROJECT = project
-DATASET = dataset
-OUTPUT  = "cui_topic_lookup.pkl"
+PROJECT = "your-gcp-project-id"
+DATASET = "your-bigquery-dataset"
+OUTPUT  = "cui_expansion_lookup.pkl"
 
-BRANCH_CUTOFF = 0.5
-_TAG_RE = re.compile(r"\(([^)]+)\)$")
+# Stop expanding past neighbors whose centrality is more than this much
+# lower than the source (means destination's reach is much larger).
+CENTRALITY_DROP = 1.0
+
 
 # ─────────────────────────────────────────────────────────────
-# STEP 1 — BIGQUERY
+# BIGQUERY
 # ─────────────────────────────────────────────────────────────
 
 def query_concepts(client):
@@ -48,290 +72,235 @@ def query_concepts(client):
     print(f"  -> {len(df):,} concepts ({time.time()-t:.1f}s)")
     return df
 
-def query_parents(client):
+
+def query_relations(client):
     sql = f"""
-        SELECT CUI1 AS cui, CUI2 AS parent_cui
+        SELECT
+            CUI1 AS cui_a,
+            CUI2 AS cui_b,
+            REL  AS rel
         FROM `{PROJECT}.{DATASET}.MRREL`
         WHERE SAB='SNOMEDCT_US'
-          AND REL='PAR'
           AND SUPPRESS='N'
     """
-    print("  Querying parent relationships...")
+    print("  Querying ALL relations (no REL filter)...")
     t = time.time()
     df = client.query(sql).to_dataframe()
-    print(f"  -> {len(df):,} parent rows ({time.time()-t:.1f}s)")
+    print(f"  -> {len(df):,} relation rows ({time.time()-t:.1f}s)")
     return df
 
+
 # ─────────────────────────────────────────────────────────────
-# STEP 2 — BUILD DAG
+# GRAPH
 # ─────────────────────────────────────────────────────────────
 
-def build_tree(concepts_df, parents_df):
-    print("  Building DAG...")
+def build_graph(concepts_df, relations_df):
+    """Multi-relation graph: cui -> {neighbor_cui: rel_type}.
+
+    All relations included. Auto-symmetric (each row produces edges in
+    both directions) so expansion catches parents and children, broader
+    and narrower, etc.
+    """
+    print("  Building multi-relation graph...")
     t = time.time()
-
-    parent_map = (
-        parents_df.drop_duplicates(["cui", "parent_cui"])
-        .groupby("cui")["parent_cui"]
-        .apply(list)
-        .to_dict()
-    )
 
     concepts_df = concepts_df.copy()
-    concepts_df["semantic_type"] = concepts_df["semantic_type"].fillna("unknown").str.lower()
-    concepts_df["full_label"] = concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
+    concepts_df["semantic_type"] = (
+        concepts_df["semantic_type"].fillna("unknown").str.lower()
+    )
+    concepts_df["full_label"] = (
+        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
+    )
 
-    def extract_tag(label):
-        m = _TAG_RE.search(label.strip())
-        return m.group(1).lower() if m else "unknown"
-
-    records = concepts_df[["CUI", "full_label"]].to_dict("records")
-
-    tree = {}
-    for r in records:
-        cui = r["CUI"]
-        label = r["full_label"]
-        tree[cui] = {
-            "label": label,
-            "own_label": label,
-            "parent_cuis": parent_map.get(cui, []),
-            "tag": extract_tag(label),
+    nodes = {}
+    for r in concepts_df[["CUI", "full_label", "semantic_type"]].to_dict("records"):
+        nodes[r["CUI"]] = {
+            "label":         r["full_label"],
+            "semantic_type": r["semantic_type"],
         }
 
-    print(f"  -> {len(tree):,} nodes ({time.time()-t:.1f}s)")
-    return tree
+    adj = defaultdict(dict)
+    skipped = 0
+    for r in relations_df.to_dict("records"):
+        a, b, rel = r["cui_a"], r["cui_b"], r["rel"]
+        if a not in nodes or b not in nodes:
+            skipped += 1
+            continue
+        if a == b:
+            continue
+        if b not in adj[a]:
+            adj[a][b] = rel
+        if a not in adj[b]:
+            adj[b][a] = rel
+
+    print(f"  -> {len(nodes):,} nodes, "
+          f"{sum(len(v) for v in adj.values()):,} directed edges  "
+          f"(skipped {skipped:,} edges to non-SNOMED CUIs)  "
+          f"({time.time()-t:.1f}s)")
+    return nodes, adj
+
 
 # ─────────────────────────────────────────────────────────────
-# STEP 3 — DESCENDANT COUNTS
+# CENTRALITY (same-semantic-type reach)
 # ─────────────────────────────────────────────────────────────
 
-def build_desc_counts(tree):
-    print("  Building descendant counts...")
-    t = time.time()
+def compute_centrality(nodes, adj):
+    """Reach is computed within the source's own semantic type only.
 
-    children = defaultdict(set)
-    for cui, node in tree.items():
-        for p in node["parent_cuis"]:
-            if p in tree:
-                children[p].add(cui)
+    BFS from each CUI, only following edges to neighbors of the same
+    semantic type. centrality = -log(reach / total_same_type).
 
-    in_degree = {n: len(children.get(n, [])) for n in tree}
-    queue = deque(n for n in tree if in_degree[n] == 0)
-    topo = []
-
-    while queue:
-        n = queue.popleft()
-        topo.append(n)
-        for p in tree[n]["parent_cuis"]:
-            if p in tree:
-                in_degree[p] -= 1
-                if in_degree[p] == 0:
-                    queue.append(p)
-
-    desc = {}
-    all_desc = {}
-
-    for node in topo:
-        s = set(children.get(node, []))
-        for c in children.get(node, []):
-            s |= all_desc.get(c, set())
-        all_desc[node] = s
-        desc[node] = len(s)
-
-        for c in children.get(node, []):
-            if all(p in desc for p in tree[c]["parent_cuis"] if p in tree):
-                all_desc.pop(c, None)
-
-    for n in tree:
-        if n not in desc:
-            desc[n] = 0
-
-    print(f"  -> done ({time.time()-t:.1f}s)")
-    return desc
-
-# ─────────────────────────────────────────────────────────────
-# STEP 4 — SIBLING REACH
-# ─────────────────────────────────────────────────────────────
-
-def sibling_reach(cui, tree, desc_counts):
-    reach_node = desc_counts.get(cui)
-    if reach_node is None:
-        return None
-
-    parents = tree[cui]["parent_cuis"]
-    if not parents:
-        return 1.0
-
-    parent_reaches = [desc_counts.get(p) for p in parents if desc_counts.get(p) is not None]
-    if not parent_reaches:
-        return None
-
-    # MAX: compare node to its broadest parent. Lower scores than MIN
-    # (smaller K per CUI), which reduces pruning cost meaningfully.
-    reach_par = max(parent_reaches)
-
-    if reach_par == 0:
-        return None
-
-    return (reach_par - reach_node + 1) / (reach_par + 1)
-
-def build_sr_map(tree, desc_counts):
-    print("  Precomputing sibling_reach...")
-    t = time.time()
-    sr = {cui: sibling_reach(cui, tree, desc_counts) for cui in tree}
-    print(f"  -> done ({time.time()-t:.1f}s)")
-    return sr
-
-# ─────────────────────────────────────────────────────────────
-# STEP 5 — UTIL
-# ─────────────────────────────────────────────────────────────
-
-def get_tag(cui, tree):
-    return tree[cui]["tag"]
-
-
-def compute_ancestors_local(nodes, tree):
-    """Compute ancestor sets for a small group of nodes.
-
-    One BFS per node, then O(1) ancestor checks for all pair comparisons.
-    Replaces the O(K^2) pairwise is_ancestor BFS (which was the bottleneck).
-
-    Why local, not global:
-      Global ancestors_map is too big at SNOMED scale (370K entries with
-      up to thousands of ancestors each). Memory cost + cache misses
-      outweigh lookup savings. Local compute keeps the working set tiny
-      per CUI so cache stays hot.
+    This means a CUI's centrality reflects how peripheral it is within
+    its own type, which is what we want since expansion is type-bounded.
     """
-    ancestors = {}
+    print("  Computing same-type reach + centrality...")
+    t = time.time()
+
+    # Count CUIs per semantic type — used as the denominator for centrality
+    type_counts = defaultdict(int)
     for n in nodes:
-        queue = deque(tree[n]["parent_cuis"])
-        seen = set()
-        while queue:
-            p = queue.popleft()
-            if p in seen:
-                continue
-            seen.add(p)
-            queue.extend(tree[p]["parent_cuis"])
-        ancestors[n] = seen
-    return ancestors
+        type_counts[nodes[n]["semantic_type"]] += 1
 
-# ─────────────────────────────────────────────────────────────
-# STEP 6 — TOPIC EXTRACTION
-# ─────────────────────────────────────────────────────────────
+    total = len(nodes)
+    centrality = {}
+    reach = {}
 
-def find_all_topics(cui, tree, desc_counts, tag, sr_map):
-    """
-    Single-pass per-parent-path topic selection.
-
-    Previously had a separate pass-1 BFS to collect all same-tag ancestors
-    into candidate_scores, then pass-2 per-parent-path walks referencing
-    that dict. Pass 1 was wasteful -- it walked every ancestor without
-    early termination, even ones pass 2 would never reach.
-
-    Now: one BFS per parent path. Each walk directly checks if an
-    ancestor qualifies (same tag + sr >= cutoff + non-root) via O(1)
-    sr_map lookup. Stops at first qualifier per path. Per-path semantics
-    (independent visited sets) preserved -- needed for polyhierarchy.
-    """
-    sr_get = sr_map.get
-
-    # topic_scores populated during the walk (used in output)
-    topic_scores = {}
-    topic_cuis = set()
-
-    for start in tree[cui]["parent_cuis"]:
-        q = deque([start])
-        seen = set()
-
-        while q:
-            n = q.popleft()
-            if n in seen:
-                continue
-            seen.add(n)
-
-            # Inline qualification check
-            if get_tag(n, tree) == tag and tree[n]["parent_cuis"]:
-                s = sr_get(n)
-                if s is not None and s >= BRANCH_CUTOFF:
-                    topic_cuis.add(n)
-                    topic_scores[n] = s
-                    continue   # stop climbing this path
-
-            q.extend(tree[n]["parent_cuis"])
-
-    if not topic_cuis:
-        # Fallback: nearest same-tag ancestor with any positive sr score.
-        q = deque(tree[cui]["parent_cuis"])
-        seen = set()
-        while q and not topic_cuis:
-            level = list(q); q.clear()
-            for n in level:
-                if n in seen:
-                    continue
-                seen.add(n)
-                if get_tag(n, tree) == tag:
-                    s = sr_get(n)
-                    if s is not None and s > 0:
-                        topic_cuis.add(n)
-                        topic_scores[n] = s
-            if not topic_cuis:
-                for n in level:
-                    q.extend(tree[n]["parent_cuis"])
-
-    if not topic_cuis:
-        return []
-
-    # Ancestor pruning via LOCAL ancestor cache.
-    # K BFS calls (one per topic), then K^2 O(1) set checks.
-    # Was K^2 BFS calls -- this is the main speedup from earlier fix.
-    if len(topic_cuis) > 1:
-        local_ancestors = compute_ancestors_local(topic_cuis, tree)
-        drop = set()
-        for a in topic_cuis:
-            for b in topic_cuis:
-                if a != b and a in local_ancestors[b]:
-                    drop.add(a)
-        topic_cuis -= drop
-
-    return [
-        {
-            "topic_cui": tc,
-            "topic_label": tree[tc]["label"],
-            "score": round(topic_scores[tc], 4),
-        }
-        for tc in topic_cuis
-    ]
-
-# ─────────────────────────────────────────────────────────────
-# BUILD LOOKUP
-# ─────────────────────────────────────────────────────────────
-
-def build_lookup(tree, desc_counts, sr_map):
-    print("  Building lookup...")
-    t = time.time()
-
-    lookup = {}
-    total = len(tree)
-
-    for i, cui in enumerate(tree):
-        if i % 50000 == 0:
+    for i, cui in enumerate(nodes):
+        if i % 25000 == 0:
             eta = ((time.time()-t) / max(i, 1)) * (total - i)
             print(f"    {i:,}/{total:,}  ETA {eta:.0f}s", flush=True)
 
-        if not tree[cui]["parent_cuis"]:
-            topics = []
-        else:
-            topics = find_all_topics(cui, tree, desc_counts, tree[cui]["tag"], sr_map)
+        src_type = nodes[cui]["semantic_type"]
+
+        # BFS within the same semantic type
+        seen = {cui}
+        q = deque([cui])
+        while q:
+            n = q.popleft()
+            for nb in adj.get(n, {}):
+                if nb in seen:
+                    continue
+                if nodes.get(nb, {}).get("semantic_type") != src_type:
+                    continue
+                seen.add(nb)
+                q.append(nb)
+
+        r = len(seen)
+        reach[cui] = r
+        # Denominator is count of CUIs in this semantic type, not total
+        denom = type_counts.get(src_type, total)
+        centrality[cui] = -math.log(r / denom)
+
+    print(f"  -> done ({time.time()-t:.1f}s)")
+    return centrality, reach
+
+
+# ─────────────────────────────────────────────────────────────
+# EXPANSION
+# ─────────────────────────────────────────────────────────────
+
+def expand_cui(cui, nodes, adj, centrality, drop):
+    """BFS within same semantic type, sorted by hop distance.
+
+    Each neighbor is checked: must be same semantic type AND have
+    centrality >= source_centrality - drop. Otherwise rejected (and
+    not walked through).
+    """
+    src_type = nodes[cui]["semantic_type"]
+    src_centrality = centrality.get(cui)
+    if src_centrality is None:
+        return []
+
+    threshold = src_centrality - drop
+
+    # BFS tracking hop distance. Each node visited at most once.
+    seen = {cui}
+    accepted = []  # list of (hop, neighbor, rel)
+
+    # First hop neighbors
+    current_layer = []
+    for nb, rel in adj.get(cui, {}).items():
+        if nb == cui or nb in seen:
+            continue
+        if nodes.get(nb, {}).get("semantic_type") != src_type:
+            continue
+        nb_centrality = centrality.get(nb)
+        if nb_centrality is None or nb_centrality < threshold:
+            continue
+        seen.add(nb)
+        accepted.append((1, nb, rel))
+        current_layer.append(nb)
+
+    hop = 1
+    while current_layer:
+        next_layer = []
+        for n in current_layer:
+            for nb, rel in adj.get(n, {}).items():
+                if nb in seen:
+                    continue
+                if nodes.get(nb, {}).get("semantic_type") != src_type:
+                    continue
+                nb_centrality = centrality.get(nb)
+                if nb_centrality is None or nb_centrality < threshold:
+                    continue
+                seen.add(nb)
+                accepted.append((hop + 1, nb, rel))
+                next_layer.append(nb)
+        current_layer = next_layer
+        hop += 1
+
+    # already in hop order from BFS, but be explicit for clarity
+    accepted.sort(key=lambda x: x[0])
+    return accepted
+
+
+def build_expansion_lookup(nodes, adj, centrality, drop):
+    print(f"  Building expansion lookup (drop={drop}, same-type only)...")
+    t = time.time()
+    total = len(nodes)
+    lookup = {}
+    sizes = []
+
+    for i, cui in enumerate(nodes):
+        if i % 25000 == 0:
+            eta = ((time.time()-t) / max(i, 1)) * (total - i)
+            avg = sum(sizes[-1000:]) / max(len(sizes[-1000:]), 1) if sizes else 0
+            print(f"    {i:,}/{total:,}  ETA {eta:.0f}s  "
+                  f"avg expansion last 1k: {avg:.0f}", flush=True)
+
+        accepted = expand_cui(cui, nodes, adj, centrality, drop)
+        expansion = [
+            {
+                "cui":        nb_cui,
+                "label":      nodes.get(nb_cui, {}).get("label", nb_cui),
+                "centrality": round(centrality[nb_cui], 4),
+                "rel":        rel,
+            }
+            for _hop, nb_cui, rel in accepted
+        ]
+        sizes.append(len(expansion))
 
         lookup[cui] = {
-            "own_label": tree[cui]["own_label"],
-            "parent_cuis": tree[cui]["parent_cuis"],
-            "tag": tree[cui]["tag"],
-            "topics": topics,
+            "own_label":     nodes[cui]["label"],
+            "semantic_type": nodes[cui]["semantic_type"],
+            "centrality":    round(centrality[cui], 4),
+            "expansion":     expansion,
         }
 
     print(f"  -> done ({time.time()-t:.1f}s)")
+    if sizes:
+        sizes_sorted = sorted(sizes)
+        print(f"    expansion size stats:")
+        print(f"      min:    {sizes_sorted[0]:,}")
+        print(f"      median: {sizes_sorted[len(sizes_sorted)//2]:,}")
+        print(f"      mean:   {sum(sizes)/len(sizes):.0f}")
+        print(f"      p95:    {sizes_sorted[int(len(sizes_sorted)*0.95)]:,}")
+        print(f"      max:    {sizes_sorted[-1]:,}")
+        n_empty = sum(1 for s in sizes if s == 0)
+        print(f"    empty expansions: {n_empty:,} ({n_empty/total*100:.1f}%)")
+
     return lookup
+
 
 # ─────────────────────────────────────────────────────────────
 # SAVE
@@ -340,7 +309,9 @@ def build_lookup(tree, desc_counts, sr_map):
 def save_pickle(obj, path):
     with open(path, "wb") as f:
         pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    print(f"Saved -> {path}")
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
+
 
 # ─────────────────────────────────────────────────────────────
 # MAIN
@@ -349,17 +320,32 @@ def save_pickle(obj, path):
 if __name__ == "__main__":
     start = time.time()
 
+    print(f"\n{'='*60}")
+    print(f"  Multi-relation expansion builder (same-semantic-type)")
+    print(f"  Project : {PROJECT}")
+    print(f"  Dataset : {DATASET}")
+    print(f"  Drop    : {CENTRALITY_DROP}")
+    print(f"{'='*60}\n")
+
     client = bigquery.Client(project=PROJECT)
 
-    concepts = query_concepts(client)
-    parents  = query_parents(client)
+    print("[1/4] Pulling concepts...")
+    concepts_df = query_concepts(client)
+    print()
 
-    tree        = build_tree(concepts, parents)
-    desc_counts = build_desc_counts(tree)
-    sr_map      = build_sr_map(tree, desc_counts)
+    print("[2/4] Pulling relations...")
+    relations_df = query_relations(client)
+    print()
 
-    lookup = build_lookup(tree, desc_counts, sr_map)
+    print("[3/4] Building graph + centrality...")
+    nodes, adj = build_graph(concepts_df, relations_df)
+    centrality, reach = compute_centrality(nodes, adj)
+    print()
 
+    print("[4/4] Building expansion lookup...")
+    lookup = build_expansion_lookup(nodes, adj, centrality, CENTRALITY_DROP)
+    print()
+
+    print("Saving pickle...")
     save_pickle(lookup, OUTPUT)
-
     print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
