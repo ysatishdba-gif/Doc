@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -111,6 +112,7 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
+6. **representative_terms[]** - What concrete clinical entities from the query map to this intent?
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -194,7 +196,7 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Query Characteristics:**
 - 2-5 words, meaningful clinical phrase
-- Must infer from nature and sub nature context 
+- Must infer from nature and sub nature context
 - A candidate is invalid if it is only a qualifier, modifier, temporal expression, severity descriptor, or status/action word without naming the  entity it applies to
 - If a modifier or status word is clinically important, bundle it with the entity it modifies so the candidate still names a concept
 - Use standard medical terminology
@@ -207,6 +209,44 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Coverage:**
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
+
+====================================================
+REPRESENTATIVE TERMS
+====================================================
+
+**Purpose:**
+Per intent, surface the concrete clinical ENTITIES the user actually named — the words a chart-search engine should latch onto. These are the "what" of the query, stripped of framing.
+
+**INCLUDE — concrete clinical entities:**
+- Symptoms named in the query: "diarrhea", "constipation", "chest pain", "shortness of breath"
+- Diagnoses / conditions named: "hypertension", "diabetes mellitus", "atrial fibrillation"
+- Medications named: "metformin", "lisinopril", "warfarin"
+- Procedures / tests named: "EKG", "colonoscopy", "MRI brain", "CBC"
+- Devices named: "pacemaker", "central line"
+- Specific anatomical sites when explicitly named: "left knee", "lower abdomen"
+- Specific lab/vital types when named: "blood pressure", "hemoglobin a1c"
+
+**EXCLUDE — framing, qualifiers, and meta-words:**
+- Question framing: "do you have", "any issue with", "is there", "tell me about"
+- Existence qualifiers: "presence", "absence", "history of", "any", "current", "ongoing"
+- Action verbs: "check", "review", "analyze", "evaluate", "assess"
+- Severity descriptors alone: "severe", "mild" (only attach to an entity if explicit, e.g. "severe headache")
+- Vague placeholders: "issue", "problem", "concern", "symptom" (without a named symptom)
+- Generic categories without a named instance: bare "medications", "labs", "vitals", "tests" — only include if the query names a specific one
+
+**Form rules:**
+- Lowercase, 1–4 words per term
+- One entity per term — do NOT concatenate ("diarrhea or constipation" → TWO terms)
+- Use the term as a clinician would write it in a chart (expand abbreviations: "HTN" → "hypertension")
+- If the query has no concrete entity for this intent, return an empty list — never invent one to fill space
+
+**Examples:**
+- Query: "do you have a diarrhea or constipation" → representative_terms: ["diarrhea", "constipation"]
+- Query: "patient with HTN and DM on metformin" → representative_terms: ["hypertension", "diabetes mellitus", "metformin"]
+- Query: "any issue with insurance bill?" → representative_terms: ["insurance bill"]
+- Query: "current medications" → representative_terms: [] (no specific medication named)
+- Query: "recent EKG findings" → representative_terms: ["EKG"]
+- Query: "presence of implanted device" → representative_terms: ["implanted device"]
 
 ====================================================
 REASONING FRAMEWORK
@@ -306,59 +346,53 @@ For each intent:
 - Each candidate must include a `temporal_signal` (LIST)
 
 TEMPORAL SIGNAL (facet definition):
-- temporal_signal: WHAT TIME WINDOWS apply for retrieval (last 12 months, current, most recent, 2025-04-22 to 2026-04-22, etc.)
+- temporal_signal: WHAT TIME WINDOWS apply for retrieval. Each entry is a string. The actual values are derived from the query's wording and the concept's clinical nature — there is NO fixed vocabulary to draw from.
 
 TEMPORAL SIGNAL TYPES:
 
-- RELATIVE: natural language spans (e.g., "recent", "past year")
-- ABSOLUTE: normalized date ranges derived from RELATIVE (ISO format)
-- STATE: lifecycle qualifiers (e.g., "current", "historical")
-- RANK: ordering cues (e.g., "latest", "most recent")
+Four categories. The values you emit come from the query's own language; do not pull from a predefined list.
 
-Emit ONLY the forms that are anchored in the query or the concept's nature. Do NOT fabricate a window just to "cover all types." Specifically:
-- Emit RELATIVE only when the query contains an explicit time span ("last year", "past 30 days", "recent").
-- Emit ABSOLUTE only when RELATIVE is present — ABSOLUTE is the ISO form of that RELATIVE.
-- Emit STATE only when the query contains a state word ("current", "active", "ongoing", "historical") or the concept is inherently a state (e.g., active medication list, current allergies).
-- Emit RANK only when the query contains ranking language ("latest", "most recent", "last 3").
+- RELATIVE: a duration or recency window expressed in the query's words
+- ABSOLUTE: the ISO date-range form of a RELATIVE signal — YYYY-MM-DD to YYYY-MM-DD, anchored to the query's reference date
+- STATE: a lifecycle qualifier — whether the concept is being asked about as present, ongoing, resolved, or past
+- RANK: an ordering cue — when the query asks for a positional pick rather than all instances
 
-If the query gives no temporal cue and the concept is not inherently a state, return an empty list. An empty temporal_signal is a valid and often correct answer.
+Use the query's wording verbatim when it is unambiguous. Normalize only when the query's wording is vague, and derive the normalization from the concept's documentation cadence — not from a fixed lookup.
+
+EMISSION RULES:
+
+Emit ONLY the forms that are anchored in the query or in the concept's nature. Do NOT fabricate a window to "cover all types."
+
+- Emit RELATIVE only when the query expresses a duration or recency window in its wording.
+- Emit ABSOLUTE only when RELATIVE is present — it is the ISO form of that span.
+- Emit STATE only when (a) the query frames the concept as a state through its wording or tense, or (b) the concept is inherently a state — meaning its clinical documentation has no useful interpretation without a state qualifier.
+- Emit RANK only when the query asks for a positional pick (one or more specific positions in an ordered set).
+
+If the query carries no temporal cue and the concept is not inherently a state, return an empty list. An empty temporal_signal is a valid and often correct answer.
 
 INFERENCE PRINCIPLES:
 
-1. Use explicit temporal cues directly from the query when present.
+1. The query's wording is the primary anchor. Verb tense, phrasing, framing, and explicit time words are all signals — read them together.
 
-2. When cues are absent, infer intent from:
-   - Question framing (e.g., presence/absence queries imply current + historical)
-   - Concept type (e.g., medications vs procedures vs diagnostics)
-   - Clinical workflow context
+2. When the query expresses a span vaguely, normalize it using the concept's documentation cadence — how often that modality is typically generated, reviewed, or considered current in clinical workflow. Cadence is a property of the concept type, not a fixed table.
 
-3. Modality-aware reasoning applies only when a RELATIVE cue is already present and ambiguous (e.g., "recent"). In that case, use modality cadence to pick a sensible span (recent EKG ≈ last 90 days; recent vitals ≈ past 24 hours). Do NOT invent a RELATIVE cue where the query has none.
+3. Do NOT invent a temporal cue the query does not carry. A query with no temporal language and a non-stateful concept yields an empty list — that is the correct answer, not a failure.
 
-4. Concepts representing:
-   - Ongoing state → favor "current", "active"
-   - Historical events → include "historical" or full history
-   - Diagnostics → favor recency proportional to clinical relevance ONLY if the query has a recency cue
-   - Ranked queries → include ordering signals (e.g., "latest")
+4. For concepts whose clinical documentation requires a state qualifier to be meaningful, emit STATE even if the query does not use a state word — but the qualifier you emit must reflect what the query's framing supports.
 
-5. Use language cues for time:
+5. Match concept type to signal type:
+   - Concepts that represent an ongoing condition → STATE matching query framing
+   - Concepts that represent past events → STATE or RELATIVE matching query framing
+   - Diagnostics and measurements → RELATIVE only if the query carries a recency cue; the span follows the modality's cadence
+   - Ranked queries → RANK matching the query's ordering language
 
-   Look at how the query is written and infer time from the wording.
-
-   - Use verb tense and phrasing as signals of time
-   - Interpret these signals in a clinical way (not just grammar)
-   - Combine language cues with the concept type and clinical context
-
-   Map the meaning into general states such as:
-   current, active, ongoing, historical, resolved, or full history
-
-   Do not rely on wording alone — always confirm with clinical meaning.
-
-6. When uncertain, prefer precision over breadth. An empty or narrow list is better than a fabricated wider one.
+6. When uncertain, prefer precision over breadth. An empty or narrow list beats a fabricated wider one.
 
 OUTPUT RULES:
 
 - temporal_signal must be a list of plain strings
-- Use ISO format for absolute dates: YYYY-MM-DD
+- Values come from the query's wording or are normalized via concept cadence — never from a fixed dictionary
+- Use ISO format for absolute date ranges: YYYY-MM-DD to YYYY-MM-DD
 - No explanations or prose
 - Empty list is valid when no meaningful temporal dimension applies
 
@@ -406,6 +440,10 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
+    # Concrete clinical entities named in the query that map to this intent.
+    # These are the "what" of the query (e.g., "diarrhea", "metformin"),
+    # stripped of framing words like "presence", "any issue with", "history of".
+    representative_terms: List[str] = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -508,10 +546,22 @@ class IntentSummaryItem(BaseModel):
 
 
 class IntentWithoutQueries(BaseModel):
+    """Intent shape used by the nature_breakdown view.
+
+    Adds two retrieval-routing fields not present in other views:
+    - representative_terms: concrete entities the query named (chart-searchable
+      terms, no framing words). Comes directly from the LLM extraction.
+    - primary_record_type: the single most-likely chart location to find this
+      intent's information. Derived from each concept's descending-sorted
+      record_types: take each concept's top-1, then take the mode across the
+      intent's concepts. None when no context is available.
+    """
     intent_title: str
     description: str
     nature: str
     sub_natures: List[SubNature]
+    representative_terms: List[str] = Field(default_factory=list)
+    primary_record_type: Optional[str] = None
 
 
 class FinalCandidateItem(BaseModel):
@@ -617,6 +667,36 @@ class ExtractionResult:
             return None
         return self._concept_index.get(atomic_concept.strip().lower())
 
+    def _primary_record_type_for_intent(self, intent: Intent) -> Optional[str]:
+        """Most likely chart location for an intent.
+
+        Each concept's record_types arrive pre-sorted descending by relevance
+        (enforced by the context prompt's ORDERING REQUIREMENT). We take each
+        concept's top-1 ("definitive source") and return the mode across the
+        intent's concepts. Ties broken by first-seen order — i.e. the concept
+        order in the intent. Returns None if no concept under this intent has
+        any record_types (e.g. context build failed)."""
+        if not self._concept_index:
+            return None
+
+        top_choices: List[str] = []
+        for sn in intent.sub_natures:
+            for c in sn.atomic_concepts or []:
+                cc = self._get_concept_context(c.strip())
+                if cc and cc.record_types:
+                    top_choices.append(cc.record_types[0])
+
+        if not top_choices:
+            return None
+
+        counts = Counter(top_choices)
+        max_count = max(counts.values())
+        # Preserve first-seen order on tie
+        for rt in top_choices:
+            if counts[rt] == max_count:
+                return rt
+        return top_choices[0]
+
     def _temporal_for_candidate(self, intent_title: str, candidate: str) -> List[str]:
         """Per-candidate temporal signal from Task 2.
 
@@ -717,15 +797,33 @@ class ExtractionResult:
         return result.model_dump()
 
     def to_nature_breakdown(self) -> Dict[str, Any]:
-        intents_no_queries = [
-            IntentWithoutQueries(
-                intent_title=i.intent_title,
-                description=i.description,
-                nature=i.nature,
-                sub_natures=i.sub_natures,
+        intents_no_queries: List[IntentWithoutQueries] = []
+        for i in self.intents.intents:
+            # Dedup representative_terms case-insensitively while preserving
+            # the order the LLM emitted them. The LLM is the source of truth
+            # for term identification — we just clean the list shape here.
+            rep_seen: set = set()
+            rep_terms: List[str] = []
+            for t in i.representative_terms or []:
+                t_clean = t.strip()
+                k = t_clean.lower()
+                if t_clean and k not in rep_seen:
+                    rep_terms.append(t_clean)
+                    rep_seen.add(k)
+
+            primary_rt = self._primary_record_type_for_intent(i)
+
+            intents_no_queries.append(
+                IntentWithoutQueries(
+                    intent_title=i.intent_title,
+                    description=i.description,
+                    nature=i.nature,
+                    sub_natures=i.sub_natures,
+                    representative_terms=rep_terms,
+                    primary_record_type=primary_rt,
+                )
             )
-            for i in self.intents.intents
-        ]
+
         result = Format_NatureBreakdown(
             is_clinical=self.intents.is_clinical,
             reason=self.intents.reason,
