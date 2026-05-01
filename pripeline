@@ -210,6 +210,55 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
 
 ====================================================
+REPRESENTATIVE TERMS (top-level, query-wide)
+====================================================
+
+In addition to the intents list, produce a TOP-LEVEL `representative_terms` field — NOT nested under any intent. A 1–5 item list summarizing the chart-search headlines for the WHOLE query.
+
+THE PRINCIPLE — apply this test to every candidate term:
+
+"If a clinician typed this exact phrase into a chart-search bar, would they expect to find a real section, entity, or record?"
+
+Include the term only if the answer is yes. The test governs the decision — apply it to every candidate, including phrases not anticipated below.
+
+WHAT TO INCLUDE:
+A term passes the test when it names a chart-anchored noun phrase the user is asking about — for example, named clinical entities (symptoms, diagnoses, medications, procedures, devices, labs, vitals); chart sections or categories when no specific entity is named ("medications", "allergies", "vital signs", "lab results", "problem list"); or administrative / operational topics when those are the actual subject ("insurance billing", "discharge instructions", "appointment").
+
+WHAT TO EXCLUDE (apply the principle — these are descriptions of HOW the test fails, not a vocabulary list):
+- Wording that FRAMES the question rather than names its subject — the wrapper around the ask, not the ask itself
+- Wording that REQUESTS AN ACTION rather than names a topic — verbs about doing, not about a thing
+- A QUALIFIER or state word with no entity attached — a modifier is not a thing
+- An ATTRIBUTE of an entity rather than the entity itself — a property of something is not that something
+- Wording too GENERIC to map to a chart section — not anchored to anything a clinician could actually search for
+
+The principle is what decides. The descriptions above explain WHY a term fails the test, not WHICH terms fail. A novel word, slang, abbreviation, or phrase you haven't seen still gets included or excluded based on whether it passes the chart-search test — never on whether it appears in any list.
+
+FORM:
+- Lowercase, 1–3 words per term
+- Expand abbreviations to canonical medical form: "HTN" → "hypertension", "DM" → "diabetes mellitus", "BP" → "blood pressure"
+- 1–5 terms total, deduped, ordered by importance
+- Empty list ONLY when the query is non-clinical or carries no chart-searchable topic
+
+EXAMPLES (each illustrates the principle, not vocabulary):
+- "do you have diarrhea or constipation" → ["diarrhea", "constipation"]
+  (entities pass the test; framing wrapping them does not)
+- "current medication list" → ["medications"]
+  ("medications" names a chart section; "current" and "list" qualify it)
+- "any issue with insurance bill?" → ["insurance billing"]
+  (the entity is the billing topic; "issue" and "any" are framing)
+- "patient with HTN and DM on metformin 500mg twice daily" → ["hypertension", "diabetes mellitus", "metformin"]
+  (three entities; the dose and frequency qualify metformin without being entities themselves)
+- "constipation severity" → ["constipation"]
+  ("severity" is an attribute of constipation, not a thing of its own)
+- "recent EKG findings" → ["EKG"]
+  ("recent" qualifies; "findings" is too generic to anchor a search)
+- "what's my blood pressure trend" → ["blood pressure"]
+  ("trend" is an attribute)
+- "all my allergies" → ["allergies"]
+- "diabetic retinopathy screening status" → ["diabetic retinopathy screening"]
+  (the procedure name passes the test; "status" is its attribute)
+
+====================================================
 REASONING FRAMEWORK
 ====================================================
 
@@ -408,6 +457,10 @@ class IntentExtractionResponse(BaseModel):
     reason: Optional[str] = None
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
+    # Query-level chart-search headlines, produced by the LLM by reading the
+    # original + expanded query as a whole. NOT nested per-intent — this
+    # summarizes the entire query in 1–5 chart-searchable noun phrases.
+    representative_terms: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fix_intent_count(self) -> "IntentExtractionResponse":
@@ -423,6 +476,9 @@ class IntentExtractionOutput(BaseModel):
     expanded_query: str
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
+    # Same as IntentExtractionResponse.representative_terms; carried through
+    # to the result so format methods can surface it without an LLM re-call.
+    representative_terms: List[str] = Field(default_factory=list)
 
 
 # Contextual environment schemas
@@ -590,64 +646,6 @@ class Format_FullPipeline(BaseModel):
 
 
 class ExtractionResult:
-
-    # Aspect / qualifier terms — tokens that name an ATTRIBUTE of an entity
-    # rather than the entity itself. Used by _is_pure_aspect to skip path
-    # segments where EVERY token is one of these. Skipping is per-token, not
-    # per-segment, so multi-word entities like "Type 2 Diabetes" or
-    # "Hemoglobin A1c" survive (their non-aspect token rescues them) while
-    # compounds like "Current List" or "Active Status" are skipped (every
-    # token is an aspect).
-    _ASPECT_TERMS = frozenset({
-        # Magnitude / measurement aspects
-        "frequency", "severity", "duration", "intensity", "level",
-        "amount", "quantity", "count", "value", "score", "reading",
-        "metric", "measurement",
-        # Status / lifecycle aspects
-        "status", "presence", "absence", "history", "occurrence",
-        "onset", "timing", "date", "time", "trend", "change",
-        # State qualifiers — these turn an entity reference into a filter
-        # ("active medications" = medications + active filter, the entity
-        # is "medications", not "active").
-        "current", "active", "inactive", "ongoing", "past", "previous",
-        "prior", "former", "recent", "latest", "new", "old", "existing",
-        # Container / collection words — name a shape, not a thing
-        "list", "set", "panel", "group", "collection", "summary",
-        # Treatment / dosing aspects
-        "dose", "dosage", "route", "regimen",
-        # Classification aspects
-        "type", "category", "subtype", "kind", "class", "classification",
-        # Generic descriptor aspects
-        "characteristic", "characteristics", "attribute", "attributes",
-        "detail", "details", "info", "information", "overview",
-        "property", "properties",
-        # Generic catch-all leaves the LLM sometimes emits
-        "general", "all", "other", "miscellaneous", "misc", "various",
-        # Outcome aspects
-        "response", "reaction", "effect", "outcome", "result",
-    })
-
-    # English stop words and clinically vacuous tokens — filtered out of
-    # query tokens before scoring path segments. "patient" is in here
-    # because it appears in nearly every clinical query and would create
-    # spurious matches against any path mentioning "patient".
-    _QUERY_STOP_WORDS = frozenset({
-        # Articles / auxiliaries / pronouns
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "do", "does", "did", "have", "has", "had", "having",
-        "you", "your", "yours", "i", "my", "mine", "we", "our", "ours",
-        "they", "their", "theirs", "he", "his", "she", "her", "hers", "it", "its",
-        # Prepositions / conjunctions
-        "of", "on", "in", "at", "to", "from", "for", "with", "by", "as",
-        "and", "or", "but", "if", "then", "else", "so",
-        # Demonstratives / quantifiers
-        "this", "that", "these", "those", "any", "some", "all",
-        "no", "not", "yes",
-        # Wh-words
-        "what", "when", "where", "who", "whom", "how", "why", "which",
-        # Clinically vacuous
-        "patient", "patients",
-    })
 
     def __init__(
         self,
@@ -927,129 +925,34 @@ class ExtractionResult:
         )
         return result.model_dump()
 
-    def _query_tokens(self) -> set:
-        """Lowercased alphanumeric tokens from the query, with English stop
-        words and clinically vacuous tokens filtered out.
-
-        Unions tokens from BOTH the original query AND the expanded query.
-        This matters because the LLM-built category_paths can use either
-        form: a path may say "GI" while the expansion says "gastrointestinal",
-        or vice versa. Unioning both ensures either form aligns with the
-        path's wording."""
-        original = self.original_query or ""
-        expanded = (self.expansion.expanded_query if self.expansion else "") or ""
-        text = f"{original} {expanded}".lower()
-        tokens = set(re.findall(r"[a-z0-9]+", text))
-        return tokens - self._QUERY_STOP_WORDS
-
-    def _is_pure_aspect(self, segment_lower: str) -> bool:
-        """A segment is "pure aspect" when every alphanumeric token in it
-        is an aspect word. Such segments name only attributes / qualifiers
-        and shouldn't be returned as the entity name.
-
-        Single-token aspect segments (e.g. "Frequency", "Status") are the
-        common case. The per-token check also catches compounds the
-        whole-segment check would miss — "Current List", "Active Status",
-        "Past History" — every token is an aspect, so the whole segment is
-        a qualifier with no entity in it.
-
-        Multi-word entities survive because at least one token is non-aspect:
-        "Type 2 Diabetes" — "diabetes" rescues it.
-        "Hemoglobin A1c" — both tokens are non-aspect.
-        "Active Tuberculosis" — "tuberculosis" rescues it.
-        Empty/whitespace segments count as pure-aspect (skip them)."""
-        tokens = re.findall(r"[a-z0-9]+", segment_lower)
-        if not tokens:
-            return True
-        return all(t in self._ASPECT_TERMS for t in tokens)
-
-    def _representative_term_from_path(
-        self, category_path: str, query_tokens: set
-    ) -> Optional[str]:
-        """Pick the segment of a category_path that names the entity the
-        question is actually about — query-aware, not pure positional.
-
-        Walks segments leaf → broad. For each segment:
-        - If the segment is "pure aspect" (every token is a qualifier word
-          like Current, List, Frequency, Severity), skip it: aspects qualify
-          entities, they aren't entities.
-        - Otherwise, tokenize the segment and check for token overlap with
-          the query. The first non-aspect segment with any overlap wins —
-          that's the segment that names what the user actually asked about.
-
-        If no segment overlaps the query (the query may use synonyms not in
-        the path, or the path may be off-topic), falls back to the deepest
-        non-aspect segment.
-
-        Returns None when the path is empty or every segment is pure aspect
-        — both pathological cases the caller should ignore."""
-        segments = [
-            s.strip()
-            for s in (category_path or "").split(">>")
-            if s.strip()
-        ]
-        if not segments:
-            return None
-
-        deepest_non_aspect: Optional[str] = None
-        # Walk leaf → broad. The first non-aspect segment with query
-        # overlap wins; otherwise we keep the deepest non-aspect as a
-        # fallback so we still return something meaningful.
-        for seg in reversed(segments):
-            seg_lower = seg.lower()
-            if self._is_pure_aspect(seg_lower):
-                continue
-            if deepest_non_aspect is None:
-                deepest_non_aspect = seg_lower
-            seg_tokens = set(re.findall(r"[a-z0-9]+", seg_lower))
-            if seg_tokens & query_tokens:
-                return seg_lower
-        return deepest_non_aspect
-
     def to_representative_terms(self) -> Dict[str, Any]:
-        """Standalone chart-search routing view, aggregated across the whole query.
+        """Standalone chart-search routing view.
 
-        Representative terms are derived from each sub_nature's category_path
-        using QUERY-AWARE selection: walk segments leaf → broad, skip aspect
-        words ("Frequency", "Severity", "General"...), and pick the first
-        segment whose tokens overlap the query. Falls back to the deepest
-        non-aspect segment if no segment matches the query.
-
-        This handles the cases pure positional picking can't:
-        - Path "Symptom >> GI >> Diarrhea >> Frequency" → "diarrhea" (aspect
-          leaf "frequency" is skipped).
-        - Path "Administrative >> Financial Management >> Billing" + query
-          "insurance bill" → "billing" (entity at the leaf, query tokens
-          align).
-        - Path "Symptom >> GI >> Diarrhea" + query "any GI issues" → "gi"
-          (broader segment matches the query's actual scope).
-
-        - representative_terms: deduped case-insensitively in first-seen
-          order across the query. Lowercased on output.
+        - representative_terms: the LLM's query-level summary, produced in
+          the intent-extraction step by reading the original + expanded
+          query holistically. Lowercased and deduped here as a final
+          cleanup; the LLM is the source of truth for selection.
         - primary_record_types: top-1 record_type from EVERY distinct atomic
           concept in the query, ranked by frequency descending.
 
-        Both lists may be empty independently; both are empty for non-clinical
-        queries."""
-        rep_terms: List[str] = []
+        Both lists may be empty independently. Both are empty for
+        non-clinical queries. The deduplication preserves the LLM's order
+        (importance-ranked per the prompt's instruction)."""
+        # Light cleanup of LLM output: lowercase, strip, dedup case-insensitive,
+        # preserve order.
         seen_terms: set = set()
-        # Walk atomic concepts in the same pass (deduped early so a concept
-        # named in two intents doesn't double-weight the record_type ranking).
+        rep_terms: List[str] = []
+        for t in self.intents.representative_terms or []:
+            t_clean = t.strip().lower()
+            if t_clean and t_clean not in seen_terms:
+                rep_terms.append(t_clean)
+                seen_terms.add(t_clean)
+
+        # Walk every atomic concept once for primary_record_types ranking.
         all_concepts: List[str] = []
         seen_concepts: set = set()
-
-        # Compute query tokens once — they're constant across all paths.
-        query_tokens = self._query_tokens()
-
         for i in self.intents.intents:
             for sn in i.sub_natures:
-                term = self._representative_term_from_path(
-                    sn.category_path, query_tokens
-                )
-                if term and term not in seen_terms:
-                    rep_terms.append(term)
-                    seen_terms.add(term)
-
                 for c in sn.atomic_concepts or []:
                     ck = c.strip().lower()
                     if ck and ck not in seen_concepts:
@@ -1186,6 +1089,7 @@ class ContextualIntentPipeline:
             expanded_query=expanded_query,
             total_intents_detected=len(raw.intents),
             intents=raw.intents,
+            representative_terms=raw.representative_terms,
         )
 
     def build_context(
