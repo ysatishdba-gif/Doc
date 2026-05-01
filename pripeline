@@ -591,12 +591,13 @@ class Format_FullPipeline(BaseModel):
 
 class ExtractionResult:
 
-    # Aspect / qualifier terms — segments that name an ATTRIBUTE of an entity
-    # rather than the entity itself. Skipped when picking the representative
-    # term from a category_path, so a path ending in "Frequency", "Severity",
-    # "General" etc. falls through to the segment that names the entity.
-    # Only single-token matches count: a multi-word segment like
-    # "Type 2 Diabetes" intentionally does NOT match "type" here.
+    # Aspect / qualifier terms — tokens that name an ATTRIBUTE of an entity
+    # rather than the entity itself. Used by _is_pure_aspect to skip path
+    # segments where EVERY token is one of these. Skipping is per-token, not
+    # per-segment, so multi-word entities like "Type 2 Diabetes" or
+    # "Hemoglobin A1c" survive (their non-aspect token rescues them) while
+    # compounds like "Current List" or "Active Status" are skipped (every
+    # token is an aspect).
     _ASPECT_TERMS = frozenset({
         # Magnitude / measurement aspects
         "frequency", "severity", "duration", "intensity", "level",
@@ -605,13 +606,20 @@ class ExtractionResult:
         # Status / lifecycle aspects
         "status", "presence", "absence", "history", "occurrence",
         "onset", "timing", "date", "time", "trend", "change",
+        # State qualifiers — these turn an entity reference into a filter
+        # ("active medications" = medications + active filter, the entity
+        # is "medications", not "active").
+        "current", "active", "inactive", "ongoing", "past", "previous",
+        "prior", "former", "recent", "latest", "new", "old", "existing",
+        # Container / collection words — name a shape, not a thing
+        "list", "set", "panel", "group", "collection", "summary",
         # Treatment / dosing aspects
         "dose", "dosage", "route", "regimen",
         # Classification aspects
         "type", "category", "subtype", "kind", "class", "classification",
         # Generic descriptor aspects
         "characteristic", "characteristics", "attribute", "attributes",
-        "detail", "details", "info", "information", "summary", "overview",
+        "detail", "details", "info", "information", "overview",
         "property", "properties",
         # Generic catch-all leaves the LLM sometimes emits
         "general", "all", "other", "miscellaneous", "misc", "various",
@@ -934,6 +942,27 @@ class ExtractionResult:
         tokens = set(re.findall(r"[a-z0-9]+", text))
         return tokens - self._QUERY_STOP_WORDS
 
+    def _is_pure_aspect(self, segment_lower: str) -> bool:
+        """A segment is "pure aspect" when every alphanumeric token in it
+        is an aspect word. Such segments name only attributes / qualifiers
+        and shouldn't be returned as the entity name.
+
+        Single-token aspect segments (e.g. "Frequency", "Status") are the
+        common case. The per-token check also catches compounds the
+        whole-segment check would miss — "Current List", "Active Status",
+        "Past History" — every token is an aspect, so the whole segment is
+        a qualifier with no entity in it.
+
+        Multi-word entities survive because at least one token is non-aspect:
+        "Type 2 Diabetes" — "diabetes" rescues it.
+        "Hemoglobin A1c" — both tokens are non-aspect.
+        "Active Tuberculosis" — "tuberculosis" rescues it.
+        Empty/whitespace segments count as pure-aspect (skip them)."""
+        tokens = re.findall(r"[a-z0-9]+", segment_lower)
+        if not tokens:
+            return True
+        return all(t in self._ASPECT_TERMS for t in tokens)
+
     def _representative_term_from_path(
         self, category_path: str, query_tokens: set
     ) -> Optional[str]:
@@ -941,21 +970,19 @@ class ExtractionResult:
         question is actually about — query-aware, not pure positional.
 
         Walks segments leaf → broad. For each segment:
-        - If the segment is a single aspect word ("Frequency", "Severity",
-          "General"...), skip it: aspects qualify entities, they aren't
-          entities. This handles the case where the LLM ends a path with
-          a measurement aspect rather than the entity itself.
+        - If the segment is "pure aspect" (every token is a qualifier word
+          like Current, List, Frequency, Severity), skip it: aspects qualify
+          entities, they aren't entities.
         - Otherwise, tokenize the segment and check for token overlap with
           the query. The first non-aspect segment with any overlap wins —
           that's the segment that names what the user actually asked about.
 
-        If no segment overlaps the query (the query may use synonyms not
-        in the path, or the path may be off-topic), falls back to the
-        deepest non-aspect segment. That's still better than returning
-        an aspect leaf or a broad category root.
+        If no segment overlaps the query (the query may use synonyms not in
+        the path, or the path may be off-topic), falls back to the deepest
+        non-aspect segment.
 
-        Returns None only when the path is empty or every segment is an
-        aspect term — both pathological cases the caller should ignore."""
+        Returns None when the path is empty or every segment is pure aspect
+        — both pathological cases the caller should ignore."""
         segments = [
             s.strip()
             for s in (category_path or "").split(">>")
@@ -970,7 +997,7 @@ class ExtractionResult:
         # fallback so we still return something meaningful.
         for seg in reversed(segments):
             seg_lower = seg.lower()
-            if seg_lower in self._ASPECT_TERMS:
+            if self._is_pure_aspect(seg_lower):
                 continue
             if deepest_non_aspect is None:
                 deepest_non_aspect = seg_lower
