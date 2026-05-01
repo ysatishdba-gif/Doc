@@ -591,6 +591,56 @@ class Format_FullPipeline(BaseModel):
 
 class ExtractionResult:
 
+    # Aspect / qualifier terms — segments that name an ATTRIBUTE of an entity
+    # rather than the entity itself. Skipped when picking the representative
+    # term from a category_path, so a path ending in "Frequency", "Severity",
+    # "General" etc. falls through to the segment that names the entity.
+    # Only single-token matches count: a multi-word segment like
+    # "Type 2 Diabetes" intentionally does NOT match "type" here.
+    _ASPECT_TERMS = frozenset({
+        # Magnitude / measurement aspects
+        "frequency", "severity", "duration", "intensity", "level",
+        "amount", "quantity", "count", "value", "score", "reading",
+        "metric", "measurement",
+        # Status / lifecycle aspects
+        "status", "presence", "absence", "history", "occurrence",
+        "onset", "timing", "date", "time", "trend", "change",
+        # Treatment / dosing aspects
+        "dose", "dosage", "route", "regimen",
+        # Classification aspects
+        "type", "category", "subtype", "kind", "class", "classification",
+        # Generic descriptor aspects
+        "characteristic", "characteristics", "attribute", "attributes",
+        "detail", "details", "info", "information", "summary", "overview",
+        "property", "properties",
+        # Generic catch-all leaves the LLM sometimes emits
+        "general", "all", "other", "miscellaneous", "misc", "various",
+        # Outcome aspects
+        "response", "reaction", "effect", "outcome", "result",
+    })
+
+    # English stop words and clinically vacuous tokens — filtered out of
+    # query tokens before scoring path segments. "patient" is in here
+    # because it appears in nearly every clinical query and would create
+    # spurious matches against any path mentioning "patient".
+    _QUERY_STOP_WORDS = frozenset({
+        # Articles / auxiliaries / pronouns
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+        "do", "does", "did", "have", "has", "had", "having",
+        "you", "your", "yours", "i", "my", "mine", "we", "our", "ours",
+        "they", "their", "theirs", "he", "his", "she", "her", "hers", "it", "its",
+        # Prepositions / conjunctions
+        "of", "on", "in", "at", "to", "from", "for", "with", "by", "as",
+        "and", "or", "but", "if", "then", "else", "so",
+        # Demonstratives / quantifiers
+        "this", "that", "these", "those", "any", "some", "all",
+        "no", "not", "yes",
+        # Wh-words
+        "what", "when", "where", "who", "whom", "how", "why", "which",
+        # Clinically vacuous
+        "patient", "patients",
+    })
+
     def __init__(
         self,
         original_query: str,
@@ -869,22 +919,88 @@ class ExtractionResult:
         )
         return result.model_dump()
 
+    def _query_tokens(self) -> set:
+        """Lowercased alphanumeric tokens from the query, with English stop
+        words and clinically vacuous tokens filtered out.
+
+        Unions tokens from BOTH the original query AND the expanded query.
+        This matters because the LLM-built category_paths can use either
+        form: a path may say "GI" while the expansion says "gastrointestinal",
+        or vice versa. Unioning both ensures either form aligns with the
+        path's wording."""
+        original = self.original_query or ""
+        expanded = (self.expansion.expanded_query if self.expansion else "") or ""
+        text = f"{original} {expanded}".lower()
+        tokens = set(re.findall(r"[a-z0-9]+", text))
+        return tokens - self._QUERY_STOP_WORDS
+
+    def _representative_term_from_path(
+        self, category_path: str, query_tokens: set
+    ) -> Optional[str]:
+        """Pick the segment of a category_path that names the entity the
+        question is actually about — query-aware, not pure positional.
+
+        Walks segments leaf → broad. For each segment:
+        - If the segment is a single aspect word ("Frequency", "Severity",
+          "General"...), skip it: aspects qualify entities, they aren't
+          entities. This handles the case where the LLM ends a path with
+          a measurement aspect rather than the entity itself.
+        - Otherwise, tokenize the segment and check for token overlap with
+          the query. The first non-aspect segment with any overlap wins —
+          that's the segment that names what the user actually asked about.
+
+        If no segment overlaps the query (the query may use synonyms not
+        in the path, or the path may be off-topic), falls back to the
+        deepest non-aspect segment. That's still better than returning
+        an aspect leaf or a broad category root.
+
+        Returns None only when the path is empty or every segment is an
+        aspect term — both pathological cases the caller should ignore."""
+        segments = [
+            s.strip()
+            for s in (category_path or "").split(">>")
+            if s.strip()
+        ]
+        if not segments:
+            return None
+
+        deepest_non_aspect: Optional[str] = None
+        # Walk leaf → broad. The first non-aspect segment with query
+        # overlap wins; otherwise we keep the deepest non-aspect as a
+        # fallback so we still return something meaningful.
+        for seg in reversed(segments):
+            seg_lower = seg.lower()
+            if seg_lower in self._ASPECT_TERMS:
+                continue
+            if deepest_non_aspect is None:
+                deepest_non_aspect = seg_lower
+            seg_tokens = set(re.findall(r"[a-z0-9]+", seg_lower))
+            if seg_tokens & query_tokens:
+                return seg_lower
+        return deepest_non_aspect
+
     def to_representative_terms(self) -> Dict[str, Any]:
         """Standalone chart-search routing view, aggregated across the whole query.
 
-        Representative terms are derived structurally from each sub_nature's
-        category_path — specifically the SECOND segment, which is the
-        "Specific" level in the "Broad >> Specific >> Detail" format. No
-        separate LLM extraction step.
+        Representative terms are derived from each sub_nature's category_path
+        using QUERY-AWARE selection: walk segments leaf → broad, skip aspect
+        words ("Frequency", "Severity", "General"...), and pick the first
+        segment whose tokens overlap the query. Falls back to the deepest
+        non-aspect segment if no segment matches the query.
 
-        - representative_terms: the "Specific" segment (index 1) of every
-          sub_nature's category_path, deduped case-insensitively in first-seen
-          order across the query. Lowercased on output. If a path has only
-          one segment, that single segment is used as a defensive fallback.
-          Empty list when the query has no sub_natures.
+        This handles the cases pure positional picking can't:
+        - Path "Symptom >> GI >> Diarrhea >> Frequency" → "diarrhea" (aspect
+          leaf "frequency" is skipped).
+        - Path "Administrative >> Financial Management >> Billing" + query
+          "insurance bill" → "billing" (entity at the leaf, query tokens
+          align).
+        - Path "Symptom >> GI >> Diarrhea" + query "any GI issues" → "gi"
+          (broader segment matches the query's actual scope).
+
+        - representative_terms: deduped case-insensitively in first-seen
+          order across the query. Lowercased on output.
         - primary_record_types: top-1 record_type from EVERY distinct atomic
-          concept in the query, ranked by frequency descending (ties broken
-          by first-seen order).
+          concept in the query, ranked by frequency descending.
 
         Both lists may be empty independently; both are empty for non-clinical
         queries."""
@@ -895,29 +1011,17 @@ class ExtractionResult:
         all_concepts: List[str] = []
         seen_concepts: set = set()
 
+        # Compute query tokens once — they're constant across all paths.
+        query_tokens = self._query_tokens()
+
         for i in self.intents.intents:
             for sn in i.sub_natures:
-                # Path is normalized to " >> " by SubNature's validator, which
-                # also pads single-segment paths with " >> General". Split is
-                # therefore reliable. Pick the "Specific" segment — index 1
-                # in "Broad >> Specific >> Detail" — which captures the
-                # category-level entity rather than the broadest container or
-                # the most-granular leaf detail.
-                segments = [
-                    s.strip()
-                    for s in (sn.category_path or "").split(">>")
-                    if s.strip()
-                ]
-                chosen: Optional[str] = None
-                if len(segments) >= 2:
-                    chosen = segments[1].lower()
-                elif segments:
-                    # Defensive: malformed path with a single segment.
-                    chosen = segments[0].lower()
-
-                if chosen and chosen not in seen_terms:
-                    rep_terms.append(chosen)
-                    seen_terms.add(chosen)
+                term = self._representative_term_from_path(
+                    sn.category_path, query_tokens
+                )
+                if term and term not in seen_terms:
+                    rep_terms.append(term)
+                    seen_terms.add(term)
 
                 for c in sn.atomic_concepts or []:
                     ck = c.strip().lower()
