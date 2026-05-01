@@ -537,12 +537,14 @@ class Format_IntentExtraction(BaseModel):
     intents: List[IntentSummaryItem]
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    representative_terms: List[str] = Field(default_factory=list)
 
 
 class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    representative_terms: List[str] = Field(default_factory=list)
     total_candidates: int
     final_candidates: List[FinalCandidateItem]
 
@@ -552,25 +554,8 @@ class Format_NatureBreakdown(BaseModel):
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
-    intents: List[IntentWithoutQueries]
-
-
-class Format_RepresentativeTerms(BaseModel):
-    """Flat list of LLM-picked representative terms across the query.
-
-    One representative_term per intent (the LLM picks it by reading that
-    intent's nature/sub_natures), aggregated across all intents into a
-    single deduped list. Ordered by intent traversal — earlier intents
-    contribute earlier terms. Empty for non-clinical queries or when no
-    intent emitted a representative_term.
-
-    Record-type alignment is intentionally NOT done in this view —
-    record_types live on each concept's context object (sorted descending
-    by relevance) and can be matched downstream when needed."""
-    user_query: str
-    is_clinical: bool
-    rejected_reason: Optional[str] = None
     representative_terms: List[str] = Field(default_factory=list)
+    intents: List[IntentWithoutQueries]
 
 
 class Format_FullPipeline(BaseModel):
@@ -579,6 +564,7 @@ class Format_FullPipeline(BaseModel):
     original_query: str
     expanded_query: str
     total_intents_detected: int
+    representative_terms: List[str] = Field(default_factory=list)
     intents: List[IntentWithContext]
 
 
@@ -685,6 +671,25 @@ class ExtractionResult:
 
     # format methods
 
+    def _representative_terms(self) -> List[str]:
+        """Per-intent representative_terms collected into a flat deduped list,
+        in intent traversal order. Each intent's LLM-emitted
+        representative_term contributes one entry; empty strings are skipped;
+        duplicates across intents are removed case-insensitively. Used by
+        every format method that surfaces this field at the top level."""
+        terms: List[str] = []
+        seen: set = set()
+        for intent in self.intents.intents:
+            t = (intent.representative_term or "").strip()
+            if not t:
+                continue
+            key = t.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(t)
+        return terms
+
     def to_intent_extraction(self) -> Dict[str, Any]:
         items = [
             IntentSummaryItem(intent_title=i.intent_title, description=i.description)
@@ -695,6 +700,7 @@ class ExtractionResult:
             intents=items,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            representative_terms=self._representative_terms(),
         )
         return result.model_dump()
 
@@ -729,6 +735,7 @@ class ExtractionResult:
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            representative_terms=self._representative_terms(),
             total_candidates=len(candidates),
             final_candidates=candidates,
         )
@@ -749,6 +756,7 @@ class ExtractionResult:
             reason=self.intents.reason,
             original_query=self.intents.original_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intents_no_queries,
         )
         return result.model_dump()
@@ -832,37 +840,8 @@ class ExtractionResult:
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intent_blocks,
-        )
-        return result.model_dump()
-
-    def to_representative_terms(self) -> Dict[str, Any]:
-        """Collect each intent's representative_term into a flat deduped list.
-
-        One contribution per intent: read intent.representative_term, skip
-        if empty, dedup case-insensitively across the query while preserving
-        intent traversal order. No record_type alignment here — that lives
-        on context and is done downstream when needed.
-
-        Empty representative_terms list for non-clinical queries or when no
-        intent emitted a representative_term."""
-        terms: List[str] = []
-        seen: set = set()
-        for intent in self.intents.intents:
-            t = (intent.representative_term or "").strip()
-            if not t:
-                continue
-            key = t.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            terms.append(t)
-
-        result = Format_RepresentativeTerms(
-            user_query=self.original_query,
-            is_clinical=self.intents.is_clinical,
-            rejected_reason=self.intents.reason,
-            representative_terms=terms,
         )
         return result.model_dump()
 
@@ -1119,7 +1098,6 @@ class ContextualIntentPipeline:
             "final_queries",
             "nature_breakdown",
             "full_pipeline",
-            "representative_terms",
         ] = "full_pipeline",
     ) -> Dict[str, Any]:
         try:
@@ -1129,7 +1107,6 @@ class ContextualIntentPipeline:
                 "final_queries": result.to_final_queries,
                 "nature_breakdown": result.to_nature_breakdown,
                 "full_pipeline": result.to_full_pipeline,
-                "representative_terms": result.to_representative_terms,
             }
             return dispatch[output_format]()
         except Exception as e:
@@ -1154,7 +1131,6 @@ class OutputConfig:
     final_queries: bool = True
     nature_breakdown: bool = True
     full_pipeline: bool = True
-    representative_terms: bool = True
 
     def enabled(self) -> List[str]:
         """Return list of format names that are turned on."""
@@ -1165,7 +1141,6 @@ class OutputConfig:
                 "final_queries",
                 "nature_breakdown",
                 "full_pipeline",
-                "representative_terms",
             )
             if getattr(self, name)
         ]
@@ -1195,7 +1170,6 @@ def run_single_query(
         "final_queries": result.to_final_queries,
         "nature_breakdown": result.to_nature_breakdown,
         "full_pipeline": result.to_full_pipeline,
-        "representative_terms": result.to_representative_terms,
     }
 
     prefix = f"query{idx}"
@@ -1222,7 +1196,6 @@ if __name__ == "__main__":
         final_queries=True,
         nature_breakdown=False,
         full_pipeline=True,
-        representative_terms=True,
     )
 
     pipeline = ContextualIntentPipeline(
