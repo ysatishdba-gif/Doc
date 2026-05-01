@@ -546,22 +546,10 @@ class IntentSummaryItem(BaseModel):
 
 
 class IntentWithoutQueries(BaseModel):
-    """Intent shape used by the nature_breakdown view.
-
-    Adds two retrieval-routing fields not present in other views:
-    - representative_terms: concrete entities the query named (chart-searchable
-      terms, no framing words). Comes directly from the LLM extraction.
-    - primary_record_type: the single most-likely chart location to find this
-      intent's information. Derived from each concept's descending-sorted
-      record_types: take each concept's top-1, then take the mode across the
-      intent's concepts. None when no context is available.
-    """
     intent_title: str
     description: str
     nature: str
     sub_natures: List[SubNature]
-    representative_terms: List[str] = Field(default_factory=list)
-    primary_record_type: Optional[str] = None
 
 
 class FinalCandidateItem(BaseModel):
@@ -603,6 +591,32 @@ class Format_NatureBreakdown(BaseModel):
     original_query: str
     total_intents_detected: int
     intents: List[IntentWithoutQueries]
+
+
+class Format_RepresentativeTerms(BaseModel):
+    """Output format that surfaces only chart-search routing for the query.
+
+    Aggregated across the entire query — no per-intent split. Two flat
+    lists you can lift directly into a chart-search call:
+
+    - representative_terms: deduped chart-searchable entities the LLM
+      extracted from the query (across all intents). Empty list when the
+      query named no concrete entity.
+    - primary_record_types: most likely chart locations, ranked descending.
+      Derived by walking every atomic concept in the query, taking each
+      concept's top-1 record_type (already sorted descending by relevance
+      per the context prompt), and ranking those top-1 values by frequency
+      across the whole query. Empty list when context build produced no
+      record_types.
+
+    Independent of nature_breakdown and full_pipeline — those views are
+    unchanged. When the query is non-clinical, both lists are empty and
+    is_clinical/rejected_reason carry the reason."""
+    user_query: str
+    is_clinical: bool
+    rejected_reason: Optional[str] = None
+    representative_terms: List[str] = Field(default_factory=list)
+    primary_record_types: List[str] = Field(default_factory=list)
 
 
 class Format_FullPipeline(BaseModel):
@@ -667,35 +681,50 @@ class ExtractionResult:
             return None
         return self._concept_index.get(atomic_concept.strip().lower())
 
-    def _primary_record_type_for_intent(self, intent: Intent) -> Optional[str]:
-        """Most likely chart location for an intent.
+    @staticmethod
+    def _dedup_representative_terms(terms: List[str]) -> List[str]:
+        """Dedup case-insensitively while preserving the order the LLM emitted.
+        The LLM is the source of truth for term identification — we just
+        clean the list shape here."""
+        seen: set = set()
+        out: List[str] = []
+        for t in terms or []:
+            t_clean = t.strip()
+            k = t_clean.lower()
+            if t_clean and k not in seen:
+                out.append(t_clean)
+                seen.add(k)
+        return out
+
+    def _primary_record_types_from_concepts(self, concepts: List[str]) -> List[str]:
+        """Most likely chart locations for a set of concepts, as a ranked list.
 
         Each concept's record_types arrive pre-sorted descending by relevance
         (enforced by the context prompt's ORDERING REQUIREMENT). We take each
-        concept's top-1 ("definitive source") and return the mode across the
-        intent's concepts. Ties broken by first-seen order — i.e. the concept
-        order in the intent. Returns None if no concept under this intent has
-        any record_types (e.g. context build failed)."""
+        concept's top-1 ("definitive source"), then return all distinct values
+        ordered by how many concepts placed them at top-1 — descending. Ties
+        broken by first-seen order across the input list.
+
+        Returns an empty list when no concept in the input has any record_types
+        (e.g. context build failed)."""
         if not self._concept_index:
-            return None
+            return []
 
         top_choices: List[str] = []
-        for sn in intent.sub_natures:
-            for c in sn.atomic_concepts or []:
-                cc = self._get_concept_context(c.strip())
-                if cc and cc.record_types:
-                    top_choices.append(cc.record_types[0])
+        for c in concepts or []:
+            cc = self._get_concept_context(c.strip())
+            if cc and cc.record_types:
+                top_choices.append(cc.record_types[0])
 
         if not top_choices:
-            return None
+            return []
 
         counts = Counter(top_choices)
-        max_count = max(counts.values())
-        # Preserve first-seen order on tie
-        for rt in top_choices:
-            if counts[rt] == max_count:
-                return rt
-        return top_choices[0]
+        # Stable sort: primary key = count desc, secondary key = first-seen
+        # index asc. Counter is insertion-ordered, so its keys() preserves
+        # first-seen order for tie-breaking.
+        first_seen = {rt: idx for idx, rt in enumerate(counts.keys())}
+        return sorted(counts.keys(), key=lambda rt: (-counts[rt], first_seen[rt]))
 
     def _temporal_for_candidate(self, intent_title: str, candidate: str) -> List[str]:
         """Per-candidate temporal signal from Task 2.
@@ -797,33 +826,15 @@ class ExtractionResult:
         return result.model_dump()
 
     def to_nature_breakdown(self) -> Dict[str, Any]:
-        intents_no_queries: List[IntentWithoutQueries] = []
-        for i in self.intents.intents:
-            # Dedup representative_terms case-insensitively while preserving
-            # the order the LLM emitted them. The LLM is the source of truth
-            # for term identification — we just clean the list shape here.
-            rep_seen: set = set()
-            rep_terms: List[str] = []
-            for t in i.representative_terms or []:
-                t_clean = t.strip()
-                k = t_clean.lower()
-                if t_clean and k not in rep_seen:
-                    rep_terms.append(t_clean)
-                    rep_seen.add(k)
-
-            primary_rt = self._primary_record_type_for_intent(i)
-
-            intents_no_queries.append(
-                IntentWithoutQueries(
-                    intent_title=i.intent_title,
-                    description=i.description,
-                    nature=i.nature,
-                    sub_natures=i.sub_natures,
-                    representative_terms=rep_terms,
-                    primary_record_type=primary_rt,
-                )
+        intents_no_queries = [
+            IntentWithoutQueries(
+                intent_title=i.intent_title,
+                description=i.description,
+                nature=i.nature,
+                sub_natures=i.sub_natures,
             )
-
+            for i in self.intents.intents
+        ]
         result = Format_NatureBreakdown(
             is_clinical=self.intents.is_clinical,
             reason=self.intents.reason,
@@ -913,6 +924,45 @@ class ExtractionResult:
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
             intents=intent_blocks,
+        )
+        return result.model_dump()
+
+    def to_representative_terms(self) -> Dict[str, Any]:
+        """Standalone chart-search routing view, aggregated across the whole query.
+
+        No per-intent split. Walks every intent and every atomic concept once:
+        - representative_terms: union of LLM-extracted entity terms across all
+          intents, deduped case-insensitively, first-seen order preserved.
+        - primary_record_types: top-1 record_type from EVERY concept in the
+          query, ranked by frequency descending (ties broken by first-seen
+          order). The first element is the single most likely chart location
+          for this query overall; subsequent elements are runners-up.
+
+        Both lists are empty for non-clinical queries; either list may be
+        empty independently when the query named no concrete entities or
+        when context build produced no record_types."""
+        # Collect representative_terms across every intent (preserve order).
+        all_terms: List[str] = []
+        # Collect every atomic concept across every intent (dedup early so a
+        # concept named in two intents doesn't double-weight the record_type
+        # ranking).
+        all_concepts: List[str] = []
+        seen_concepts: set = set()
+        for i in self.intents.intents:
+            all_terms.extend(i.representative_terms or [])
+            for sn in i.sub_natures:
+                for c in sn.atomic_concepts or []:
+                    k = c.strip().lower()
+                    if k and k not in seen_concepts:
+                        all_concepts.append(c.strip())
+                        seen_concepts.add(k)
+
+        result = Format_RepresentativeTerms(
+            user_query=self.original_query,
+            is_clinical=self.intents.is_clinical,
+            rejected_reason=self.intents.reason,
+            representative_terms=self._dedup_representative_terms(all_terms),
+            primary_record_types=self._primary_record_types_from_concepts(all_concepts),
         )
         return result.model_dump()
 
@@ -1169,6 +1219,7 @@ class ContextualIntentPipeline:
             "final_queries",
             "nature_breakdown",
             "full_pipeline",
+            "representative_terms",
         ] = "full_pipeline",
     ) -> Dict[str, Any]:
         try:
@@ -1178,6 +1229,7 @@ class ContextualIntentPipeline:
                 "final_queries": result.to_final_queries,
                 "nature_breakdown": result.to_nature_breakdown,
                 "full_pipeline": result.to_full_pipeline,
+                "representative_terms": result.to_representative_terms,
             }
             return dispatch[output_format]()
         except Exception as e:
@@ -1202,6 +1254,7 @@ class OutputConfig:
     final_queries: bool = True
     nature_breakdown: bool = True
     full_pipeline: bool = True
+    representative_terms: bool = True
 
     def enabled(self) -> List[str]:
         """Return list of format names that are turned on."""
@@ -1212,6 +1265,7 @@ class OutputConfig:
                 "final_queries",
                 "nature_breakdown",
                 "full_pipeline",
+                "representative_terms",
             )
             if getattr(self, name)
         ]
@@ -1241,6 +1295,7 @@ def run_single_query(
         "final_queries": result.to_final_queries,
         "nature_breakdown": result.to_nature_breakdown,
         "full_pipeline": result.to_full_pipeline,
+        "representative_terms": result.to_representative_terms,
     }
 
     prefix = f"query{idx}"
@@ -1267,6 +1322,7 @@ if __name__ == "__main__":
         final_queries=True,
         nature_breakdown=False,
         full_pipeline=True,
+        representative_terms=True,
     )
 
     pipeline = ContextualIntentPipeline(
