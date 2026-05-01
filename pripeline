@@ -210,6 +210,14 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
 
 ====================================================
+REPRESENTATIVE TERMS (top-level)
+====================================================
+
+Also produce a TOP-LEVEL `representative_terms` field — a list of 1–5 specific terms that represent what the user is asking about. Read the original query and the expanded query; pick the few atomic_concepts (from this same response) that most directly answer "what is this query about?"
+
+The terms must be drawn from the atomic_concepts pool you've already generated — pick a small representative subset, do not invent new strings here. Empty list is correct when no atomic_concept rises to a representative anchor.
+
+====================================================
 REASONING FRAMEWORK
 ====================================================
 
@@ -408,6 +416,10 @@ class IntentExtractionResponse(BaseModel):
     reason: Optional[str] = None
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
+    # 1–5 LLM-picked representative terms for the query, chosen from the
+    # atomic_concepts pool. Used by the representative_terms output view —
+    # each term is looked up against atomic_concepts to find its record_type.
+    representative_terms: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fix_intent_count(self) -> "IntentExtractionResponse":
@@ -423,6 +435,7 @@ class IntentExtractionOutput(BaseModel):
     expanded_query: str
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
+    representative_terms: List[str] = Field(default_factory=list)
 
 
 # Contextual environment schemas
@@ -842,46 +855,50 @@ class ExtractionResult:
         return result.model_dump()
 
     def to_representative_terms(self) -> Dict[str, Any]:
-        """Group every distinct atomic_concept in the query by its top-1
-        record_type (from the LLM-built context, sorted descending by
-        relevance). Each group becomes "this is what to search for in this
-        record type."
+        """Group LLM-picked representative terms by their record_type.
 
-        Walk:
-        1. Iterate every intent → sub_nature → atomic_concept in order.
-        2. Dedup concepts case-insensitively (a concept named in two intents
-           contributes once).
-        3. For each concept, look up its top-1 record_type in the context.
-           Concepts without context (record_types empty / missing) are
-           skipped — they have no chart home to assign.
-        4. Group concepts under their top-1 record_type, preserving concept
-           order within each group.
-        5. Order groups by size descending (more concepts → higher relevance
-           to the query). First-seen tiebreaker via insertion order.
+        The LLM has already done the semantic selection in the intent-
+        extraction step: representative_terms is a small list (1–5) it
+        picked from its own atomic_concepts pool by reading the original
+        query and the expansion. This method's job is just to look up each
+        term's chart home and group accordingly:
 
-        Empty record_type_groups for non-clinical queries or when context
-        build returned no record_types for any concept."""
-        # Step 1+2: ordered, deduped concept list across the whole query.
-        ordered_concepts: List[str] = []
-        seen_concepts: set = set()
-        for i in self.intents.intents:
-            for sn in i.sub_natures:
-                for c in sn.atomic_concepts or []:
-                    k = c.strip().lower()
-                    if k and k not in seen_concepts:
-                        ordered_concepts.append(c.strip())
-                        seen_concepts.add(k)
+        1. Build an atomic_concept → top-1 record_type lookup from context.
+           Keys are lowercased so case differences between the LLM's
+           representative_terms and atomic_concepts don't break matching.
+        2. For each LLM-picked representative_term, find its record_type
+           via the lookup. Terms with no match (the LLM emitted something
+           outside the atomic_concepts pool) are skipped — there is no
+           chart home to assign.
+        3. Group surviving terms under their record_type, preserving the
+           LLM's emission order within each group.
+        4. Order groups by size descending; first-seen tiebreak.
 
-        # Step 3+4: group by top-1 record_type. dict insertion order =
-        # first-seen, which we rely on for tiebreaks below.
+        Empty record_type_groups for non-clinical queries, when the LLM
+        emitted no representative_terms, or when none of them matched a
+        concept with a known record_type."""
+        # Step 1: lookup table from atomic_concept (lowercased) → top-1 record_type.
+        concept_to_rt: Dict[str, str] = {}
+        if self.context and self.context.concepts_with_context:
+            for cc in self.context.concepts_with_context:
+                if cc.record_types:
+                    concept_to_rt[cc.atomic_concept.strip().lower()] = cc.record_types[0]
+
+        # Steps 2 + 3: walk LLM-picked terms in their emitted order, dedup
+        # case-insensitively, look up each one's record_type, group.
         groups: Dict[str, List[str]] = {}
-        for c in ordered_concepts:
-            cc = self._get_concept_context(c)
-            if cc and cc.record_types:
-                primary_rt = cc.record_types[0]
-                groups.setdefault(primary_rt, []).append(c)
+        seen: set = set()
+        for term in self.intents.representative_terms or []:
+            t_clean = term.strip()
+            t_key = t_clean.lower()
+            if not t_key or t_key in seen:
+                continue
+            seen.add(t_key)
+            rt = concept_to_rt.get(t_key)
+            if rt:
+                groups.setdefault(rt, []).append(t_clean)
 
-        # Step 5: order groups by size desc, tiebreak by first-seen.
+        # Step 4: order groups by size desc, tiebreak by first-seen.
         first_seen = {rt: idx for idx, rt in enumerate(groups.keys())}
         ordered_record_types = sorted(
             groups.keys(),
@@ -1022,6 +1039,7 @@ class ContextualIntentPipeline:
             expanded_query=expanded_query,
             total_intents_detected=len(raw.intents),
             intents=raw.intents,
+            representative_terms=raw.representative_terms,
         )
 
     def build_context(
