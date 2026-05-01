@@ -112,7 +112,6 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
-6. **representative_terms[]** - What concrete clinical entities from the query map to this intent?
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -209,72 +208,6 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Coverage:**
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
-
-====================================================
-REPRESENTATIVE TERMS
-====================================================
-
-**Purpose:**
-Surface the SMALL set of HEAD entities (1–3 per intent, 3 is the absolute cap) that uniquely anchor what this intent is about. These are the words a clinician would type into a chart-search bar to locate the answer. NOT a comprehensive list of every clinical noun in the query.
-
-**Source — pick from the candidates you generated:**
-The representative_terms for each intent must be drawn from (or be a tight paraphrase of) that intent's atomic_concepts. They are a curated SUBSET of the candidates, not a separately invented vocabulary. If the query named an entity but no candidate captures it, fix the candidate list — do not invent a representative term outside the candidate pool.
-
-**Selection principle — head entity, not every entity:**
-
-Pick the entity that, if seen alone on a search bar, would be enough to tell a clinician which chart section this question is about. Drop everything that merely qualifies, modifies, or duplicates that head entity, even if clinically present in the query:
-
-- Drop quantities, dosages, frequencies, routes — they qualify the head entity, they aren't the entity ("metformin 500mg" → "metformin"; "twice daily" → drop entirely)
-- Drop measurement values and readings ("140/90", "BP 140/90 mmHg", "HbA1c 7.2" → drop the value, keep "blood pressure" or "hemoglobin a1c" only if that *is* the question's anchor)
-- Drop temporal qualifiers attached to entities ("recent EKG" → "EKG"; "current medications" → drop entirely if no specific medication is named)
-- Drop sub-entities when a more specific parent already names the anchor — pick ONE level of granularity, not both
-- Drop redundant synonyms or paraphrases of an entity already on the list
-- Drop items that exist only as context/modifier for another intent's anchor
-
-**Cap — strict:**
-- 1 term when the intent is about a single clear entity ("diarrhea", "metformin")
-- 2 terms when the intent inherently couples two distinct entities
-- 3 absolute maximum — if you have more, you've kept qualifiers, sub-entities, or synonyms; remove them
-- Empty list is correct when the query names no concrete head entity for this intent
-
-**INCLUDE — head clinical entities only:**
-- The named symptom (not its severity, frequency, duration, or laterality)
-- The named diagnosis or condition (not its stage, control status, or sub-type unless the sub-type IS the question)
-- The named medication (not dose, frequency, route, or formulation)
-- The named procedure or test (not site qualifiers if the procedure name already carries them)
-- The named device or implant
-
-**EXCLUDE:**
-- Framing words: "do you have", "any issue with", "history of", "presence", "absence", "currently"
-- Action verbs: "check", "review", "evaluate", "assess", "look for"
-- Bare severity, quantity, frequency, dose, route, duration, recency words
-- Generic category words without a named instance: "medications", "labs", "vitals", "tests" (only include if the query gives a specific named one)
-- Synonyms or paraphrases of an entity already selected
-
-**Form rules:**
-- Lowercase, 1–3 words per term
-- One entity per term — never concatenate ("diarrhea or constipation" → two separate terms across two intents, not one combined term)
-- Expand abbreviations to chart-canonical form ("HTN" → "hypertension", "DM" → "diabetes mellitus")
-- The string must appear (verbatim or as a tight paraphrase) in this intent's atomic_concepts list
-
-**Examples:**
-- Query: "do you have diarrhea or constipation"
-  - Diarrhea intent → ["diarrhea"]
-  - Constipation intent → ["constipation"]
-- Query: "patient with HTN and DM on metformin 500mg twice daily, recent BP 140/90"
-  - Hypertension intent → ["hypertension"]
-  - Diabetes intent → ["diabetes mellitus"]
-  - Medication intent → ["metformin"]  (NOT "metformin 500mg" — dose is a qualifier)
-  - BP measurement intent → ["blood pressure"]  (NOT "BP 140/90" or "recent BP")
-- Query: "any issue with insurance bill?"
-  - Single intent → ["insurance bill"]
-- Query: "current medications"
-  - Single intent → []  (no specific medication named)
-- Query: "recent EKG findings"
-  - Single intent → ["EKG"]  (NOT "recent EKG" or "EKG findings")
-- Query: "looking for diabetic retinopathy screening"
-  - Single intent → ["diabetic retinopathy screening"]  OR  ["diabetic retinopathy"]
-  - Pick the ONE that matches the intent's actual focus. Not both.
 
 ====================================================
 REASONING FRAMEWORK
@@ -468,10 +401,6 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
-    # Concrete clinical entities named in the query that map to this intent.
-    # These are the "what" of the query (e.g., "diarrhea", "metformin"),
-    # stripped of framing words like "presence", "any issue with", "history of".
-    representative_terms: List[str] = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -709,21 +638,6 @@ class ExtractionResult:
             return None
         return self._concept_index.get(atomic_concept.strip().lower())
 
-    @staticmethod
-    def _dedup_representative_terms(terms: List[str]) -> List[str]:
-        """Dedup case-insensitively while preserving the order the LLM emitted.
-        The LLM is the source of truth for term identification — we just
-        clean the list shape here."""
-        seen: set = set()
-        out: List[str] = []
-        for t in terms or []:
-            t_clean = t.strip()
-            k = t_clean.lower()
-            if t_clean and k not in seen:
-                out.append(t_clean)
-                seen.add(k)
-        return out
-
     def _primary_record_types_from_concepts(self, concepts: List[str]) -> List[str]:
         """Most likely chart locations for a set of concepts, as a ranked list.
 
@@ -955,54 +869,59 @@ class ExtractionResult:
         )
         return result.model_dump()
 
-    # Per-intent cap on representative_terms. The prompt instructs the LLM
-    # to emit 1–3 head entities per intent; this is a programmatic backstop
-    # in case the LLM drifts. The slice is applied AFTER dedup so synonyms
-    # don't burn the budget, and BEFORE aggregation across intents.
-    _REPRESENTATIVE_TERMS_PER_INTENT_CAP = 3
-
     def to_representative_terms(self) -> Dict[str, Any]:
         """Standalone chart-search routing view, aggregated across the whole query.
 
-        No per-intent split in the OUTPUT. Internally we dedup and cap each
-        intent's representative_terms at _REPRESENTATIVE_TERMS_PER_INTENT_CAP
-        before unioning, so an over-eager intent can't dominate the final list.
+        Representative terms are derived structurally from each sub_nature's
+        category_path — specifically the rightmost segment, which is the most
+        specific concept the LLM committed to in the hierarchy. No separate
+        LLM extraction step, no per-intent cap heuristic; the bound is the
+        number of distinct sub_nature leaves in the query.
 
-        - representative_terms: union of LLM-extracted HEAD entity terms
-          across all intents — already filtered to head entities by the
-          prompt's REPRESENTATIVE TERMS rules, capped per intent here, then
-          deduped case-insensitively across the query with first-seen order.
-        - primary_record_types: top-1 record_type from EVERY distinct concept
-          in the query, ranked by frequency descending (ties broken by
-          first-seen order).
+        - representative_terms: leaf segment of every sub_nature's
+          category_path, deduped case-insensitively in first-seen order
+          across the query. Lowercased on output. Empty list when the query
+          has no sub_natures (non-clinical or extraction failure).
+        - primary_record_types: top-1 record_type from EVERY distinct atomic
+          concept in the query, ranked by frequency descending (ties broken
+          by first-seen order).
 
         Both lists may be empty independently; both are empty for non-clinical
         queries."""
-        # Per-intent: dedup, cap, then accumulate. Capping per-intent (not on
-        # the final unioned list) means each intent gets fair share — an
-        # intent that emits 1 useful term isn't squeezed out by another
-        # intent that ignored the cap.
-        all_terms: List[str] = []
+        rep_terms: List[str] = []
+        seen_terms: set = set()
+        # Walk atomic concepts in the same pass (deduped early so a concept
+        # named in two intents doesn't double-weight the record_type ranking).
         all_concepts: List[str] = []
         seen_concepts: set = set()
+
         for i in self.intents.intents:
-            intent_terms = self._dedup_representative_terms(i.representative_terms)
-            all_terms.extend(intent_terms[: self._REPRESENTATIVE_TERMS_PER_INTENT_CAP])
             for sn in i.sub_natures:
+                # Leaf = rightmost ">>"-separated segment of the category_path.
+                # The path is normalized to " >> " by SubNature's validator,
+                # so a simple split is reliable. Skip empty/malformed paths.
+                segments = [
+                    s.strip()
+                    for s in (sn.category_path or "").split(">>")
+                    if s.strip()
+                ]
+                if segments:
+                    leaf = segments[-1].lower()
+                    if leaf and leaf not in seen_terms:
+                        rep_terms.append(leaf)
+                        seen_terms.add(leaf)
+
                 for c in sn.atomic_concepts or []:
-                    k = c.strip().lower()
-                    if k and k not in seen_concepts:
+                    ck = c.strip().lower()
+                    if ck and ck not in seen_concepts:
                         all_concepts.append(c.strip())
-                        seen_concepts.add(k)
+                        seen_concepts.add(ck)
 
         result = Format_RepresentativeTerms(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            # Final dedup across the query — an entity legitimately shared
-            # by two intents (e.g. "diabetes mellitus" appearing in both a
-            # diagnosis intent and a medication intent) collapses to one.
-            representative_terms=self._dedup_representative_terms(all_terms),
+            representative_terms=rep_terms,
             primary_record_types=self._primary_record_types_from_concepts(all_concepts),
         )
         return result.model_dump()
