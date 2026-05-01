@@ -873,15 +873,15 @@ class ExtractionResult:
         """Standalone chart-search routing view, aggregated across the whole query.
 
         Representative terms are derived structurally from each sub_nature's
-        category_path — specifically the rightmost segment, which is the most
-        specific concept the LLM committed to in the hierarchy. No separate
-        LLM extraction step, no per-intent cap heuristic; the bound is the
-        number of distinct sub_nature leaves in the query.
+        category_path — specifically the SECOND segment, which is the
+        "Specific" level in the "Broad >> Specific >> Detail" format. No
+        separate LLM extraction step.
 
-        - representative_terms: leaf segment of every sub_nature's
-          category_path, deduped case-insensitively in first-seen order
-          across the query. Lowercased on output. Empty list when the query
-          has no sub_natures (non-clinical or extraction failure).
+        - representative_terms: the "Specific" segment (index 1) of every
+          sub_nature's category_path, deduped case-insensitively in first-seen
+          order across the query. Lowercased on output. If a path has only
+          one segment, that single segment is used as a defensive fallback.
+          Empty list when the query has no sub_natures.
         - primary_record_types: top-1 record_type from EVERY distinct atomic
           concept in the query, ranked by frequency descending (ties broken
           by first-seen order).
@@ -897,19 +897,27 @@ class ExtractionResult:
 
         for i in self.intents.intents:
             for sn in i.sub_natures:
-                # Leaf = rightmost ">>"-separated segment of the category_path.
-                # The path is normalized to " >> " by SubNature's validator,
-                # so a simple split is reliable. Skip empty/malformed paths.
+                # Path is normalized to " >> " by SubNature's validator, which
+                # also pads single-segment paths with " >> General". Split is
+                # therefore reliable. Pick the "Specific" segment — index 1
+                # in "Broad >> Specific >> Detail" — which captures the
+                # category-level entity rather than the broadest container or
+                # the most-granular leaf detail.
                 segments = [
                     s.strip()
                     for s in (sn.category_path or "").split(">>")
                     if s.strip()
                 ]
-                if segments:
-                    leaf = segments[-1].lower()
-                    if leaf and leaf not in seen_terms:
-                        rep_terms.append(leaf)
-                        seen_terms.add(leaf)
+                chosen: Optional[str] = None
+                if len(segments) >= 2:
+                    chosen = segments[1].lower()
+                elif segments:
+                    # Defensive: malformed path with a single segment.
+                    chosen = segments[0].lower()
+
+                if chosen and chosen not in seen_terms:
+                    rep_terms.append(chosen)
+                    seen_terms.add(chosen)
 
                 for c in sn.atomic_concepts or []:
                     ck = c.strip().lower()
