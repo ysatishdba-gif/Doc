@@ -111,7 +111,7 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
-6. **representative_term** - A 1–3 word phrase naming the specific entity this intent is about. Read your own `nature` and `sub_natures` to choose it: it should be the clean chart-search anchor that summarizes this intent at the entity level. One phrase per intent — not a list, not a decomposition.
+6. **representative_terms[]** - A short list (typically 1–3 phrases) at the ENTITY level, summarizing what this intent is about as a whole. Read the entire intent breakdown — nature, sub_natures, and atomic_concepts — together. Understand what the intent is talking about across all of them. Then synthesize entity-level chart-search anchors. Do NOT enumerate atomic_concepts here — atomic_concepts decompose the intent into measurable pieces; representative_terms summarize it. If the intent genuinely concerns multiple distinct entities, list them; if it concerns one entity discussed at multiple grains, list it once.
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -401,11 +401,12 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
-    # Single LLM-picked phrase naming the entity this intent is about.
-    # Derived from reading this intent's nature + sub_natures, chosen at the
-    # right level for chart-search anchoring (not the deep atomic_concepts,
-    # not the broad nature label). Empty string if the LLM didn't emit one.
-    representative_term: str = ""
+    # Short list (typically 1–3) of LLM-picked entity-level phrases summarizing
+    # what this intent is about. The LLM reads nature + sub_natures +
+    # atomic_concepts together and synthesizes; these are NOT atomic_concepts
+    # copied verbatim (those decompose the intent), but entity-level summaries
+    # derived from the whole. Empty list when the LLM didn't emit any.
+    representative_terms: list = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -537,14 +538,14 @@ class Format_IntentExtraction(BaseModel):
     intents: List[IntentSummaryItem]
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    representative_terms: List[str] = Field(default_factory=list)
+    representative_terms: list = Field(default_factory=list)
 
 
 class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    representative_terms: List[str] = Field(default_factory=list)
+    representative_terms: list = Field(default_factory=list)
     total_candidates: int
     final_candidates: List[FinalCandidateItem]
 
@@ -554,7 +555,7 @@ class Format_NatureBreakdown(BaseModel):
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
-    representative_terms: List[str] = Field(default_factory=list)
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithoutQueries]
 
 
@@ -564,7 +565,7 @@ class Format_FullPipeline(BaseModel):
     original_query: str
     expanded_query: str
     total_intents_detected: int
-    representative_terms: List[str] = Field(default_factory=list)
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithContext]
 
 
@@ -672,22 +673,27 @@ class ExtractionResult:
     # format methods
 
     def _representative_terms(self) -> List[str]:
-        """Per-intent representative_terms collected into a flat deduped list,
-        in intent traversal order. Each intent's LLM-emitted
-        representative_term contributes one entry; empty strings are skipped;
-        duplicates across intents are removed case-insensitively. Used by
-        every format method that surfaces this field at the top level."""
+        """Per-intent representative_terms flattened into a single deduped list.
+
+        Each intent contributes its own short list of entity-level phrases
+        (the LLM synthesizes them by reading nature + sub_natures +
+        atomic_concepts together — see prompt INTENT STRUCTURE item 6).
+        We flatten across intents in traversal order, coerce items to str
+        (the field is an untyped list so items could in principle be other
+        scalars), strip whitespace, skip empties, and dedup case-
+        insensitively across the whole query."""
         terms: List[str] = []
         seen: set = set()
         for intent in self.intents.intents:
-            t = (intent.representative_term or "").strip()
-            if not t:
-                continue
-            key = t.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            terms.append(t)
+            for t in intent.representative_terms or []:
+                t_clean = str(t).strip()
+                if not t_clean:
+                    continue
+                key = t_clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                terms.append(t_clean)
         return terms
 
     def to_intent_extraction(self) -> Dict[str, Any]:
