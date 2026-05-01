@@ -210,50 +210,6 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 Generate multiple atomic queries per intent. Each atomic_concept should appear in at least one query, but keep each query short and focused.
 
 ====================================================
-REPRESENTATIVE TERMS (top-level, query-wide)
-====================================================
-
-In addition to the intents list, produce a TOP-LEVEL `representative_terms` field — NOT nested under any intent. A 1–5 item list summarizing the chart-search headlines for the WHOLE query.
-
-THE PRINCIPLE — every term must pass BOTH tests:
-
-TEST 1 — CHART-SEARCHABLE:
-"If a clinician typed this exact phrase into a chart-search bar, would they expect to find a real section, entity, or record?"
-
-TEST 2 — GROUNDED IN THE QUERY (no decomposition):
-"Did the user explicitly name or ask about this specific thing — or am I adding it from medical knowledge of what's related, what's measurable, or what's adjacent?"
-
-Include the term only when BOTH answers are yes. The second test is what prevents going deeper than the query asks: if the user said "diarrhea", the term is "diarrhea" — NOT "stool consistency", "bowel frequency", or "blood in stool", even though all of those are chart-searchable. Stay at the level of specificity the query uses. Do not decompose an entity into its components, sub-symptoms, related findings, or things you would assess about it. The user told you what they care about; do not replace it with what they could have asked.
-
-WHAT TO INCLUDE:
-A term passes both tests when it names a chart-anchored noun phrase the user is actually asking about — for example, named clinical entities the query points at (symptoms, diagnoses, medications, procedures, devices, labs, vitals); chart sections or categories when no specific entity is named ("medications", "allergies", "vital signs", "lab results", "problem list"); or administrative / operational topics when those are the actual subject ("insurance billing", "discharge instructions", "appointment").
-
-WHAT TO EXCLUDE (these are descriptions of HOW the tests fail, not a vocabulary list):
-- Wording that FRAMES the question rather than names its subject — the wrapper around the ask, not the ask itself
-- Wording that REQUESTS AN ACTION rather than names a topic — verbs about doing, not about a thing
-- A QUALIFIER or state word with no entity attached — a modifier is not a thing
-- An ATTRIBUTE of an entity rather than the entity itself — a property of something is not that something
-- A SUB-COMPONENT, related finding, or measurable aspect the user did not name — even if chart-searchable, this fails Test 2 by adding depth the query didn't request
-- Wording too GENERIC to map to a chart section — not anchored to anything searchable
-
-The principle is what decides. The descriptions above explain WHY a term fails, not WHICH terms fail. A novel word, slang, abbreviation, or phrase you haven't seen still gets included or excluded based on whether it passes both tests — never on whether it appears in any list.
-
-FORM:
-- Lowercase, 1–3 words per term
-- Expand abbreviations to canonical medical form: "HTN" → "hypertension", "DM" → "diabetes mellitus", "BP" → "blood pressure"
-- 1–5 terms total, deduped, ordered by importance
-- Empty list ONLY when the query is non-clinical or carries no chart-searchable topic the user explicitly named
-
-EXAMPLES (illustrating the tests, not vocabulary):
-
-1. "do you have diarrhea or constipation" → ["diarrhea", "constipation"]
-   These pass both tests: the user named them, and a clinician would search a chart for them.
-   NOT ["bowel movement", "stool consistency", "blood in stool"] — those fail Test 2. They decompose diarrhea into things you'd ASSESS about it; the user didn't ask about those.
-
-2. "current medication list" → ["medications"]
-   "medications" passes both tests: it's the chart section the query is about. "current" and "list" are qualifiers — modifiers, not entities.
-
-====================================================
 REASONING FRAMEWORK
 ====================================================
 
@@ -452,10 +408,6 @@ class IntentExtractionResponse(BaseModel):
     reason: Optional[str] = None
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
-    # Query-level chart-search headlines, produced by the LLM by reading the
-    # original + expanded query as a whole. NOT nested per-intent — this
-    # summarizes the entire query in 1–5 chart-searchable noun phrases.
-    representative_terms: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def fix_intent_count(self) -> "IntentExtractionResponse":
@@ -471,9 +423,6 @@ class IntentExtractionOutput(BaseModel):
     expanded_query: str
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
-    # Same as IntentExtractionResponse.representative_terms; carried through
-    # to the result so format methods can surface it without an LLM re-call.
-    representative_terms: List[str] = Field(default_factory=list)
 
 
 # Contextual environment schemas
@@ -601,30 +550,32 @@ class Format_NatureBreakdown(BaseModel):
     intents: List[IntentWithoutQueries]
 
 
+class RecordTypeGroup(BaseModel):
+    """A chart section paired with the query-relevant concepts documented there.
+
+    record_type: the chart location (e.g. "radiology_report", "medication_list").
+    concepts: atomic_concepts from the query whose top-1 record_type is this
+    record_type — i.e. concepts that primarily live in this chart section.
+    A clinician searching this section would look for these concepts."""
+    record_type: str
+    concepts: List[str] = Field(default_factory=list)
+
+
 class Format_RepresentativeTerms(BaseModel):
-    """Output format that surfaces only chart-search routing for the query.
+    """Chart-routing view organized by record type.
 
-    Aggregated across the entire query — no per-intent split. Two flat
-    lists you can lift directly into a chart-search call:
+    For each record_type relevant to the query, lists the concepts from the
+    query that live there. The grouping is structural: every concept's
+    top-1 record_type (from context, already sorted descending by relevance)
+    determines its home group. Groups are ordered by size descending —
+    record types holding more of the query's concepts come first.
 
-    - representative_terms: deduped chart-searchable entities the LLM
-      extracted from the query (across all intents). Empty list when the
-      query named no concrete entity.
-    - primary_record_types: most likely chart locations, ranked descending.
-      Derived by walking every atomic concept in the query, taking each
-      concept's top-1 record_type (already sorted descending by relevance
-      per the context prompt), and ranking those top-1 values by frequency
-      across the whole query. Empty list when context build produced no
-      record_types.
-
-    Independent of nature_breakdown and full_pipeline — those views are
-    unchanged. When the query is non-clinical, both lists are empty and
-    is_clinical/rejected_reason carry the reason."""
+    Both fields may be empty for non-clinical queries or when context build
+    produced no record_types."""
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    representative_terms: List[str] = Field(default_factory=list)
-    primary_record_types: List[str] = Field(default_factory=list)
+    record_type_groups: List[RecordTypeGroup] = Field(default_factory=list)
 
 
 class Format_FullPipeline(BaseModel):
@@ -688,36 +639,6 @@ class ExtractionResult:
         if self._concept_index is None:
             return None
         return self._concept_index.get(atomic_concept.strip().lower())
-
-    def _primary_record_types_from_concepts(self, concepts: List[str]) -> List[str]:
-        """Most likely chart locations for a set of concepts, as a ranked list.
-
-        Each concept's record_types arrive pre-sorted descending by relevance
-        (enforced by the context prompt's ORDERING REQUIREMENT). We take each
-        concept's top-1 ("definitive source"), then return all distinct values
-        ordered by how many concepts placed them at top-1 — descending. Ties
-        broken by first-seen order across the input list.
-
-        Returns an empty list when no concept in the input has any record_types
-        (e.g. context build failed)."""
-        if not self._concept_index:
-            return []
-
-        top_choices: List[str] = []
-        for c in concepts or []:
-            cc = self._get_concept_context(c.strip())
-            if cc and cc.record_types:
-                top_choices.append(cc.record_types[0])
-
-        if not top_choices:
-            return []
-
-        counts = Counter(top_choices)
-        # Stable sort: primary key = count desc, secondary key = first-seen
-        # index asc. Counter is insertion-ordered, so its keys() preserves
-        # first-seen order for tie-breaking.
-        first_seen = {rt: idx for idx, rt in enumerate(counts.keys())}
-        return sorted(counts.keys(), key=lambda rt: (-counts[rt], first_seen[rt]))
 
     def _temporal_for_candidate(self, intent_title: str, candidate: str) -> List[str]:
         """Per-candidate temporal signal from Task 2.
@@ -921,45 +842,62 @@ class ExtractionResult:
         return result.model_dump()
 
     def to_representative_terms(self) -> Dict[str, Any]:
-        """Standalone chart-search routing view.
+        """Group every distinct atomic_concept in the query by its top-1
+        record_type (from the LLM-built context, sorted descending by
+        relevance). Each group becomes "this is what to search for in this
+        record type."
 
-        - representative_terms: the LLM's query-level summary, produced in
-          the intent-extraction step by reading the original + expanded
-          query holistically. Lowercased and deduped here as a final
-          cleanup; the LLM is the source of truth for selection.
-        - primary_record_types: top-1 record_type from EVERY distinct atomic
-          concept in the query, ranked by frequency descending.
+        Walk:
+        1. Iterate every intent → sub_nature → atomic_concept in order.
+        2. Dedup concepts case-insensitively (a concept named in two intents
+           contributes once).
+        3. For each concept, look up its top-1 record_type in the context.
+           Concepts without context (record_types empty / missing) are
+           skipped — they have no chart home to assign.
+        4. Group concepts under their top-1 record_type, preserving concept
+           order within each group.
+        5. Order groups by size descending (more concepts → higher relevance
+           to the query). First-seen tiebreaker via insertion order.
 
-        Both lists may be empty independently. Both are empty for
-        non-clinical queries. The deduplication preserves the LLM's order
-        (importance-ranked per the prompt's instruction)."""
-        # Light cleanup of LLM output: lowercase, strip, dedup case-insensitive,
-        # preserve order.
-        seen_terms: set = set()
-        rep_terms: List[str] = []
-        for t in self.intents.representative_terms or []:
-            t_clean = t.strip().lower()
-            if t_clean and t_clean not in seen_terms:
-                rep_terms.append(t_clean)
-                seen_terms.add(t_clean)
-
-        # Walk every atomic concept once for primary_record_types ranking.
-        all_concepts: List[str] = []
+        Empty record_type_groups for non-clinical queries or when context
+        build returned no record_types for any concept."""
+        # Step 1+2: ordered, deduped concept list across the whole query.
+        ordered_concepts: List[str] = []
         seen_concepts: set = set()
         for i in self.intents.intents:
             for sn in i.sub_natures:
                 for c in sn.atomic_concepts or []:
-                    ck = c.strip().lower()
-                    if ck and ck not in seen_concepts:
-                        all_concepts.append(c.strip())
-                        seen_concepts.add(ck)
+                    k = c.strip().lower()
+                    if k and k not in seen_concepts:
+                        ordered_concepts.append(c.strip())
+                        seen_concepts.add(k)
+
+        # Step 3+4: group by top-1 record_type. dict insertion order =
+        # first-seen, which we rely on for tiebreaks below.
+        groups: Dict[str, List[str]] = {}
+        for c in ordered_concepts:
+            cc = self._get_concept_context(c)
+            if cc and cc.record_types:
+                primary_rt = cc.record_types[0]
+                groups.setdefault(primary_rt, []).append(c)
+
+        # Step 5: order groups by size desc, tiebreak by first-seen.
+        first_seen = {rt: idx for idx, rt in enumerate(groups.keys())}
+        ordered_record_types = sorted(
+            groups.keys(),
+            key=lambda rt: (-len(groups[rt]), first_seen[rt]),
+        )
+
+        rt_groups = [
+            RecordTypeGroup(record_type=rt, concepts=groups[rt])
+            for rt in ordered_record_types
+        ]
 
         result = Format_RepresentativeTerms(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            representative_terms=rep_terms,
-            primary_record_types=self._primary_record_types_from_concepts(all_concepts),
+            record_type_groups=rt_groups,
         )
         return result.model_dump()
 
@@ -1084,7 +1022,6 @@ class ContextualIntentPipeline:
             expanded_query=expanded_query,
             total_intents_detected=len(raw.intents),
             intents=raw.intents,
-            representative_terms=raw.representative_terms,
         )
 
     def build_context(
