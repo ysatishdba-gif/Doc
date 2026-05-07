@@ -1,25 +1,341 @@
-what is centrality
-For each CUI in a semantic type, we compute:
-centrality(C) = -log(reach(C) / total_in_type)
-Where:
+"""
+Stage 1 of 2: build per-CUI expansion lookup from MRREL.
 
-reach(C) = how many CUIs in the same semantic type are reachable from C through allowed relations
-total_in_type = total CUIs in that semantic type
+Reads:  BigQuery MRCONSO, MRSTY, MRREL
+Writes: cui_expansion_lookup.pkl
 
-Examples (made up but realistic for finding semantic type with say 50,000 CUIs):
-CUIReachReach / TotalCentralityPain30,0000.60-log(0.60) = 0.51Lower limb pain5,0000.10-log(0.10) = 2.30Knee pain5000.01-log(0.01) = 4.61Left knee pain500.001-log(0.001) = 6.91
-Higher centrality = more specific/peripheral. Lower centrality = more general/central in the graph.
-Now the BFS bound
-When we BFS-expand from a source CUI, we set:
-threshold = source_centrality - 0.5
-Then we ONLY walk to a neighbor if neighbor_centrality >= threshold.
-In other words: we refuse to walk to a CUI whose centrality is more than 0.5 below the source's.
-Concrete example: starting from "Knee pain"
+For each CUI in SNOMEDCT_US:
+  - expansion = list of same-semantic-type CUIs reachable via filtered REL
+    relations (PAR, CHD, RB, RN, SY, SIB), with the relation type and
+    RELA sub-attribute preserved per edge.
+  - rela_neighbors = list of (RELA, target_cui) pairs from MRREL,
+    regardless of REL type. This is the data Stage 2 uses for
+    sub-topic assignment.
 
-Source: Knee pain, centrality = 4.61
-Threshold = 4.61 − 0.5 = 4.11
-BFS will accept neighbors with centrality ≥ 4.11
-BFS will REJECT neighbors with centrality < 4.11
+Bounds:
+  - Same semantic type only (BFS doesn't cross semantic types)
+  - Filtered REL types for expansion (RO and others excluded from expansion)
+  - No hop limit, no centrality drop
 
-Walking outward from Knee pain:
-NeighborCentrality4.11 thresholdVerdictLeft knee pain6.91≥ 4.11✅ Accept (more specific)Right knee pain6.91≥ 4.11✅ AcceptKnee disorder4.50≥ 4.11✅ Accept (similar specificity)Lower limb pain2.30< 4.11❌ Reject (too general)Pain0.51< 4.11❌ Reject (way too general)
+Output pickle structure:
+  {
+    cui: {
+      "own_label":     str,
+      "semantic_type": str,
+      "expansion": [
+        {"cui": str, "label": str, "rel": str, "rela": str | None},
+        ...
+      ],
+      "rela_neighbors": [
+        {"rela": str, "target_cui": str, "target_label": str},
+        ...
+      ]
+    }
+  }
+"""
+
+import os
+import pickle
+import sys
+import time
+from collections import defaultdict, deque
+from google.cloud import bigquery
+
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
+
+PROJECT = "your-gcp-project-id"
+DATASET = "your-bigquery-dataset"
+OUTPUT  = "cui_expansion_lookup.pkl"
+
+# REL types used to build the expansion graph (within same semantic type).
+# These are broader/narrower/synonym/sibling — the hierarchical backbone.
+EXPANSION_RELS = {"PAR", "CHD", "RB", "RN", "SY", "SIB"}
+
+
+# ─────────────────────────────────────────────────────────────
+# BIGQUERY
+# ─────────────────────────────────────────────────────────────
+
+def query_concepts(client):
+    sql = f"""
+        SELECT DISTINCT
+            c.CUI,
+            c.STR AS label,
+            LOWER(COALESCE(s.STY, 'unknown')) AS semantic_type
+        FROM `{PROJECT}.{DATASET}.MRCONSO` c
+        LEFT JOIN `{PROJECT}.{DATASET}.MRSTY` s ON c.CUI = s.CUI
+        WHERE c.SAB='SNOMEDCT_US'
+          AND c.LAT='ENG'
+          AND c.ISPREF='Y'
+          AND c.SUPPRESS='N'
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY c.CUI ORDER BY s.STY NULLS LAST
+        ) = 1
+    """
+    print("  Querying concepts...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} concepts ({time.time()-t:.1f}s)")
+    return df
+
+
+def query_relations(client):
+    """Pull all SNOMEDCT_US relations, keeping REL and RELA. We need:
+       - REL filtered to EXPANSION_RELS for the expansion graph
+       - All RELA values (for sub-topic computation in Stage 2),
+         which means including REL=RO rows where most RELAs live.
+    """
+    sql = f"""
+        SELECT
+            CUI1 AS cui_a,
+            CUI2 AS cui_b,
+            REL  AS rel,
+            RELA AS rela
+        FROM `{PROJECT}.{DATASET}.MRREL`
+        WHERE SAB='SNOMEDCT_US'
+          AND SUPPRESS='N'
+    """
+    print("  Querying ALL relations (need RELA from RO rows too)...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} relation rows ({time.time()-t:.1f}s)")
+    return df
+
+
+# ─────────────────────────────────────────────────────────────
+# GRAPH + EXPANSION
+# ─────────────────────────────────────────────────────────────
+
+def build_nodes(concepts_df):
+    print("  Building node table...")
+    t = time.time()
+    concepts_df = concepts_df.copy()
+    concepts_df["semantic_type"] = (
+        concepts_df["semantic_type"].fillna("unknown").str.lower()
+    )
+    concepts_df["full_label"] = (
+        concepts_df["label"] + " (" + concepts_df["semantic_type"] + ")"
+    )
+    nodes = {}
+    for r in concepts_df[["CUI", "full_label", "semantic_type"]].to_dict("records"):
+        nodes[r["CUI"]] = {
+            "label":         r["full_label"],
+            "semantic_type": r["semantic_type"],
+        }
+    print(f"  -> {len(nodes):,} nodes ({time.time()-t:.1f}s)")
+    return nodes
+
+
+def build_expansion_graph(nodes, relations_df):
+    """Adjacency for expansion BFS: cui -> dict of neighbor -> (rel, rela).
+
+    Only includes edges where REL is in EXPANSION_RELS. The graph is
+    auto-symmetric — each row produces edges in both directions so BFS
+    can walk parents and children, broader and narrower, etc.
+    """
+    print(f"  Building expansion graph (REL in {sorted(EXPANSION_RELS)})...")
+    t = time.time()
+    adj = defaultdict(dict)
+    skipped_non_node = 0
+    skipped_other_rel = 0
+    for r in relations_df.to_dict("records"):
+        rel = r["rel"]
+        if rel not in EXPANSION_RELS:
+            skipped_other_rel += 1
+            continue
+        a, b = r["cui_a"], r["cui_b"]
+        if a not in nodes or b not in nodes:
+            skipped_non_node += 1
+            continue
+        if a == b:
+            continue
+        rela = r["rela"] if r["rela"] else None
+        if b not in adj[a]:
+            adj[a][b] = (rel, rela)
+        if a not in adj[b]:
+            adj[b][a] = (rel, rela)
+    print(f"  -> {sum(len(v) for v in adj.values()):,} directed edges  "
+          f"(skipped {skipped_other_rel:,} non-EXPANSION_RELS rows, "
+          f"{skipped_non_node:,} edges to non-SNOMED CUIs)  "
+          f"({time.time()-t:.1f}s)")
+    return adj
+
+
+def build_rela_neighbors(nodes, relations_df):
+    """For every CUI, list (rela, target_cui) pairs from ALL relations
+    (including REL=RO, where most RELAs live). Used by Stage 2 for
+    sub-topic assignment. Skips rows where rela is NULL or empty."""
+    print("  Building RELA neighbor lookup (all REL types, RELA only)...")
+    t = time.time()
+    rela_neighbors = defaultdict(list)
+    skipped_null_rela = 0
+    skipped_non_node = 0
+    for r in relations_df.to_dict("records"):
+        rela = r["rela"]
+        if not rela:
+            skipped_null_rela += 1
+            continue
+        a, b = r["cui_a"], r["cui_b"]
+        if a not in nodes or b not in nodes:
+            skipped_non_node += 1
+            continue
+        if a == b:
+            continue
+        # Each MRREL row encodes "a has relation rela to b". We store from
+        # a's perspective. The reverse direction will also have a row in
+        # MRREL with its own RELA (often the inverse, e.g. has_finding_site
+        # vs finding_site_of), so we don't auto-symmetrize here.
+        rela_neighbors[a].append({
+            "rela":         rela,
+            "target_cui":   b,
+            "target_label": nodes[b]["label"],
+        })
+    n_total = sum(len(v) for v in rela_neighbors.values())
+    print(f"  -> {n_total:,} RELA-bearing edges  "
+          f"(skipped {skipped_null_rela:,} NULL-RELA rows, "
+          f"{skipped_non_node:,} edges to non-SNOMED CUIs)  "
+          f"({time.time()-t:.1f}s)")
+    return rela_neighbors
+
+
+def expand_cui(cui, nodes, adj):
+    """BFS within same semantic type via filtered REL edges. No hop limit,
+    no centrality bound. Sorted by hop distance for downstream consumers
+    that want to know how close each neighbor is.
+    """
+    src_type = nodes[cui]["semantic_type"]
+    seen = {cui}
+    accepted = []  # list of (hop, neighbor, rel, rela)
+
+    current_layer = []
+    for nb, (rel, rela) in adj.get(cui, {}).items():
+        if nb == cui or nb in seen:
+            continue
+        if nodes.get(nb, {}).get("semantic_type") != src_type:
+            continue
+        seen.add(nb)
+        accepted.append((1, nb, rel, rela))
+        current_layer.append(nb)
+
+    hop = 1
+    while current_layer:
+        next_layer = []
+        for n in current_layer:
+            for nb, (rel, rela) in adj.get(n, {}).items():
+                if nb in seen:
+                    continue
+                if nodes.get(nb, {}).get("semantic_type") != src_type:
+                    continue
+                seen.add(nb)
+                accepted.append((hop + 1, nb, rel, rela))
+                next_layer.append(nb)
+        current_layer = next_layer
+        hop += 1
+
+    accepted.sort(key=lambda x: x[0])
+    return accepted
+
+
+def build_lookup(nodes, adj, rela_neighbors):
+    print("  Building per-CUI expansion lookup...")
+    t = time.time()
+    total = len(nodes)
+    lookup = {}
+    expansion_sizes = []
+    rela_sizes = []
+
+    for i, cui in enumerate(nodes):
+        if i % 25000 == 0:
+            eta = ((time.time()-t) / max(i, 1)) * (total - i)
+            avg_e = sum(expansion_sizes[-1000:]) / max(len(expansion_sizes[-1000:]), 1) if expansion_sizes else 0
+            avg_r = sum(rela_sizes[-1000:]) / max(len(rela_sizes[-1000:]), 1) if rela_sizes else 0
+            print(f"    {i:,}/{total:,}  ETA {eta:.0f}s  "
+                  f"avg expansion last 1k: {avg_e:.0f}, "
+                  f"avg rela neighbors: {avg_r:.0f}", flush=True)
+
+        accepted = expand_cui(cui, nodes, adj)
+        expansion = [
+            {
+                "cui":   nb_cui,
+                "label": nodes.get(nb_cui, {}).get("label", nb_cui),
+                "rel":   rel,
+                "rela":  rela,
+            }
+            for _hop, nb_cui, rel, rela in accepted
+        ]
+        expansion_sizes.append(len(expansion))
+
+        rela_list = rela_neighbors.get(cui, [])
+        rela_sizes.append(len(rela_list))
+
+        lookup[cui] = {
+            "own_label":     nodes[cui]["label"],
+            "semantic_type": nodes[cui]["semantic_type"],
+            "expansion":     expansion,
+            "rela_neighbors": rela_list,
+        }
+
+    print(f"  -> done ({time.time()-t:.1f}s)")
+    if expansion_sizes:
+        sorted_e = sorted(expansion_sizes)
+        n = len(sorted_e)
+        print(f"    expansion size: min={sorted_e[0]:,}  median={sorted_e[n//2]:,}  "
+              f"mean={sum(sorted_e)/n:.0f}  p95={sorted_e[int(n*0.95)]:,}  "
+              f"max={sorted_e[-1]:,}")
+        print(f"    empty expansions: {sum(1 for s in expansion_sizes if s == 0):,}")
+    if rela_sizes:
+        sorted_r = sorted(rela_sizes)
+        n = len(sorted_r)
+        print(f"    rela neighbors: min={sorted_r[0]:,}  median={sorted_r[n//2]:,}  "
+              f"mean={sum(sorted_r)/n:.0f}  p95={sorted_r[int(n*0.95)]:,}  "
+              f"max={sorted_r[-1]:,}")
+
+    return lookup
+
+
+def save_pickle(obj, path):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
+
+
+if __name__ == "__main__":
+    start = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"  Stage 1: expansion + RELA lookup builder")
+    print(f"  Project        : {PROJECT}")
+    print(f"  Dataset        : {DATASET}")
+    print(f"  Expansion REL  : {sorted(EXPANSION_RELS)}")
+    print(f"  RELA           : all RELA-bearing rows (any REL)")
+    print(f"{'='*60}\n")
+
+    client = bigquery.Client(project=PROJECT)
+
+    print("[1/4] Pulling concepts...")
+    concepts_df = query_concepts(client)
+    print()
+
+    print("[2/4] Pulling relations...")
+    relations_df = query_relations(client)
+    print()
+
+    print("[3/4] Building graphs...")
+    nodes = build_nodes(concepts_df)
+    adj = build_expansion_graph(nodes, relations_df)
+    rela_neighbors = build_rela_neighbors(nodes, relations_df)
+    print()
+
+    print("[4/4] Building lookup...")
+    lookup = build_lookup(nodes, adj, rela_neighbors)
+    print()
+
+    print("Saving pickle...")
+    save_pickle(lookup, OUTPUT)
+    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
+    print(f"\nNext: run `python run_topics.py` to add topic + sub-topic IDs.")
