@@ -279,12 +279,25 @@ def fetch_cui_metadata(client):
     return df
 
 
+# Cluster type preference for sorting. Higher score = listed first in the
+# per-CUI cluster list. Adaptor consumers take top K from this sorted list.
+CLUSTER_TYPE_RANK = {
+    "CROSS_SEMANTIC_CLUSTER": 3,
+    "RELATION_CLUSTER":       2,
+    "SUPER_SET":              1,
+}
+
+
 def build_lookup(membership_df, metadata_df):
-    """Pivot the (cui, cluster, role) rows into per-CUI dict."""
+    """Pivot the (cui, cluster, role) rows into per-CUI dict.
+
+    Each CUI's `clusters` list is sorted by cluster_type preference:
+    CROSS first, then RELATION, then SUPER. Stable order within type.
+    Adaptor consumers take top K from the front of this list.
+    """
     print("  Pivoting into per-CUI lookup...")
     t = time.time()
 
-    # Build base lookup from CUI metadata (every CUI gets an entry)
     lookup = {}
     for row in metadata_df.to_dict("records"):
         lookup[row["cui"]] = {
@@ -293,13 +306,10 @@ def build_lookup(membership_df, metadata_df):
             "clusters":      [],
         }
 
-    # Append cluster memberships
     n_orphan = 0
     for row in membership_df.to_dict("records"):
         cui = row["cui"]
         if cui not in lookup:
-            # CUI in MRREL but missing from MRCONSO/MRSTY metadata.
-            # Still add it — we have the cluster info, just less label data.
             lookup[cui] = {
                 "label":         row["cui_label"] or cui,
                 "semantic_type": row["cluster_semantic_type"] or "unknown",
@@ -313,22 +323,88 @@ def build_lookup(membership_df, metadata_df):
             "role":         row["role"],
         })
 
+    # Sort each CUI's clusters by type preference. Python's sort is stable,
+    # so ties within a type preserve insertion order from BQ.
+    for entry in lookup.values():
+        entry["clusters"].sort(
+            key=lambda c: -CLUSTER_TYPE_RANK.get(c["cluster_type"], 0)
+        )
+
     print(f"  -> {len(lookup):,} CUIs ({time.time()-t:.1f}s)")
     if n_orphan:
-        print(f"     Note: {n_orphan:,} CUIs had cluster memberships but no metadata "
-              f"in MRCONSO/MRSTY")
+        print(f"     Note: {n_orphan:,} CUIs had cluster memberships but no "
+              f"metadata in MRCONSO/MRSTY")
 
     if lookup:
-        cluster_counts = sorted(len(e["clusters"]) for e in lookup.values())
-        n = len(cluster_counts)
-        print(f"    Per-CUI cluster count: "
-              f"min={cluster_counts[0]}  median={cluster_counts[n//2]}  "
-              f"mean={sum(cluster_counts)/n:.1f}  "
-              f"p95={cluster_counts[int(n*0.95)]}  max={cluster_counts[-1]}")
-        print(f"    CUIs with no clusters: "
-              f"{sum(1 for c in cluster_counts if c == 0):,}")
+        _print_distribution_stats(lookup)
 
     return lookup
+
+
+def _print_distribution_stats(lookup):
+    """Emit detailed cluster-membership stats per CUI to help pick K."""
+    n_total = len(lookup)
+
+    cluster_counts   = sorted(len(e["clusters"]) for e in lookup.values())
+    cross_counts     = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "CROSS_SEMANTIC_CLUSTER")
+        for e in lookup.values()
+    )
+    relation_counts  = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "RELATION_CLUSTER")
+        for e in lookup.values()
+    )
+    super_counts     = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "SUPER_SET")
+        for e in lookup.values()
+    )
+
+    def _stats(label, sorted_counts):
+        n = len(sorted_counts)
+        if n == 0:
+            print(f"    {label}: no data")
+            return
+        print(f"    {label:30s} "
+              f"min={sorted_counts[0]:>6,}  "
+              f"median={sorted_counts[n//2]:>6,}  "
+              f"mean={sum(sorted_counts)/n:>8.1f}  "
+              f"p95={sorted_counts[int(n*0.95)]:>6,}  "
+              f"max={sorted_counts[-1]:>6,}")
+
+    print(f"\n    Per-CUI cluster counts (n={n_total:,} CUIs)")
+    _stats("Total clusters", cluster_counts)
+    _stats("CROSS clusters", cross_counts)
+    _stats("RELATION clusters", relation_counts)
+    _stats("SUPER clusters", super_counts)
+
+    # Coverage thresholds — what % of CUIs have at least N CROSS clusters
+    print(f"\n    Coverage by CROSS cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in cross_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} CROSS clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    print(f"\n    Coverage by RELATION cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in relation_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} RELATION clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    # CUIs with no specific clusters (only SUPER, or nothing)
+    n_only_super = sum(
+        1 for e in lookup.values()
+        if e["clusters"] and all(c["cluster_type"] == "SUPER_SET" for c in e["clusters"])
+    )
+    n_no_clusters = sum(1 for e in lookup.values() if not e["clusters"])
+    print(f"\n    CUIs with NO clusters at all:        "
+          f"{n_no_clusters:>7,} ({100.0*n_no_clusters/n_total:>5.1f}%)")
+    print(f"    CUIs with ONLY SUPER clusters:       "
+          f"{n_only_super:>7,} ({100.0*n_only_super/n_total:>5.1f}%)")
+    print(f"    CUIs with at least one CROSS or REL: "
+          f"{n_total - n_only_super - n_no_clusters:>7,} "
+          f"({100.0*(n_total - n_only_super - n_no_clusters)/n_total:>5.1f}%)")
 
 
 def save_pickle(obj, path):
