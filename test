@@ -294,10 +294,33 @@ def build_lookup(membership_df, metadata_df):
     Each CUI's `clusters` list is sorted by cluster_type preference:
     CROSS first, then RELATION, then SUPER. Stable order within type.
     Adaptor consumers take top K from the front of this list.
+
+    Each cluster entry also carries:
+      - member_count: total CUIs in the cluster
+      - sample_members: up to 10 members (cui + label) for quick inspection
     """
     print("  Pivoting into per-CUI lookup...")
     t = time.time()
 
+    # ── First pass: compute cluster sizes and gather sample members ──
+    print("    Pass 1: computing cluster sizes and samples...", flush=True)
+    cluster_member_count = defaultdict(int)
+    cluster_samples      = defaultdict(list)   # cluster_id -> [{cui, label}, ...]
+    SAMPLE_LIMIT = 10
+
+    cui_label_map = {row["cui"]: row["label"] for row in metadata_df.to_dict("records")}
+
+    for row in membership_df.to_dict("records"):
+        cid = row["cluster_id"]
+        cluster_member_count[cid] += 1
+        if len(cluster_samples[cid]) < SAMPLE_LIMIT:
+            cluster_samples[cid].append({
+                "cui":   row["cui"],
+                "label": cui_label_map.get(row["cui"], row["cui_label"] or row["cui"]),
+            })
+
+    # ── Second pass: build per-CUI lookup with cluster metadata ──
+    print("    Pass 2: building per-CUI lookup...", flush=True)
     lookup = {}
     for row in metadata_df.to_dict("records"):
         lookup[row["cui"]] = {
@@ -309,6 +332,7 @@ def build_lookup(membership_df, metadata_df):
     n_orphan = 0
     for row in membership_df.to_dict("records"):
         cui = row["cui"]
+        cid = row["cluster_id"]
         if cui not in lookup:
             lookup[cui] = {
                 "label":         row["cui_label"] or cui,
@@ -317,10 +341,12 @@ def build_lookup(membership_df, metadata_df):
             }
             n_orphan += 1
         lookup[cui]["clusters"].append({
-            "cluster_id":   row["cluster_id"],
-            "cluster_type": row["cluster_type"],
-            "cluster_name": row["cluster_name"],
-            "role":         row["role"],
+            "cluster_id":     cid,
+            "cluster_type":   row["cluster_type"],
+            "cluster_name":   row["cluster_name"],
+            "role":           row["role"],
+            "member_count":   cluster_member_count[cid],
+            "sample_members": cluster_samples[cid],
         })
 
     # Sort each CUI's clusters by type preference. Python's sort is stable,
@@ -337,6 +363,7 @@ def build_lookup(membership_df, metadata_df):
 
     if lookup:
         _print_distribution_stats(lookup)
+
 
     return lookup
 
