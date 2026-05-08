@@ -1,59 +1,491 @@
-MRREL rows touching C2142181: 14
+"""
+Build per-CUI cluster lookup pickle from MRREL, with cluster construction
+done entirely in BigQuery. Python just reads results and writes the pickle.
 
-CUI1            REL     RELA                            CUI2          
-----------------------------------------------------------------------------------------------------
-C0231749        CHD     isa                             C2142181      
-  CUI1: Pain of joint of knee (finding)
-  CUI2: Pain of left knee joint (finding)
+Reads:  BigQuery MRCONSO, MRSTY, MRREL
+Writes: cui_topic_lookup.pkl
 
-C5442019        CHD     isa                             C2142181      
-  CUI1: Pain of left knee region (finding)
-  CUI2: Pain of left knee joint (finding)
+Cluster types (built in BQ):
+  RELATION_CLUSTER            per (semantic_type, effective_rel, target_cui), same-type
+  CROSS_SEMANTIC_CLUSTER      per (origin_type, target_type, effective_rel, target_cui)
 
-C2142181        CHD     isa                             C2051306      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Patellofemoral syndrome of left knee
+  effective_rel = COALESCE(RELA, REL)
 
-C2142181        CHD     isa                             C2220048      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Pain of bilateral knee joints (finding)
+SUPER clusters (one per semantic type) are NOT generated. They were too
+broad to be useful — they would match any CUI of the same semantic type
+to any other, diluting retrieval signal.
 
-C2142181        CHD     isa                             C4509797      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Chronic pain following left total knee arthroplasty (finding)
+Bidirectional dedup: MRREL encodes each conceptual relationship twice
+(e.g., A isa B AND B inverse_isa A). We keep only one direction:
+  - Drop RELA values that start with 'inverse_' or end with '_of'
+    (these are passive/inverse forms; the active form is kept)
+  - For REL-only rows (no RELA), drop PAR and RB (CHD and RN are kept)
+  - For symmetric relations (SY, SIB, possibly_equivalent_to, same_as),
+    keep only rows where CUI1 < CUI2
 
-C2142181        PAR     inverse_isa                     C0231749      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Pain of joint of knee (finding)
+Cluster IDs are deterministic FARM_FINGERPRINT hashes of the cluster's
+defining tuple — same input always produces the same cluster_id.
 
-C2142181        PAR     inverse_isa                     C5442019      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Pain of left knee region (finding)
+Output pickle structure (per CUI):
+  {
+    cui: {
+      "label":         str,
+      "semantic_type": str,
+      "clusters": [
+        {
+          "cluster_id":     str,
+          "cluster_type":   str,    # CROSS_SEMANTIC_CLUSTER / RELATION_CLUSTER
+          "cluster_name":   str,
+          "role":           str,    # ORIGIN / TARGET
+          "member_count":   int,    # distinct CUI count in the cluster
+          "sample_members": list,   # up to 10 sample CUIs with labels
+        },
+        ...
+      ]
+    }
+  }
 
-C2051306        PAR     inverse_isa                     C2142181      
-  CUI1: Patellofemoral syndrome of left knee
-  CUI2: Pain of left knee joint (finding)
+CUIs may have no clusters at all (empty list) if they don't appear in
+filtered MRREL. The adaptor handles that case as "no matchable signal."
 
-C2220048        PAR     inverse_isa                     C2142181      
-  CUI1: Pain of bilateral knee joints (finding)
-  CUI2: Pain of left knee joint (finding)
+Adaptor matching: two CUIs match iff they share at least one cluster_id.
+"""
 
-C4509797        PAR     inverse_isa                     C2142181      
-  CUI1: Chronic pain following left total knee arthroplasty (finding)
-  CUI2: Pain of left knee joint (finding)
+import os
+import pickle
+import sys
+import time
+from collections import defaultdict
+from google.cloud import bigquery
 
-C2142181        RO      finding_site_of                 C4304721      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Structure of left knee joint (body structure)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
-C4304721        RO      has_finding_site                C2142181      
-  CUI1: Structure of left knee joint (body structure)
-  CUI2: Pain of left knee joint (finding)
 
-C5442019        RO      possibly_equivalent_to          C2142181      
-  CUI1: Pain of left knee region (finding)
-  CUI2: Pain of left knee joint (finding)
+PROJECT = "your-gcp-project-id"
+DATASET = "your-bigquery-dataset"
+OUTPUT  = "cui_topic_lookup.pkl"
 
-C2142181        RO      possibly_equivalent_to          C5442019      
-  CUI1: Pain of left knee joint (finding)
-  CUI2: Pain of left knee region (finding)
+
+# ─────────────────────────────────────────────────────────────
+# THE BQ QUERY
+# ─────────────────────────────────────────────────────────────
+
+# Single query with CTEs. One scan of MRREL, all cluster work done in SQL.
+# Output: one row per (cui, cluster_id, role), with cluster metadata
+# joined in. Python pivots to per-CUI dict.
+
+CLUSTER_QUERY = """
+WITH
+  -- Concept labels (preferred English term per CUI)
+  concept_label AS (
+    SELECT
+      CUI,
+      ANY_VALUE(STR) AS label
+    FROM `{project}.{dataset}.MRCONSO`
+    WHERE SAB='SNOMEDCT_US'
+      AND LAT='ENG'
+      AND ISPREF='Y'
+      AND SUPPRESS='N'
+    GROUP BY CUI
+  ),
+
+  -- One semantic type per CUI (lower-cased)
+  semantic_map AS (
+    SELECT
+      CUI,
+      LOWER(ANY_VALUE(STY)) AS semantic_type
+    FROM `{project}.{dataset}.MRSTY`
+    GROUP BY CUI
+  ),
+
+  -- Filtered MRREL with semantic types and effective relation.
+  -- Dedup logic: each conceptual relationship is encoded twice in MRREL
+  -- (e.g., A isa B AND B inverse_isa A). We keep only one direction.
+  --
+  -- Rules:
+  --   - If RELA is the passive/inverse form (starts with 'inverse_' or
+  --     ends with '_of'), drop the row. The active form sibling is
+  --     kept instead.
+  --   - For REL-only rows (no RELA), drop PAR (CHD is the active form).
+  --   - For known symmetric relations (SY, SIB, same_as,
+  --     possibly_equivalent_to), keep only rows where CUI1 < CUI2.
+  rel AS (
+    SELECT
+      origin_cui,
+      target_cui,
+      origin_sem,
+      target_sem,
+      effective_rel
+    FROM (
+      SELECT
+        r.CUI1                                   AS origin_cui,
+        r.CUI2                                   AS target_cui,
+        COALESCE(s1.semantic_type, 'unknown')    AS origin_sem,
+        COALESCE(s2.semantic_type, 'unknown')    AS target_sem,
+        COALESCE(r.RELA, r.REL)                  AS effective_rel,
+        r.REL                                    AS rel,
+        r.RELA                                   AS rela,
+        r.CUI1                                   AS cui1,
+        r.CUI2                                   AS cui2
+      FROM `{project}.{dataset}.MRREL` r
+      LEFT JOIN semantic_map s1 ON r.CUI1 = s1.CUI
+      LEFT JOIN semantic_map s2 ON r.CUI2 = s2.CUI
+      WHERE r.SAB='SNOMEDCT_US'
+        AND r.SUPPRESS='N'
+    )
+    WHERE
+      -- Drop passive RELA forms (active sibling exists in MRREL)
+      NOT (rela IS NOT NULL AND (
+        STARTS_WITH(rela, 'inverse_')
+        OR ENDS_WITH(rela, '_of')
+      ))
+      -- Drop PAR when no RELA (CHD is the active form for hierarchy)
+      AND NOT (rela IS NULL AND rel = 'PAR')
+      AND NOT (rela IS NULL AND rel = 'RB')   -- RN is the active form
+      -- For symmetric relations, dedupe by CUI ordering
+      AND NOT (rela IN ('possibly_equivalent_to', 'same_as')
+               AND cui1 >= cui2)
+      AND NOT (rela IS NULL AND rel IN ('SY', 'SIB')
+               AND cui1 >= cui2)
+  ),
+
+  -- ──────────────────────────────────────────────────────
+  -- CLUSTER DEFINITIONS
+  -- ──────────────────────────────────────────────────────
+
+  -- RELATION_CLUSTER: same-type origin/target with same effective_rel & target_cui
+  relation_clusters AS (
+    SELECT DISTINCT
+      CONCAT('REL_', FORMAT('%016x',
+        FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+      'RELATION_CLUSTER'                                                AS cluster_type,
+      CONCAT(origin_sem, '_', effective_rel, '_to_', target_cui)        AS cluster_name,
+      origin_sem                                                        AS semantic_type
+    FROM rel
+    WHERE origin_sem = target_sem
+  ),
+
+  -- CROSS_SEMANTIC_CLUSTER: cross-type origin/target
+  cross_clusters AS (
+    SELECT DISTINCT
+      CONCAT('CROSS_', FORMAT('%016x',
+        FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+      'CROSS_SEMANTIC_CLUSTER'                                                                      AS cluster_type,
+      CONCAT(origin_sem, '_to_', target_sem, '_', effective_rel, '_', target_cui)                   AS cluster_name,
+      origin_sem                                                                                    AS semantic_type
+    FROM rel
+    WHERE origin_sem != target_sem
+  ),
+
+  -- ──────────────────────────────────────────────────────
+  -- MEMBERSHIPS  (cui, cluster_id, role)
+  -- ──────────────────────────────────────────────────────
+
+  -- RELATION membership: origin and target of same-type rows
+  relation_membership AS (
+    SELECT origin_cui AS cui,
+           CONCAT('REL_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'ORIGIN' AS role
+    FROM rel WHERE origin_sem = target_sem
+    UNION ALL
+    SELECT target_cui AS cui,
+           CONCAT('REL_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'TARGET' AS role
+    FROM rel WHERE origin_sem = target_sem
+  ),
+
+  -- CROSS membership: origin and target of cross-type rows
+  cross_membership AS (
+    SELECT origin_cui AS cui,
+           CONCAT('CROSS_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'ORIGIN' AS role
+    FROM rel WHERE origin_sem != target_sem
+    UNION ALL
+    SELECT target_cui AS cui,
+           CONCAT('CROSS_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'TARGET' AS role
+    FROM rel WHERE origin_sem != target_sem
+  ),
+
+  -- All memberships, deduped on (cui, cluster_id, role)
+  all_membership AS (
+    SELECT DISTINCT cui, cluster_id, role
+    FROM (
+      SELECT * FROM relation_membership
+      UNION ALL
+      SELECT * FROM cross_membership
+    )
+  ),
+
+  -- All cluster definitions
+  all_clusters AS (
+    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM relation_clusters
+    UNION ALL
+    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM cross_clusters
+  )
+
+-- Final result: one row per (cui, cluster), with metadata joined in
+SELECT
+  m.cui,
+  l.label                      AS cui_label,
+  cl.semantic_type             AS cluster_semantic_type,
+  m.cluster_id,
+  cl.cluster_type,
+  cl.cluster_name,
+  m.role
+FROM all_membership m
+JOIN all_clusters cl ON m.cluster_id = cl.cluster_id
+LEFT JOIN concept_label l ON m.cui = l.CUI
+"""
+
+
+# ─────────────────────────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────────────────────────
+
+def fetch_clusters(client):
+    """Run the cluster query and return the result DataFrame."""
+    sql = CLUSTER_QUERY.format(project=PROJECT, dataset=DATASET)
+    print("  Running cluster query in BigQuery...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} (cui, cluster, role) rows ({time.time()-t:.1f}s)")
+    return df
+
+
+def fetch_cui_metadata(client):
+    """Fetch label and semantic type per CUI separately. Smaller than the
+    cluster join, easier to attach to the final lookup.
+    """
+    sql = f"""
+        WITH
+          concept_label AS (
+            SELECT
+              CUI,
+              ANY_VALUE(STR) AS label
+            FROM `{PROJECT}.{DATASET}.MRCONSO`
+            WHERE SAB='SNOMEDCT_US' AND LAT='ENG'
+              AND ISPREF='Y' AND SUPPRESS='N'
+            GROUP BY CUI
+          ),
+          semantic_map AS (
+            SELECT
+              CUI,
+              LOWER(ANY_VALUE(STY)) AS semantic_type
+            FROM `{PROJECT}.{DATASET}.MRSTY`
+            GROUP BY CUI
+          )
+        SELECT
+          l.CUI                                AS cui,
+          l.label                              AS label,
+          COALESCE(s.semantic_type, 'unknown') AS semantic_type
+        FROM concept_label l
+        LEFT JOIN semantic_map s ON l.CUI = s.CUI
+    """
+    print("  Fetching CUI metadata...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} CUIs ({time.time()-t:.1f}s)")
+    return df
+
+
+# Cluster type preference for sorting. Higher score = listed first in the
+# per-CUI cluster list. Adaptor consumers take top K from this sorted list.
+CLUSTER_TYPE_RANK = {
+    "CROSS_SEMANTIC_CLUSTER": 2,
+    "RELATION_CLUSTER":       1,
+}
+
+
+def build_lookup(membership_df, metadata_df):
+    """Pivot the (cui, cluster, role) rows into per-CUI dict.
+
+    Each CUI's `clusters` list is sorted by cluster_type preference:
+    CROSS first, then RELATION. Stable order within type.
+    Adaptor consumers take top K from the front of this list.
+
+    Each cluster entry also carries:
+      - member_count: distinct CUI count in the cluster
+      - sample_members: up to 10 distinct members (cui + label)
+    """
+    print("  Pivoting into per-CUI lookup...")
+    t = time.time()
+
+    # ── First pass: compute cluster sizes and gather sample members ──
+    # Both are deduped by CUI within each cluster. The same CUI can appear
+    # multiple rows for the same cluster (once as ORIGIN, once as TARGET,
+    # once via different MRREL rows) — count and samples treat each CUI
+    # as one member regardless.
+    print("    Pass 1: computing cluster sizes and samples...", flush=True)
+    cluster_distinct_cuis = defaultdict(set)   # cluster_id -> set of cuis
+    cluster_samples       = defaultdict(list)  # cluster_id -> [{cui, label}, ...]
+    cluster_sample_seen   = defaultdict(set)   # cluster_id -> set of cuis already in samples
+    SAMPLE_LIMIT = 10
+
+    cui_label_map = {row["cui"]: row["label"] for row in metadata_df.to_dict("records")}
+
+    for row in membership_df.to_dict("records"):
+        cid = row["cluster_id"]
+        cui = row["cui"]
+        cluster_distinct_cuis[cid].add(cui)
+        if (cui not in cluster_sample_seen[cid]
+                and len(cluster_samples[cid]) < SAMPLE_LIMIT):
+            cluster_sample_seen[cid].add(cui)
+            cluster_samples[cid].append({
+                "cui":   cui,
+                "label": cui_label_map.get(cui, row["cui_label"] or cui),
+            })
+
+    cluster_member_count = {cid: len(cuis) for cid, cuis in cluster_distinct_cuis.items()}
+    # Free the per-cluster sets — we only need the counts going forward
+    del cluster_distinct_cuis
+    del cluster_sample_seen
+
+    # ── Second pass: build per-CUI lookup with cluster metadata ──
+    print("    Pass 2: building per-CUI lookup...", flush=True)
+    lookup = {}
+    for row in metadata_df.to_dict("records"):
+        lookup[row["cui"]] = {
+            "label":         row["label"],
+            "semantic_type": row["semantic_type"],
+            "clusters":      [],
+        }
+
+    n_orphan = 0
+    for row in membership_df.to_dict("records"):
+        cui = row["cui"]
+        cid = row["cluster_id"]
+        if cui not in lookup:
+            lookup[cui] = {
+                "label":         row["cui_label"] or cui,
+                "semantic_type": row["cluster_semantic_type"] or "unknown",
+                "clusters":      [],
+            }
+            n_orphan += 1
+        lookup[cui]["clusters"].append({
+            "cluster_id":     cid,
+            "cluster_type":   row["cluster_type"],
+            "cluster_name":   row["cluster_name"],
+            "role":           row["role"],
+            "member_count":   cluster_member_count[cid],
+            "sample_members": cluster_samples[cid],
+        })
+
+    # Sort each CUI's clusters by type preference. Python's sort is stable,
+    # so ties within a type preserve insertion order from BQ.
+    for entry in lookup.values():
+        entry["clusters"].sort(
+            key=lambda c: -CLUSTER_TYPE_RANK.get(c["cluster_type"], 0)
+        )
+
+    print(f"  -> {len(lookup):,} CUIs ({time.time()-t:.1f}s)")
+    if n_orphan:
+        print(f"     Note: {n_orphan:,} CUIs had cluster memberships but no "
+              f"metadata in MRCONSO/MRSTY")
+
+    if lookup:
+        _print_distribution_stats(lookup)
+
+
+    return lookup
+
+
+def _print_distribution_stats(lookup):
+    """Emit detailed cluster-membership stats per CUI to help pick K."""
+    n_total = len(lookup)
+
+    cluster_counts   = sorted(len(e["clusters"]) for e in lookup.values())
+    cross_counts     = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "CROSS_SEMANTIC_CLUSTER")
+        for e in lookup.values()
+    )
+    relation_counts  = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "RELATION_CLUSTER")
+        for e in lookup.values()
+    )
+
+    def _stats(label, sorted_counts):
+        n = len(sorted_counts)
+        if n == 0:
+            print(f"    {label}: no data")
+            return
+        print(f"    {label:30s} "
+              f"min={sorted_counts[0]:>6,}  "
+              f"median={sorted_counts[n//2]:>6,}  "
+              f"mean={sum(sorted_counts)/n:>8.1f}  "
+              f"p95={sorted_counts[int(n*0.95)]:>6,}  "
+              f"max={sorted_counts[-1]:>6,}")
+
+    print(f"\n    Per-CUI cluster counts (n={n_total:,} CUIs)")
+    _stats("Total clusters", cluster_counts)
+    _stats("CROSS clusters", cross_counts)
+    _stats("RELATION clusters", relation_counts)
+
+    # Coverage thresholds — what % of CUIs have at least N CROSS clusters
+    print(f"\n    Coverage by CROSS cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in cross_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} CROSS clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    print(f"\n    Coverage by RELATION cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in relation_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} RELATION clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    n_no_clusters = sum(1 for e in lookup.values() if not e["clusters"])
+    print(f"\n    CUIs with NO clusters at all:        "
+          f"{n_no_clusters:>7,} ({100.0*n_no_clusters/n_total:>5.1f}%)")
+    print(f"    CUIs with at least one cluster:      "
+          f"{n_total - n_no_clusters:>7,} "
+          f"({100.0*(n_total - n_no_clusters)/n_total:>5.1f}%)")
+
+
+def save_pickle(obj, path):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    start = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"  Cluster lookup builder (BQ-driven)")
+    print(f"  Project : {PROJECT}")
+    print(f"  Dataset : {DATASET}")
+    print(f"  Output  : {OUTPUT}")
+    print(f"{'='*60}\n")
+
+    client = bigquery.Client(project=PROJECT)
+
+    print("[1/4] Running cluster query...")
+    membership_df = fetch_clusters(client)
+    print()
+
+    print("[2/4] Fetching CUI metadata...")
+    metadata_df = fetch_cui_metadata(client)
+    print()
+
+    print("[3/4] Building per-CUI lookup...")
+    lookup = build_lookup(membership_df, metadata_df)
+    print()
+
+    print("[4/4] Saving pickle...")
+    save_pickle(lookup, OUTPUT)
+    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
