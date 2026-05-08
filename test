@@ -1,242 +1,514 @@
-C0474495  Constipation alternates with diarrhoea  (sign or symptom)
-7 clusters
+"""
+Build per-CUI cluster lookup pickle from MRREL, with cluster construction
+done entirely in BigQuery. Python just reads results and writes pickles.
 
-[1] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    organism function_to_sign or symptom_interprets_C0474495
-      - C0474495  Constipation alternates with diarrhoea
-      - C0011135  Passes stool completely (finding)
+Reads:  BigQuery MRCONSO, MRSTY, MRREL
+Writes: cui_topic_lookup.pkl        (LEAN  — production, adaptor reads this)
+        cui_topic_lookup_debug.pkl  (DEBUG — full schema for inspection)
 
-[2] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    body part, organ, or organ component_to_sign or symptom_has_finding_site_C0474495
-      - C0474495  Constipation alternates with diarrhoea
-      - C0021853  Intestinal structure
+Cluster types (built in BQ):
+  RELATION_CLUSTER            per (semantic_type, effective_rel, target_cui), same-type
+  CROSS_SEMANTIC_CLUSTER      per (origin_type, target_type, effective_rel, target_cui)
 
-[3] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    functional concept_to_sign or symptom_has_interpretation_C0474495
-      - C0392747  Altered (qualifier value)
-      - C0474495  Constipation alternates with diarrhoea
+  effective_rel = COALESCE(RELA, REL)
 
-[4] CROSS_SEMANTIC_CLUSTER  role=ORIGIN  members=20
-    sign or symptom_to_organism function_is_interpreted_by_C0011135
-      - C5880843  Acute constipation in childhood (finding)
-      - C2316708  Constipation due to atony of colon (disorder)
-      - C0151791  Nausea, vomiting and diarrhea
-      - C0401148  Acute constipation (finding)
-      - C0150019  Simple constipation
-      - C0426636  Precipitancy of defecation
-      - C0011135  Passes stool completely (finding)
-      - C0278008  Altered bowel habits
-      - C0278010  Pseudodiarrhea (finding)
-      - C0401150  Chronic constipation without overflow (disorder)
+SUPER clusters (one per semantic type) are NOT generated.
 
-[5] RELATION_CLUSTER  role=ORIGIN  members=4
-    sign or symptom_mapped_from_to_C0278008
-      - C0426636  Precipitancy of defecation
-      - C0577105  Decreased frequency of defecation
-      - C0278008  Altered bowel habits
-      - C0474495  Constipation alternates with diarrhoea
+Bidirectional dedup: MRREL encodes each conceptual relationship twice.
+We keep only one direction (drop passive RELA forms like inverse_isa,
+*_of, REL=PAR/RB; symmetric relations dedup by CUI ordering).
 
-[6] RELATION_CLUSTER  role=TARGET  members=3
-    sign or symptom_isa_to_C0474495
-      - C0474495  Constipation alternates with diarrhoea
-      - C0011991  Diarrhea symptom (finding)
-      - C0009806  Difficulty passing stool
+Cluster IDs are deterministic FARM_FINGERPRINT hashes.
 
-[7] RELATION_CLUSTER  role=TARGET  members=2
-    sign or symptom_mapped_to_to_C0474495
-      - C0474495  Constipation alternates with diarrhoea
-      - C0278008  Altered bowel habits
----------------
-C0009375  Neoplasm of colon  (neoplastic process)
-16 clusters
+LEAN pickle structure (production, smaller):
+  {
+    cui: [(cluster_id, member_count), ...]
+  }
 
-[1] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    body part, organ, or organ component_to_neoplastic process_has_finding_site_C0009375
-      - C0009375  Neoplasm of colon
-      - C0009368  Colon structure
+DEBUG pickle structure (full, for inspection):
+  {
+    cui: {
+      "label":         str,
+      "semantic_type": str,
+      "clusters": [
+        {
+          "cluster_id":     str,
+          "cluster_type":   str,    # CROSS_SEMANTIC_CLUSTER / RELATION_CLUSTER
+          "cluster_name":   str,
+          "role":           str,    # ORIGIN / TARGET
+          "member_count":   int,
+          "sample_members": list,
+        },
+        ...
+      ]
+    }
+  }
 
-[2] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=3
-    finding_to_neoplastic process_isa_C0009375
-      - C3874484  Colonic lesion (disorder)
-      - C0009375  Neoplasm of colon
-      - C3887631  Mass of colon
+Adaptor reads LEAN. Match score = sum of 1/member_count over shared cluster_ids.
+inspect_topics_debug.py reads DEBUG.
+"""
 
-[3] RELATION_CLUSTER  role=TARGET  members=3
-    neoplastic process_mapped_to_to_C0009375
-      - C0009375  Neoplasm of colon
-      - C2873735  C2873735
-      - C0496907  Neoplasm of uncertain behaviour of colon
+import os
+import pickle
+import sys
+import time
+from collections import defaultdict
+from google.cloud import bigquery
 
-[4] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C0037073
-      - C0009375  Neoplasm of colon
-      - C0030793  Tumor of pelvis
-      - C0037073  Neoplasm of sigmoid colon (disorder)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
 
-[5] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C0496907
-      - C0686086  Neoplasm of uncertain behaviour of large intestine
-      - C0496907  Neoplasm of uncertain behaviour of colon
-      - C0009375  Neoplasm of colon
 
-[6] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C0007102
-      - C0009375  Neoplasm of colon
-      - C5848476  Malignant neoplasm of colorectum
-      - C0007102  Malignant neoplasm of colon
+PROJECT      = "your-gcp-project-id"
+DATASET      = "your-bigquery-dataset"
+OUTPUT       = "cui_topic_lookup.pkl"        # lean: cui -> [(cluster_id, member_count), ...]
+OUTPUT_DEBUG = "cui_topic_lookup_debug.pkl"  # full: includes labels, names, samples, etc.
 
-[7] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C0004991
-      - C0009375  Neoplasm of colon
-      - C0347272  Benign tumour of large intestine
-      - C0004991  Benign tumour of colon
 
-[8] RELATION_CLUSTER  role=ORIGIN  members=106
-    neoplastic process_mapped_from_to_C2873735
-      - C0013291  Neoplasm of duodenum (disorder)
-      - C0345543  Neoplasm of lateral floor of mouth
-      - C0345767  Neoplasm of thoracic esophagus
-      - C0009442  Neoplasm of common bile duct
-      - C0036095  Tumour of salivary gland
-      - C0345777  Tumor of upper third of esophagus
-      - C0030581  Neoplasm of parotid gland (disorder)
-      - C0345849  Tumour of ascending colon
-      - C0345472  Neoplasm of vermilion border of upper lip (disorder)
-      - C2103149  Tumor of tonsil
+# ─────────────────────────────────────────────────────────────
+# THE BQ QUERY
+# ─────────────────────────────────────────────────────────────
 
-[9] RELATION_CLUSTER  role=ORIGIN  members=2
-    neoplastic process_isa_to_C0345865
-      - C0345865  Neoplasm of descending colon (disorder)
-      - C0009375  Neoplasm of colon
+# Single query with CTEs. One scan of MRREL, all cluster work done in SQL.
+# Output: one row per (cui, cluster_id, role), with cluster metadata
+# joined in. Python pivots to per-CUI dict.
 
-[10] RELATION_CLUSTER  role=TARGET  members=2
-    neoplastic process_isa_to_C0009375
-      - C0009375  Neoplasm of colon
-      - C5889719  Neoplasm of caecum and/or colon and/or rectum
+CLUSTER_QUERY = """
+WITH
+  -- Concept labels (preferred English term per CUI)
+  concept_label AS (
+    SELECT
+      CUI,
+      ANY_VALUE(STR) AS label
+    FROM `{project}.{dataset}.MRCONSO`
+    WHERE SAB='SNOMEDCT_US'
+      AND LAT='ENG'
+      AND ISPREF='Y'
+      AND SUPPRESS='N'
+    GROUP BY CUI
+  ),
 
-[11] RELATION_CLUSTER  role=ORIGIN  members=2
-    neoplastic process_isa_to_C0345857
-      - C0345857  Neoplasm of transverse colon
-      - C0009375  Neoplasm of colon
+  -- One semantic type per CUI (lower-cased)
+  semantic_map AS (
+    SELECT
+      CUI,
+      LOWER(ANY_VALUE(STY)) AS semantic_type
+    FROM `{project}.{dataset}.MRSTY`
+    GROUP BY CUI
+  ),
 
-[12] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C5547339
-      - C0009375  Neoplasm of colon
-      - C5547339  Gastrointestinal stromal neoplasm of colon
-      - C2960068  Gastrointestinal stromal tumor of large intestine
+  -- Filtered MRREL with semantic types and effective relation.
+  -- Dedup logic: each conceptual relationship is encoded twice in MRREL
+  -- (e.g., A isa B AND B inverse_isa A). We keep only one direction.
+  --
+  -- Rules:
+  --   - If RELA is the passive/inverse form (starts with 'inverse_' or
+  --     ends with '_of'), drop the row. The active form sibling is
+  --     kept instead.
+  --   - For REL-only rows (no RELA), drop PAR (CHD is the active form).
+  --   - For known symmetric relations (SY, SIB, same_as,
+  --     possibly_equivalent_to), keep only rows where CUI1 < CUI2.
+  rel AS (
+    SELECT
+      origin_cui,
+      target_cui,
+      origin_sem,
+      target_sem,
+      effective_rel
+    FROM (
+      SELECT
+        r.CUI1                                   AS origin_cui,
+        r.CUI2                                   AS target_cui,
+        COALESCE(s1.semantic_type, 'unknown')    AS origin_sem,
+        COALESCE(s2.semantic_type, 'unknown')    AS target_sem,
+        COALESCE(r.RELA, r.REL)                  AS effective_rel,
+        r.REL                                    AS rel,
+        r.RELA                                   AS rela,
+        r.CUI1                                   AS cui1,
+        r.CUI2                                   AS cui2
+      FROM `{project}.{dataset}.MRREL` r
+      LEFT JOIN semantic_map s1 ON r.CUI1 = s1.CUI
+      LEFT JOIN semantic_map s2 ON r.CUI2 = s2.CUI
+      WHERE r.SAB='SNOMEDCT_US'
+        AND r.SUPPRESS='N'
+    )
+    WHERE
+      -- Drop passive RELA forms (active sibling exists in MRREL)
+      NOT (rela IS NOT NULL AND (
+        STARTS_WITH(rela, 'inverse_')
+        OR ENDS_WITH(rela, '_of')
+      ))
+      -- Drop PAR when no RELA (CHD is the active form for hierarchy)
+      AND NOT (rela IS NULL AND rel = 'PAR')
+      AND NOT (rela IS NULL AND rel = 'RB')   -- RN is the active form
+      -- For symmetric relations, dedupe by CUI ordering
+      AND NOT (rela IN ('possibly_equivalent_to', 'same_as')
+               AND cui1 >= cui2)
+      AND NOT (rela IS NULL AND rel IN ('SY', 'SIB')
+               AND cui1 >= cui2)
+  ),
 
-[13] RELATION_CLUSTER  role=ORIGIN  members=3
-    neoplastic process_isa_to_C0154061
-      - C0009375  Neoplasm of colon
-      - C0686087  Carcinoma in situ of large intestine (disorder)
-      - C0154061  Cancer in situ of colon
+  -- ──────────────────────────────────────────────────────
+  -- CLUSTER DEFINITIONS
+  -- ──────────────────────────────────────────────────────
 
-[14] RELATION_CLUSTER  role=ORIGIN  members=21
-    neoplastic process_mapped_from_to_C0496907
-      - C0009375  Neoplasm of colon
-      - C0345849  Tumour of ascending colon
-      - C0686094  Neoplasm of uncertain behaviour of transverse colon
-      - C0686098  Neoplasm of uncertain behavior of descending colon (disorder)
-      - C0496907  Neoplasm of uncertain behaviour of colon
-      - C0009404  Neoplasm of large intestine (disorder)
-      - C2960068  Gastrointestinal stromal tumor of large intestine
-      - C0686086  Neoplasm of uncertain behaviour of large intestine
-      - C0686096  Neoplasm of uncertain behavior of splenic flexure of colon
-      - C5686078  High grade glandular intraepithelial neoplasia of large intestine
+  -- RELATION_CLUSTER: same-type origin/target with same effective_rel & target_cui
+  relation_clusters AS (
+    SELECT DISTINCT
+      CONCAT('REL_', FORMAT('%016x',
+        FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+      'RELATION_CLUSTER'                                                AS cluster_type,
+      CONCAT(origin_sem, '_', effective_rel, '_to_', target_cui)        AS cluster_name,
+      origin_sem                                                        AS semantic_type
+    FROM rel
+    WHERE origin_sem = target_sem
+  ),
 
-[15] RELATION_CLUSTER  role=TARGET  members=2
-    neoplastic process_has_associated_morphology_to_C0009375
-      - C0009375  Neoplasm of colon
-      - C0027651  Neoplasm (morphologic abnormality)
+  -- CROSS_SEMANTIC_CLUSTER: cross-type origin/target
+  cross_clusters AS (
+    SELECT DISTINCT
+      CONCAT('CROSS_', FORMAT('%016x',
+        FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+      'CROSS_SEMANTIC_CLUSTER'                                                                      AS cluster_type,
+      CONCAT(origin_sem, '_to_', target_sem, '_', effective_rel, '_', target_cui)                   AS cluster_name,
+      origin_sem                                                                                    AS semantic_type
+    FROM rel
+    WHERE origin_sem != target_sem
+  ),
 
-[16] RELATION_CLUSTER  role=ORIGIN  members=2
-    neoplastic process_isa_to_C0345849
-      - C0009375  Neoplasm of colon
-      - C0345849  Tumour of ascending colon
-------------
-C0000729  C0000729  (intellectual product)
-5 clusters
+  -- ──────────────────────────────────────────────────────
+  -- MEMBERSHIPS  (cui, cluster_id, role)
+  -- ──────────────────────────────────────────────────────
 
-[1] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    intellectual product_to_sign or symptom_moved_to_C0000729
-      - C1299996  Extension Namespace {1000000} (namespace concept)
-      - C0000729  C0000729
+  -- RELATION membership: origin and target of same-type rows
+  relation_membership AS (
+    SELECT origin_cui AS cui,
+           CONCAT('REL_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'ORIGIN' AS role
+    FROM rel WHERE origin_sem = target_sem
+    UNION ALL
+    SELECT target_cui AS cui,
+           CONCAT('REL_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'TARGET' AS role
+    FROM rel WHERE origin_sem = target_sem
+  ),
 
-[2] CROSS_SEMANTIC_CLUSTER  role=ORIGIN  members=318
-    sign or symptom_to_intellectual product_moved_from_C1299996
-      - C0038450  Stridor (finding)
-      - C0476253  C0476253
-      - C0751837  Ataxic gait
-      - C0476281  Noncardiac chest pain
-      - C0039070  Blackout
-      - C0231785  Carpopedal spasm (finding)
-      - C0232504  Umbilical pain
-      - C0478146  C0478146
-      - C0015672  Lacking in energy
-      - C0008031  Chest pain
+  -- CROSS membership: origin and target of cross-type rows
+  cross_membership AS (
+    SELECT origin_cui AS cui,
+           CONCAT('CROSS_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'ORIGIN' AS role
+    FROM rel WHERE origin_sem != target_sem
+    UNION ALL
+    SELECT target_cui AS cui,
+           CONCAT('CROSS_', FORMAT('%016x',
+             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
+           'TARGET' AS role
+    FROM rel WHERE origin_sem != target_sem
+  ),
 
-[3] RELATION_CLUSTER  role=ORIGIN  members=2
-    sign or symptom_possibly_equivalent_to_to_C0426649
-      - C0426649  Bowel spasm (finding)
-      - C0000729  C0000729
+  -- All memberships, deduped on (cui, cluster_id, role)
+  all_membership AS (
+    SELECT DISTINCT cui, cluster_id, role
+    FROM (
+      SELECT * FROM relation_membership
+      UNION ALL
+      SELECT * FROM cross_membership
+    )
+  ),
 
-[4] RELATION_CLUSTER  role=ORIGIN  members=2
-    sign or symptom_possibly_equivalent_to_to_C0344375
-      - C0344375  Stomach cramps
-      - C0000729  C0000729
+  -- All cluster definitions
+  all_clusters AS (
+    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM relation_clusters
+    UNION ALL
+    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM cross_clusters
+  )
 
-[5] RELATION_CLUSTER  role=TARGET  members=3
-    sign or symptom_has_alternative_to_C0000729
-      - C0344375  Stomach cramps
-      - C0426649  Bowel spasm (finding)
-      - C0000729  C0000729
----------------
-C5396442  Annual visit (procedure)  (health care activity)
-2 clusters
+-- Final result: one row per (cui, cluster), with metadata joined in
+SELECT
+  m.cui,
+  l.label                      AS cui_label,
+  cl.semantic_type             AS cluster_semantic_type,
+  m.cluster_id,
+  cl.cluster_type,
+  cl.cluster_name,
+  m.role
+FROM all_membership m
+JOIN all_clusters cl ON m.cluster_id = cl.cluster_id
+LEFT JOIN concept_label l ON m.cui = l.CUI
+"""
 
-[1] CROSS_SEMANTIC_CLUSTER  role=ORIGIN  members=2
-    health care activity_to_finding_has_associated_procedure_C5396443
-      - C5396442  Annual visit (procedure)
-      - C5396443  Annual visit declined (situation)
 
-[2] RELATION_CLUSTER  role=TARGET  members=2
-    health care activity_isa_to_C5396442
-      - C5396442  Annual visit (procedure)
-      - C0586016  Patient encounter procedure (procedure)
--------------
-C4512001  History of chest pain (situation)  (finding)
-6 clusters
+# ─────────────────────────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────────────────────────
 
-[1] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    population group_to_finding_has_subject_relationship_context_C4512001
-      - C4512001  History of chest pain (situation)
-      - C1444713  Subject of record (person)
+def fetch_clusters(client):
+    """Run the cluster query and return the result DataFrame."""
+    sql = CLUSTER_QUERY.format(project=PROJECT, dataset=DATASET)
+    print("  Running cluster query in BigQuery...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} (cui, cluster, role) rows ({time.time()-t:.1f}s)")
+    return df
 
-[2] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    sign or symptom_to_finding_has_associated_finding_C4512001
-      - C4512001  History of chest pain (situation)
-      - C0008031  Chest pain
 
-[3] CROSS_SEMANTIC_CLUSTER  role=TARGET  members=2
-    temporal concept_to_finding_has_temporal_context_C4512001
-      - C4512001  History of chest pain (situation)
-      - C1444637  In the past (qualifier value)
+def fetch_cui_metadata(client):
+    """Fetch label and semantic type per CUI separately. Smaller than the
+    cluster join, easier to attach to the final lookup.
+    """
+    sql = f"""
+        WITH
+          concept_label AS (
+            SELECT
+              CUI,
+              ANY_VALUE(STR) AS label
+            FROM `{PROJECT}.{DATASET}.MRCONSO`
+            WHERE SAB='SNOMEDCT_US' AND LAT='ENG'
+              AND ISPREF='Y' AND SUPPRESS='N'
+            GROUP BY CUI
+          ),
+          semantic_map AS (
+            SELECT
+              CUI,
+              LOWER(ANY_VALUE(STY)) AS semantic_type
+            FROM `{PROJECT}.{DATASET}.MRSTY`
+            GROUP BY CUI
+          )
+        SELECT
+          l.CUI                                AS cui,
+          l.label                              AS label,
+          COALESCE(s.semantic_type, 'unknown') AS semantic_type
+        FROM concept_label l
+        LEFT JOIN semantic_map s ON l.CUI = s.CUI
+    """
+    print("  Fetching CUI metadata...")
+    t = time.time()
+    df = client.query(sql).to_dataframe()
+    print(f"  -> {len(df):,} CUIs ({time.time()-t:.1f}s)")
+    return df
 
-[4] RELATION_CLUSTER  role=TARGET  members=2
-    finding_isa_to_C4512001
-      - C4512001  History of chest pain (situation)
-      - C2317559  Past history of clinical finding
 
-[5] RELATION_CLUSTER  role=TARGET  members=2
-    finding_has_finding_context_to_C4512001
-      - C1444639  Known present
-      - C4512001  History of chest pain (situation)
+# Cluster type preference for sorting. Higher score = listed first in the
+# per-CUI cluster list. Adaptor consumers take top K from this sorted list.
+CLUSTER_TYPE_RANK = {
+    "CROSS_SEMANTIC_CLUSTER": 2,
+    "RELATION_CLUSTER":       1,
+}
 
-[6] RELATION_CLUSTER  role=ORIGIN  members=4
-    finding_isa_to_C0455530
-      - C4512001  History of chest pain (situation)
-      - C0455586  History of injury (situation)
-      - C0455530  History of angina pectoris
-      - C0559157  H/O: heart disorder
 
-​
+def build_lookup(membership_df, metadata_df):
+    """Pivot the (cui, cluster, role) rows into per-CUI dict.
+
+    Each CUI's `clusters` list is sorted by cluster_type preference:
+    CROSS first, then RELATION. Stable order within type.
+    Adaptor consumers take top K from the front of this list.
+
+    Each cluster entry also carries:
+      - member_count: distinct CUI count in the cluster
+      - sample_members: up to 10 distinct members (cui + label)
+    """
+    print("  Pivoting into per-CUI lookup...")
+    t = time.time()
+
+    # ── First pass: compute cluster sizes and gather sample members ──
+    # Both are deduped by CUI within each cluster. The same CUI can appear
+    # multiple rows for the same cluster (once as ORIGIN, once as TARGET,
+    # once via different MRREL rows) — count and samples treat each CUI
+    # as one member regardless.
+    print("    Pass 1: computing cluster sizes and samples...", flush=True)
+    cluster_distinct_cuis = defaultdict(set)   # cluster_id -> set of cuis
+    cluster_samples       = defaultdict(list)  # cluster_id -> [{cui, label}, ...]
+    cluster_sample_seen   = defaultdict(set)   # cluster_id -> set of cuis already in samples
+    SAMPLE_LIMIT = 10
+
+    cui_label_map = {row["cui"]: row["label"] for row in metadata_df.to_dict("records")}
+
+    for row in membership_df.to_dict("records"):
+        cid = row["cluster_id"]
+        cui = row["cui"]
+        cluster_distinct_cuis[cid].add(cui)
+        if (cui not in cluster_sample_seen[cid]
+                and len(cluster_samples[cid]) < SAMPLE_LIMIT):
+            cluster_sample_seen[cid].add(cui)
+            cluster_samples[cid].append({
+                "cui":   cui,
+                "label": cui_label_map.get(cui, row["cui_label"] or cui),
+            })
+
+    cluster_member_count = {cid: len(cuis) for cid, cuis in cluster_distinct_cuis.items()}
+    # Free the per-cluster sets — we only need the counts going forward
+    del cluster_distinct_cuis
+    del cluster_sample_seen
+
+    # ── Second pass: build per-CUI lookup with cluster metadata ──
+    print("    Pass 2: building per-CUI lookup...", flush=True)
+    lookup = {}
+    for row in metadata_df.to_dict("records"):
+        lookup[row["cui"]] = {
+            "label":         row["label"],
+            "semantic_type": row["semantic_type"],
+            "clusters":      [],
+        }
+
+    n_orphan = 0
+    for row in membership_df.to_dict("records"):
+        cui = row["cui"]
+        cid = row["cluster_id"]
+        if cui not in lookup:
+            lookup[cui] = {
+                "label":         row["cui_label"] or cui,
+                "semantic_type": row["cluster_semantic_type"] or "unknown",
+                "clusters":      [],
+            }
+            n_orphan += 1
+        lookup[cui]["clusters"].append({
+            "cluster_id":     cid,
+            "cluster_type":   row["cluster_type"],
+            "cluster_name":   row["cluster_name"],
+            "role":           row["role"],
+            "member_count":   cluster_member_count[cid],
+            "sample_members": cluster_samples[cid],
+        })
+
+    # Sort each CUI's clusters by type preference. Python's sort is stable,
+    # so ties within a type preserve insertion order from BQ.
+    for entry in lookup.values():
+        entry["clusters"].sort(
+            key=lambda c: -CLUSTER_TYPE_RANK.get(c["cluster_type"], 0)
+        )
+
+    print(f"  -> {len(lookup):,} CUIs ({time.time()-t:.1f}s)")
+    if n_orphan:
+        print(f"     Note: {n_orphan:,} CUIs had cluster memberships but no "
+              f"metadata in MRCONSO/MRSTY")
+
+    if lookup:
+        _print_distribution_stats(lookup)
+
+
+    return lookup
+
+
+def _print_distribution_stats(lookup):
+    """Emit detailed cluster-membership stats per CUI to help pick K."""
+    n_total = len(lookup)
+
+    cluster_counts   = sorted(len(e["clusters"]) for e in lookup.values())
+    cross_counts     = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "CROSS_SEMANTIC_CLUSTER")
+        for e in lookup.values()
+    )
+    relation_counts  = sorted(
+        sum(1 for c in e["clusters"] if c["cluster_type"] == "RELATION_CLUSTER")
+        for e in lookup.values()
+    )
+
+    def _stats(label, sorted_counts):
+        n = len(sorted_counts)
+        if n == 0:
+            print(f"    {label}: no data")
+            return
+        print(f"    {label:30s} "
+              f"min={sorted_counts[0]:>6,}  "
+              f"median={sorted_counts[n//2]:>6,}  "
+              f"mean={sum(sorted_counts)/n:>8.1f}  "
+              f"p95={sorted_counts[int(n*0.95)]:>6,}  "
+              f"max={sorted_counts[-1]:>6,}")
+
+    print(f"\n    Per-CUI cluster counts (n={n_total:,} CUIs)")
+    _stats("Total clusters", cluster_counts)
+    _stats("CROSS clusters", cross_counts)
+    _stats("RELATION clusters", relation_counts)
+
+    # Coverage thresholds — what % of CUIs have at least N CROSS clusters
+    print(f"\n    Coverage by CROSS cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in cross_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} CROSS clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    print(f"\n    Coverage by RELATION cluster count:")
+    for k in (1, 3, 5, 10, 20):
+        n_with_k = sum(1 for c in relation_counts if c >= k)
+        pct = 100.0 * n_with_k / n_total
+        print(f"      CUIs with >= {k:>2d} RELATION clusters: "
+              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+
+    n_no_clusters = sum(1 for e in lookup.values() if not e["clusters"])
+    print(f"\n    CUIs with NO clusters at all:        "
+          f"{n_no_clusters:>7,} ({100.0*n_no_clusters/n_total:>5.1f}%)")
+    print(f"    CUIs with at least one cluster:      "
+          f"{n_total - n_no_clusters:>7,} "
+          f"({100.0*(n_total - n_no_clusters)/n_total:>5.1f}%)")
+
+
+def build_lean_lookup(full_lookup):
+    """Convert full lookup to lean form for production: cui -> [(cluster_id, member_count), ...].
+
+    Drops labels, semantic_types, cluster_names, cluster_types, roles, and
+    sample_members. Keeps only what the adaptor needs for matching with
+    1/member_count weighting.
+    """
+    print("  Building lean production pickle...")
+    t = time.time()
+    lean = {}
+    for cui, entry in full_lookup.items():
+        lean[cui] = [
+            (c["cluster_id"], c["member_count"])
+            for c in entry["clusters"]
+        ]
+    print(f"  -> {len(lean):,} entries  ({time.time()-t:.1f}s)")
+    return lean
+
+
+def save_pickle(obj, path):
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    size_mb = round(os.path.getsize(path) / 1e6, 1)
+    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    start = time.time()
+
+    print(f"\n{'='*60}")
+    print(f"  Cluster lookup builder (BQ-driven)")
+    print(f"  Project       : {PROJECT}")
+    print(f"  Dataset       : {DATASET}")
+    print(f"  Lean output   : {OUTPUT}")
+    print(f"  Debug output  : {OUTPUT_DEBUG}")
+    print(f"{'='*60}\n")
+
+    client = bigquery.Client(project=PROJECT)
+
+    print("[1/5] Running cluster query...")
+    membership_df = fetch_clusters(client)
+    print()
+
+    print("[2/5] Fetching CUI metadata...")
+    metadata_df = fetch_cui_metadata(client)
+    print()
+
+    print("[3/5] Building per-CUI lookup...")
+    lookup = build_lookup(membership_df, metadata_df)
+    print()
+
+    print("[4/5] Saving debug pickle (full schema)...")
+    save_pickle(lookup, OUTPUT_DEBUG)
+    print()
+
+    print("[5/5] Building and saving lean pickle (production)...")
+    lean = build_lean_lookup(lookup)
+    save_pickle(lean, OUTPUT)
+    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
