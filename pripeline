@@ -6,32 +6,36 @@ Writes: cui_topic_lookup.pkl
 
 For each CUI, the pickle stores:
   - label, semantic_type
-  - topics_by_relation: dict mapping effective_relation -> list of topic CUIs
+  - topic_cuis: deduped list of all CUIs this CUI relates to via MRREL.
+    Each entry includes the relation metadata (REL, RELA) for reference,
+    but the adaptor only needs the cui field.
 
-"Effective relation" is RELA if present (more specific clinical relation),
-otherwise REL (generic relation type). All rows in MRREL contribute.
+All MRREL rows contribute regardless of REL or RELA value.
 
 Output pickle structure:
   {
     cui: {
       "label":         str,
       "semantic_type": str,
-      "topics_by_relation": {
-        "<relation>": [
-          {"topic_cui": str, "topic_label": str, "topic_semantic_type": str},
-          ...
-        ],
+      "topic_cuis": [
+        {
+          "cui":           str,
+          "label":         str,
+          "semantic_type": str,
+          "rel":           str,         # MRREL REL value (PAR/CHD/RB/RN/RO/SY/SIB/...)
+          "rela":          str | None,  # MRREL RELA value (isa, has_finding_site, ...) if present
+        },
         ...
-      }
+      ]
     }
   }
 
-Adaptor usage:
+Adaptor usage (ignores rel/rela):
   >>> import pickle
   >>> with open("cui_topic_lookup.pkl", "rb") as f:
   ...     lookup = pickle.load(f)
-  >>> entry = lookup.get("C0231807")     # knee pain
-  >>> entry["topics_by_relation"]["isa"] # CUIs knee pain isa
+  >>> entry = lookup.get("C0231807")          # knee pain
+  >>> [t["cui"] for t in entry["topic_cuis"]] # all topic CUIs
 """
 
 import os
@@ -53,8 +57,8 @@ OUTPUT  = "cui_topic_lookup.pkl"
 
 
 def fetch_topic_data(client):
-    """Pull source-target-relation rows joined with semantic types and
-    preferred labels. One row per MRREL relationship.
+    """Pull source-target rows joined with semantic types and labels.
+    REL and RELA are kept as metadata per row.
     """
     sql = f"""
         WITH semantic_map AS (
@@ -81,7 +85,8 @@ def fetch_topic_data(client):
             r.CUI2                       AS topic_cui,
             l2.label                     AS topic_label,
             COALESCE(s2.semantic_type,'unknown') AS topic_semantic_type,
-            COALESCE(r.RELA, r.REL)      AS relation
+            r.REL                        AS rel,
+            r.RELA                       AS rela
         FROM `{PROJECT}.{DATASET}.MRREL` r
         JOIN concept_label l1 ON r.CUI1 = l1.CUI
         JOIN concept_label l2 ON r.CUI2 = l2.CUI
@@ -98,81 +103,76 @@ def fetch_topic_data(client):
 
 
 def build_lookup(df):
-    """Group rows by source_cui, then by relation, into the output dict."""
+    """Group rows by source_cui. Each topic entry records the topic CUI
+    plus the REL and RELA from MRREL.
+
+    Dedup key is (topic_cui, rel, rela): if the same source -> target
+    pair appears via two different relations, both are kept as separate
+    entries. If the same exact (rel, rela) row repeats, only one is kept.
+    """
     print("  Building lookup...")
     t = time.time()
     lookup = {}
 
     rows = df.to_dict("records")
     n_rows = len(rows)
-    seen_per_source = defaultdict(set)  # (source, relation, topic_cui) dedupe
+    seen = defaultdict(set)  # source_cui -> set of (topic_cui, rel, rela)
+
+    import math
 
     for i, row in enumerate(rows):
         if i % 500000 == 0 and i > 0:
             print(f"    processed {i:,}/{n_rows:,}", flush=True)
 
-        source_cui    = row["source_cui"]
-        source_label  = row["source_label"]
-        source_sem    = row["source_semantic_type"]
-        topic_cui     = row["topic_cui"]
-        topic_label   = row["topic_label"]
-        topic_sem     = row["topic_semantic_type"]
-        relation      = row["relation"]
+        source_cui = row["source_cui"]
+        topic_cui  = row["topic_cui"]
+        rel        = row["rel"]
+        rela       = row["rela"]
+
+        # pandas converts NULL -> NaN; normalize to None for clean pickle
+        if rela is None or (isinstance(rela, float) and math.isnan(rela)):
+            rela = None
 
         if source_cui not in lookup:
             lookup[source_cui] = {
-                "label":         source_label,
-                "semantic_type": source_sem,
-                "topics_by_relation": defaultdict(list),
+                "label":         row["source_label"],
+                "semantic_type": row["source_semantic_type"],
+                "topic_cuis":    [],
             }
 
-        # Dedupe (source, relation, topic_cui)
-        dedupe_key = (relation, topic_cui)
-        if dedupe_key in seen_per_source[source_cui]:
+        dedup_key = (topic_cui, rel, rela)
+        if dedup_key in seen[source_cui]:
             continue
-        seen_per_source[source_cui].add(dedupe_key)
+        seen[source_cui].add(dedup_key)
 
-        lookup[source_cui]["topics_by_relation"][relation].append({
-            "topic_cui":           topic_cui,
-            "topic_label":         topic_label,
-            "topic_semantic_type": topic_sem,
+        lookup[source_cui]["topic_cuis"].append({
+            "cui":           topic_cui,
+            "label":         row["topic_label"],
+            "semantic_type": row["topic_semantic_type"],
+            "rel":           rel,
+            "rela":          rela,
         })
-
-    # Convert defaultdicts to plain dicts for pickle cleanliness
-    for entry in lookup.values():
-        entry["topics_by_relation"] = dict(entry["topics_by_relation"])
 
     print(f"  -> {len(lookup):,} CUIs indexed ({time.time()-t:.1f}s)")
 
-    # Stats
     if lookup:
-        n_relations = sum(len(e["topics_by_relation"]) for e in lookup.values())
-        n_topics = sum(
-            sum(len(v) for v in e["topics_by_relation"].values())
-            for e in lookup.values()
-        )
-        print(f"    Total relation buckets across CUIs: {n_relations:,}")
-        print(f"    Total (source, relation, topic) triples: {n_topics:,}")
-
-        rel_counts = defaultdict(int)
-        for entry in lookup.values():
-            for rel, topics in entry["topics_by_relation"].items():
-                rel_counts[rel] += len(topics)
-        top_relations = sorted(rel_counts.items(), key=lambda x: -x[1])[:15]
-        print(f"\n    Top 15 relations by count:")
-        for rel, n in top_relations:
-            print(f"      {rel:35s}  {n:>10,}")
-
-        # Per-CUI topic counts
-        per_cui_counts = sorted(
-            sum(len(v) for v in e["topics_by_relation"].values())
-            for e in lookup.values()
-        )
+        per_cui_counts = sorted(len(e["topic_cuis"]) for e in lookup.values())
         n = len(per_cui_counts)
-        print(f"\n    Per-CUI topic count: "
+        n_total_topics = sum(per_cui_counts)
+        print(f"    Total (source, topic, rel, rela) entries: {n_total_topics:,}")
+        print(f"    Per-CUI topic count: "
               f"min={per_cui_counts[0]}  median={per_cui_counts[n//2]}  "
               f"mean={sum(per_cui_counts)/n:.1f}  "
               f"p95={per_cui_counts[int(n*0.95)]}  max={per_cui_counts[-1]}")
+
+        # Distinct topic CUIs per source (ignoring rel/rela duplicates)
+        per_cui_distinct = sorted(
+            len({t["cui"] for t in e["topic_cuis"]}) for e in lookup.values()
+        )
+        print(f"    Per-CUI DISTINCT topic CUI count: "
+              f"min={per_cui_distinct[0]}  median={per_cui_distinct[n//2]}  "
+              f"mean={sum(per_cui_distinct)/n:.1f}  "
+              f"p95={per_cui_distinct[int(n*0.95)]}  max={per_cui_distinct[-1]}")
 
     return lookup
 
