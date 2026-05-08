@@ -1,241 +1,267 @@
-"""
-Stage 2 of 2: assign topics and sub-topics from MRREL data.
-
-Reads:  cui_expansion_lookup.pkl   (built by run_builder.py)
-Writes: cui_topic_lookup.pkl       (same data + topic_id + subtopics)
-
-Topic = connected component of REL-relations within the same semantic type.
-        CUIs are in the same topic if they're connected via PAR/CHD/RB/RN/SY/SIB
-        edges (transitively).
-
-Sub-topic = (RELA, target_cui) grouping within a topic. Each CUI gets one
-            sub-topic ID per RELA-relation it has, so a CUI can belong to
-            multiple sub-topics simultaneously.
-
-This stage uses no clustering algorithm — both topic and sub-topic
-assignments are direct lookups from MRREL data.
-
-Topic ID format:
-    "<semantic_type>::<int>"
-    "<semantic_type>::singleton::<cui>"
-
-Sub-topic ID format:
-    "<topic_id>::<rela>::<target_cui>"
-"""
-
-import os
-import pickle
-import sys
-import time
-from collections import defaultdict
-
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-except AttributeError:
-    pass
-
-
-INPUT  = "cui_expansion_lookup.pkl"
-OUTPUT = "cui_topic_lookup.pkl"
-
-
-# ─────────────────────────────────────────────────────────────
-# TOPIC: connected components on REL graph
-# ─────────────────────────────────────────────────────────────
-
-def assign_topics(lookup):
-    """For each semantic type, build a graph from CUIs' expansion lists
-    (which are REL-filtered, same-type) and find connected components.
-    Each component is a topic.
+def fetch_relation_data(client):
     """
-    print("  Assigning topics via connected components...")
-    t = time.time()
-
-    # Bucket CUIs by semantic type
-    by_type = defaultdict(set)
-    for cui, entry in lookup.items():
-        by_type[entry["semantic_type"]].add(cui)
-
-    topic_assignments = {}
-    component_sizes = []
-    n_types = len(by_type)
-
-    for type_idx, (sem_type, cuis_in_type) in enumerate(by_type.items(), 1):
-        n_cuis = len(cuis_in_type)
-        if type_idx % 20 == 0 or type_idx == 1 or type_idx == n_types:
-            print(f"    [{type_idx}/{n_types}] semantic_type={sem_type!r}  "
-                  f"CUIs={n_cuis:,}", flush=True)
-
-        # Union-Find for connected components
-        parent = {c: c for c in cuis_in_type}
-
-        def find(x):
-            root = x
-            while parent[root] != root:
-                root = parent[root]
-            while parent[x] != root:
-                parent[x], x = root, parent[x]
-            return root
-
-        def union(a, b):
-            ra, rb = find(a), find(b)
-            if ra != rb:
-                parent[ra] = rb
-
-        for cui in cuis_in_type:
-            for e in lookup[cui]["expansion"]:
-                other = e["cui"]
-                if other in parent:
-                    union(cui, other)
-
-        # Group by root
-        components = defaultdict(list)
-        for cui in cuis_in_type:
-            components[find(cui)].append(cui)
-
-        for comp_idx, members in enumerate(components.values()):
-            component_sizes.append(len(members))
-            if len(members) == 1:
-                topic_assignments[members[0]] = (
-                    f"{sem_type}::singleton::{members[0]}"
-                )
-            else:
-                tid = f"{sem_type}::{comp_idx}"
-                for cui in members:
-                    topic_assignments[cui] = tid
-
-    for cui, entry in lookup.items():
-        entry["topic_id"] = topic_assignments.get(
-            cui, f"{entry['semantic_type']}::unassigned"
-        )
-
-    distinct = set(topic_assignments.values())
-    singletons = sum(1 for x in distinct if "::singleton::" in x)
-    multi = len(distinct) - singletons
-
-    print(f"  -> done ({time.time()-t:.1f}s)")
-    print(f"    Topics: {len(distinct):,} distinct  "
-          f"({multi:,} multi-CUI, {singletons:,} singletons)")
-    if component_sizes:
-        sizes = sorted(component_sizes)
-        n = len(sizes)
-        print(f"    Component size: min={sizes[0]:,}  median={sizes[n//2]:,}  "
-              f"mean={sum(sizes)/n:.0f}  p95={sizes[int(n*0.95)]:,}  "
-              f"max={sizes[-1]:,}")
-
-    return lookup
-
-
-# ─────────────────────────────────────────────────────────────
-# SUB-TOPIC: (RELA, target_cui) groupings
-# ─────────────────────────────────────────────────────────────
-
-def assign_subtopics(lookup):
-    """For each CUI, build sub-topic IDs from its rela_neighbors list.
-    Each (RELA, target_cui) pair becomes one sub-topic.
-
-    Sub-topic ID is scoped under the CUI's main topic so the same RELA
-    target produces a different sub-topic ID for CUIs in different topics.
+    Fetch relation graph with semantic types
     """
-    print("  Assigning sub-topics from RELA neighbors...")
-    t = time.time()
 
-    n_subtopics_total = 0
-    cuis_with_subtopics = 0
+    query = f"""
+    WITH semantic_map AS (
+        SELECT DISTINCT
+            cui,
+            semantic_type
+        FROM `{SEMANTIC_TABLE}`
+    )
 
-    for cui, entry in lookup.items():
-        topic_id = entry["topic_id"]
-        rela_list = entry.get("rela_neighbors", [])
-        subtopics = []
-        seen = set()  # dedupe (rela, target_cui) pairs in case of duplicates
-        for r in rela_list:
-            key = (r["rela"], r["target_cui"])
-            if key in seen:
-                continue
-            seen.add(key)
-            subtopic_id = f"{topic_id}::{r['rela']}::{r['target_cui']}"
-            subtopics.append({
-                "rela":         r["rela"],
-                "target_cui":   r["target_cui"],
-                "target_label": r["target_label"],
-                "subtopic_id":  subtopic_id,
+    SELECT
+        r.origin_cui,
+        r.origin_cui_name,
+        r.target_cui,
+        r.target_cui_name,
+        r.relation,
+
+        s1.semantic_type AS origin_semantic_type,
+        s2.semantic_type AS target_semantic_type
+
+    FROM `{RELATION_TABLE}` r
+
+    LEFT JOIN semantic_map s1
+        ON r.origin_cui = s1.cui
+
+    LEFT JOIN semantic_map s2
+        ON r.target_cui = s2.cui
+    """
+
+    return client.query(query).to_dataframe()
+def load_dataframe_to_bigquery(client, dataframe, table_name):
+    """
+    Load pandas dataframe into BigQuery
+    """
+
+    job = client.load_table_from_dataframe(
+        dataframe,
+        table_name
+    )
+
+    job.result()
+
+    print(f"Loaded {len(dataframe)} rows into {table_name}")
+def generate_cluster_id(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def build_clusters(df):
+    """
+    Logic:
+
+    1. Every semantic type becomes a SUPER cluster
+    2. Inside semantic type cluster:
+         - if relation differs => create subcluster
+         - if target semantic type differs => create cross-semantic cluster
+    3. Preserve hierarchy through parent_cluster_id
+    """
+
+    clusters = []
+    members = []
+    mappings = []
+
+    created_super_clusters = {}
+    created_relation_clusters = {}
+    created_cross_clusters = {}
+
+    now = datetime.utcnow()
+
+    for _, row in df.iterrows():
+
+        origin_cui = row["origin_cui"]
+        origin_name = row["origin_cui_name"]
+
+        target_cui = row["target_cui"]
+        target_name = row["target_cui_name"]
+
+        relation = row["relation"]
+
+        origin_sem = row["origin_semantic_type"]
+        target_sem = row["target_semantic_type"]
+
+        # =========================================================
+        # 1. SUPER CLUSTER : semantic type
+        # =========================================================
+
+        if origin_sem not in created_super_clusters:
+
+            super_cluster_id = generate_cluster_id("SUPER")
+
+            created_super_clusters[origin_sem] = super_cluster_id
+
+            clusters.append({
+                "cluster_id": super_cluster_id,
+                "cluster_name": f"SemanticType_{origin_sem}",
+                "cluster_type": "SUPER_SET",
+                "semantic_type": origin_sem,
+                "relation": None,
+                "parent_cluster_id": None,
+                "created_at": now
             })
-        entry["subtopics"] = subtopics
-        n_subtopics_total += len(subtopics)
-        if subtopics:
-            cuis_with_subtopics += 1
 
-    print(f"  -> done ({time.time()-t:.1f}s)")
-    print(f"    Sub-topics: {n_subtopics_total:,} total  "
-          f"({cuis_with_subtopics:,} CUIs have at least one sub-topic, "
-          f"{len(lookup) - cuis_with_subtopics:,} have none)")
+        super_cluster_id = created_super_clusters[origin_sem]
 
-    # Distribution stats
-    subtopic_counts = [len(e["subtopics"]) for e in lookup.values()]
-    if subtopic_counts:
-        sorted_c = sorted(subtopic_counts)
-        n = len(sorted_c)
-        print(f"    Per-CUI sub-topic count: min={sorted_c[0]}  "
-              f"median={sorted_c[n//2]}  mean={sum(sorted_c)/n:.1f}  "
-              f"p95={sorted_c[int(n*0.95)]}  max={sorted_c[-1]}")
+        # =========================================================
+        # 2. SAME SEMANTIC TYPE + SAME RELATION
+        # =========================================================
 
-    # Most common RELA values
-    rela_counter = defaultdict(int)
-    for entry in lookup.values():
-        for s in entry["subtopics"]:
-            rela_counter[s["rela"]] += 1
-    if rela_counter:
-        top_relas = sorted(rela_counter.items(), key=lambda x: -x[1])[:15]
-        print(f"    Top 15 RELA values:")
-        for rela, n in top_relas:
-            print(f"      {rela:35s}  {n:>10,}")
+        if origin_sem == target_sem:
 
-    return lookup
+            relation_key = (origin_sem, relation)
+
+            if relation_key not in created_relation_clusters:
+
+                relation_cluster_id = generate_cluster_id("REL")
+
+                created_relation_clusters[relation_key] = relation_cluster_id
+
+                clusters.append({
+                    "cluster_id": relation_cluster_id,
+                    "cluster_name": f"{origin_sem}_{relation}",
+                    "cluster_type": "RELATION_CLUSTER",
+                    "semantic_type": origin_sem,
+                    "relation": relation,
+                    "parent_cluster_id": super_cluster_id,
+                    "created_at": now
+                })
+
+                mappings.append({
+                    "source_cluster_id": super_cluster_id,
+                    "target_cluster_id": relation_cluster_id,
+                    "mapping_type": "PARENT_CHILD",
+                    "created_at": now
+                })
+
+            relation_cluster_id = created_relation_clusters[relation_key]
+
+            # add origin member
+            members.append({
+                "cluster_id": relation_cluster_id,
+                "cui": origin_cui,
+                "cui_name": origin_name,
+                "semantic_type": origin_sem,
+                "role": "ORIGIN",
+                "created_at": now
+            })
+
+            # add target member
+            members.append({
+                "cluster_id": relation_cluster_id,
+                "cui": target_cui,
+                "cui_name": target_name,
+                "semantic_type": target_sem,
+                "role": "TARGET",
+                "created_at": now
+            })
+
+        # =========================================================
+        # 3. CROSS SEMANTIC TYPE CLUSTER
+        # =========================================================
+
+        else:
+
+            cross_key = (origin_sem, target_sem, relation)
+
+            if cross_key not in created_cross_clusters:
+
+                cross_cluster_id = generate_cluster_id("CROSS")
+
+                created_cross_clusters[cross_key] = cross_cluster_id
+
+                clusters.append({
+                    "cluster_id": cross_cluster_id,
+                    "cluster_name": f"{origin_sem}_TO_{target_sem}_{relation}",
+                    "cluster_type": "CROSS_SEMANTIC_CLUSTER",
+                    "semantic_type": origin_sem,
+                    "relation": relation,
+                    "parent_cluster_id": super_cluster_id,
+                    "created_at": now
+                })
+
+                mappings.append({
+                    "source_cluster_id": super_cluster_id,
+                    "target_cluster_id": cross_cluster_id,
+                    "mapping_type": "PARENT_CHILD",
+                    "created_at": now
+                })
+
+            cross_cluster_id = created_cross_clusters[cross_key]
+
+            members.append({
+                "cluster_id": cross_cluster_id,
+                "cui": origin_cui,
+                "cui_name": origin_name,
+                "semantic_type": origin_sem,
+                "role": "ORIGIN",
+                "created_at": now
+            })
+
+            members.append({
+                "cluster_id": cross_cluster_id,
+                "cui": target_cui,
+                "cui_name": target_name,
+                "semantic_type": target_sem,
+                "role": "TARGET",
+                "created_at": now
+            })
+
+    return clusters, members, mappings
+def run_clustering():
+
+    client = bigquery.Client(project=PROJECT_ID)
 
 
-# ─────────────────────────────────────────────────────────────
-# IO + MAIN
-# ─────────────────────────────────────────────────────────────
+    print("Fetching relation graph...")
+    df = fetch_relation_data(client)
 
-def load_pickle(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"{path} not found. Run run_builder.py first."
-        )
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    print(f"Fetched {len(df)} rows")
 
+    print("Building clusters...")
+    clusters, members, mappings = build_clusters(df)
 
-def save_pickle(obj, path):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
+    import pandas as pd
 
+    cluster_df = pd.DataFrame(clusters).drop_duplicates()
 
+    member_df = pd.DataFrame(members).drop_duplicates()
+
+    map_df = pd.DataFrame(mappings).drop_duplicates()
+
+    print("Loading cluster table...")
+    load_dataframe_to_bigquery(
+        client,
+        cluster_df,
+        CLUSTER_TABLE
+    )
+
+    print("Loading member table...")
+    load_dataframe_to_bigquery(
+        client,
+        member_df,
+        MEMBER_TABLE
+    )
+
+    print("Loading map table...")
+    load_dataframe_to_bigquery(
+        client,
+        map_df,
+        MAP_TABLE
+    )
+
+    print("Scenario 4 clustering completed")
+
+    return {
+        "clusters": len(cluster_df),
+        "members": len(member_df),
+        "mappings": len(map_df)
+    }
+
+# Execute
 if __name__ == "__main__":
-    start = time.time()
 
-    print(f"\n{'='*60}")
-    print(f"  Stage 2: topic (REL components) + sub-topic (RELA)")
-    print(f"  Input  : {INPUT}")
-    print(f"  Output : {OUTPUT}")
-    print(f"{'='*60}\n")
+    result = run_clustering()
 
-    print("[1/4] Loading expansion pickle...")
-    t = time.time()
-    lookup = load_pickle(INPUT)
-    print(f"  -> {len(lookup):,} entries  ({time.time()-t:.1f}s)")
-    print()
-
-    print("[2/4] Assigning topics...")
-    lookup = assign_topics(lookup)
-    print()
-
-    print("[3/4] Assigning sub-topics...")
-    lookup = assign_subtopics(lookup)
-    print()
-
-    print("[4/4] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
+    print(result)
