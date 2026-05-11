@@ -74,29 +74,16 @@ functional status, mood, substance use), identity and consent
 code status), and encounter metadata (provider, date, location,
 visit type). When uncertain, default to clinical.
 
-A query is PROCESSABLE if it carries at least one such addressable
-concept. Set is_clinical=true, is_excluded=false, and extract intents.
+If the query carries at least one such addressable concept, set
+is_clinical=true and extract intents.
 
-A query is UNPROCESSABLE in two situations:
-
-1. Dialogue function — the utterance's function is to manage the
-   conversation itself rather than to convey or request clinical-
-   domain content. Illustrative patterns (not exhaustive):
-   conversational moves (greetings, sign-offs), subjective feelings
-   or opinions about the encounter, acknowledgments and comprehension
-   checks, courtesy and rapport, generic offers or generic consent
-   without a specific concept bound, questions about the system or
-   speaker itself, retractions or cancellations of one's own utterance,
-   asides not directed at the system, rhetorical or hypothetical
-   musings, performative declarations, fragmented or unparseable
-   speech. Set is_clinical=false, is_excluded=true, intents=[],
-   and provide an exclusion_category (short snake_case label,
-   open vocabulary — pick what fits) and a one-sentence reason.
-
-2. Off-domain — the query is fully outside healthcare (e.g.,
-   "best restaurants in Chicago", "how to fix a flat tire"). Set
-   is_clinical=false, is_excluded=false, intents=[], leave
-   exclusion_category null, and provide a one-sentence reason.
+If the query does not — either because its function is to manage
+the dialogue itself (greetings, opinions, acknowledgments, courtesy,
+generic offers or consent, system-meta questions, retractions,
+rhetorical musings, asides not directed at the system, fragmented
+speech, etc.) or because it is fully outside healthcare (e.g.,
+"best restaurants in Chicago", "how to fix a flat tire") — set
+is_clinical=false, intents=[], and provide a one-sentence reason.
 
 Reason about the function and content of the utterance, not its
 surface words.
@@ -398,11 +385,6 @@ Concepts to document:
 """
 
 
-# Exclusion category vocabulary is defined in the PHASE 0 prompt block,
-# not hardcoded here. The prompt is the single source of truth; adding,
-# removing, or renaming categories does not require a code change.
-
-
 # LLM EXTRACTION SCHEMAS
 
 class QueryExpansionOutput(BaseModel):
@@ -435,8 +417,6 @@ class Intent(BaseModel):
 
 class IntentExtractionResponse(BaseModel):
     is_clinical: bool
-    is_excluded: Optional[bool] = False
-    exclusion_category: Optional[str] = None
     reason: Optional[str] = None
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
@@ -450,8 +430,6 @@ class IntentExtractionResponse(BaseModel):
 # Full internal object after both pipeline steps
 class IntentExtractionOutput(BaseModel):
     is_clinical: bool
-    is_excluded: Optional[bool] = False
-    exclusion_category: Optional[str] = None
     reason: Optional[str] = None
     original_query: str
     expanded_query: str
@@ -562,22 +540,18 @@ class IntentWithContext(BaseModel):
 
 
 class Format_IntentExtraction(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     is_clinical: bool
-    actionable: str = Field(..., alias="Actionable")
-    exclusion_category: Optional[str] = None
     rejected_reason: Optional[str] = None
     user_query: str
     intents: List[IntentSummaryItem]
 
 
 class Format_FinalQueries(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     is_clinical: bool
-    actionable: str = Field(..., alias="Actionable")
-    exclusion_category: Optional[str] = None
     rejected_reason: Optional[str] = None
     user_query: str
     total_candidates: int
@@ -585,11 +559,9 @@ class Format_FinalQueries(BaseModel):
 
 
 class Format_NatureBreakdown(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     is_clinical: bool
-    actionable: str = Field(..., alias="Actionable")
-    exclusion_category: Optional[str] = None
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
@@ -597,11 +569,9 @@ class Format_NatureBreakdown(BaseModel):
 
 
 class Format_FullPipeline(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+    model_config = ConfigDict(extra="forbid")
 
     is_clinical: bool
-    actionable: str = Field(..., alias="Actionable")
-    exclusion_category: Optional[str] = None
     reason: Optional[str] = None
     original_query: str
     expanded_query: str
@@ -721,16 +691,6 @@ class ExtractionResult:
             clinical_setting=settings,
         )
 
-    def _is_actionable(self) -> str:
-        """'Yes' if the query carries an actionable or recordable concept
-        and reached intent extraction; 'No' for excluded queries (no
-        actionable concept) and non-clinical queries (off-domain). Both
-        surface as is_clinical=False internally."""
-        return "Yes" if (
-            self.intents.is_clinical
-            and not self.intents.is_excluded
-        ) else "No"
-
     # format methods
 
     def to_intent_extraction(self) -> Dict[str, Any]:
@@ -740,13 +700,11 @@ class ExtractionResult:
         ]
         result = Format_IntentExtraction(
             is_clinical=self.intents.is_clinical,
-            actionable=self._is_actionable(),
-            exclusion_category=self.intents.exclusion_category,
             rejected_reason=self.intents.reason,
             user_query=self.original_query,
             intents=items,
         )
-        return result.model_dump(by_alias=True, exclude_none=True)
+        return result.model_dump(exclude_none=True)
 
     def to_final_queries(self) -> Dict[str, Any]:
         candidates: List[FinalCandidateItem] = []
@@ -777,14 +735,12 @@ class ExtractionResult:
                     )
         result = Format_FinalQueries(
             is_clinical=self.intents.is_clinical,
-            actionable=self._is_actionable(),
-            exclusion_category=self.intents.exclusion_category,
             rejected_reason=self.intents.reason,
             user_query=self.original_query,
             total_candidates=len(candidates),
             final_candidates=candidates,
         )
-        return result.model_dump(by_alias=True, exclude_none=True)
+        return result.model_dump(exclude_none=True)
 
     def to_nature_breakdown(self) -> Dict[str, Any]:
         intents_no_queries = [
@@ -798,14 +754,12 @@ class ExtractionResult:
         ]
         result = Format_NatureBreakdown(
             is_clinical=self.intents.is_clinical,
-            actionable=self._is_actionable(),
-            exclusion_category=self.intents.exclusion_category,
             reason=self.intents.reason,
             original_query=self.intents.original_query,
             total_intents_detected=self.intents.total_intents_detected,
             intents=intents_no_queries,
         )
-        return result.model_dump(by_alias=True, exclude_none=True)
+        return result.model_dump(exclude_none=True)
 
     @staticmethod
     def _merge_signals(candidates: List[FinalCandidateItem]) -> FlatRetrievalSignals:
@@ -882,15 +836,13 @@ class ExtractionResult:
 
         result = Format_FullPipeline(
             is_clinical=self.intents.is_clinical,
-            actionable=self._is_actionable(),
-            exclusion_category=self.intents.exclusion_category,
             reason=self.intents.reason,
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
             intents=intent_blocks,
         )
-        return result.model_dump(by_alias=True, exclude_none=True)
+        return result.model_dump(exclude_none=True)
 
 
 
@@ -1002,14 +954,12 @@ class ContextualIntentPipeline:
             prompt,
             IntentExtractionResponse,
             fallback=IntentExtractionResponse(
-                is_clinical=False, is_excluded=False, reason="LLM call failed"
+                is_clinical=False, reason="LLM call failed"
             ),
             max_tokens=16384,
         )
         return IntentExtractionOutput(
             is_clinical=raw.is_clinical,
-            is_excluded=bool(raw.is_excluded),
-            exclusion_category=raw.exclusion_category,
             reason=raw.reason,
             original_query=original_query,
             expanded_query=expanded_query,
@@ -1026,8 +976,8 @@ class ContextualIntentPipeline:
         """Step 3 — map each atomic concept's documentation facets AND
         produce temporal signals per intent / candidate in one LLM call.
 
-        Skipped automatically for excluded or non-clinical queries (both
-        return is_clinical=False and intents=[])."""
+        Skipped automatically for non-clinical queries (is_clinical=False
+        with intents=[])."""
         if not intent_out.is_clinical or not intent_out.intents:
             return None
 
@@ -1121,12 +1071,7 @@ class ContextualIntentPipeline:
         sub_nature_count = sum(len(i.sub_natures) for i in intent_out.intents)
         print(f"Query     : {query[:80]}")
         print(f"Expanded  : {expansion.expanded_query[:80]}")
-        if intent_out.is_excluded:
-            print(
-                f"Status    : Excluded ({intent_out.exclusion_category}) "
-                f"— {intent_out.reason}"
-            )
-        elif intent_out.is_clinical:
+        if intent_out.is_clinical:
             print("Status    : Clinical")
             print(
                 f"Intents: {intent_out.total_intents_detected} | "
