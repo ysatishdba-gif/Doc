@@ -16,64 +16,6 @@ for _name in ("google_genai", "httpx", "httpcore", "urllib3", "google"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 
-RELEVANCE_CHECK_PROMPT = """
-You are a relevance gate for a clinical retrieval pipeline. Decide
-whether the ORIGINAL user query should be processed by downstream
-clinical extraction, or short-circuited as out of scope.
-
-A query is PROCESSABLE if its answer would be information that exists
-or could be recorded somewhere in healthcare — a chart, a claim, a
-schedule, a referral, an authorization, a benefit, a coordination
-note, an identifier, anything a healthcare team would document,
-retrieve, or act on.
-
-A query is UNPROCESSABLE if it is one of:
-- a conversational move (greeting, sign-off, small talk)
-- an opinion or feeling about the encounter
-- a politeness or courtesy phrase
-- a meta or capability question about the system
-- an instruction or prompt directed at a human operator
-  (e.g., "select X", "click Y", "read this aloud", "have you been
-  instructed to...") — the answer is a behavior, not a record
-- a script, guidance, or workflow direction telling someone what to do
-- a retraction or cancellation
-- a fragment, noise, or unanswerable
-- entirely unrelated to healthcare
-
-PRAGMATIC SIGNALS to weigh — read the ORIGINAL query as written:
-- Verb form and addressee: questions to staff about staff actions
-  ("Have you been instructed to...", "Did you verify...") are usually
-  not record queries.
-- Wrapper text: instructions ABOUT the utterance (e.g.,
-  "SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE")
-  signal that the underlying content is operational direction, not
-  a data request.
-- Imperatives to the reader ("select", "choose", "navigate",
-  "confirm", "click") are behaviors, not retrievals.
-
-DEFAULT: when uncertain, return is_processable=true. Downstream
-extraction has its own safeguards. It is better to process a
-borderline query than to reject a legitimate one.
-
-Return ONLY valid JSON (no markdown, no explanation):
-{{
-  "is_processable": true,
-  "reason": "<terse label, MAX 5-8 words>"
-}}
-
-The reason field MUST be 5-8 words MAX. A terse label, NOT a sentence.
-Do NOT restate the query. Do NOT explain reasoning. Do NOT use
-subordinate clauses. Good examples:
-- "Operational instruction to staff."
-- "Conversational greeting."
-- "Asks for a behavior, not data."
-- "Off-topic, not healthcare-related."
-- "Wrapper-framed staff direction."
-- "Politeness phrase, no record target."
-
-Original query: {query}
-"""
-
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
@@ -169,6 +111,14 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
+6. **representative_terms[]** - A short list (typically 1–3) of named clinical entities this intent is about. Read the intent's nature, sub_natures, and atomic_concepts together.Each term must name a thing that a typical
+   patient chart has its own section, list, or record for — diagnoses,medications, tests, procedures, devices, allergies, billing, insurance,visits, etc. If a candidate doesn't correspond to a chart section,drop it.
+
+   Ask: "what is this question ABOUT?" The answer is a named entity — a noun the chart has a section for — like "chemotherapy", "cancer", "medications". Pick the canonical name. NOT descriptive paraphrases or action phrases that wrap the entity in qualifiers (e.g. "prior systemic anti-cancer treatments", "review of pharmacotherapy"). The wrapping language describes what's being done WITH the entity; the entity is the subject — pick the subject.
+
+   A modifier narrows or scopes the question — it's a property of an entity, not the entity itself. Apply the deletion test: remove the candidate term from the question. If the question still makes coherent clinical sense without it, the term was a modifier — drop it. If removing it makes the question incoherent, the term is the subject — keep it. "Have you had a CT scan in the last 12 months" — remove "CT scan" and the question collapses (subject); remove "12 months" and the question still asks about CT scans (modifier). Pick "CT scan" only.
+
+   Do NOT enumerate atomic_concepts — those decompose; representative_terms summarize. Each term must name a DIFFERENT entity. Synonyms, abbreviations, and qualifier-wrapped forms of the same entity collapse to ONE — pick the canonical short name. Examples: "CT scan" and "computed tomography" name the same entity → pick one, not both. "billing", "billing statement", "billing process" all wrap the same entity → pick "billing", not all three.
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -252,7 +202,7 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Query Characteristics:**
 - 2-5 words, meaningful clinical phrase
-- Must infer from nature and sub nature context 
+- Must infer from nature and sub nature context
 - A candidate is invalid if it is only a qualifier, modifier, temporal expression, severity descriptor, or status/action word without naming the  entity it applies to
 - If a modifier or status word is clinically important, bundle it with the entity it modifies so the candidate still names a concept
 - Use standard medical terminology
@@ -432,11 +382,6 @@ Concepts to document:
 
 # LLM EXTRACTION SCHEMAS
 
-class RelevanceCheckOutput(BaseModel):
-    is_processable: bool
-    reason: Optional[str] = None
-
-
 class QueryExpansionOutput(BaseModel):
     expanded_query: str
     abbreviations_expanded: List[str] = Field(default_factory=list)
@@ -463,6 +408,12 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
+    # Short list (typically 1–3) of LLM-picked entity-level phrases summarizing
+    # what this intent is about. The LLM reads nature + sub_natures +
+    # atomic_concepts together and synthesizes; these are NOT atomic_concepts
+    # copied verbatim (those decompose the intent), but entity-level summaries
+    # derived from the whole. Empty list when the LLM didn't emit any.
+    representative_terms: list = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -594,12 +545,14 @@ class Format_IntentExtraction(BaseModel):
     intents: List[IntentSummaryItem]
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    representative_terms: list = Field(default_factory=list)
 
 
 class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    representative_terms: list = Field(default_factory=list)
     total_candidates: int
     final_candidates: List[FinalCandidateItem]
 
@@ -609,6 +562,7 @@ class Format_NatureBreakdown(BaseModel):
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithoutQueries]
 
 
@@ -618,6 +572,7 @@ class Format_FullPipeline(BaseModel):
     original_query: str
     expanded_query: str
     total_intents_detected: int
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithContext]
 
 
@@ -724,6 +679,30 @@ class ExtractionResult:
 
     # format methods
 
+    def _representative_terms(self) -> List[str]:
+        """Per-intent representative_terms flattened into a single deduped list.
+
+        Each intent contributes its own short list of entity-level phrases
+        (the LLM synthesizes them by reading nature + sub_natures +
+        atomic_concepts together — see prompt INTENT STRUCTURE item 6).
+        We flatten across intents in traversal order, coerce items to str
+        (the field is an untyped list so items could in principle be other
+        scalars), strip whitespace, skip empties, and dedup case-
+        insensitively across the whole query."""
+        terms: List[str] = []
+        seen: set = set()
+        for intent in self.intents.intents:
+            for t in intent.representative_terms or []:
+                t_clean = str(t).strip()
+                if not t_clean:
+                    continue
+                key = t_clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                terms.append(t_clean)
+        return terms
+
     def to_intent_extraction(self) -> Dict[str, Any]:
         items = [
             IntentSummaryItem(intent_title=i.intent_title, description=i.description)
@@ -734,6 +713,7 @@ class ExtractionResult:
             intents=items,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            representative_terms=self._representative_terms(),
         )
         return result.model_dump()
 
@@ -768,6 +748,7 @@ class ExtractionResult:
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            representative_terms=self._representative_terms(),
             total_candidates=len(candidates),
             final_candidates=candidates,
         )
@@ -788,6 +769,7 @@ class ExtractionResult:
             reason=self.intents.reason,
             original_query=self.intents.original_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intents_no_queries,
         )
         return result.model_dump()
@@ -871,6 +853,7 @@ class ExtractionResult:
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intent_blocks,
         )
         return result.model_dump()
@@ -931,59 +914,38 @@ class ContextualIntentPipeline:
         fallback=None,
         max_tokens: int = 8192,
     ):
-        """Call the LLM with structured output. Single attempt — on failure,
-        return `fallback` (if provided) or re-raise. Retry was removed to
-        avoid doubling latency on slow / timing-out calls; transient
-        failures fall to the fallback path instead."""
-        try:
-            config = types.GenerateContentConfig(
-                temperature=0.0,
-                top_p=0.2,
-                seed=23,
-                max_output_tokens=max_tokens,
-                response_mime_type="application/json",
-                response_schema=schema,
-            )
-            response = self.client.models.generate_content(
-                model=self.model_name, contents=prompt, config=config
-            )
-            data = self._extract_json(response)
-            if isinstance(data, list):
-                fields = schema.model_fields
-                list_field = next(
-                    (k for k, v in fields.items() if "List" in str(v.annotation)),
-                    None,
+        """Call the LLM with structured output. Retry once on error.
+        If still failing, return `fallback` (if provided) or re-raise."""
+        for attempt in range(2):
+            try:
+                config = types.GenerateContentConfig(
+                    temperature=0.0,
+                    top_p=0.2,
+                    seed=23,
+                    max_output_tokens=max_tokens,
+                    response_mime_type="application/json",
+                    response_schema=schema,
                 )
-                data = {list_field: data} if list_field else data
-            return schema.model_validate(data)
-        except Exception:
-            if fallback is not None:
-                return fallback
-            raise
+                response = self.client.models.generate_content(
+                    model=self.model_name, contents=prompt, config=config
+                )
+                data = self._extract_json(response)
+                if isinstance(data, list):
+                    fields = schema.model_fields
+                    list_field = next(
+                        (k for k, v in fields.items() if "List" in str(v.annotation)),
+                        None,
+                    )
+                    data = {list_field: data} if list_field else data
+                return schema.model_validate(data)
+            except Exception:
+                if attempt == 0:
+                    continue
+                if fallback is not None:
+                    return fallback
+                raise
 
     # -- pipeline steps --
-
-    def check_relevance(self, query: str) -> RelevanceCheckOutput:
-        """Step 0 — relevance gate. Runs on the ORIGINAL query, before
-        expansion. Decides whether the query carries content worth
-        processing or is dialogue noise / out of scope.
-
-        Operates on the original (not expanded) query deliberately:
-        expansion aggressively medicalizes input, which can hide the
-        pragmatic signals (wrappers, staff-directed verbs, scripting
-        framing) that this gate needs to see. Wrapper-framed staff
-        directions look clinical after expansion; they look like what
-        they are in the raw text.
-
-        Fallback on LLM failure: is_processable=True. We default to
-        processing so a flaky gate never silently drops legitimate
-        clinical queries — downstream has its own validation."""
-        return self._call_model(
-            RELEVANCE_CHECK_PROMPT.format(query=query),
-            RelevanceCheckOutput,
-            fallback=RelevanceCheckOutput(is_processable=True),
-            max_tokens=512,
-        )
 
     def expand_query(self, query: str) -> QueryExpansionOutput:
         """Step 1 — normalize the query (abbreviations + explicit temporals)."""
@@ -991,7 +953,7 @@ class ContextualIntentPipeline:
             QUERY_EXPANSION_PROMPT.format(query=query),
             QueryExpansionOutput,
             fallback=QueryExpansionOutput(expanded_query=query),
-            max_tokens=1024,
+            max_tokens=2048,
         )
 
     def extract_intents(
@@ -1008,7 +970,7 @@ class ContextualIntentPipeline:
             fallback=IntentExtractionResponse(
                 is_clinical=False, reason="LLM call failed"
             ),
-            max_tokens=8192,
+            max_tokens=16384,
         )
         return IntentExtractionOutput(
             is_clinical=raw.is_clinical,
@@ -1078,7 +1040,7 @@ class ContextualIntentPipeline:
             ),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=16384,
+            max_tokens=32768,
         )
 
     # -- main entry points --
@@ -1089,46 +1051,10 @@ class ContextualIntentPipeline:
 
         t0 = datetime.utcnow()
 
-        # Steps 0 & 1 run in parallel. Both read the ORIGINAL query and
-        # neither depends on the other's output, so wall time becomes
-        # max(relevance, expansion) instead of the sum. On rejected
-        # queries the expansion result is discarded, but we still skip
-        # the much larger intent + context calls, so net latency on
-        # rejected traffic is still substantially lower.
-        t_par = datetime.utcnow()
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            _rel_fut = _pool.submit(self.check_relevance, query)
-            _exp_fut = _pool.submit(self.expand_query, query)
-            relevance = _rel_fut.result()
-            expansion = _exp_fut.result()
-        t_par_e = (datetime.utcnow() - t_par).total_seconds()
-
-        if not relevance.is_processable:
-            # Short-circuit: discard the expansion result and skip intent
-            # extraction + context build. Use the original query as
-            # expanded_query so downstream formatters still get a valid
-            # ExtractionResult.
-            processing_time = (datetime.utcnow() - t0).total_seconds()
-            empty_expansion = QueryExpansionOutput(expanded_query=query)
-            empty_intents = IntentExtractionOutput(
-                is_clinical=False,
-                reason=relevance.reason or "Rejected by relevance gate.",
-                original_query=query,
-                expanded_query=query,
-                total_intents_detected=0,
-                intents=[],
-            )
-            print(f"Query     : {query[:80]}")
-            print(f"Status    : Rejected by relevance gate — {empty_intents.reason}")
-            print(
-                f"Timing    : gate+expand={t_par_e:.1f}s  "
-                f"total={processing_time:.1f}s  (intents/context skipped)"
-            )
-            print()
-            return ExtractionResult(
-                query, empty_expansion, empty_intents,
-                None, None, processing_time,
-            )
+        # Step 1 — query normalization
+        t1 = datetime.utcnow()
+        expansion = self.expand_query(query)
+        t1e = (datetime.utcnow() - t1).total_seconds()
 
         # Step 2 — intent extraction
         t2 = datetime.utcnow()
@@ -1164,7 +1090,7 @@ class ContextualIntentPipeline:
                 f"candidates: {candidate_count}"
             )
             print(
-                f"Timing    : gate+expand={t_par_e:.1f}s  "
+                f"Timing    : expand={t1e:.1f}s  "
                 f"intents={t2e:.1f}s  "
                 f"context={t3e:.1f}s  "
                 f"total={processing_time:.1f}s"
@@ -1280,7 +1206,7 @@ if __name__ == "__main__":
 
     output_config = OutputConfig(
         intent_extraction=False,
-        final_queries=True,
+        final_queries=False,
         nature_breakdown=False,
         full_pipeline=True,
     )
@@ -1289,13 +1215,41 @@ if __name__ == "__main__":
         project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
     )
 
-    test_queries = [
-        "medication list"
-    ]
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(run_single_query, pipeline, q, idx, output_config): q
-            for idx, q in enumerate(test_queries, 3)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import json
+
+    results = []
+    test_queries = questions[:86]
+
+    def minimal_pipeline(q):
+        # STEP 1: expansion
+        expansion = pipeline.expand_query(q)
+
+        # STEP 2: intent extraction
+        intent_out = pipeline.extract_intents(q, expansion.expanded_query)
+
+        terms = []
+
+        if intent_out and intent_out.intents:
+            for intent in intent_out.intents:
+                
+                terms.extend(intent.representative_terms or [])
+
+        # clean + dedupe
+        terms = list({t.strip() for t in terms if t and t.strip()})
+
+        return {
+            "question": q,
+            "representative_terms": terms
         }
-        for future in as_completed(futures):
-            future.result()
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(minimal_pipeline, q) for q in test_queries]
+
+        for f in as_completed(futures):
+            results.append(f.result())
+
+    with open("rep_term.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    print("rep_terms.json")
