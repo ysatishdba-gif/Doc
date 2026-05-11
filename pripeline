@@ -16,6 +16,54 @@ for _name in ("google_genai", "httpx", "httpcore", "urllib3", "google"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 
+RELEVANCE_CHECK_PROMPT = """
+You are a relevance gate for a clinical retrieval pipeline. Decide
+whether the ORIGINAL user query should be processed by downstream
+clinical extraction, or short-circuited as out of scope.
+
+A query is PROCESSABLE if its answer would be information that exists
+or could be recorded somewhere in healthcare — a chart, a claim, a
+schedule, a referral, an authorization, a benefit, a coordination
+note, an identifier, anything a healthcare team would document,
+retrieve, or act on.
+
+A query is UNPROCESSABLE if it is one of:
+- a conversational move (greeting, sign-off, small talk)
+- an opinion or feeling about the encounter
+- a politeness or courtesy phrase
+- a meta or capability question about the system
+- an instruction or prompt directed at a human operator
+  (e.g., "select X", "click Y", "read this aloud", "have you been
+  instructed to...") — the answer is a behavior, not a record
+- a script, guidance, or workflow direction telling someone what to do
+- a retraction or cancellation
+- a fragment, noise, or unanswerable
+- entirely unrelated to healthcare
+
+PRAGMATIC SIGNALS to weigh — read the ORIGINAL query as written:
+- Verb form and addressee: questions to staff about staff actions
+  ("Have you been instructed to...", "Did you verify...") are usually
+  not record queries.
+- Wrapper text: instructions ABOUT the utterance (e.g.,
+  "SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE")
+  signal that the underlying content is operational direction, not
+  a data request.
+- Imperatives to the reader ("select", "choose", "navigate",
+  "confirm", "click") are behaviors, not retrievals.
+
+DEFAULT: when uncertain, return is_processable=true. Downstream
+extraction has its own safeguards. It is better to process a
+borderline query than to reject a legitimate one.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "is_processable": true,
+  "reason": "one short sentence explaining the decision"
+}}
+
+Original query: {query}
+"""
+
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
@@ -373,6 +421,11 @@ Concepts to document:
 
 
 # LLM EXTRACTION SCHEMAS
+
+class RelevanceCheckOutput(BaseModel):
+    is_processable: bool
+    reason: Optional[str] = None
+
 
 class QueryExpansionOutput(BaseModel):
     expanded_query: str
@@ -901,6 +954,28 @@ class ContextualIntentPipeline:
 
     # -- pipeline steps --
 
+    def check_relevance(self, query: str) -> RelevanceCheckOutput:
+        """Step 0 — relevance gate. Runs on the ORIGINAL query, before
+        expansion. Decides whether the query carries content worth
+        processing or is dialogue noise / out of scope.
+
+        Operates on the original (not expanded) query deliberately:
+        expansion aggressively medicalizes input, which can hide the
+        pragmatic signals (wrappers, staff-directed verbs, scripting
+        framing) that this gate needs to see. Wrapper-framed staff
+        directions look clinical after expansion; they look like what
+        they are in the raw text.
+
+        Fallback on LLM failure: is_processable=True. We default to
+        processing so a flaky gate never silently drops legitimate
+        clinical queries — downstream has its own validation."""
+        return self._call_model(
+            RELEVANCE_CHECK_PROMPT.format(query=query),
+            RelevanceCheckOutput,
+            fallback=RelevanceCheckOutput(is_processable=True),
+            max_tokens=512,
+        )
+
     def expand_query(self, query: str) -> QueryExpansionOutput:
         """Step 1 — normalize the query (abbreviations + explicit temporals)."""
         return self._call_model(
@@ -1005,6 +1080,38 @@ class ContextualIntentPipeline:
 
         t0 = datetime.utcnow()
 
+        # Step 0 — relevance gate (on the ORIGINAL query, before any expansion)
+        t_rel = datetime.utcnow()
+        relevance = self.check_relevance(query)
+        t_rel_e = (datetime.utcnow() - t_rel).total_seconds()
+
+        if not relevance.is_processable:
+            # Short-circuit: do not call expansion / intent extraction /
+            # context build. Build an empty ExtractionResult so the
+            # downstream formatters produce the standard non-clinical
+            # output shape.
+            processing_time = (datetime.utcnow() - t0).total_seconds()
+            empty_expansion = QueryExpansionOutput(expanded_query=query)
+            empty_intents = IntentExtractionOutput(
+                is_clinical=False,
+                reason=relevance.reason or "Rejected by relevance gate.",
+                original_query=query,
+                expanded_query=query,
+                total_intents_detected=0,
+                intents=[],
+            )
+            print(f"Query     : {query[:80]}")
+            print(f"Status    : Rejected by relevance gate — {empty_intents.reason}")
+            print(
+                f"Timing    : relevance={t_rel_e:.1f}s  "
+                f"total={processing_time:.1f}s  (expansion/intents/context skipped)"
+            )
+            print()
+            return ExtractionResult(
+                query, empty_expansion, empty_intents,
+                None, None, processing_time,
+            )
+
         # Step 1 — query normalization
         t1 = datetime.utcnow()
         expansion = self.expand_query(query)
@@ -1044,7 +1151,8 @@ class ContextualIntentPipeline:
                 f"candidates: {candidate_count}"
             )
             print(
-                f"Timing    : expand={t1e:.1f}s  "
+                f"Timing    : relevance={t_rel_e:.1f}s  "
+                f"expand={t1e:.1f}s  "
                 f"intents={t2e:.1f}s  "
                 f"context={t3e:.1f}s  "
                 f"total={processing_time:.1f}s"
