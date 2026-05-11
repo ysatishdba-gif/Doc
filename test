@@ -16,6 +16,64 @@ for _name in ("google_genai", "httpx", "httpcore", "urllib3", "google"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 
+RELEVANCE_CHECK_PROMPT = """
+You are a relevance gate for a clinical retrieval pipeline. Decide
+whether the ORIGINAL user query should be processed by downstream
+clinical extraction, or short-circuited as out of scope.
+
+A query is PROCESSABLE if its answer would be information that exists
+or could be recorded somewhere in healthcare — a chart, a claim, a
+schedule, a referral, an authorization, a benefit, a coordination
+note, an identifier, anything a healthcare team would document,
+retrieve, or act on.
+
+A query is UNPROCESSABLE if it is one of:
+- a conversational move (greeting, sign-off, small talk)
+- an opinion or feeling about the encounter
+- a politeness or courtesy phrase
+- a meta or capability question about the system
+- an instruction or prompt directed at a human operator
+  (e.g., "select X", "click Y", "read this aloud", "have you been
+  instructed to...") — the answer is a behavior, not a record
+- a script, guidance, or workflow direction telling someone what to do
+- a retraction or cancellation
+- a fragment, noise, or unanswerable
+- entirely unrelated to healthcare
+
+PRAGMATIC SIGNALS to weigh — read the ORIGINAL query as written:
+- Verb form and addressee: questions to staff about staff actions
+  ("Have you been instructed to...", "Did you verify...") are usually
+  not record queries.
+- Wrapper text: instructions ABOUT the utterance (e.g.,
+  "SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE")
+  signal that the underlying content is operational direction, not
+  a data request.
+- Imperatives to the reader ("select", "choose", "navigate",
+  "confirm", "click") are behaviors, not retrievals.
+
+DEFAULT: when uncertain, return is_processable=true. Downstream
+extraction has its own safeguards. It is better to process a
+borderline query than to reject a legitimate one.
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "is_processable": true,
+  "reason": "<terse label, MAX 5-8 words>"
+}}
+
+The reason field MUST be 5-8 words MAX. A terse label, NOT a sentence.
+Do NOT restate the query. Do NOT explain reasoning. Do NOT use
+subordinate clauses. Good examples:
+- "Operational instruction to staff."
+- "Conversational greeting."
+- "Asks for a behavior, not data."
+- "Off-topic, not healthcare-related."
+- "Wrapper-framed staff direction."
+- "Politeness phrase, no record target."
+
+Original query: {query}
+"""
+
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
@@ -381,6 +439,11 @@ Concepts to document:
 
 
 # LLM EXTRACTION SCHEMAS
+
+class RelevanceCheckOutput(BaseModel):
+    is_processable: bool
+    reason: Optional[str] = None
+
 
 class QueryExpansionOutput(BaseModel):
     expanded_query: str
@@ -914,38 +977,54 @@ class ContextualIntentPipeline:
         fallback=None,
         max_tokens: int = 8192,
     ):
-        """Call the LLM with structured output. Retry once on error.
-        If still failing, return `fallback` (if provided) or re-raise."""
-        for attempt in range(2):
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0.0,
-                    top_p=0.2,
-                    seed=23,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=schema,
+        """Call the LLM with structured output. Single attempt — on failure,
+        return `fallback` (if provided) or re-raise. Retry was removed to
+        avoid doubling latency on slow / timing-out calls; transient
+        failures fall to the fallback path instead."""
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.0,
+                top_p=0.2,
+                seed=23,
+                max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                response_schema=schema,
+            )
+            response = self.client.models.generate_content(
+                model=self.model_name, contents=prompt, config=config
+            )
+            data = self._extract_json(response)
+            if isinstance(data, list):
+                fields = schema.model_fields
+                list_field = next(
+                    (k for k, v in fields.items() if "List" in str(v.annotation)),
+                    None,
                 )
-                response = self.client.models.generate_content(
-                    model=self.model_name, contents=prompt, config=config
-                )
-                data = self._extract_json(response)
-                if isinstance(data, list):
-                    fields = schema.model_fields
-                    list_field = next(
-                        (k for k, v in fields.items() if "List" in str(v.annotation)),
-                        None,
-                    )
-                    data = {list_field: data} if list_field else data
-                return schema.model_validate(data)
-            except Exception:
-                if attempt == 0:
-                    continue
-                if fallback is not None:
-                    return fallback
-                raise
+                data = {list_field: data} if list_field else data
+            return schema.model_validate(data)
+        except Exception:
+            if fallback is not None:
+                return fallback
+            raise
 
     # -- pipeline steps --
+
+    def check_relevance(self, query: str) -> RelevanceCheckOutput:
+        """Step 0 — relevance gate. Runs on the ORIGINAL query before any
+        expansion. Decides whether the query carries content worth
+        processing. Operates on the raw query intentionally — expansion
+        aggressively medicalizes input, which hides pragmatic signals
+        (wrappers, staff-directed verbs) that this gate needs to see.
+
+        Fallback on LLM failure: is_processable=True. We default to
+        processing so a flaky gate never silently drops legitimate
+        clinical queries — downstream has its own validation."""
+        return self._call_model(
+            RELEVANCE_CHECK_PROMPT.format(query=query),
+            RelevanceCheckOutput,
+            fallback=RelevanceCheckOutput(is_processable=True),
+            max_tokens=512,
+        )
 
     def expand_query(self, query: str) -> QueryExpansionOutput:
         """Step 1 — normalize the query (abbreviations + explicit temporals)."""
@@ -953,7 +1032,7 @@ class ContextualIntentPipeline:
             QUERY_EXPANSION_PROMPT.format(query=query),
             QueryExpansionOutput,
             fallback=QueryExpansionOutput(expanded_query=query),
-            max_tokens=2048,
+            max_tokens=1024,
         )
 
     def extract_intents(
@@ -970,7 +1049,7 @@ class ContextualIntentPipeline:
             fallback=IntentExtractionResponse(
                 is_clinical=False, reason="LLM call failed"
             ),
-            max_tokens=16384,
+            max_tokens=8192,
         )
         return IntentExtractionOutput(
             is_clinical=raw.is_clinical,
@@ -1040,7 +1119,7 @@ class ContextualIntentPipeline:
             ),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=32768,
+            max_tokens=16384,
         )
 
     # -- main entry points --
@@ -1222,6 +1301,18 @@ if __name__ == "__main__":
     test_queries = questions[:86]
 
     def minimal_pipeline(q):
+        # STEP 0: relevance gate (on the ORIGINAL query, before expansion).
+        # If the query is dialogue/operational/off-topic, short-circuit
+        # without paying for expansion or intent extraction.
+        relevance = pipeline.check_relevance(q)
+        if not relevance.is_processable:
+            return {
+                "question": q,
+                "is_processable": False,
+                "reason": relevance.reason,
+                "representative_terms": [],
+            }
+
         # STEP 1: expansion
         expansion = pipeline.expand_query(q)
 
@@ -1240,7 +1331,8 @@ if __name__ == "__main__":
 
         return {
             "question": q,
-            "representative_terms": terms
+            "is_processable": True,
+            "representative_terms": terms,
         }
 
     with ThreadPoolExecutor(max_workers=10) as executor:
