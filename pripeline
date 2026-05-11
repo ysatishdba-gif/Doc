@@ -921,36 +921,35 @@ class ContextualIntentPipeline:
         fallback=None,
         max_tokens: int = 8192,
     ):
-        """Call the LLM with structured output. Retry once on error.
-        If still failing, return `fallback` (if provided) or re-raise."""
-        for attempt in range(2):
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0.0,
-                    top_p=0.2,
-                    seed=23,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=schema,
+        """Call the LLM with structured output. Single attempt — on failure,
+        return `fallback` (if provided) or re-raise. Retry was removed to
+        avoid doubling latency on slow / timing-out calls; transient
+        failures fall to the fallback path instead."""
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.0,
+                top_p=0.2,
+                seed=23,
+                max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                response_schema=schema,
+            )
+            response = self.client.models.generate_content(
+                model=self.model_name, contents=prompt, config=config
+            )
+            data = self._extract_json(response)
+            if isinstance(data, list):
+                fields = schema.model_fields
+                list_field = next(
+                    (k for k, v in fields.items() if "List" in str(v.annotation)),
+                    None,
                 )
-                response = self.client.models.generate_content(
-                    model=self.model_name, contents=prompt, config=config
-                )
-                data = self._extract_json(response)
-                if isinstance(data, list):
-                    fields = schema.model_fields
-                    list_field = next(
-                        (k for k, v in fields.items() if "List" in str(v.annotation)),
-                        None,
-                    )
-                    data = {list_field: data} if list_field else data
-                return schema.model_validate(data)
-            except Exception:
-                if attempt == 0:
-                    continue
-                if fallback is not None:
-                    return fallback
-                raise
+                data = {list_field: data} if list_field else data
+            return schema.model_validate(data)
+        except Exception:
+            if fallback is not None:
+                return fallback
+            raise
 
     # -- pipeline steps --
 
@@ -982,7 +981,7 @@ class ContextualIntentPipeline:
             QUERY_EXPANSION_PROMPT.format(query=query),
             QueryExpansionOutput,
             fallback=QueryExpansionOutput(expanded_query=query),
-            max_tokens=2048,
+            max_tokens=1024,
         )
 
     def extract_intents(
@@ -999,7 +998,7 @@ class ContextualIntentPipeline:
             fallback=IntentExtractionResponse(
                 is_clinical=False, reason="LLM call failed"
             ),
-            max_tokens=16384,
+            max_tokens=8192,
         )
         return IntentExtractionOutput(
             is_clinical=raw.is_clinical,
@@ -1069,7 +1068,7 @@ class ContextualIntentPipeline:
             ),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=32768,
+            max_tokens=16384,
         )
 
     # -- main entry points --
@@ -1080,16 +1079,25 @@ class ContextualIntentPipeline:
 
         t0 = datetime.utcnow()
 
-        # Step 0 — relevance gate (on the ORIGINAL query, before any expansion)
-        t_rel = datetime.utcnow()
-        relevance = self.check_relevance(query)
-        t_rel_e = (datetime.utcnow() - t_rel).total_seconds()
+        # Steps 0 & 1 run in parallel. Both read the ORIGINAL query and
+        # neither depends on the other's output, so wall time becomes
+        # max(relevance, expansion) instead of the sum. On rejected
+        # queries the expansion result is discarded, but we still skip
+        # the much larger intent + context calls, so net latency on
+        # rejected traffic is still substantially lower.
+        t_par = datetime.utcnow()
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _rel_fut = _pool.submit(self.check_relevance, query)
+            _exp_fut = _pool.submit(self.expand_query, query)
+            relevance = _rel_fut.result()
+            expansion = _exp_fut.result()
+        t_par_e = (datetime.utcnow() - t_par).total_seconds()
 
         if not relevance.is_processable:
-            # Short-circuit: do not call expansion / intent extraction /
-            # context build. Build an empty ExtractionResult so the
-            # downstream formatters produce the standard non-clinical
-            # output shape.
+            # Short-circuit: discard the expansion result and skip intent
+            # extraction + context build. Use the original query as
+            # expanded_query so downstream formatters still get a valid
+            # ExtractionResult.
             processing_time = (datetime.utcnow() - t0).total_seconds()
             empty_expansion = QueryExpansionOutput(expanded_query=query)
             empty_intents = IntentExtractionOutput(
@@ -1103,19 +1111,14 @@ class ContextualIntentPipeline:
             print(f"Query     : {query[:80]}")
             print(f"Status    : Rejected by relevance gate — {empty_intents.reason}")
             print(
-                f"Timing    : relevance={t_rel_e:.1f}s  "
-                f"total={processing_time:.1f}s  (expansion/intents/context skipped)"
+                f"Timing    : gate+expand={t_par_e:.1f}s  "
+                f"total={processing_time:.1f}s  (intents/context skipped)"
             )
             print()
             return ExtractionResult(
                 query, empty_expansion, empty_intents,
                 None, None, processing_time,
             )
-
-        # Step 1 — query normalization
-        t1 = datetime.utcnow()
-        expansion = self.expand_query(query)
-        t1e = (datetime.utcnow() - t1).total_seconds()
 
         # Step 2 — intent extraction
         t2 = datetime.utcnow()
@@ -1151,8 +1154,7 @@ class ContextualIntentPipeline:
                 f"candidates: {candidate_count}"
             )
             print(
-                f"Timing    : relevance={t_rel_e:.1f}s  "
-                f"expand={t1e:.1f}s  "
+                f"Timing    : gate+expand={t_par_e:.1f}s  "
                 f"intents={t2e:.1f}s  "
                 f"context={t3e:.1f}s  "
                 f"total={processing_time:.1f}s"
