@@ -1,449 +1,243 @@
-import os
-import pickle
-import sys
-import time
-from collections import defaultdict
-from google.cloud import bigquery
-from config import PROJECT_ID, DATASET_ID
-
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-except AttributeError:
-    pass
-
-
-PROJECT = PROJECT_ID
-DATASET = DATASET_ID
-OUTPUT  = "cui_topic_lookup.pkl"
-
-
-
-# BQ QUERY
-
-
-CLUSTER_QUERY = """
-WITH
-  -- Concept labels (preferred English term per CUI)
-  concept_label AS (
-    SELECT
-      CUI,
-      ANY_VALUE(STR) AS label
-    FROM `{project}.{dataset}.MRCONSO`
-    WHERE SAB='SNOMEDCT_US'
-      AND LAT='ENG'
-      AND ISPREF='Y'
-      AND SUPPRESS='N'
-    GROUP BY CUI
-  ),
-
-  -- One semantic type per CUI (lower-cased)
-  semantic_map AS (
-    SELECT
-      CUI,
-      LOWER(ANY_VALUE(STY)) AS semantic_type
-    FROM `{project}.{dataset}.MRSTY`
-    GROUP BY CUI
-  ),
-
-  -- Filtered MRREL with semantic types and effective relation.
-  -- Dedup logic: each conceptual relationship is encoded twice in MRREL
-  -- (e.g., A isa B AND B inverse_isa A). We keep only one direction.
-  --
-  -- Rules:
-  --   - If RELA is the passive/inverse form (starts with 'inverse_' or
-  --     ends with '_of'), drop the row. The active form sibling is
-  --     kept instead.
-  --   - For REL-only rows (no RELA), drop PAR (CHD is the active form).
-  --   - For known symmetric relations (SY, SIB, same_as,
-  --     possibly_equivalent_to), keep only rows where CUI1 < CUI2.
-  rel AS (
-    SELECT
-      origin_cui,
-      target_cui,
-      origin_sem,
-      target_sem,
-      effective_rel
-    FROM (
-      SELECT
-        r.CUI1                                   AS origin_cui,
-        r.CUI2                                   AS target_cui,
-        COALESCE(s1.semantic_type, 'unknown')    AS origin_sem,
-        COALESCE(s2.semantic_type, 'unknown')    AS target_sem,
-        COALESCE(r.RELA, r.REL)                  AS effective_rel,
-        r.REL                                    AS rel,
-        r.RELA                                   AS rela,
-        r.CUI1                                   AS cui1,
-        r.CUI2                                   AS cui2
-      FROM `{project}.{dataset}.MRREL` r
-      LEFT JOIN semantic_map s1 ON r.CUI1 = s1.CUI
-      LEFT JOIN semantic_map s2 ON r.CUI2 = s2.CUI
-      WHERE r.SAB='SNOMEDCT_US'
-        AND r.SUPPRESS='N'
-    )
-    WHERE
-      -- Drop passive RELA forms (active sibling exists in MRREL)
-      NOT (rela IS NOT NULL AND (
-        STARTS_WITH(rela, 'inverse_')
-        OR ENDS_WITH(rela, '_of')
-      ))
-      -- Drop PAR when no RELA (CHD is the active form for hierarchy)
-      AND NOT (rela IS NULL AND rel = 'PAR')
-      AND NOT (rela IS NULL AND rel = 'RB')   -- RN is the active form
-      -- For symmetric relations, dedupe by CUI ordering
-      AND NOT (rela IN ('possibly_equivalent_to', 'same_as')
-               AND cui1 >= cui2)
-      AND NOT (rela IS NULL AND rel IN ('SY', 'SIB')
-               AND cui1 >= cui2)
-  ),
-
-  -- ──────────────────────────────────────────────────────
-  -- CLUSTER DEFINITIONS
-  -- ──────────────────────────────────────────────────────
-
-  -- RELATION_CLUSTER: same-type origin/target with same effective_rel & target_cui
-  relation_clusters AS (
-    SELECT DISTINCT
-      CONCAT('REL_', FORMAT('%016x',
-        FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-      'RELATION_CLUSTER'                                                AS cluster_type,
-      CONCAT(origin_sem, '_', effective_rel, '_to_', target_cui)        AS cluster_name,
-      origin_sem                                                        AS semantic_type
-    FROM rel
-    WHERE origin_sem = target_sem
-  ),
-
-  -- CROSS_SEMANTIC_CLUSTER: cross-type origin/target
-  cross_clusters AS (
-    SELECT DISTINCT
-      CONCAT('CROSS_', FORMAT('%016x',
-        FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-      'CROSS_SEMANTIC_CLUSTER'                                                                      AS cluster_type,
-      CONCAT(origin_sem, '_to_', target_sem, '_', effective_rel, '_', target_cui)                   AS cluster_name,
-      origin_sem                                                                                    AS semantic_type
-    FROM rel
-    WHERE origin_sem != target_sem
-  ),
-
-  -- ──────────────────────────────────────────────────────
-  -- MEMBERSHIPS  (cui, cluster_id, role)
-  -- ──────────────────────────────────────────────────────
-
-  -- RELATION membership: origin and target of same-type rows
-  relation_membership AS (
-    SELECT origin_cui AS cui,
-           CONCAT('REL_', FORMAT('%016x',
-             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-           'ORIGIN' AS role
-    FROM rel WHERE origin_sem = target_sem
-    UNION ALL
-    SELECT target_cui AS cui,
-           CONCAT('REL_', FORMAT('%016x',
-             FARM_FINGERPRINT(CONCAT('REL|', origin_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-           'TARGET' AS role
-    FROM rel WHERE origin_sem = target_sem
-  ),
-
-  -- CROSS membership: origin and target of cross-type rows
-  cross_membership AS (
-    SELECT origin_cui AS cui,
-           CONCAT('CROSS_', FORMAT('%016x',
-             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-           'ORIGIN' AS role
-    FROM rel WHERE origin_sem != target_sem
-    UNION ALL
-    SELECT target_cui AS cui,
-           CONCAT('CROSS_', FORMAT('%016x',
-             FARM_FINGERPRINT(CONCAT('CROSS|', origin_sem, '|', target_sem, '|', effective_rel, '|', target_cui)))) AS cluster_id,
-           'TARGET' AS role
-    FROM rel WHERE origin_sem != target_sem
-  ),
-
-  -- All memberships, deduped on (cui, cluster_id, role)
-  all_membership AS (
-    SELECT DISTINCT cui, cluster_id, role
-    FROM (
-      SELECT * FROM relation_membership
-      UNION ALL
-      SELECT * FROM cross_membership
-    )
-  ),
-
-  -- All cluster definitions
-  all_clusters AS (
-    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM relation_clusters
-    UNION ALL
-    SELECT cluster_id, cluster_type, cluster_name, semantic_type FROM cross_clusters
-  )
-
--- Final result: one row per (cui, cluster), with metadata joined in
-SELECT
-  m.cui,
-  l.label                      AS cui_label,
-  cl.semantic_type             AS cluster_semantic_type,
-  m.cluster_id,
-  cl.cluster_type,
-  cl.cluster_name,
-  m.role
-FROM all_membership m
-JOIN all_clusters cl ON m.cluster_id = cl.cluster_id
-LEFT JOIN concept_label l ON m.cui = l.CUI
 """
-# PIPELINE
+Document-side processor.
+
+Pipeline:
+  sample_idx -> case_ids from stats["samples"][sample_idx]
+  for each case_id:
+    blobs = recon[case_id]["reconstructed"]["blobs"]
+    for each blob:
+      CUIExtractor.extract(blob) -> CUIs
+  union all CUIs
+  CUISummarizer.summarize(union) -> surviving CUIs
+  adaptor.cluster_ids_for(surviving) -> doc cluster_ids
+
+Usage:
+    from document_processor import DocumentProcessor
+    dp = DocumentProcessor()
+    result = dp.process_sample(120)
+    # result has: cluster_ids, surviving_cuis, raw_cuis, n_blobs, etc.
+"""
+
+import pickle
+import time
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Set
+
+from config import (
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
+    CUI_TOPIC_LOOKUP_PATH,
+)
+from cui_core import CUIExtractor
+from cui_summarizer import CUISummarizer
+from adaptor import Adaptor
+from topic_filter import TopicFilter
 
 
-def fetch_clusters(client):
-    """Run the cluster query and return the result DataFrame."""
-    sql = CLUSTER_QUERY.format(project=PROJECT, dataset=DATASET)
-    print("  Running cluster query in BigQuery...")
-    t = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  -> {len(df):,} (cui, cluster, role) rows ({time.time()-t:.1f}s)")
-    return df
+def _load_pickle(path: str):
+    """Load a pickle from local path or gs:// URI."""
+    if path.startswith("gs://"):
+        from google.cloud import storage
+        without_prefix = path[len("gs://"):]
+        bucket_name, _, blob_path = without_prefix.partition("/")
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_path)
+        return pickle.load(BytesIO(blob.download_as_bytes()))
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
 
-def fetch_cui_metadata(client):
-    """Fetch label and semantic type per CUI separately. Smaller than the
-    cluster join, easier to attach to the final lookup.
-    """
-    sql = f"""
-        WITH
-          concept_label AS (
-            SELECT
-              CUI,
-              ANY_VALUE(STR) AS label
-            FROM `{PROJECT}.{DATASET}.MRCONSO`
-            WHERE SAB='SNOMEDCT_US' AND LAT='ENG'
-              AND ISPREF='Y' AND SUPPRESS='N'
-            GROUP BY CUI
-          ),
-          semantic_map AS (
-            SELECT
-              CUI,
-              LOWER(ANY_VALUE(STY)) AS semantic_type
-            FROM `{PROJECT}.{DATASET}.MRSTY`
-            GROUP BY CUI
-          )
-        SELECT
-          l.CUI                                AS cui,
-          l.label                              AS label,
-          COALESCE(s.semantic_type, 'unknown') AS semantic_type
-        FROM concept_label l
-        LEFT JOIN semantic_map s ON l.CUI = s.CUI
-    """
-    print("  Fetching CUI metadata...")
-    t = time.time()
-    df = client.query(sql).to_dataframe()
-    print(f"  -> {len(df):,} CUIs ({time.time()-t:.1f}s)")
-    return df
+def _cui_id(c: Any) -> str:
+    return c if isinstance(c, str) else c.get("cui", "")
 
 
-# Cluster type preference for sorting. Higher score = listed first in the
-# per-CUI cluster list. Adaptor consumers take top K from this sorted list.
-CLUSTER_TYPE_RANK = {
-    "CROSS_SEMANTIC_CLUSTER": 2,
-    "RELATION_CLUSTER":       1,
-}
+def _cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
+    """Same shape as demo.py: flatten the CUIExtractor's per-input dict."""
+    out, seen = [], set()
+    for d in raw.values():
+        for c in d.get("cuis", []):
+            key = c if isinstance(c, str) else c.get("cui", c)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
 
 
-def build_lookup(membership_df, metadata_df):
-    """Pivot the (cui, cluster, role) rows into per-CUI dict.
+class DocumentProcessor:
 
-    Each CUI's `clusters` list is sorted by cluster_type preference:
-    CROSS first, then RELATION. Stable order within type.
-    Adaptor consumers take top K from the front of this list.
+    def __init__(
+        self,
+        stats_path: str,
+        recon_path: str,
+        extractor: Optional[CUIExtractor] = None,
+        summarizer: Optional[CUISummarizer] = None,
+        adaptor: Optional[Adaptor] = None,
+        topic_filter: Optional[TopicFilter] = None,
+        verbose: bool = True,
+    ):
+        self.verbose = verbose
+        t = time.time()
+        if verbose:
+            print(f"Loading stats from {stats_path}...")
+        self.stats = _load_pickle(stats_path)
+        if verbose:
+            print(f"  {time.time()-t:.1f}s")
 
-    Each cluster entry also carries:
-      - member_count: distinct CUI count in the cluster
-      - sample_members: up to 10 distinct members (cui + label)
-    """
-    print("  Pivoting into per-CUI lookup...")
-    t = time.time()
+        t = time.time()
+        if verbose:
+            print(f"Loading reconstructed from {recon_path}...")
+        self.recon = _load_pickle(recon_path)
+        if verbose:
+            print(f"  {time.time()-t:.1f}s")
 
-    # ── First pass: compute cluster sizes and gather sample members ──
-    # Both are deduped by CUI within each cluster. The same CUI can appear
-    # multiple rows for the same cluster (once as ORIGIN, once as TARGET,
-    # once via different MRREL rows) — count and samples treat each CUI
-    # as one member regardless.
-    print("    Pass 1: computing cluster sizes and samples...", flush=True)
-    cluster_distinct_cuis = defaultdict(set)   # cluster_id -> set of cuis
-    cluster_samples       = defaultdict(list)  # cluster_id -> [{cui, label}, ...]
-    cluster_sample_seen   = defaultdict(set)   # cluster_id -> set of cuis already in samples
-    SAMPLE_LIMIT = 10
+        # samples map: sample_idx -> {cases, file_name, ...}
+        self.samples = self.stats["samples"]
 
-    cui_label_map = {row["cui"]: row["label"] for row in metadata_df.to_dict("records")}
-
-    for row in membership_df.to_dict("records"):
-        cid = row["cluster_id"]
-        cui = row["cui"]
-        cluster_distinct_cuis[cid].add(cui)
-        if (cui not in cluster_sample_seen[cid]
-                and len(cluster_samples[cid]) < SAMPLE_LIMIT):
-            cluster_sample_seen[cid].add(cui)
-            cluster_samples[cid].append({
-                "cui":   cui,
-                "label": cui_label_map.get(cui, row["cui_label"] or cui),
-            })
-
-    cluster_member_count = {cid: len(cuis) for cid, cuis in cluster_distinct_cuis.items()}
-    # Free the per-cluster sets — we only need the counts going forward
-    del cluster_distinct_cuis
-    del cluster_sample_seen
-
-    # ── Second pass: build per-CUI lookup with cluster metadata ──
-    print("    Pass 2: building per-CUI lookup...", flush=True)
-    lookup = {}
-    for row in metadata_df.to_dict("records"):
-        lookup[row["cui"]] = {
-            "label":         row["label"],
-            "semantic_type": row["semantic_type"],
-            "clusters":      [],
-        }
-
-    n_orphan = 0
-    for row in membership_df.to_dict("records"):
-        cui = row["cui"]
-        cid = row["cluster_id"]
-        if cui not in lookup:
-            lookup[cui] = {
-                "label":         row["cui_label"] or cui,
-                "semantic_type": row["cluster_semantic_type"] or "unknown",
-                "clusters":      [],
-            }
-            n_orphan += 1
-        lookup[cui]["clusters"].append({
-            "cluster_id":     cid,
-            "cluster_type":   row["cluster_type"],
-            "cluster_name":   row["cluster_name"],
-            "role":           row["role"],
-            "member_count":   cluster_member_count[cid],
-            "sample_members": cluster_samples[cid],
-        })
-
-    # Sort each CUI's clusters by type preference. Python's sort is stable,
-    # so ties within a type preserve insertion order from BQ.
-    for entry in lookup.values():
-        entry["clusters"].sort(
-            key=lambda c: -CLUSTER_TYPE_RANK.get(c["cluster_type"], 0)
+        # Clients (reuse if caller passed them in)
+        self.extractor    = extractor    or CUIExtractor(
+            API_URL, top_k=TOP_K, top_p=TOP_P,
+            cluster_set=CLUSTER_SET, combined=COMBINED,
         )
+        self.summarizer   = summarizer   or CUISummarizer()
+        self.adaptor      = adaptor      or Adaptor(CUI_TOPIC_LOOKUP_PATH)
+        self.topic_filter = topic_filter or TopicFilter(adaptor=self.adaptor)
 
-    print(f"  -> {len(lookup):,} CUIs ({time.time()-t:.1f}s)")
-    if n_orphan:
-        print(f"     Note: {n_orphan:,} CUIs had cluster memberships but no "
-              f"metadata in MRCONSO/MRSTY")
+    def _blobs_for_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return list of {case_id, blob_idx, text} for every blob in every case.
 
-    if lookup:
-        _print_distribution_stats(lookup)
+        If max_cases is set, only the first N case IDs are used.
+        """
+        meta = self.samples.get(sample_idx)
+        if meta is None:
+            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
+        case_ids = meta.get("cases", [])
+        if max_cases is not None:
+            case_ids = case_ids[:max_cases]
+        out = []
+        for cid in case_ids:
+            case = self.recon.get(cid)
+            if case is None:
+                if self.verbose:
+                    print(f"    case_id {cid} missing from recon, skipping")
+                continue
+            blobs = (case.get("reconstructed") or {}).get("blobs") or []
+            for i, blob in enumerate(blobs):
+                if isinstance(blob, str) and blob.strip():
+                    out.append({"case_id": cid, "blob_idx": i, "text": blob})
+        return out
 
+    def process_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> Dict[str, Any]:
+        meta = self.samples.get(sample_idx)
+        if meta is None:
+            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
 
-    return lookup
+        file_name = meta.get("file_name", f"sample_{sample_idx}")
+        all_case_ids = meta.get("cases", [])
+        used_case_ids = all_case_ids[:max_cases] if max_cases is not None else all_case_ids
 
+        if self.verbose:
+            print(f"\nProcessing {file_name} (sample_idx={sample_idx})")
+            print(f"  total case_ids in sample: {len(all_case_ids)}")
+            if max_cases is not None and len(all_case_ids) > max_cases:
+                print(f"  *** FILTERED to first {max_cases} case_ids for speed ***")
+            print(f"  using case_ids: {used_case_ids}")
 
-def _print_distribution_stats(lookup):
-    """Emit detailed cluster-membership stats per CUI to help pick K."""
-    n_total = len(lookup)
+        blobs = self._blobs_for_sample(sample_idx, max_cases=max_cases)
+        if self.verbose:
+            print(f"  total blobs across cases: {len(blobs)}")
 
-    cluster_counts   = sorted(len(e["clusters"]) for e in lookup.values())
-    cross_counts     = sorted(
-        sum(1 for c in e["clusters"] if c["cluster_type"] == "CROSS_SEMANTIC_CLUSTER")
-        for e in lookup.values()
-    )
-    relation_counts  = sorted(
-        sum(1 for c in e["clusters"] if c["cluster_type"] == "RELATION_CLUSTER")
-        for e in lookup.values()
-    )
+        # ---- CUI extraction: one call per blob ----
+        all_cuis: List[Any] = []
+        seen: Set[str] = set()
+        t_extract = time.time()
+        for i, b in enumerate(blobs, 1):
+            text = b["text"]
+            try:
+                raw = self.extractor.extract([text], [text])
+                cuis = _cuis_from_raw(raw)
+            except Exception as e:
+                if self.verbose:
+                    print(f"    blob {i} extract FAILED: {e}")
+                cuis = []
+            for c in cuis:
+                cid = _cui_id(c)
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    all_cuis.append(c)
+            if self.verbose and (i % 10 == 0 or i == len(blobs)):
+                print(f"    extracted blob {i}/{len(blobs)}  "
+                      f"(unique CUIs so far: {len(seen)})")
+        extract_secs = time.time() - t_extract
 
-    def _stats(label, sorted_counts):
-        n = len(sorted_counts)
-        if n == 0:
-            print(f"    {label}: no data")
-            return
-        print(f"    {label:30s} "
-              f"min={sorted_counts[0]:>6,}  "
-              f"median={sorted_counts[n//2]:>6,}  "
-              f"mean={sum(sorted_counts)/n:>8.1f}  "
-              f"p95={sorted_counts[int(n*0.95)]:>6,}  "
-              f"max={sorted_counts[-1]:>6,}")
+        if self.verbose:
+            print(f"  extraction: {extract_secs:.1f}s, "
+                  f"{len(seen)} unique CUIs")
 
-    print(f"\n    Per-CUI cluster counts (n={n_total:,} CUIs)")
-    _stats("Total clusters", cluster_counts)
-    _stats("CROSS clusters", cross_counts)
-    _stats("RELATION clusters", relation_counts)
+        # ---- Summarize ----
+        if not all_cuis:
+            if self.verbose:
+                print("  no CUIs to summarize")
+            return {
+                "sample_idx":      sample_idx,
+                "file_name":       file_name,
+                "all_case_ids":    all_case_ids,
+                "case_ids":        used_case_ids,
+                "n_blobs":         len(blobs),
+                "raw_cuis":        [],
+                "surviving_cuis":  [],
+                "cluster_ids":     set(),
+                "extract_seconds": extract_secs,
+                "summarize_seconds": 0.0,
+            }
 
-    # Coverage thresholds — what % of CUIs have at least N CROSS clusters
-    print(f"\n    Coverage by CROSS cluster count:")
-    for k in (1, 3, 5, 10, 20):
-        n_with_k = sum(1 for c in cross_counts if c >= k)
-        pct = 100.0 * n_with_k / n_total
-        print(f"      CUIs with >= {k:>2d} CROSS clusters: "
-              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+        t_sum = time.time()
+        s = self.summarizer.summarize(all_cuis, sources=["SNOMEDCT_US"])
+        summarize_secs = time.time() - t_sum
+        m = s["metrics"]
+        if self.verbose:
+            print(f"  summarize: {summarize_secs:.1f}s  "
+                  f"{m['input_code_count']} in -> {m['output_code_count']} out")
 
-    print(f"\n    Coverage by RELATION cluster count:")
-    for k in (1, 3, 5, 10, 20):
-        n_with_k = sum(1 for c in relation_counts if c >= k)
-        pct = 100.0 * n_with_k / n_total
-        print(f"      CUIs with >= {k:>2d} RELATION clusters: "
-              f"{n_with_k:>7,} ({pct:>5.1f}%)")
+        surviving_cuis = [c["cui"] for c in s["surviving_cuis"]]
 
-    n_no_clusters = sum(1 for e in lookup.values() if not e["clusters"])
-    print(f"\n    CUIs with NO clusters at all:        "
-          f"{n_no_clusters:>7,} ({100.0*n_no_clusters/n_total:>5.1f}%)")
-    print(f"    CUIs with at least one cluster:      "
-          f"{n_total - n_no_clusters:>7,} "
-          f"({100.0*(n_total - n_no_clusters)/n_total:>5.1f}%)")
+        # ---- Topic filter (drop singletons) ----
+        cluster_ids = self.topic_filter.filter_clusters(surviving_cuis)
+        if self.verbose:
+            print(f"  cluster_ids (after singleton drop): "
+                  f"{len(cluster_ids)} distinct clusters\n")
 
-
-def save_pickle(obj, path):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-    size_mb = round(os.path.getsize(path) / 1e6, 1)
-    print(f"  Saved {len(obj):,} entries -> {path}  ({size_mb} MB)")
-
-
-
-# MAIN
+        return {
+            "sample_idx":         sample_idx,
+            "file_name":          file_name,
+            "all_case_ids":       all_case_ids,
+            "case_ids":           used_case_ids,
+            "n_blobs":            len(blobs),
+            "raw_cuis":           all_cuis,
+            "surviving_cuis":     s["surviving_cuis"],
+            "removed_cuis":       s["removed_cuis"],
+            "cluster_ids":        cluster_ids,
+            "extract_seconds":    extract_secs,
+            "summarize_seconds":  summarize_secs,
+        }
 
 
 if __name__ == "__main__":
-    start = time.time()
+    # Standalone test on sample_120 — limited to first 2 case IDs for speed
+    import os
+    STATS_PATH = os.environ.get("STATS_PATH",  "sampling_1_stats.pk")
+    RECON_PATH = os.environ.get("RECON_PATH",  "reconstructed_obj.pk")
+    SAMPLE_IDX = int(os.environ.get("SAMPLE_IDX", "120"))
+    MAX_CASES  = int(os.environ.get("MAX_CASES", "2"))
 
-    client = bigquery.Client(project=PROJECT)
+    dp = DocumentProcessor(stats_path=STATS_PATH, recon_path=RECON_PATH)
+    result = dp.process_sample(SAMPLE_IDX, max_cases=MAX_CASES)
 
-    print("[1/4] Running cluster query...")
-    membership_df = fetch_clusters(client)
-    print()
-
-    print("[2/4] Fetching CUI metadata...")
-    metadata_df = fetch_cui_metadata(client)
-    print()
-
-    print("[3/4] Building per-CUI lookup...")
-    lookup = build_lookup(membership_df, metadata_df)
-    print()
-
-    print("[4/4] Saving pickle...")
-    save_pickle(lookup, OUTPUT)
-    print(f"\nTotal time: {(time.time()-start)/60:.1f} min")
-------------------
-  -- One semantic type per CUI (lower-cased)
-
-  semantic_map AS (
-
-    SELECT
-
-      CUI,
-
-      LOWER(ANY_VALUE(STY)) AS semantic_type
-
-    FROM `{project}.{dataset}.MRSTY`
-
-    GROUP BY CUI
-
-  )
- 
- 
-This will give only one semantic type not all
- 
-since all semantic type are not considered so cross semantic will become incorrect as it worked on partial info. May be that semantic type was there along with others
- 
-
-
+    print("="*70)
+    print(f"Result for {result['file_name']}:")
+    print(f"  all cases:      {result['all_case_ids']}")
+    print(f"  used cases:     {result['case_ids']}")
+    print(f"  n_blobs:        {result['n_blobs']}")
+    print(f"  raw CUIs:       {len(result['raw_cuis'])}")
+    print(f"  surviving CUIs: {len(result['surviving_cuis'])}")
+    print(f"  cluster_ids:    {len(result['cluster_ids'])}")
+    print(f"  extract: {result['extract_seconds']:.1f}s | "
+          f"summarize: {result['summarize_seconds']:.1f}s")
