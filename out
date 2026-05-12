@@ -1,104 +1,85 @@
 """
-Topic filter.
+Cluster-based retrieval adaptor.
 
-Runs after summarization. Given a list of surviving CUIs, returns the
-cluster_ids that represent real topics in this CUI set — meaning clusters
-where at least `min_members` of the input CUIs are members.
+Loads the lean cluster pickle and provides:
+  - cluster_ids_for(cuis)            : map list of CUIs -> set of cluster_ids
+  - score(query_cluster_ids, doc_cluster_ids): weighted overlap score
+  - rank_documents(query_cuis, docs) : full pipeline
 
-Singleton clusters (where only 1 input CUI is present) are dropped.
-This avoids "topic expansion" beyond what's actually in the document/query.
-
-Usage:
-    from topic_filter import TopicFilter
-    tf = TopicFilter(adaptor)
-    topics = tf.filter_clusters(surviving_cuis)
-    # topics is a set of cluster_ids
+Matching logic:
+  - Each CUI has a set of cluster_ids (precomputed in pickle)
+  - Query CUIs and document CUIs are mapped to cluster_id sets
+  - Score = sum over shared cluster_ids of (1 / member_count)
+  - Big noisy clusters self-attenuate; small specific clusters dominate
 """
 
-from collections import defaultdict
-from typing import Iterable, Optional, Set, Dict, List, Tuple
-
-from adaptor import Adaptor
+import os
+import pickle
 
 
-class TopicFilter:
+PICKLE_PATH = "cui_topic_lookup.pkl"  # lean production pickle
 
-    def __init__(
-        self,
-        adaptor: Optional[Adaptor] = None,
-        pickle_path: Optional[str] = None,
-        min_members: int = 2,
-    ):
+
+# ─────────────────────────────────────────────────────────────
+# CORE ADAPTOR
+# ─────────────────────────────────────────────────────────────
+
+class Adaptor:
+    def __init__(self, pickle_path=PICKLE_PATH):
+        """Load the lean cluster pickle and build cluster_id -> size index."""
+        if not os.path.exists(pickle_path):
+            raise FileNotFoundError(
+                f"{pickle_path} not found. Run run_topics.py first."
+            )
+        with open(pickle_path, "rb") as f:
+            self.lookup = pickle.load(f)
+
+        # Build inverse index: cluster_id -> member_count
+        # One pass at startup.
+        self.cluster_size = {}
+        for cui, clusters in self.lookup.items():
+            for cluster_id, member_count in clusters:
+                self.cluster_size[cluster_id] = member_count
+
+    def cluster_ids_for(self, cuis):
+        """Return set of cluster_ids covering all CUIs in the input list."""
+        out = set()
+        for cui in cuis:
+            for cluster_id, _mc in self.lookup.get(cui, []):
+                out.add(cluster_id)
+        return out
+
+    def score(self, query_cluster_ids, doc_cluster_ids):
+        """Weighted overlap score. Each shared cluster contributes 1/member_count."""
+        shared = query_cluster_ids & doc_cluster_ids
+        if not shared:
+            return 0.0
+        return sum(
+            1.0 / self.cluster_size.get(cid, 1)
+            for cid in shared
+        )
+
+    def rank_documents(self, query_cuis, docs):
+        """Score and rank documents against a query.
+
+        `docs` is a list of dicts each with at least:
+          - "doc_id": str
+          - "cuis":   list[str]   (summarized CUIs for the document)
+        Optional:
+          - "cluster_ids": set[str]  (pre-computed; otherwise computed here)
+
+        Returns list of (doc, score, shared_clusters) sorted by score desc.
         """
-        Parameters
-        ----------
-        adaptor : Adaptor or None
-            Existing Adaptor to reuse. If None, builds one from pickle_path.
-        pickle_path : str or None
-            Path to lean pickle. Used only if adaptor is None.
-        min_members : int
-            Minimum number of input CUIs that must be in a cluster for it
-            to be kept. Default 2 (drop singletons).
-        """
-        if adaptor is None:
-            from config import CUI_TOPIC_LOOKUP_PATH
-            adaptor = Adaptor(pickle_path or CUI_TOPIC_LOOKUP_PATH)
-        self.adaptor = adaptor
-        self.min_members = min_members
+        query_clusters = self.cluster_ids_for(query_cuis)
 
-    def filter_clusters(
-        self,
-        cuis: Iterable[str],
-        min_members: Optional[int] = None,
-    ) -> Set[str]:
-        """Return cluster_ids where at least `min_members` of `cuis` are members.
+        results = []
+        for doc in docs:
+            doc_clusters = doc.get("cluster_ids")
+            if doc_clusters is None:
+                doc_clusters = self.cluster_ids_for(doc["cuis"])
+            shared = query_clusters & doc_clusters
+            s = self.score(query_clusters, doc_clusters)
+            results.append((doc, s, shared))
 
-        Singletons (only 1 of `cuis` in the cluster) are dropped when
-        min_members >= 2.
-        """
-        if min_members is None:
-            min_members = self.min_members
-
-        cui_set = set(cuis)
-        cluster_hits: Dict[str, Set[str]] = defaultdict(set)
-        for cui in cui_set:
-            for cluster_id, _mc in self.adaptor.lookup.get(cui, []):
-                cluster_hits[cluster_id].add(cui)
-
-        return {
-            cid for cid, hits in cluster_hits.items()
-            if len(hits) >= min_members
-        }
-
-    def filter_with_details(
-        self,
-        cuis: Iterable[str],
-        min_members: Optional[int] = None,
-    ) -> List[Dict]:
-        """Same filter but returns per-cluster details for inspection.
-
-        Each dict: cluster_id, member_count (total in SNOMED), matched_cuis
-        (the subset of input CUIs in this cluster).
-        """
-        if min_members is None:
-            min_members = self.min_members
-
-        cui_set = set(cuis)
-        cluster_hits: Dict[str, Set[str]] = defaultdict(set)
-        for cui in cui_set:
-            for cluster_id, _mc in self.adaptor.lookup.get(cui, []):
-                cluster_hits[cluster_id].add(cui)
-
-        kept: List[Dict] = []
-        for cid, hits in cluster_hits.items():
-            if len(hits) < min_members:
-                continue
-            kept.append({
-                "cluster_id":   cid,
-                "member_count": self.adaptor.cluster_size.get(cid, 0),
-                "matched_cuis": sorted(hits),
-                "n_matched":    len(hits),
-            })
-        # Sort: most matched CUIs first, then smallest cluster size first
-        kept.sort(key=lambda x: (-x["n_matched"], x["member_count"]))
-        return kept
+        results.sort(key=lambda x: -x[1])
+        return results
