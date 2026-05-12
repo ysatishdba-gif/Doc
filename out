@@ -1,13 +1,41 @@
 """Inspect the source pickles to understand their structure.
 
+Paths can be local (/path/to/file.pk) or GCS (gs://bucket/path/file.pk).
 Edit the two paths below and run:
     python inspect_source_pkls.py
+
+Requirements for GCS:
+    pip install google-cloud-storage
 """
 import pickle
 import os
+from io import BytesIO
 
-RECONSTRUCTED_PATH = "reconstructed_obj.pk"
-STATS_PATH         = "sampling_1_stats.pk"
+RECONSTRUCTED_PATH = "gs://your-bucket/reconstructed_obj.pk"
+STATS_PATH         = "gs://your-bucket/sampling_1_stats.pk"
+
+
+def load_pickle(path):
+    """Load a pickle from a local path or gs:// URI."""
+    if path.startswith("gs://"):
+        from google.cloud import storage
+        # Strip gs:// and split into bucket + blob
+        without_prefix = path[len("gs://"):]
+        bucket_name, _, blob_path = without_prefix.partition("/")
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        if not blob.exists():
+            raise FileNotFoundError(f"GCS blob not found: {path}")
+        data = blob.download_as_bytes()
+        size_mb = len(data) / 1e6
+        return pickle.load(BytesIO(data)), size_mb
+    else:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Local file not found: {path}")
+        size_mb = os.path.getsize(path) / 1e6
+        with open(path, "rb") as f:
+            return pickle.load(f), size_mb
 
 
 def describe(name, obj, indent=0):
@@ -43,13 +71,15 @@ def inspect_pickle(path):
     print(f"\n{'='*70}")
     print(f"  File: {path}")
     print(f"{'='*70}")
-    if not os.path.exists(path):
-        print(f"  ERROR: file not found")
+    try:
+        obj, size_mb = load_pickle(path)
+    except FileNotFoundError as e:
+        print(f"  ERROR: {e}")
         return None
-    size_mb = os.path.getsize(path) / 1e6
-    print(f"  Size on disk: {size_mb:.2f} MB")
-    with open(path, "rb") as f:
-        obj = pickle.load(f)
+    except Exception as e:
+        print(f"  ERROR loading: {type(e).__name__}: {e}")
+        return None
+    print(f"  Size: {size_mb:.2f} MB")
     describe("root", obj)
 
     # If DataFrame, peek at one cell from each column
