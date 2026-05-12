@@ -1,23 +1,23 @@
 """
+End-to-end demo.
+
+Query side (mirrors the old demo exactly):
   PASS 1: Pipeline structure
-    For each intent:
-      - intent title, nature, description
-      - for each sub_nature:
-          category_path
-          atomic_concepts
-      - retrieval_signals (per intent, deduped)
-
+    For each intent: title, nature, description, sub_natures w/ atomics,
+                     retrieval signals.
   PASS 2: CUI extraction + per-intent summarization
-    For each intent:
-      For each sub_nature:
-        For each path segment: text -> CUIs
-        For each atomic concept: text -> CUIs
-      Retrieval-signal CUIs (separate, NOT summarized into the intent)
-      Intent summary (atomic CUIs only)
+    Path segments -> CUIs (printed, NOT summarized)
+    Atomic concepts -> CUIs (printed AND summarized per intent)
+    Retrieval signals -> CUIs (printed, NOT summarized, NOT in cluster match)
 
-  PASS 3: Topics
-    Union of all per-intent surviving CUIs -> one topic run
-    (hierarchy, embedding, siblingreach)
+Document side (sample_120):
+    case_ids = stats["samples"][120]["cases"]   (limited to first MAX_CASES)
+    for each case_id: for each blob -> CUIExtractor
+    union all CUIs -> CUISummarizer -> doc cluster_ids
+
+Intersection:
+    For each query: shared = query_clusters & doc_clusters
+                    weighted score = sum(1/member_count for shared)
 """
 
 import sys
@@ -28,52 +28,59 @@ from typing import Any, Dict, List
 from config import (
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
     PROJECT_ID, LOCATION, MODEL_VERSION,
+    CUI_TOPIC_LOOKUP_PATH,
 )
 from intents import ContextualIntentPipeline
 from cui_core import CUIExtractor
 from cui_summarizer import CUISummarizer
-from cui_topics import CUITopics
-from topic_labeler import TopicLabeler
-from siblingreach_compare import SiblingReachGrouper
+from adaptor import Adaptor
+from document_processor import DocumentProcessor
 
+
+# ---------- Edit me ----------
+STATS_PATH = "gs://your-bucket/sampling_1_stats.pk"
+RECON_PATH = "gs://your-bucket/reconstructed_obj.pk"
+SAMPLE_IDX = 120
+MAX_CASES  = 2     # first N case IDs; None = all
+
+QUERIES: List[str] = [
+    "Do you have constipation or diarrhea?",
+    "Is your primary concern related to colon or rectal cancer or mass?",
+    "What medications is the patient taking at discharge?",
+    "Has the patient had a recent MRI?",
+]
+# -----------------------------
 
 
 class _Tee:
-    """Write everything to all targets (terminal + file)."""
     def __init__(self, *targets):
         self.targets = targets
-
     def write(self, data):
         for t in self.targets:
-            t.write(data)
-            t.flush()
-
+            t.write(data); t.flush()
     def flush(self):
         for t in self.targets:
             t.flush()
 
 
-_log_filename = f"Output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+_log_filename = f"Demo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 _log_file = open(_log_filename, "w", encoding="utf-8")
 sys.stdout = _Tee(sys.__stdout__, _log_file)
 sys.stderr = _Tee(sys.__stderr__, _log_file)
-print(f"[Logging full output to {_log_filename}]\n")
+print(f"[Logging to {_log_filename}]\n")
 
 
-
-# Build clients
-
+# Build shared clients (used by both query and document sides)
 pipeline   = ContextualIntentPipeline(project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION)
-extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P, cluster_set=CLUSTER_SET, combined=COMBINED)
+extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P,
+                          cluster_set=CLUSTER_SET, combined=COMBINED)
 summarizer = CUISummarizer()
-topics_mod = CUITopics()
-labeler    = TopicLabeler()
-grouper    = SiblingReachGrouper("cui_topic_lookup.pkl")
+adaptor    = Adaptor(CUI_TOPIC_LOOKUP_PATH)
 
 
-
-# Helpers
-
+# ─────────────────────────────────────────────────────────────
+# Helpers (kept identical to old demo for query-side parity)
+# ─────────────────────────────────────────────────────────────
 
 SIGNAL_FIELDS = (
     "document_types",
@@ -89,8 +96,7 @@ def split_path(path: str) -> List[str]:
 
 
 def cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
-    out = []
-    seen = set()
+    out, seen = [], set()
     for d in raw.values():
         for c in d.get("cuis", []):
             key = c if isinstance(c, str) else c.get("cui", c)
@@ -109,12 +115,6 @@ def cui_term(c: Any) -> str:
 
 
 def union_signals_from_candidates(intent: Dict[str, Any]) -> Dict[str, List[str]]:
-    """Union retrieval signals across all final_candidates of an intent.
-
-    The intent-level retrieval_signals field is sometimes empty even when
-    per-candidate signals are populated .
-    Reading directly from candidates.
-    """
     out: Dict[str, List[str]] = {f: [] for f in SIGNAL_FIELDS}
     seen: Dict[str, set] = {f: set() for f in SIGNAL_FIELDS}
     for fc in intent.get("final_candidates", []) or []:
@@ -132,7 +132,6 @@ def union_signals_from_candidates(intent: Dict[str, Any]) -> Dict[str, List[str]
 
 
 def fmt_cuis_comma(cuis: List[Any]) -> str:
-    """Format a CUI list as compact comma-separated codes only."""
     ids = [cui_id(c) for c in cuis if cui_id(c)]
     return ", ".join(ids) if ids else "(none)"
 
@@ -141,13 +140,11 @@ def hr(char="=", n=70):
     print(char * n)
 
 
+# ─────────────────────────────────────────────────────────────
+# PASS 1
+# ─────────────────────────────────────────────────────────────
 
-# PASS 1: Pipeline structure
-
-
-def print_pipeline_structure(full_output: Dict[str, Any]) -> None:  
-    
-   
+def print_pipeline_structure(full_output: Dict[str, Any]) -> None:
     print(f"\nQuery:    {full_output.get('original_query', '')!r}")
     print(f"Expanded: {full_output.get('expanded_query', '')!r}")
     print(f"Total intents: {full_output.get('total_intents_detected', 0)}")
@@ -156,7 +153,6 @@ def print_pipeline_structure(full_output: Dict[str, Any]) -> None:
         print()
         hr("-")
         print(f"  INTENT {i}: {intent.get('intent_title', '')}")
-     
         print(f"    Nature:      {intent.get('nature', '')}")
         print(f"    Description: {intent.get('description', '')}")
 
@@ -167,8 +163,6 @@ def print_pipeline_structure(full_output: Dict[str, Any]) -> None:
             for atom in sn.get("atomic_concepts", []) or []:
                 print(f"          atomic: {atom}")
 
-        # Per-candidate signals unioned at intent level (more reliable than
-        # reading the intent-level retrieval_signals field, which may be empty).
         signals = union_signals_from_candidates(intent)
         print(f"\n    Retrieval signals (deduped from candidates):")
         for field in SIGNAL_FIELDS:
@@ -181,16 +175,11 @@ def print_pipeline_structure(full_output: Dict[str, Any]) -> None:
                 print(f"      {field:18s}: []")
 
 
-# PASS 2: CUI extraction + per-intent summarization
-
+# ─────────────────────────────────────────────────────────────
+# PASS 2
+# ─────────────────────────────────────────────────────────────
 
 def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
-    """For one intent:
-      - extract CUIs per sub-nature (path segments + atomic concepts)
-      - extract CUIs from retrieval signals (kept separate)
-      - summarize the path+atomic CUIs at intent level
-    Print everything as it happens.
-    """
     intent_title = intent.get("intent_title", "")
     sub_natures = intent.get("sub_natures", []) or []
 
@@ -199,10 +188,6 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     print(f"  INTENT: {intent_title}")
     hr("-")
 
-    # Two separate CUI buckets:
-    #   - intent_cuis_for_summary: ATOMIC CONCEPTS ONLY (fed to summarizer)     
-    #   - all displayed CUIs: BOTH path and atomic, with provenance, used
-    #     only for printing pass-2 output.
     intent_cuis_for_summary = []
     seen_summary = set()
     provenance: Dict[str, List[Dict[str, str]]] = {}
@@ -226,7 +211,6 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
                     "source": "path_segment",
                     "sub_nature": path,
                 })
-                # NOTE: path-segment CUIs are NOT added to summary input
 
         for concept in atoms:
             concept = (concept or "").strip()
@@ -245,12 +229,10 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
                     "source": "atomic_concept",
                     "sub_nature": path,
                 })
-                # ONLY atomic-concept CUIs go to the summarizer
                 if cid not in seen_summary:
                     seen_summary.add(cid)
                     intent_cuis_for_summary.append(c)
 
-    # Retrieval signal CUIs (kept SEPARATE — not added to summarizer input)
     print(f"\n    --- RETRIEVAL SIGNAL CUIs -NOT summarized — for filters ---")
     signals = union_signals_from_candidates(intent)
     signal_cuis_by_field: Dict[str, List[Any]] = {f: [] for f in SIGNAL_FIELDS}
@@ -261,7 +243,6 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
             print(f"      {field}: (no terms)")
             continue
         any_signals = True
-        # extract once per field with all terms in that field
         raw = extractor.extract(terms, terms)
         cuis = cuis_from_raw(raw)
         signal_cuis_by_field[field] = cuis
@@ -270,19 +251,17 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     if not any_signals:
         print(f"      (no retrieval signals available for this intent)")
 
-    # Per-intent summarize (atomic-concept CUIs only — path-segment CUIs
-    # they were generic noise the summarizer, would have dropped anyway.
     print(f"\n    --- INTENT SUMMARIZATION - atomic-concept CUIs only) ---")
     print(f"    input CUIs: {len(intent_cuis_for_summary)}")
 
     if not intent_cuis_for_summary:
         print(f"    no CUIs to summarize.")
         return {
-            "intent_title":      intent_title,
-            "surviving_cuis":    [],
-            "removed_cuis":      [],
-            "signal_cuis":       signal_cuis_by_field,
-            "provenance":        provenance,
+            "intent_title":   intent_title,
+            "surviving_cuis": [],
+            "removed_cuis":   [],
+            "signal_cuis":    signal_cuis_by_field,
+            "provenance":     provenance,
         }
 
     t = time.time()
@@ -295,13 +274,7 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
 
     print(f"\n    Surviving CUIs for INTENT: {intent_title!r}:")
     for c in s["surviving_cuis"]:
-        prov = provenance.get(c["cui"], [])
-        prov_str = ", ".join(f"{p['source']}={p['text']!r}" for p in prov[:2])
-        if len(prov) > 2:
-            prov_str += f" (+{len(prov)-2} more)"
         print(f"      {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
-        # if prov_str:
-        #     print(f"        from: {prov_str}")
 
     if s["removed_cuis"]:
         print(f"\n    Removed CUIs (collapsed during summarization):")
@@ -318,80 +291,13 @@ def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ─────────────────────────────────────────────────────────────
+# Query-side wrapper: run all PASS 1+2 logic, return the union
+# of per-intent surviving CUIs (this is what feeds the adaptor).
+# ─────────────────────────────────────────────────────────────
 
-# PASS 3: Topics on union of all surviving CUIs
-
-
-def run_topics(intent_results: List[Dict[str, Any]]) -> None:
-    print()
-    hr("-")
-    print("  TOPIC - union of all per-intent surviving CUIs")
-    hr("-")
-
-    # Union surviving CUIs across intents (deduped)
-    all_surviving: List[Dict[str, Any]] = []
-    seen = set()
-    for ir in intent_results:
-        for c in ir["surviving_cuis"]:
-            if c["cui"] not in seen:
-                seen.add(c["cui"])
-                all_surviving.append(c)
-
-    if not all_surviving:
-        print("\n  no surviving CUIs across intents; skipping topics.")
-        return
-
-    cui_ids  = [c["cui"] for c in all_surviving]
-    ic_map   = {c["cui"]: c["ic"] for c in all_surviving}
-    term_map = {c["cui"]: c["preferred_term"] for c in all_surviving}
-
-    print(f"\n  combined surviving CUIs: {len(cui_ids)}")
-
-    # hierarchy + embedding via existing pipeline
-    for strategy in ["hierarchy", "embedding"]:
-        try:
-            t = time.time()
-            t_result = topics_mod.build_topics(cui_ids, strategy=strategy)
-            relabeled = labeler.relabel(t_result, ic_map=ic_map)
-            print(f"\n  [{strategy}] {time.time()-t:.1f}s  "
-                  f"-> {relabeled['metrics']['topic_count']} topics, "
-                  f"{relabeled['metrics']['singleton_count']} singletons")
-            for topic in relabeled["topics"]:
-                print(f"    [{topic['topic_id']}] {topic['topic_label']}  "
-                      f"({topic['label_source']})")
-                for mem in topic["members"]:
-                    print(f"      {mem['cui']}  {mem['preferred_term']}  "
-                          f"IC={mem['ic']}")
-        except Exception as e:
-            print(f"\n  [{strategy}] FAILED: {e}")
-
-    # siblingreach
-    try:
-        sr = grouper.group(cui_ids, ic_map=ic_map, term_map=term_map, min_members=1)
-        n_singletons = sum(1 for t in sr["topics"] if len(t["members"]) == 1)
-        print(f"\n  [siblingreach] {sr['metrics']['topic_count']} topics, "
-              f"{n_singletons} singletons "
-              f"(missing: {sr['metrics']['missing_cui_count']})")
-        for topic in sr["topics"]:
-            print(f"    [{topic['topic_id']}] {topic['topic_label']}  "
-                  f"score={topic['score']}")
-            for mem in topic["members"]:
-                print(f"      {mem['cui']}  {mem['preferred_term']}  "
-                      f"IC={mem['ic']}")
-    except Exception as e:
-        print(f"\n  [siblingreach] FAILED: {e}")
-
-
-
-# MAIN
-
-
-if __name__ == "__main__":
-    query = "Do you have constipation or diarrhea?"
-    # query = "Is your primary concern related to colon or rectal cancer or mass?"
-    # query = Which best describes your primary concern?"
-
-    print(f"#  Query: {query!r}")
+def process_query(query: str) -> Dict[str, Any]:
+    print(f"\n#  Query: {query!r}")
 
     t = time.time()
     full_output = pipeline.run(query=query, output_format="full_pipeline")
@@ -399,27 +305,107 @@ if __name__ == "__main__":
 
     if not full_output.get("is_clinical", False):
         print(f"Non-clinical query: {full_output.get('reason')}")
-        raise SystemExit(0)
+        return {
+            "query":           query,
+            "is_clinical":     False,
+            "intent_results":  [],
+            "surviving_cuis":  [],
+            "cluster_ids":     set(),
+        }
 
     # PASS 1
     print_pipeline_structure(full_output)
 
     # PASS 2
     print()
-    
-
     intent_results = []
     for intent in full_output.get("intents", []):
         intent_results.append(extract_for_intent(intent))
 
-    # PASS 3
-    run_topics(intent_results)
+    # Union surviving CUIs across intents (each intent summarized independently)
+    all_surviving = []
+    seen = set()
+    for ir in intent_results:
+        for c in ir["surviving_cuis"]:
+            if c["cui"] not in seen:
+                seen.add(c["cui"])
+                all_surviving.append(c)
 
-  
+    cui_list = [c["cui"] for c in all_surviving]
+    cluster_ids = adaptor.cluster_ids_for(cui_list)
+
+    return {
+        "query":           query,
+        "is_clinical":     True,
+        "intent_results":  intent_results,
+        "surviving_cuis":  all_surviving,
+        "cluster_ids":     cluster_ids,
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    # 1) DOCUMENT SIDE
+    hr()
+    print(f"DOCUMENT SIDE: processing sample_{SAMPLE_IDX} (max_cases={MAX_CASES})")
+    hr()
+    dp = DocumentProcessor(
+        stats_path=STATS_PATH, recon_path=RECON_PATH,
+        extractor=extractor, summarizer=summarizer, adaptor=adaptor,
+    )
+    doc_result = dp.process_sample(SAMPLE_IDX, max_cases=MAX_CASES)
+    doc_clusters = doc_result["cluster_ids"]
+
+    print(f"\nDocument summary:")
+    print(f"  file_name:        {doc_result['file_name']}")
+    print(f"  total cases:      {len(doc_result['all_case_ids'])}")
+    print(f"  used cases:       {doc_result['case_ids']}")
+    print(f"  n_blobs:          {doc_result['n_blobs']}")
+    print(f"  raw CUIs:         {len(doc_result['raw_cuis'])}")
+    print(f"  surviving CUIs:   {len(doc_result['surviving_cuis'])}")
+    print(f"  cluster_ids:      {len(doc_clusters)}")
+
+    # 2) PER-QUERY: run full query pipeline, then intersect with doc
+    for q in QUERIES:
+        print()
+        hr()
+        print(f"QUERY: {q!r}")
+        hr()
+        qr = process_query(q)
+        if not qr["is_clinical"]:
+            continue
+        q_clusters = qr["cluster_ids"]
+
+        shared = q_clusters & doc_clusters
+        score = sum(1.0 / adaptor.cluster_size.get(cid, 1) for cid in shared)
+
+        print()
+        hr("-")
+        print(f"  INTERSECTION with sample_{SAMPLE_IDX}")
+        hr("-")
+        print(f"  query clusters:   {len(q_clusters)}")
+        print(f"  doc clusters:     {len(doc_clusters)}")
+        print(f"  SHARED:           {len(shared)}")
+        print(f"  weighted score:   {score:.4f}")
+
+        if shared:
+            print(f"\n  Shared clusters (sorted by weight):")
+            weighted = sorted(
+                ((cid, adaptor.cluster_size.get(cid, 1)) for cid in shared),
+                key=lambda x: 1.0 / x[1], reverse=True,
+            )
+            for cid, mc in weighted[:20]:
+                w = 1.0 / mc if mc else 0.0
+                print(f"    {cid:25s}  size={mc:>5d}  weight={w:.4f}")
+            if len(weighted) > 20:
+                print(f"    ... (+{len(weighted)-20} more)")
+        else:
+            print("\n  No shared cluster_ids \u2014 query and document do not overlap.")
+
     print()
-   
     summarizer.close()
-    topics_mod.close()
-   
     print(f"\n[Full output saved to {_log_filename}]")
     _log_file.close()
