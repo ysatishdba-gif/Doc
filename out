@@ -1,42 +1,96 @@
 """
-Query-side processor.
+  PASS 1: Pipeline structure
+    For each intent:
+      - intent title, nature, description
+      - for each sub_nature:
+          category_path
+          atomic_concepts
+      - retrieval_signals (per intent, deduped)
 
-Pipeline:
-  query string
-    -> ContextualIntentPipeline -> intents w/ atomic concepts
-    -> for each intent's atomic concepts:
-         CUIExtractor.extract per concept
-    -> CUISummarizer per intent
-  union all surviving CUIs across intents
-    -> adaptor.cluster_ids_for(union) -> query cluster_ids
+  PASS 2: CUI extraction + per-intent summarization
+    For each intent:
+      For each sub_nature:
+        For each path segment: text -> CUIs
+        For each atomic concept: text -> CUIs
+      Retrieval-signal CUIs (separate, NOT summarized into the intent)
+      Intent summary (atomic CUIs only)
 
-Usage:
-    from query_processor import QueryProcessor
-    qp = QueryProcessor()
-    result = qp.process_query("Do you have constipation or diarrhea?")
-    # result has: cluster_ids, surviving_cuis, intents, ...
+  PASS 3: Topics
+    Union of all per-intent surviving CUIs -> one topic run
+    (hierarchy, embedding, siblingreach)
 """
 
+import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime
+from typing import Any, Dict, List
 
 from config import (
     API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
     PROJECT_ID, LOCATION, MODEL_VERSION,
-    CUI_TOPIC_LOOKUP_PATH,
 )
 from intents import ContextualIntentPipeline
 from cui_core import CUIExtractor
 from cui_summarizer import CUISummarizer
-from adaptor import Adaptor
+from cui_topics import CUITopics
+from topic_labeler import TopicLabeler
+from siblingreach_compare import SiblingReachGrouper
 
 
-def _cui_id(c: Any) -> str:
-    return c if isinstance(c, str) else c.get("cui", "")
+
+class _Tee:
+    """Write everything to all targets (terminal + file)."""
+    def __init__(self, *targets):
+        self.targets = targets
+
+    def write(self, data):
+        for t in self.targets:
+            t.write(data)
+            t.flush()
+
+    def flush(self):
+        for t in self.targets:
+            t.flush()
 
 
-def _cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
-    out, seen = [], set()
+_log_filename = f"Output_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+_log_file = open(_log_filename, "w", encoding="utf-8")
+sys.stdout = _Tee(sys.__stdout__, _log_file)
+sys.stderr = _Tee(sys.__stderr__, _log_file)
+print(f"[Logging full output to {_log_filename}]\n")
+
+
+
+# Build clients
+
+pipeline   = ContextualIntentPipeline(project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION)
+extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P, cluster_set=CLUSTER_SET, combined=COMBINED)
+summarizer = CUISummarizer()
+topics_mod = CUITopics()
+labeler    = TopicLabeler()
+grouper    = SiblingReachGrouper("cui_topic_lookup.pkl")
+
+
+
+# Helpers
+
+
+SIGNAL_FIELDS = (
+    "document_types",
+    "author_roles",
+    "temporal_signals",
+    "content_signals",
+    "clinical_setting",
+)
+
+
+def split_path(path: str) -> List[str]:
+    return [seg.strip() for seg in path.split(">>") if seg.strip()]
+
+
+def cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
+    out = []
+    seen = set()
     for d in raw.values():
         for c in d.get("cuis", []):
             key = c if isinstance(c, str) else c.get("cui", c)
@@ -46,142 +100,326 @@ def _cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
     return out
 
 
-def _split_path(path: str) -> List[str]:
-    return [seg.strip() for seg in path.split(">>") if seg.strip()]
+def cui_id(c: Any) -> str:
+    return c if isinstance(c, str) else c.get("cui", "")
 
 
-class QueryProcessor:
+def cui_term(c: Any) -> str:
+    return c.get("preferred_term", "") if isinstance(c, dict) else ""
 
-    def __init__(
-        self,
-        pipeline:   Optional[ContextualIntentPipeline] = None,
-        extractor:  Optional[CUIExtractor] = None,
-        summarizer: Optional[CUISummarizer] = None,
-        adaptor:    Optional[Adaptor] = None,
-        verbose: bool = True,
-    ):
-        self.verbose    = verbose
-        self.pipeline   = pipeline   or ContextualIntentPipeline(
-            project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION,
-        )
-        self.extractor  = extractor  or CUIExtractor(
-            API_URL, top_k=TOP_K, top_p=TOP_P,
-            cluster_set=CLUSTER_SET, combined=COMBINED,
-        )
-        self.summarizer = summarizer or CUISummarizer()
-        self.adaptor    = adaptor    or Adaptor(CUI_TOPIC_LOOKUP_PATH)
 
-    def _extract_for_intent(self, intent: Dict[str, Any]) -> List[Any]:
-        """Mirror demo.py PASS 2 logic but return only the surviving CUIs."""
-        atomic_cuis: List[Any] = []
-        seen: Set[str] = set()
-        for sn in intent.get("sub_natures", []) or []:
-            for concept in sn.get("atomic_concepts", []) or []:
-                concept = (concept or "").strip()
-                if not concept:
+def union_signals_from_candidates(intent: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Union retrieval signals across all final_candidates of an intent.
+
+    The intent-level retrieval_signals field is sometimes empty even when
+    per-candidate signals are populated .
+    Reading directly from candidates.
+    """
+    out: Dict[str, List[str]] = {f: [] for f in SIGNAL_FIELDS}
+    seen: Dict[str, set] = {f: set() for f in SIGNAL_FIELDS}
+    for fc in intent.get("final_candidates", []) or []:
+        sigs = fc.get("retrieval_signals") or {}
+        for field in SIGNAL_FIELDS:
+            for term in sigs.get(field, []) or []:
+                term = term.strip() if isinstance(term, str) else term
+                if not term:
                     continue
-                try:
-                    raw = self.extractor.extract([concept], [concept])
-                    cuis = _cuis_from_raw(raw)
-                except Exception as e:
-                    if self.verbose:
-                        print(f"      extract FAILED for {concept!r}: {e}")
-                    cuis = []
-                for c in cuis:
-                    cid = _cui_id(c)
-                    if cid and cid not in seen:
-                        seen.add(cid)
-                        atomic_cuis.append(c)
-        return atomic_cuis
+                key = term.lower()
+                if key not in seen[field]:
+                    seen[field].add(key)
+                    out[field].append(term)
+    return out
 
-    def process_query(self, query: str) -> Dict[str, Any]:
-        if self.verbose:
-            print(f"\nQuery: {query!r}")
 
-        t_pipe = time.time()
-        full = self.pipeline.run(query=query, output_format="full_pipeline")
-        pipe_secs = time.time() - t_pipe
+def fmt_cuis_comma(cuis: List[Any]) -> str:
+    """Format a CUI list as compact comma-separated codes only."""
+    ids = [cui_id(c) for c in cuis if cui_id(c)]
+    return ", ".join(ids) if ids else "(none)"
 
-        if not full.get("is_clinical", False):
-            if self.verbose:
-                print(f"  non-clinical: {full.get('reason')}")
-            return {
-                "query":             query,
-                "is_clinical":       False,
-                "reason":            full.get("reason", ""),
-                "surviving_cuis":    [],
-                "cluster_ids":       set(),
-                "pipeline_seconds":  pipe_secs,
-                "extract_seconds":   0.0,
-                "summarize_seconds": 0.0,
-            }
 
-        intents = full.get("intents", []) or []
-        if self.verbose:
-            print(f"  intents: {len(intents)}, pipeline {pipe_secs:.1f}s")
+def hr(char="=", n=70):
+    print(char * n)
 
-        # Atomic CUIs across intents (then summarize union)
-        all_atomic: List[Any] = []
-        all_seen: Set[str] = set()
-        t_extract = time.time()
-        for i, intent in enumerate(intents, 1):
-            title = intent.get("intent_title", "")
-            cuis = self._extract_for_intent(intent)
-            if self.verbose:
-                print(f"    intent {i} {title!r:60s} -> {len(cuis)} CUIs")
+
+
+# PASS 1: Pipeline structure
+
+
+def print_pipeline_structure(full_output: Dict[str, Any]) -> None:  
+    
+   
+    print(f"\nQuery:    {full_output.get('original_query', '')!r}")
+    print(f"Expanded: {full_output.get('expanded_query', '')!r}")
+    print(f"Total intents: {full_output.get('total_intents_detected', 0)}")
+
+    for i, intent in enumerate(full_output.get("intents", []), 1):
+        print()
+        hr("-")
+        print(f"  INTENT {i}: {intent.get('intent_title', '')}")
+     
+        print(f"    Nature:      {intent.get('nature', '')}")
+        print(f"    Description: {intent.get('description', '')}")
+
+        sub_natures = intent.get("sub_natures", []) or []
+        print(f"\n    Sub-natures ({len(sub_natures)}):")
+        for sn in sub_natures:
+            print(f"      - {sn.get('category_path', '')}")
+            for atom in sn.get("atomic_concepts", []) or []:
+                print(f"          atomic: {atom}")
+
+        # Per-candidate signals unioned at intent level (more reliable than
+        # reading the intent-level retrieval_signals field, which may be empty).
+        signals = union_signals_from_candidates(intent)
+        print(f"\n    Retrieval signals (deduped from candidates):")
+        for field in SIGNAL_FIELDS:
+            vals = signals.get(field, []) or []
+            if vals:
+                preview = vals[:5]
+                more = "" if len(vals) <= 5 else f"  (+{len(vals)-5} more)"
+                print(f"      {field:18s}: {preview}{more}")
+            else:
+                print(f"      {field:18s}: []")
+
+
+# PASS 2: CUI extraction + per-intent summarization
+
+
+def extract_for_intent(intent: Dict[str, Any]) -> Dict[str, Any]:
+    """For one intent:
+      - extract CUIs per sub-nature (path segments + atomic concepts)
+      - extract CUIs from retrieval signals (kept separate)
+      - summarize the path+atomic CUIs at intent level
+    Print everything as it happens.
+    """
+    intent_title = intent.get("intent_title", "")
+    sub_natures = intent.get("sub_natures", []) or []
+
+    print()
+    hr("-")
+    print(f"  INTENT: {intent_title}")
+    hr("-")
+
+    # Two separate CUI buckets:
+    #   - intent_cuis_for_summary: ATOMIC CONCEPTS ONLY (fed to summarizer)     
+    #   - all displayed CUIs: BOTH path and atomic, with provenance, used
+    #     only for printing pass-2 output.
+    intent_cuis_for_summary = []
+    seen_summary = set()
+    provenance: Dict[str, List[Dict[str, str]]] = {}
+
+    for sn in sub_natures:
+        path = sn.get("category_path", "")
+        atoms = sn.get("atomic_concepts", []) or []
+        print(f"\n    sub_nature: {path}")
+
+        for seg in split_path(path):
+            raw = extractor.extract([seg], [seg])
+            cuis = cuis_from_raw(raw)
+            print(f"      [path]   {seg!r:30s} -> {len(cuis)} CUIs: "
+                  f"{fmt_cuis_comma(cuis)}")
             for c in cuis:
-                cid = _cui_id(c)
-                if cid and cid not in all_seen:
-                    all_seen.add(cid)
-                    all_atomic.append(c)
-        extract_secs = time.time() - t_extract
+                cid = cui_id(c)
+                if not cid:
+                    continue
+                provenance.setdefault(cid, []).append({
+                    "text":   seg,
+                    "source": "path_segment",
+                    "sub_nature": path,
+                })
+                # NOTE: path-segment CUIs are NOT added to summary input
 
-        if not all_atomic:
-            if self.verbose:
-                print("  no atomic CUIs to summarize")
-            return {
-                "query":             query,
-                "is_clinical":       True,
-                "intents":           intents,
-                "surviving_cuis":    [],
-                "cluster_ids":       set(),
-                "pipeline_seconds":  pipe_secs,
-                "extract_seconds":   extract_secs,
-                "summarize_seconds": 0.0,
-            }
+        for concept in atoms:
+            concept = (concept or "").strip()
+            if not concept:
+                continue
+            raw = extractor.extract([concept], [concept])
+            cuis = cuis_from_raw(raw)
+            print(f"      [atomic] {concept!r:30s} -> {len(cuis)} CUIs: "
+                  f"{fmt_cuis_comma(cuis)}")
+            for c in cuis:
+                cid = cui_id(c)
+                if not cid:
+                    continue
+                provenance.setdefault(cid, []).append({
+                    "text":   concept,
+                    "source": "atomic_concept",
+                    "sub_nature": path,
+                })
+                # ONLY atomic-concept CUIs go to the summarizer
+                if cid not in seen_summary:
+                    seen_summary.add(cid)
+                    intent_cuis_for_summary.append(c)
 
-        t_sum = time.time()
-        s = self.summarizer.summarize(all_atomic, sources=["SNOMEDCT_US"])
-        summarize_secs = time.time() - t_sum
-        if self.verbose:
-            m = s["metrics"]
-            print(f"  summarize: {summarize_secs:.1f}s  "
-                  f"{m['input_code_count']} in -> {m['output_code_count']} out")
+    # Retrieval signal CUIs (kept SEPARATE — not added to summarizer input)
+    print(f"\n    --- RETRIEVAL SIGNAL CUIs -NOT summarized — for filters ---")
+    signals = union_signals_from_candidates(intent)
+    signal_cuis_by_field: Dict[str, List[Any]] = {f: [] for f in SIGNAL_FIELDS}
+    any_signals = False
+    for field in SIGNAL_FIELDS:
+        terms = signals.get(field, []) or []
+        if not terms:
+            print(f"      {field}: (no terms)")
+            continue
+        any_signals = True
+        # extract once per field with all terms in that field
+        raw = extractor.extract(terms, terms)
+        cuis = cuis_from_raw(raw)
+        signal_cuis_by_field[field] = cuis
+        print(f"      {field}: {len(terms)} terms -> {len(cuis)} CUIs: "
+              f"{fmt_cuis_comma(cuis)}")
+    if not any_signals:
+        print(f"      (no retrieval signals available for this intent)")
 
-        surviving_cuis = [c["cui"] for c in s["surviving_cuis"]]
-        cluster_ids = self.adaptor.cluster_ids_for(surviving_cuis)
+    # Per-intent summarize (atomic-concept CUIs only — path-segment CUIs
+    # they were generic noise the summarizer, would have dropped anyway.
+    print(f"\n    --- INTENT SUMMARIZATION - atomic-concept CUIs only) ---")
+    print(f"    input CUIs: {len(intent_cuis_for_summary)}")
 
-        if self.verbose:
-            print(f"  cluster_ids: {len(cluster_ids)} distinct clusters")
-
+    if not intent_cuis_for_summary:
+        print(f"    no CUIs to summarize.")
         return {
-            "query":             query,
-            "is_clinical":       True,
-            "intents":           intents,
-            "raw_cuis":          all_atomic,
-            "surviving_cuis":    s["surviving_cuis"],
-            "removed_cuis":      s["removed_cuis"],
-            "cluster_ids":       cluster_ids,
-            "pipeline_seconds":  pipe_secs,
-            "extract_seconds":   extract_secs,
-            "summarize_seconds": summarize_secs,
+            "intent_title":      intent_title,
+            "surviving_cuis":    [],
+            "removed_cuis":      [],
+            "signal_cuis":       signal_cuis_by_field,
+            "provenance":        provenance,
         }
+
+    t = time.time()
+    s = summarizer.summarize(intent_cuis_for_summary, sources=["SNOMEDCT_US"])
+    print(f"    summarize: {time.time()-t:.1f}s")
+
+    m = s["metrics"]
+    print(f"    {m['input_code_count']} in -> {m['output_code_count']} out "
+          f"(reduction {(1 - m['output_code_count']/max(m['input_code_count'],1))*100:.0f}%)")
+
+    print(f"\n    Surviving CUIs for INTENT: {intent_title!r}:")
+    for c in s["surviving_cuis"]:
+        prov = provenance.get(c["cui"], [])
+        prov_str = ", ".join(f"{p['source']}={p['text']!r}" for p in prov[:2])
+        if len(prov) > 2:
+            prov_str += f" (+{len(prov)-2} more)"
+        print(f"      {c['cui']}  {c['preferred_term']}  IC={c['ic']}")
+        # if prov_str:
+        #     print(f"        from: {prov_str}")
+
+    if s["removed_cuis"]:
+        print(f"\n    Removed CUIs (collapsed during summarization):")
+        for c in s["removed_cuis"]:
+            print(f"      {c['cui']}  {c['preferred_term']}  "
+                  f"<- by {c['retained_by']} ({c['reason']})")
+
+    return {
+        "intent_title":   intent_title,
+        "surviving_cuis": s["surviving_cuis"],
+        "removed_cuis":   s["removed_cuis"],
+        "signal_cuis":    signal_cuis_by_field,
+        "provenance":     provenance,
+    }
+
+
+
+# PASS 3: Topics on union of all surviving CUIs
+
+
+def run_topics(intent_results: List[Dict[str, Any]]) -> None:
+    print()
+    hr("-")
+    print("  TOPIC - union of all per-intent surviving CUIs")
+    hr("-")
+
+    # Union surviving CUIs across intents (deduped)
+    all_surviving: List[Dict[str, Any]] = []
+    seen = set()
+    for ir in intent_results:
+        for c in ir["surviving_cuis"]:
+            if c["cui"] not in seen:
+                seen.add(c["cui"])
+                all_surviving.append(c)
+
+    if not all_surviving:
+        print("\n  no surviving CUIs across intents; skipping topics.")
+        return
+
+    cui_ids  = [c["cui"] for c in all_surviving]
+    ic_map   = {c["cui"]: c["ic"] for c in all_surviving}
+    term_map = {c["cui"]: c["preferred_term"] for c in all_surviving}
+
+    print(f"\n  combined surviving CUIs: {len(cui_ids)}")
+
+    # hierarchy + embedding via existing pipeline
+    for strategy in ["hierarchy", "embedding"]:
+        try:
+            t = time.time()
+            t_result = topics_mod.build_topics(cui_ids, strategy=strategy)
+            relabeled = labeler.relabel(t_result, ic_map=ic_map)
+            print(f"\n  [{strategy}] {time.time()-t:.1f}s  "
+                  f"-> {relabeled['metrics']['topic_count']} topics, "
+                  f"{relabeled['metrics']['singleton_count']} singletons")
+            for topic in relabeled["topics"]:
+                print(f"    [{topic['topic_id']}] {topic['topic_label']}  "
+                      f"({topic['label_source']})")
+                for mem in topic["members"]:
+                    print(f"      {mem['cui']}  {mem['preferred_term']}  "
+                          f"IC={mem['ic']}")
+        except Exception as e:
+            print(f"\n  [{strategy}] FAILED: {e}")
+
+    # siblingreach
+    try:
+        sr = grouper.group(cui_ids, ic_map=ic_map, term_map=term_map, min_members=1)
+        n_singletons = sum(1 for t in sr["topics"] if len(t["members"]) == 1)
+        print(f"\n  [siblingreach] {sr['metrics']['topic_count']} topics, "
+              f"{n_singletons} singletons "
+              f"(missing: {sr['metrics']['missing_cui_count']})")
+        for topic in sr["topics"]:
+            print(f"    [{topic['topic_id']}] {topic['topic_label']}  "
+                  f"score={topic['score']}")
+            for mem in topic["members"]:
+                print(f"      {mem['cui']}  {mem['preferred_term']}  "
+                      f"IC={mem['ic']}")
+    except Exception as e:
+        print(f"\n  [siblingreach] FAILED: {e}")
+
+
+
+# MAIN
 
 
 if __name__ == "__main__":
-    qp = QueryProcessor()
-    q = "Do you have constipation or diarrhea?"
-    r = qp.process_query(q)
-    print("="*70)
-    print(f"Result: {len(r.get('surviving_cuis', []))} surviving CUIs, "
-          f"{len(r.get('cluster_ids', set()))} cluster_ids")
+    query = "Do you have constipation or diarrhea?"
+    # query = "Is your primary concern related to colon or rectal cancer or mass?"
+    # query = Which best describes your primary concern?"
+
+    print(f"#  Query: {query!r}")
+
+    t = time.time()
+    full_output = pipeline.run(query=query, output_format="full_pipeline")
+    print(f"\nContextual pipeline: {time.time()-t:.1f}s")
+
+    if not full_output.get("is_clinical", False):
+        print(f"Non-clinical query: {full_output.get('reason')}")
+        raise SystemExit(0)
+
+    # PASS 1
+    print_pipeline_structure(full_output)
+
+    # PASS 2
+    print()
+    
+
+    intent_results = []
+    for intent in full_output.get("intents", []):
+        intent_results.append(extract_for_intent(intent))
+
+    # PASS 3
+    run_topics(intent_results)
+
+  
+    print()
+   
+    summarizer.close()
+    topics_mod.close()
+   
+    print(f"\n[Full output saved to {_log_filename}]")
+    _log_file.close()
