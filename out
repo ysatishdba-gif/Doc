@@ -1,61 +1,239 @@
-Inspecting source pickles...
+"""
+Document-side processor.
+
+Pipeline:
+  sample_idx -> case_ids from stats["samples"][sample_idx]
+  for each case_id:
+    blobs = recon[case_id]["reconstructed"]["blobs"]
+    for each blob:
+      CUIExtractor.extract(blob) -> CUIs
+  union all CUIs
+  CUISummarizer.summarize(union) -> surviving CUIs
+  adaptor.cluster_ids_for(surviving) -> doc cluster_ids
+
+Usage:
+    from document_processor import DocumentProcessor
+    dp = DocumentProcessor()
+    result = dp.process_sample(120)
+    # result has: cluster_ids, surviving_cuis, raw_cuis, n_blobs, etc.
+"""
+
+import pickle
+import time
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Set
+
+from config import (
+    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
+    CUI_TOPIC_LOOKUP_PATH,
+)
+from cui_core import CUIExtractor
+from cui_summarizer import CUISummarizer
+from adaptor import Adaptor
 
 
-======================================================================
-======================================================================
-  Size: 7.65 MB
-root: dict, 500 keys
-  first 5 keys: [0, 1, 2, 3, 4]
-  value type for first key: dict
+def _load_pickle(path: str):
+    """Load a pickle from local path or gs:// URI."""
+    if path.startswith("gs://"):
+        from google.cloud import storage
+        without_prefix = path[len("gs://"):]
+        bucket_name, _, blob_path = without_prefix.partition("/")
+        client = storage.Client()
+        blob = client.bucket(bucket_name).blob(blob_path)
+        return pickle.load(BytesIO(blob.download_as_bytes()))
+    with open(path, "rb") as f:
+        return pickle.load(f)
 
-  Drilling into first key: 0
-  value of 0: dict, 2 keys
-    first 5 keys: ['raw_document', 'reconstructed']
-    value type for first key: str
-    inner keys: ['raw_document', 'reconstructed']
-      inner['raw_document']: str, value (truncated): Discharge Summary
-      inner['reconstructed']: dict, 8 keys
-      first 5 keys: ['text', 'pages', 'document', 'blobs', 'sections']
-      value type for first key: str
 
-======================================================================
-======================================================================
-  Size: 0.08 MB
-root: dict, 2 keys
-  first 5 keys: ['sampling_id', 'samples']
-  value type for first key: str
+def _cui_id(c: Any) -> str:
+    return c if isinstance(c, str) else c.get("cui", "")
 
-  Drilling into first key: 'sampling_id'
-  value of 'sampling_id': str, value (truncated): sampling_1
 
-======================================================================
-  FOCUSED DRILL-DOWN
-======================================================================
+def _cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
+    """Same shape as demo.py: flatten the CUIExtractor's per-input dict."""
+    out, seen = [], set()
+    for d in raw.values():
+        for c in d.get("cuis", []):
+            key = c if isinstance(c, str) else c.get("cui", c)
+            if key and key not in seen:
+                seen.add(key)
+                out.append(c)
+    return out
 
-stats['samples']: type=dict
-  dict with 121 keys; first 5: [0, 1, 2, 3, 4]
-  samples[0]:
-    value: dict, 5 keys
-    first 5 keys: ['cases', 'data_documents', 'reconstructed_documents', 'n_pages', 'file_name']
-    value type for first key: list
 
-recon[0] full structure:
-  keys: ['raw_document', 'reconstructed']
-  reconstructed keys (8): ['text', 'pages', 'document', 'blobs', 'sections', 'topics', 'tables', 'figures']
-    text: str, len=3253, preview: 'DISCHARGE SUMMARY\nPatient Name: JANE DOE DOB: 01/15/1960 MRN: 12345678\nAdmission Date: 03/10/2023 Discharge Date: 03/15/2023\nAttending Physician: Dr. A. Smith\n\nALLERGIES: Penicillin (Rash), Sulfa (Hiv'
-    pages: int, value: 1
-    document: str, len=109, preview: 'Medical Record > Hospital Document > Discharge Summary > Cardiac Event Discharge > Post-PCI Discharge Summary'
-    blobs: list, len=21, first item type: str
-      first item preview: DISCHARGE SUMMARY Patient Name: JANE DOE DOB: 01/15/1960 MRN: 12345678 Admission Date: 03/10/2023 Discharge Date: 03/15/2023 Attending Physician: Dr. A. Smith
-    sections: list, len=21, first item type: dict
-      first item preview: {'Section': 'DISCHARGE SUMMARY', 'SampleText': 'DISCHARGE SUMMARY Patient Name: JANE DOE DOB: 01/15/1960 MRN: 12345678'}
-    topics: list, len=23, first item type: str
-      first item preview: Patient Demographics
-    tables: list, len=1, first item type: dict
-      first item preview: {'Detected': True, 'Topic': 'Medications at Discharge', 'SampleText': 'Medication Dosage Frequency Route Notes Aspirin 81 mg Daily PO Take with food Metoprolol 25 mg BID PO For blood pressure Atorvastatin 40 mg Daily PO For cholesterol\n\nDIETARY RECOMMENDATIONS: Diet: Low sodium, low fat. Avoid pro
-    figures: list, len=1, first item type: dict
-      first item preview: {'Contained': False, 'Topic': 'NA', 'Description': 'A standard medical discharge summary typically does not contain figures such as charts, graphs, or images. While an EKG is mentioned, its results are described textually rather than presented as a visual waveform.'}
+class DocumentProcessor:
 
-======================================================================
-Paste this output back.
-======================================================================
+    def __init__(
+        self,
+        stats_path: str,
+        recon_path: str,
+        extractor: Optional[CUIExtractor] = None,
+        summarizer: Optional[CUISummarizer] = None,
+        adaptor: Optional[Adaptor] = None,
+        verbose: bool = True,
+    ):
+        self.verbose = verbose
+        t = time.time()
+        if verbose:
+            print(f"Loading stats from {stats_path}...")
+        self.stats = _load_pickle(stats_path)
+        if verbose:
+            print(f"  {time.time()-t:.1f}s")
+
+        t = time.time()
+        if verbose:
+            print(f"Loading reconstructed from {recon_path}...")
+        self.recon = _load_pickle(recon_path)
+        if verbose:
+            print(f"  {time.time()-t:.1f}s")
+
+        # samples map: sample_idx -> {cases, file_name, ...}
+        self.samples = self.stats["samples"]
+
+        # Clients (reuse if caller passed them in)
+        self.extractor  = extractor  or CUIExtractor(
+            API_URL, top_k=TOP_K, top_p=TOP_P,
+            cluster_set=CLUSTER_SET, combined=COMBINED,
+        )
+        self.summarizer = summarizer or CUISummarizer()
+        self.adaptor    = adaptor    or Adaptor(CUI_TOPIC_LOOKUP_PATH)
+
+    def _blobs_for_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Return list of {case_id, blob_idx, text} for every blob in every case.
+
+        If max_cases is set, only the first N case IDs are used.
+        """
+        meta = self.samples.get(sample_idx)
+        if meta is None:
+            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
+        case_ids = meta.get("cases", [])
+        if max_cases is not None:
+            case_ids = case_ids[:max_cases]
+        out = []
+        for cid in case_ids:
+            case = self.recon.get(cid)
+            if case is None:
+                if self.verbose:
+                    print(f"    case_id {cid} missing from recon, skipping")
+                continue
+            blobs = (case.get("reconstructed") or {}).get("blobs") or []
+            for i, blob in enumerate(blobs):
+                if isinstance(blob, str) and blob.strip():
+                    out.append({"case_id": cid, "blob_idx": i, "text": blob})
+        return out
+
+    def process_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> Dict[str, Any]:
+        meta = self.samples.get(sample_idx)
+        if meta is None:
+            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
+
+        file_name = meta.get("file_name", f"sample_{sample_idx}")
+        all_case_ids = meta.get("cases", [])
+        used_case_ids = all_case_ids[:max_cases] if max_cases is not None else all_case_ids
+
+        if self.verbose:
+            print(f"\nProcessing {file_name} (sample_idx={sample_idx})")
+            print(f"  total case_ids in sample: {len(all_case_ids)}")
+            if max_cases is not None and len(all_case_ids) > max_cases:
+                print(f"  *** FILTERED to first {max_cases} case_ids for speed ***")
+            print(f"  using case_ids: {used_case_ids}")
+
+        blobs = self._blobs_for_sample(sample_idx, max_cases=max_cases)
+        if self.verbose:
+            print(f"  total blobs across cases: {len(blobs)}")
+
+        # ---- CUI extraction: one call per blob ----
+        all_cuis: List[Any] = []
+        seen: Set[str] = set()
+        t_extract = time.time()
+        for i, b in enumerate(blobs, 1):
+            text = b["text"]
+            try:
+                raw = self.extractor.extract([text], [text])
+                cuis = _cuis_from_raw(raw)
+            except Exception as e:
+                if self.verbose:
+                    print(f"    blob {i} extract FAILED: {e}")
+                cuis = []
+            for c in cuis:
+                cid = _cui_id(c)
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    all_cuis.append(c)
+            if self.verbose and (i % 10 == 0 or i == len(blobs)):
+                print(f"    extracted blob {i}/{len(blobs)}  "
+                      f"(unique CUIs so far: {len(seen)})")
+        extract_secs = time.time() - t_extract
+
+        if self.verbose:
+            print(f"  extraction: {extract_secs:.1f}s, "
+                  f"{len(seen)} unique CUIs")
+
+        # ---- Summarize ----
+        if not all_cuis:
+            if self.verbose:
+                print("  no CUIs to summarize")
+            return {
+                "sample_idx":      sample_idx,
+                "file_name":       file_name,
+                "all_case_ids":    all_case_ids,
+                "case_ids":        used_case_ids,
+                "n_blobs":         len(blobs),
+                "raw_cuis":        [],
+                "surviving_cuis":  [],
+                "cluster_ids":     set(),
+                "extract_seconds": extract_secs,
+                "summarize_seconds": 0.0,
+            }
+
+        t_sum = time.time()
+        s = self.summarizer.summarize(all_cuis, sources=["SNOMEDCT_US"])
+        summarize_secs = time.time() - t_sum
+        m = s["metrics"]
+        if self.verbose:
+            print(f"  summarize: {summarize_secs:.1f}s  "
+                  f"{m['input_code_count']} in -> {m['output_code_count']} out")
+
+        surviving_cuis = [c["cui"] for c in s["surviving_cuis"]]
+
+        # ---- Cluster lookup ----
+        cluster_ids = self.adaptor.cluster_ids_for(surviving_cuis)
+        if self.verbose:
+            print(f"  cluster_ids: {len(cluster_ids)} distinct clusters\n")
+
+        return {
+            "sample_idx":         sample_idx,
+            "file_name":          file_name,
+            "all_case_ids":       all_case_ids,
+            "case_ids":           used_case_ids,
+            "n_blobs":            len(blobs),
+            "raw_cuis":           all_cuis,
+            "surviving_cuis":     s["surviving_cuis"],
+            "removed_cuis":       s["removed_cuis"],
+            "cluster_ids":        cluster_ids,
+            "extract_seconds":    extract_secs,
+            "summarize_seconds":  summarize_secs,
+        }
+
+
+if __name__ == "__main__":
+    # Standalone test on sample_120 — limited to first 2 case IDs for speed
+    import os
+    STATS_PATH = os.environ.get("STATS_PATH",  "sampling_1_stats.pk")
+    RECON_PATH = os.environ.get("RECON_PATH",  "reconstructed_obj.pk")
+    SAMPLE_IDX = int(os.environ.get("SAMPLE_IDX", "120"))
+    MAX_CASES  = int(os.environ.get("MAX_CASES", "2"))
+
+    dp = DocumentProcessor(stats_path=STATS_PATH, recon_path=RECON_PATH)
+    result = dp.process_sample(SAMPLE_IDX, max_cases=MAX_CASES)
+
+    print("="*70)
+    print(f"Result for {result['file_name']}:")
+    print(f"  all cases:      {result['all_case_ids']}")
+    print(f"  used cases:     {result['case_ids']}")
+    print(f"  n_blobs:        {result['n_blobs']}")
+    print(f"  raw CUIs:       {len(result['raw_cuis'])}")
+    print(f"  surviving CUIs: {len(result['surviving_cuis'])}")
+    print(f"  cluster_ids:    {len(result['cluster_ids'])}")
+    print(f"  extract: {result['extract_seconds']:.1f}s | "
+          f"summarize: {result['summarize_seconds']:.1f}s")
