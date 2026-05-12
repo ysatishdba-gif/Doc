@@ -1,243 +1,104 @@
 """
-Document-side processor.
+Topic filter.
 
-Pipeline:
-  sample_idx -> case_ids from stats["samples"][sample_idx]
-  for each case_id:
-    blobs = recon[case_id]["reconstructed"]["blobs"]
-    for each blob:
-      CUIExtractor.extract(blob) -> CUIs
-  union all CUIs
-  CUISummarizer.summarize(union) -> surviving CUIs
-  adaptor.cluster_ids_for(surviving) -> doc cluster_ids
+Runs after summarization. Given a list of surviving CUIs, returns the
+cluster_ids that represent real topics in this CUI set — meaning clusters
+where at least `min_members` of the input CUIs are members.
+
+Singleton clusters (where only 1 input CUI is present) are dropped.
+This avoids "topic expansion" beyond what's actually in the document/query.
 
 Usage:
-    from document_processor import DocumentProcessor
-    dp = DocumentProcessor()
-    result = dp.process_sample(120)
-    # result has: cluster_ids, surviving_cuis, raw_cuis, n_blobs, etc.
+    from topic_filter import TopicFilter
+    tf = TopicFilter(adaptor)
+    topics = tf.filter_clusters(surviving_cuis)
+    # topics is a set of cluster_ids
 """
 
-import pickle
-import time
-from io import BytesIO
-from typing import Any, Dict, List, Optional, Set
+from collections import defaultdict
+from typing import Iterable, Optional, Set, Dict, List, Tuple
 
-from config import (
-    API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED,
-    CUI_TOPIC_LOOKUP_PATH,
-)
-from cui_core import CUIExtractor
-from cui_summarizer import CUISummarizer
 from adaptor import Adaptor
-from topic_filter import TopicFilter
 
 
-def _load_pickle(path: str):
-    """Load a pickle from local path or gs:// URI."""
-    if path.startswith("gs://"):
-        from google.cloud import storage
-        without_prefix = path[len("gs://"):]
-        bucket_name, _, blob_path = without_prefix.partition("/")
-        client = storage.Client()
-        blob = client.bucket(bucket_name).blob(blob_path)
-        return pickle.load(BytesIO(blob.download_as_bytes()))
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def _cui_id(c: Any) -> str:
-    return c if isinstance(c, str) else c.get("cui", "")
-
-
-def _cuis_from_raw(raw: Dict[str, Any]) -> List[Any]:
-    """Same shape as demo.py: flatten the CUIExtractor's per-input dict."""
-    out, seen = [], set()
-    for d in raw.values():
-        for c in d.get("cuis", []):
-            key = c if isinstance(c, str) else c.get("cui", c)
-            if key and key not in seen:
-                seen.add(key)
-                out.append(c)
-    return out
-
-
-class DocumentProcessor:
+class TopicFilter:
 
     def __init__(
         self,
-        stats_path: str,
-        recon_path: str,
-        extractor: Optional[CUIExtractor] = None,
-        summarizer: Optional[CUISummarizer] = None,
         adaptor: Optional[Adaptor] = None,
-        topic_filter: Optional[TopicFilter] = None,
-        verbose: bool = True,
+        pickle_path: Optional[str] = None,
+        min_members: int = 2,
     ):
-        self.verbose = verbose
-        t = time.time()
-        if verbose:
-            print(f"Loading stats from {stats_path}...")
-        self.stats = _load_pickle(stats_path)
-        if verbose:
-            print(f"  {time.time()-t:.1f}s")
-
-        t = time.time()
-        if verbose:
-            print(f"Loading reconstructed from {recon_path}...")
-        self.recon = _load_pickle(recon_path)
-        if verbose:
-            print(f"  {time.time()-t:.1f}s")
-
-        # samples map: sample_idx -> {cases, file_name, ...}
-        self.samples = self.stats["samples"]
-
-        # Clients (reuse if caller passed them in)
-        self.extractor    = extractor    or CUIExtractor(
-            API_URL, top_k=TOP_K, top_p=TOP_P,
-            cluster_set=CLUSTER_SET, combined=COMBINED,
-        )
-        self.summarizer   = summarizer   or CUISummarizer()
-        self.adaptor      = adaptor      or Adaptor(CUI_TOPIC_LOOKUP_PATH)
-        self.topic_filter = topic_filter or TopicFilter(adaptor=self.adaptor)
-
-    def _blobs_for_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Return list of {case_id, blob_idx, text} for every blob in every case.
-
-        If max_cases is set, only the first N case IDs are used.
         """
-        meta = self.samples.get(sample_idx)
-        if meta is None:
-            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
-        case_ids = meta.get("cases", [])
-        if max_cases is not None:
-            case_ids = case_ids[:max_cases]
-        out = []
-        for cid in case_ids:
-            case = self.recon.get(cid)
-            if case is None:
-                if self.verbose:
-                    print(f"    case_id {cid} missing from recon, skipping")
-                continue
-            blobs = (case.get("reconstructed") or {}).get("blobs") or []
-            for i, blob in enumerate(blobs):
-                if isinstance(blob, str) and blob.strip():
-                    out.append({"case_id": cid, "blob_idx": i, "text": blob})
-        return out
+        Parameters
+        ----------
+        adaptor : Adaptor or None
+            Existing Adaptor to reuse. If None, builds one from pickle_path.
+        pickle_path : str or None
+            Path to lean pickle. Used only if adaptor is None.
+        min_members : int
+            Minimum number of input CUIs that must be in a cluster for it
+            to be kept. Default 2 (drop singletons).
+        """
+        if adaptor is None:
+            from config import CUI_TOPIC_LOOKUP_PATH
+            adaptor = Adaptor(pickle_path or CUI_TOPIC_LOOKUP_PATH)
+        self.adaptor = adaptor
+        self.min_members = min_members
 
-    def process_sample(self, sample_idx: int, max_cases: Optional[int] = None) -> Dict[str, Any]:
-        meta = self.samples.get(sample_idx)
-        if meta is None:
-            raise KeyError(f"sample_idx {sample_idx} not found in stats['samples']")
+    def filter_clusters(
+        self,
+        cuis: Iterable[str],
+        min_members: Optional[int] = None,
+    ) -> Set[str]:
+        """Return cluster_ids where at least `min_members` of `cuis` are members.
 
-        file_name = meta.get("file_name", f"sample_{sample_idx}")
-        all_case_ids = meta.get("cases", [])
-        used_case_ids = all_case_ids[:max_cases] if max_cases is not None else all_case_ids
+        Singletons (only 1 of `cuis` in the cluster) are dropped when
+        min_members >= 2.
+        """
+        if min_members is None:
+            min_members = self.min_members
 
-        if self.verbose:
-            print(f"\nProcessing {file_name} (sample_idx={sample_idx})")
-            print(f"  total case_ids in sample: {len(all_case_ids)}")
-            if max_cases is not None and len(all_case_ids) > max_cases:
-                print(f"  *** FILTERED to first {max_cases} case_ids for speed ***")
-            print(f"  using case_ids: {used_case_ids}")
-
-        blobs = self._blobs_for_sample(sample_idx, max_cases=max_cases)
-        if self.verbose:
-            print(f"  total blobs across cases: {len(blobs)}")
-
-        # ---- CUI extraction: one call per blob ----
-        all_cuis: List[Any] = []
-        seen: Set[str] = set()
-        t_extract = time.time()
-        for i, b in enumerate(blobs, 1):
-            text = b["text"]
-            try:
-                raw = self.extractor.extract([text], [text])
-                cuis = _cuis_from_raw(raw)
-            except Exception as e:
-                if self.verbose:
-                    print(f"    blob {i} extract FAILED: {e}")
-                cuis = []
-            for c in cuis:
-                cid = _cui_id(c)
-                if cid and cid not in seen:
-                    seen.add(cid)
-                    all_cuis.append(c)
-            if self.verbose and (i % 10 == 0 or i == len(blobs)):
-                print(f"    extracted blob {i}/{len(blobs)}  "
-                      f"(unique CUIs so far: {len(seen)})")
-        extract_secs = time.time() - t_extract
-
-        if self.verbose:
-            print(f"  extraction: {extract_secs:.1f}s, "
-                  f"{len(seen)} unique CUIs")
-
-        # ---- Summarize ----
-        if not all_cuis:
-            if self.verbose:
-                print("  no CUIs to summarize")
-            return {
-                "sample_idx":      sample_idx,
-                "file_name":       file_name,
-                "all_case_ids":    all_case_ids,
-                "case_ids":        used_case_ids,
-                "n_blobs":         len(blobs),
-                "raw_cuis":        [],
-                "surviving_cuis":  [],
-                "cluster_ids":     set(),
-                "extract_seconds": extract_secs,
-                "summarize_seconds": 0.0,
-            }
-
-        t_sum = time.time()
-        s = self.summarizer.summarize(all_cuis, sources=["SNOMEDCT_US"])
-        summarize_secs = time.time() - t_sum
-        m = s["metrics"]
-        if self.verbose:
-            print(f"  summarize: {summarize_secs:.1f}s  "
-                  f"{m['input_code_count']} in -> {m['output_code_count']} out")
-
-        surviving_cuis = [c["cui"] for c in s["surviving_cuis"]]
-
-        # ---- Topic filter (drop singletons) ----
-        cluster_ids = self.topic_filter.filter_clusters(surviving_cuis)
-        if self.verbose:
-            print(f"  cluster_ids (after singleton drop): "
-                  f"{len(cluster_ids)} distinct clusters\n")
+        cui_set = set(cuis)
+        cluster_hits: Dict[str, Set[str]] = defaultdict(set)
+        for cui in cui_set:
+            for cluster_id, _mc in self.adaptor.lookup.get(cui, []):
+                cluster_hits[cluster_id].add(cui)
 
         return {
-            "sample_idx":         sample_idx,
-            "file_name":          file_name,
-            "all_case_ids":       all_case_ids,
-            "case_ids":           used_case_ids,
-            "n_blobs":            len(blobs),
-            "raw_cuis":           all_cuis,
-            "surviving_cuis":     s["surviving_cuis"],
-            "removed_cuis":       s["removed_cuis"],
-            "cluster_ids":        cluster_ids,
-            "extract_seconds":    extract_secs,
-            "summarize_seconds":  summarize_secs,
+            cid for cid, hits in cluster_hits.items()
+            if len(hits) >= min_members
         }
 
+    def filter_with_details(
+        self,
+        cuis: Iterable[str],
+        min_members: Optional[int] = None,
+    ) -> List[Dict]:
+        """Same filter but returns per-cluster details for inspection.
 
-if __name__ == "__main__":
-    # Standalone test on sample_120 — limited to first 2 case IDs for speed
-    import os
-    STATS_PATH = os.environ.get("STATS_PATH",  "sampling_1_stats.pk")
-    RECON_PATH = os.environ.get("RECON_PATH",  "reconstructed_obj.pk")
-    SAMPLE_IDX = int(os.environ.get("SAMPLE_IDX", "120"))
-    MAX_CASES  = int(os.environ.get("MAX_CASES", "2"))
+        Each dict: cluster_id, member_count (total in SNOMED), matched_cuis
+        (the subset of input CUIs in this cluster).
+        """
+        if min_members is None:
+            min_members = self.min_members
 
-    dp = DocumentProcessor(stats_path=STATS_PATH, recon_path=RECON_PATH)
-    result = dp.process_sample(SAMPLE_IDX, max_cases=MAX_CASES)
+        cui_set = set(cuis)
+        cluster_hits: Dict[str, Set[str]] = defaultdict(set)
+        for cui in cui_set:
+            for cluster_id, _mc in self.adaptor.lookup.get(cui, []):
+                cluster_hits[cluster_id].add(cui)
 
-    print("="*70)
-    print(f"Result for {result['file_name']}:")
-    print(f"  all cases:      {result['all_case_ids']}")
-    print(f"  used cases:     {result['case_ids']}")
-    print(f"  n_blobs:        {result['n_blobs']}")
-    print(f"  raw CUIs:       {len(result['raw_cuis'])}")
-    print(f"  surviving CUIs: {len(result['surviving_cuis'])}")
-    print(f"  cluster_ids:    {len(result['cluster_ids'])}")
-    print(f"  extract: {result['extract_seconds']:.1f}s | "
-          f"summarize: {result['summarize_seconds']:.1f}s")
+        kept: List[Dict] = []
+        for cid, hits in cluster_hits.items():
+            if len(hits) < min_members:
+                continue
+            kept.append({
+                "cluster_id":   cid,
+                "member_count": self.adaptor.cluster_size.get(cid, 0),
+                "matched_cuis": sorted(hits),
+                "n_matched":    len(hits),
+            })
+        # Sort: most matched CUIs first, then smallest cluster size first
+        kept.sort(key=lambda x: (-x["n_matched"], x["member_count"]))
+        return kept
