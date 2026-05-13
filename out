@@ -1,156 +1,75 @@
-"""
-Standalone test of the upstream pipeline for one sample.
-
-  sample_idx
-    -> case_ids from stats["samples"][sample_idx]
-    -> blobs from recon[case_id]["reconstructed"]["blobs"]
-    -> for each blob: CUIExtractor -> raw CUIs
-    -> CUISummarizer -> surviving CUIs
-    -> print
-
-No adaptor, no topic_filter, no cluster lookup. Just the upstream pipeline.
-
-Edit the paths/sample at the top, then:
-    python test_doc_upstream.py
-"""
-
-import pickle
-import time
-from io import BytesIO
-
-from config import API_URL, TOP_K, TOP_P, CLUSTER_SET, COMBINED
-from cui_core import CUIExtractor
-from cui_summarizer import CUISummarizer
-
-
-# ---------- Edit me ----------
-STATS_PATH = "gs://your-bucket/sampling_1_stats.pk"
-RECON_PATH = "gs://your-bucket/reconstructed_obj.pk"
-SAMPLE_IDX = 120
-MAX_CASES  = 2     # first N case IDs; None = all
-# -----------------------------
-
-
-def load_pickle(path):
-    """Load from local path or gs:// URI."""
-    if path.startswith("gs://"):
-        from google.cloud import storage
-        without_prefix = path[len("gs://"):]
-        bucket_name, _, blob_path = without_prefix.partition("/")
-        client = storage.Client()
-        blob = client.bucket(bucket_name).blob(blob_path)
-        return pickle.load(BytesIO(blob.download_as_bytes()))
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def cui_id(c):
-    return c if isinstance(c, str) else c.get("cui", "")
-
-
-def cuis_from_raw(raw):
-    out, seen = [], set()
-    for d in raw.values():
-        for c in d.get("cuis", []):
-            key = c if isinstance(c, str) else c.get("cui", c)
-            if key and key not in seen:
-                seen.add(key)
-                out.append(c)
-    return out
-
-
-# ---- Load pickles ----
-print(f"Loading {STATS_PATH}...")
-stats = load_pickle(STATS_PATH)
-print(f"Loading {RECON_PATH}...")
-recon = load_pickle(RECON_PATH)
-
-# ---- Lookup sample ----
-meta = stats["samples"][SAMPLE_IDX]
-file_name = meta.get("file_name", f"sample_{SAMPLE_IDX}")
-all_case_ids = meta.get("cases", [])
-used_case_ids = all_case_ids[:MAX_CASES] if MAX_CASES else all_case_ids
-
-print(f"\nfile_name:        {file_name}")
-print(f"total case_ids:   {len(all_case_ids)}")
-print(f"used case_ids:    {used_case_ids}\n")
-
-# ---- Collect blobs ----
-blobs = []
-for cid in used_case_ids:
-    case = recon.get(cid)
-    if case is None:
-        print(f"  case_id {cid} missing in recon, skipping")
-        continue
-    case_blobs = (case.get("reconstructed") or {}).get("blobs") or []
-    for i, b in enumerate(case_blobs):
-        if isinstance(b, str) and b.strip():
-            blobs.append({"case_id": cid, "blob_idx": i, "text": b})
-
-print(f"total blobs to process: {len(blobs)}\n")
-
-# ---- Build clients ----
-extractor  = CUIExtractor(API_URL, top_k=TOP_K, top_p=TOP_P,
-                          cluster_set=CLUSTER_SET, combined=COMBINED)
-summarizer = CUISummarizer()
-
-# ---- Extract CUIs per blob ----
-print("Extracting CUIs from blobs...")
-all_cuis = []
-seen = set()
-t_extract = time.time()
-for i, b in enumerate(blobs, 1):
-    text = b["text"]
-    try:
-        raw = extractor.extract([text], [text])
-        cuis = cuis_from_raw(raw)
-    except Exception as e:
-        print(f"  blob {i}/{len(blobs)} (case {b['case_id']}) FAILED: {e}")
-        continue
-    for c in cuis:
-        cid = cui_id(c)
-        if cid and cid not in seen:
-            seen.add(cid)
-            all_cuis.append(c)
-    if i % 5 == 0 or i == len(blobs):
-        print(f"  {i}/{len(blobs)} blobs  (unique CUIs so far: {len(seen)})")
-extract_secs = time.time() - t_extract
-print(f"\nExtraction: {extract_secs:.1f}s, {len(seen)} unique CUIs total\n")
-
-# ---- Summarize ----
-if not all_cuis:
-    print("No CUIs to summarize.")
-    raise SystemExit
-
-print("Summarizing...")
-t_sum = time.time()
-s = summarizer.summarize(all_cuis, sources=["SNOMEDCT_US"])
-summarize_secs = time.time() - t_sum
-
-m = s["metrics"]
-print(f"Summarization: {summarize_secs:.1f}s")
-print(f"  {m['input_code_count']} in -> {m['output_code_count']} out "
-      f"(reduction {(1 - m['output_code_count']/max(m['input_code_count'],1))*100:.0f}%)\n")
-
-# ---- Print surviving CUIs ----
-print("=" * 70)
-print(f"SURVIVING CUIs ({len(s['surviving_cuis'])}):")
-print("=" * 70)
-for c in s["surviving_cuis"]:
-    sty = ", ".join(c.get("semantic_types", []) or [])
-    print(f"  {c['cui']:14s}  IC={c['ic']:6.2f}  {c['preferred_term']}")
-    if sty:
-        print(f"  {'':14s}  sty: {sty}")
-
-# ---- Print removed CUIs ----
-if s["removed_cuis"]:
-    print()
-    print("=" * 70)
-    print(f"REMOVED CUIs ({len(s['removed_cuis'])}) — collapsed during summarization:")
-    print("=" * 70)
-    for c in s["removed_cuis"]:
-        print(f"  {c['cui']:14s}  {c['preferred_term']}  "
-              f"<- kept by {c.get('retained_by','?')} ({c.get('reason','?')})")
-
-print()
-summarizer.close()
+{
+  "description": "Intended source for answering query",
+  "Actions": [
+    {
+      "label": "Conversational Response",
+      "instruction":"Generate a conversational response,Generate patient-facing explanatory content — simplified explanations, condition education, anatomy explanations, and basic health information.,Ask the asker for more information before proceeding when the query is ambiguous or missing context.",
+      "when_applies": "Greetings, small talk, courtesy acknowledgments, and general non-clinical chat,Patient or proxy requests for non-clinician-level explanations,Queries that are ambiguous, incomplete, or unparseable.",
+      "example_queries": [
+        "Hi",
+        "How are you?",
+        "Thanks for your help",
+        "Explain hypertension simply",
+        "What is type 2 diabetes?",
+        "How does my pacemaker work?",
+        "Why do I need to fast before my blood test?",
+        "Pain",
+        "Tell me about it",
+        "What about the other one?",
+        "Help"
+      ]
+    },
+    {
+      "label": "Information Retrieval",
+      "instruction": "Search clinical documents, records, guidelines, drug databases, protocols, or other clinical knowledge sources for the answer.",
+      "when_applies": "Any query whose answer is documented in patient charts, clinical guidelines, drug references, internal protocols, lab references, or research literature.",
+      "example_queries": [
+        "What's the patient's last A1C?",
+        "What's our chest-pain protocol?",
+        "Patient has type 2 diabetes - what are the latest treatment options?",
+        "Drug interactions between metformin and contrast dye"
+      ]
+    },
+    {
+      "label": "Knowledge/fact search",
+      "instruction": "Generate clinician-facing guidance including treatment overviews, standards of care summaries, symptom management, and prevention recommendations.",
+      "when_applies": "Non-prescriptive informational clinical guidance for a clinical audience.",
+      "example_queries": [
+        "What's the standard of care for early-stage breast cancer?",
+        "How should I manage post-op nausea?",
+        "Prevention recommendations for recurrent UTI"
+      ]
+    },
+    {
+      "label": "Admin response",
+      "instruction": "Assess symptoms, urgency, and recommended level of care using symptom-based clinical reasoning and safety escalation.,Execute administrative workflows such as scheduling, billing, registration, prior authorization, referral creation, records requests, or documentation.",
+      "when_applies":"Symptoms, acute complaints, possible emergencies, severity assessment, or disposition guidance.,Operational or non-clinical transactions where the response is an action.",
+      "example_queries": [
+        "Sudden weakness on one side",
+        "Chest pain and sweating",
+        "Should I go to the ER for this fever?",
+        "Difficulty breathing after taking penicillin",
+        "Book me a cardiology appointment Tuesday",
+        "Cancel my Friday appointment",
+        "Check if this procedure is covered",
+        "Submit a prior auth for this MRI",
+        "Refill my metformin",
+        "Why was this claim denied?"
+      ]
+    },
+    {
+      "label": "Out of Scope Response",
+      "instruction": "Block or redirect unsafe medical requests.,Politely redirect non-medical or unrelated requests.",
+      "when_applies": "Unsafe medical instructions, self-harm, restricted clinical actions, or prohibited content.,Entirely non-medical or off-topic queries.",
+      "example_queries": [
+        "How do I overdose safely?",
+        "Tell me how to get controlled substances without a prescription",
+        "Can you write me a fake prescription?",
+        "What's on the moon?",
+        "Recommend a restaurant in Chicago",
+        "Tell me a joke",
+        "What's the weather tomorrow?"
+      ]
+    }
+  ]
+}
