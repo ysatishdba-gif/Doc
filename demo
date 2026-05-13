@@ -58,7 +58,7 @@ ACTION CATEGORIES
 ROUTING DECISION (is_processable)
 ====================================================
 
-`action` is a LIST. Most queries map to exactly one action; some legitimately need more than one (e.g., a symptom triage that also benefits from chart lookup may be ["admin_response", "information_retrieval"]). Only include a second action when it materially changes how the answer is produced — do NOT pad the list.
+Pick exactly ONE action — the primary one. When a query could fit multiple categories, pick the one that best describes how the answer should be produced. If a query is ambiguous (e.g., symptom triage that could also benefit from chart lookup), pick the one whose response shape is the most actionable for the user; do not try to express multiple intents.
 
 Per-action mapping to is_processable:
 - information_retrieval     -> processable
@@ -68,7 +68,7 @@ Per-action mapping to is_processable:
 - conversational_response   -> not processable
 - out_of_scope              -> not processable
 
-Combine across the action list with OR: is_processable = true if ANY action in the list is processable. is_processable=true means downstream intent extraction will run. is_processable=false short-circuits the pipeline; the action list tells the caller how to respond instead.
+is_processable=true means downstream intent extraction will run. is_processable=false short-circuits the pipeline; the action label tells the caller how to respond instead.
 
 ====================================================
 PRAGMATIC SIGNALS
@@ -92,11 +92,9 @@ OUTPUT
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
-  "action": ["<one or more of: conversational_response | information_retrieval | knowledge_fact_search | admin_response | out_of_scope>"],
+  "action": "<one of: conversational_response | information_retrieval | knowledge_fact_search | admin_response | out_of_scope>",
   "is_processable": <true | false>
 }}
-
-`action` MUST be a JSON array, even when there is only one value. Multi-value arrays are only for queries where the second action materially changes the response.
 
 Original query: {query}
 """
@@ -491,15 +489,13 @@ Concepts to document:
 # LLM EXTRACTION SCHEMAS
 
 class RelevanceCheckOutput(BaseModel):
-    action: List[
-        Literal[
-            "conversational_response",
-            "information_retrieval",
-            "knowledge_fact_search",
-            "admin_response",
-            "out_of_scope",
-        ]
-    ] = Field(default_factory=lambda: ["information_retrieval"])
+    action: Literal[
+        "conversational_response",
+        "information_retrieval",
+        "knowledge_fact_search",
+        "admin_response",
+        "out_of_scope",
+    ] = "information_retrieval"
     is_processable: bool = True
 
 
@@ -1009,17 +1005,17 @@ class ExtractionResult:
 # PIPELINE CLASS
 
 
-def _fmt_action_label(actions: Optional[List[str]]) -> str:
-    """Format an action list for display (e.g. Status lines, logs).
+def _fmt_action_label(action: Optional[str]) -> str:
+    """Format an action category for display (e.g. Status lines, logs).
 
-    snake_case -> 'Title case' per action, comma-joined for multi-action.
-    Examples: ['admin_response'] -> 'Admin response'
-              ['admin_response', 'information_retrieval'] -> 'Admin response, Information retrieval'
-              [] or None -> 'Unknown'
+    snake_case -> 'Title case'.
+    Examples: 'admin_response' -> 'Admin response'
+              'information_retrieval' -> 'Information retrieval'
+              None / '' -> 'Unknown'
     """
-    if not actions:
+    if not action:
         return "Unknown"
-    return ", ".join(a.replace("_", " ").capitalize() for a in actions)
+    return action.replace("_", " ").capitalize()
 
 
 class ContextualIntentPipeline:
@@ -1112,7 +1108,7 @@ class ContextualIntentPipeline:
             RELEVANCE_CHECK_PROMPT.format(query=query),
             RelevanceCheckOutput,
             fallback=RelevanceCheckOutput(
-                action=["information_retrieval"],
+                action="information_retrieval",
                 is_processable=True,
             ),
             max_tokens=512,
