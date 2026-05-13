@@ -17,89 +17,45 @@ for _name in ("google_genai", "httpx", "httpcore", "urllib3", "google"):
 
 
 RELEVANCE_CHECK_PROMPT = """
-You are a routing gate for a clinical AI system. Classify the ORIGINAL user query into exactly ONE action category that describes the intended source for answering it, then decide whether downstream clinical extraction should run.
+You are a relevance gate for a clinical retrieval pipeline. Decide whether the ORIGINAL user query should be processed by downstream clinical extraction, or short-circuited as out of scope.
 
-====================================================
-ACTION CATEGORIES
-====================================================
+A query is PROCESSABLE if its answer would be information that exists or could be recorded somewhere in healthcare — a chart, a claim, a schedule, a referral, an authorization, a benefit, a coordination
+note, an identifier, anything a healthcare team would document,retrieve, or act on.
 
-1. "conversational_response"
-   When applies:
-   - Greetings, small talk, courtesy acknowledgments, general non-clinical chat
-   - Patient-facing simplified explanations of conditions, anatomy, or basic health concepts (not chart-specific)
-   - Ambiguous, incomplete, or unparseable queries needing clarification
-   Examples: "Hi", "Thanks for your help", "Explain hypertension simply", "What is type 2 diabetes?", "How does my pacemaker work?", "Pain", "Tell me about it", "Help"
+A query is UNPROCESSABLE if it is one of:
+- a conversational move (greeting, sign-off, small talk)
+- an opinion or feeling about the encounter
+- a politeness or courtesy phrase
+- a meta or capability question about the system
+- an instruction or prompt directed at a human operator  (e.g., "select X", "click Y", "read this aloud", "have you been instructed to...") — the answer is a behavior, not a record
+- a script, guidance, or workflow direction telling someone what to do
+- a retraction or cancellation
+- a fragment, noise, or unanswerable
+- entirely unrelated to healthcare
 
-2. "information_retrieval"
-   When applies:
-   - Any query whose answer is documented in patient charts, clinical records, internal protocols, drug references, lab references, or research literature
-   - Chart-specific lookups, protocol lookups, drug interaction lookups
-   Examples: "What's the patient's last A1C?", "What's our chest-pain protocol?", "Patient has type 2 diabetes - what are the latest treatment options?", "Drug interactions between metformin and contrast dye"
+PRAGMATIC SIGNALS to weigh — read the ORIGINAL query as written:
+- Verb form and addressee: questions to staff about staff actions ("Have you been instructed to...", "Did you verify...") are usually not record queries.
+- Wrapper text: instructions ABOUT the utterance (e.g.,"SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE") signal that the underlying content is operational direction, not
+  a data request.
+- Imperatives to the reader ("select", "choose", "navigate","confirm", "click") are behaviors, not retrievals.
 
-3. "knowledge_fact_search"
-   When applies:
-   - Clinician-facing informational guidance — treatment overviews, standards of care, symptom management, prevention recommendations
-   - Non-prescriptive clinical guidance for a clinical audience (no specific patient context)
-   Examples: "What's the standard of care for early-stage breast cancer?", "How should I manage post-op nausea?", "Prevention recommendations for recurrent UTI"
-
-4. "admin_response"
-   When applies (either branch):
-   - SYMPTOM TRIAGE: symptoms, acute complaints, possible emergencies, severity assessment, disposition guidance
-   - OPERATIONAL WORKFLOW: scheduling, billing, registration, prior authorization, referrals, records requests, refills, claims
-   Examples: "Sudden weakness on one side", "Chest pain and sweating", "Should I go to the ER for this fever?", "Book me a cardiology appointment Tuesday", "Cancel my Friday appointment", "Refill my metformin", "Why was this claim denied?"
-
-5. "out_of_scope"
-   When applies:
-   - Unsafe medical instructions, self-harm, restricted clinical actions, prohibited content
-   - Entirely non-medical or off-topic queries
-   Examples: "How do I overdose safely?", "Write me a fake prescription", "What's the weather tomorrow?", "Recommend a restaurant in Chicago", "Tell me a joke"
-
-====================================================
-ROUTING DECISION (is_processable)
-====================================================
-
-`action` is a LIST. Most queries map to exactly one action; some legitimately need more than one (e.g., a symptom triage that also benefits from chart lookup may be ["admin_response", "information_retrieval"]). Only include a second action when it materially changes how the answer is produced — do NOT pad the list.
-
-Per-action mapping to is_processable:
-- information_retrieval     -> processable
-- knowledge_fact_search     -> processable
-- admin_response (symptom triage branch)   -> processable
-- admin_response (operational branch)      -> not processable
-- conversational_response   -> not processable
-- out_of_scope              -> not processable
-
-Combine across the action list with OR: is_processable = true if ANY action in the list is processable. is_processable=true means downstream intent extraction will run. is_processable=false short-circuits the pipeline; the action list tells the caller how to respond instead.
-
-====================================================
-PRAGMATIC SIGNALS
-====================================================
-
-Read the ORIGINAL query as written, before any expansion:
-- Verb form and addressee: questions to staff about staff actions ("Have you been instructed to...", "Did you verify...") are conversational/operational, not record queries.
-- Wrapper text: instructions ABOUT the utterance ("SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE") signal operational direction, not a data request.
-- Imperatives to the reader ("select", "click", "navigate", "confirm") are behaviors, not retrievals.
-- Patient-voice phrasing ("my", "I have", "should I") + simple explanation request -> conversational_response, not information_retrieval.
-- Clinician-voice phrasing + patient context ("the patient's...", "my patient with...") -> information_retrieval.
-
-DEFAULTS when uncertain:
-- Between information_retrieval and knowledge_fact_search -> prefer information_retrieval.
-- Between admin_response (triage) and information_retrieval -> prefer information_retrieval (downstream has its own safeguards).
-- Between processing and rejecting overall -> prefer is_processable=true.
-
-====================================================
-OUTPUT
-====================================================
+DEFAULT: when uncertain, return is_processable=true. Downstream extraction has its own safeguards. It is better to process a borderline query than to reject a legitimate one.
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
-  "action": ["<one or more of: conversational_response | information_retrieval | knowledge_fact_search | admin_response | out_of_scope>"],
-  "is_processable": <true | false>,
-  "reason": "<one of the action category names: conversational_response | information_retrieval | knowledge_fact_search | admin_response | out_of_scope>"
+  "is_processable": true,
+  "reason": "<terse label, MAX 5-8 words>"
 }}
 
-`action` MUST be a JSON array, even when there is only one value. Multi-value arrays are only for queries where the second action materially changes the response.
-
-The `reason` field MUST be one of the action category names. It should match the primary action (the first entry in the `action` list). Do NOT write a sentence. Do NOT restate the query.
+The reason field MUST be 5-8 words MAX. A terse label, NOT a sentence.
+Do NOT restate the query. Do NOT explain reasoning. Do NOT use
+subordinate clauses. Good examples:
+- "Operational instruction to staff."
+- "Conversational greeting."
+- "Asks for a behavior, not data."
+- "Off-topic, not healthcare-related."
+- "Wrapper-framed staff direction."
+- "Politeness phrase, no record target."
 
 Original query: {query}
 """
@@ -199,14 +155,6 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
-6. **representative_terms[]** - A short list (typically 1–3) of named clinical entities this intent is about. Read the intent's nature, sub_natures, and atomic_concepts together.Each term must name a thing that a typical
-   patient chart has its own section, list, or record for — diagnoses,medications, tests, procedures, devices, allergies, billing, insurance,visits, etc. If a candidate doesn't correspond to a chart section,drop it.
-
-   Ask: "what is this question ABOUT?" The answer is a named entity — a noun the chart has a section for — like "chemotherapy", "cancer", "medications". Pick the canonical name. NOT descriptive paraphrases or action phrases that wrap the entity in qualifiers (e.g. "prior systemic anti-cancer treatments", "review of pharmacotherapy"). The wrapping language describes what's being done WITH the entity; the entity is the subject — pick the subject.
-
-   A modifier narrows or scopes the question — it's a property of an entity, not the entity itself. Apply the deletion test: remove the candidate term from the question. If the question still makes coherent clinical sense without it, the term was a modifier — drop it. If removing it makes the question incoherent, the term is the subject — keep it. "Have you had a CT scan in the last 12 months" — remove "CT scan" and the question collapses (subject); remove "12 months" and the question still asks about CT scans (modifier). Pick "CT scan" only.
-
-   Do NOT enumerate atomic_concepts — those decompose; representative_terms summarize. Each term must name a DIFFERENT entity. Synonyms, abbreviations, and qualifier-wrapped forms of the same entity collapse to ONE — pick the canonical short name. Examples: "CT scan" and "computed tomography" name the same entity → pick one, not both. "billing", "billing statement", "billing process" all wrap the same entity → pick "billing", not all three.
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -290,7 +238,7 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Query Characteristics:**
 - 2-5 words, meaningful clinical phrase
-- Must infer from nature and sub nature context
+- Must infer from nature and sub nature context 
 - A candidate is invalid if it is only a qualifier, modifier, temporal expression, severity descriptor, or status/action word without naming the  entity it applies to
 - If a modifier or status word is clinically important, bundle it with the entity it modifies so the candidate still names a concept
 - Use standard medical terminology
@@ -471,25 +419,8 @@ Concepts to document:
 # LLM EXTRACTION SCHEMAS
 
 class RelevanceCheckOutput(BaseModel):
-    action: List[
-        Literal[
-            "conversational_response",
-            "information_retrieval",
-            "knowledge_fact_search",
-            "admin_response",
-            "out_of_scope",
-        ]
-    ] = Field(default_factory=lambda: ["information_retrieval"])
-    is_processable: bool = True
-    reason: Optional[
-        Literal[
-            "conversational_response",
-            "information_retrieval",
-            "knowledge_fact_search",
-            "admin_response",
-            "out_of_scope",
-        ]
-    ] = None
+    is_processable: bool
+    reason: Optional[str] = None
 
 
 class QueryExpansionOutput(BaseModel):
@@ -518,12 +449,6 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
-    # Short list (typically 1–3) of LLM-picked entity-level phrases summarizing
-    # what this intent is about. The LLM reads nature + sub_natures +
-    # atomic_concepts together and synthesizes; these are NOT atomic_concepts
-    # copied verbatim (those decompose the intent), but entity-level summaries
-    # derived from the whole. Empty list when the LLM didn't emit any.
-    representative_terms: list = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -655,14 +580,12 @@ class Format_IntentExtraction(BaseModel):
     intents: List[IntentSummaryItem]
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    representative_terms: list = Field(default_factory=list)
 
 
 class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    representative_terms: list = Field(default_factory=list)
     total_candidates: int
     final_candidates: List[FinalCandidateItem]
 
@@ -672,7 +595,6 @@ class Format_NatureBreakdown(BaseModel):
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
-    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithoutQueries]
 
 
@@ -682,7 +604,6 @@ class Format_FullPipeline(BaseModel):
     original_query: str
     expanded_query: str
     total_intents_detected: int
-    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithContext]
 
 
@@ -789,30 +710,6 @@ class ExtractionResult:
 
     # format methods
 
-    def _representative_terms(self) -> List[str]:
-        """Per-intent representative_terms flattened into a single deduped list.
-
-        Each intent contributes its own short list of entity-level phrases
-        (the LLM synthesizes them by reading nature + sub_natures +
-        atomic_concepts together — see prompt INTENT STRUCTURE item 6).
-        We flatten across intents in traversal order, coerce items to str
-        (the field is an untyped list so items could in principle be other
-        scalars), strip whitespace, skip empties, and dedup case-
-        insensitively across the whole query."""
-        terms: List[str] = []
-        seen: set = set()
-        for intent in self.intents.intents:
-            for t in intent.representative_terms or []:
-                t_clean = str(t).strip()
-                if not t_clean:
-                    continue
-                key = t_clean.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                terms.append(t_clean)
-        return terms
-
     def to_intent_extraction(self) -> Dict[str, Any]:
         items = [
             IntentSummaryItem(intent_title=i.intent_title, description=i.description)
@@ -823,7 +720,6 @@ class ExtractionResult:
             intents=items,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            representative_terms=self._representative_terms(),
         )
         return result.model_dump()
 
@@ -858,7 +754,6 @@ class ExtractionResult:
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            representative_terms=self._representative_terms(),
             total_candidates=len(candidates),
             final_candidates=candidates,
         )
@@ -879,7 +774,6 @@ class ExtractionResult:
             reason=self.intents.reason,
             original_query=self.intents.original_query,
             total_intents_detected=self.intents.total_intents_detected,
-            representative_terms=self._representative_terms(),
             intents=intents_no_queries,
         )
         return result.model_dump()
@@ -963,7 +857,6 @@ class ExtractionResult:
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
-            representative_terms=self._representative_terms(),
             intents=intent_blocks,
         )
         return result.model_dump()
@@ -1057,29 +950,24 @@ class ContextualIntentPipeline:
     # -- pipeline steps --
 
     def check_relevance(self, query: str) -> RelevanceCheckOutput:
-        """Step 0 — relevance + action-routing gate. Runs on the ORIGINAL
-        query before any expansion. Classifies the query into one of five
-        action categories (conversational_response, information_retrieval,
-        knowledge_fact_search, admin_response, out_of_scope) and decides
-        whether downstream clinical extraction should run.
+        """Step 0 — relevance gate. Runs on the ORIGINAL query, before
+        expansion. Decides whether the query carries content worth
+        processing or is dialogue noise / out of scope.
 
-        Operates on the raw query intentionally — expansion aggressively
-        medicalizes input, which hides pragmatic signals (wrappers, staff-
-        directed verbs, patient-voice phrasing) that this gate needs to
-        see.
+        Operates on the original (not expanded) query deliberately:
+        expansion aggressively medicalizes input, which can hide the
+        pragmatic signals (wrappers, staff-directed verbs, scripting
+        framing) that this gate needs to see. Wrapper-framed staff
+        directions look clinical after expansion; they look like what
+        they are in the raw text.
 
-        Fallback on LLM failure: action='information_retrieval',
-        is_processable=True. We default to processing so a flaky gate
-        never silently drops legitimate clinical queries — downstream has
-        its own validation."""
+        Fallback on LLM failure: is_processable=True. We default to
+        processing so a flaky gate never silently drops legitimate
+        clinical queries — downstream has its own validation."""
         return self._call_model(
             RELEVANCE_CHECK_PROMPT.format(query=query),
             RelevanceCheckOutput,
-            fallback=RelevanceCheckOutput(
-                action=["information_retrieval"],
-                is_processable=True,
-                reason="information_retrieval",
-            ),
+            fallback=RelevanceCheckOutput(is_processable=True),
             max_tokens=512,
         )
 
@@ -1187,10 +1075,46 @@ class ContextualIntentPipeline:
 
         t0 = datetime.utcnow()
 
-        # Step 1 — query normalization
-        t1 = datetime.utcnow()
-        expansion = self.expand_query(query)
-        t1e = (datetime.utcnow() - t1).total_seconds()
+        # Steps 0 & 1 run in parallel. Both read the ORIGINAL query and
+        # neither depends on the other's output, so wall time becomes
+        # max(relevance, expansion) instead of the sum. On rejected
+        # queries the expansion result is discarded, but we still skip
+        # the much larger intent + context calls, so net latency on
+        # rejected traffic is still substantially lower.
+        t_par = datetime.utcnow()
+        with ThreadPoolExecutor(max_workers=2) as _pool:
+            _rel_fut = _pool.submit(self.check_relevance, query)
+            _exp_fut = _pool.submit(self.expand_query, query)
+            relevance = _rel_fut.result()
+            expansion = _exp_fut.result()
+        t_par_e = (datetime.utcnow() - t_par).total_seconds()
+
+        if not relevance.is_processable:
+            # Short-circuit: discard the expansion result and skip intent
+            # extraction + context build. Use the original query as
+            # expanded_query so downstream formatters still get a valid
+            # ExtractionResult.
+            processing_time = (datetime.utcnow() - t0).total_seconds()
+            empty_expansion = QueryExpansionOutput(expanded_query=query)
+            empty_intents = IntentExtractionOutput(
+                is_clinical=False,
+                reason=relevance.reason or "Rejected by relevance gate.",
+                original_query=query,
+                expanded_query=query,
+                total_intents_detected=0,
+                intents=[],
+            )
+            print(f"Query     : {query[:80]}")
+            print(f"Status    : Rejected by relevance gate — {empty_intents.reason}")
+            print(
+                f"Timing    : gate+expand={t_par_e:.1f}s  "
+                f"total={processing_time:.1f}s  (intents/context skipped)"
+            )
+            print()
+            return ExtractionResult(
+                query, empty_expansion, empty_intents,
+                None, None, processing_time,
+            )
 
         # Step 2 — intent extraction
         t2 = datetime.utcnow()
@@ -1226,7 +1150,7 @@ class ContextualIntentPipeline:
                 f"candidates: {candidate_count}"
             )
             print(
-                f"Timing    : expand={t1e:.1f}s  "
+                f"Timing    : gate+expand={t_par_e:.1f}s  "
                 f"intents={t2e:.1f}s  "
                 f"context={t3e:.1f}s  "
                 f"total={processing_time:.1f}s"
@@ -1351,57 +1275,13 @@ if __name__ == "__main__":
         project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
     )
 
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    import json
-
-    results = []
-    test_queries = questions[:86]
-
-    def minimal_pipeline(q):
-        # STEP 0: relevance + action-routing gate (on the ORIGINAL query,
-        # before expansion). Classifies into one of five action categories
-        # and short-circuits when is_processable=False.
-        relevance = pipeline.check_relevance(q)
-        if not relevance.is_processable:
-            return {
-                "question": q,
-                "is_processable": False,
-                "action": relevance.action,
-                "reason": relevance.reason,
-                "representative_terms": [],
-            }
-
-        # STEP 1: expansion
-        expansion = pipeline.expand_query(q)
-
-        # STEP 2: intent extraction
-        intent_out = pipeline.extract_intents(q, expansion.expanded_query)
-
-        terms = []
-
-        if intent_out and intent_out.intents:
-            for intent in intent_out.intents:
-
-                terms.extend(intent.representative_terms or [])
-
-        # clean + dedupe
-        terms = list({t.strip() for t in terms if t and t.strip()})
-
-        return {
-            "question": q,
-            "is_processable": True,
-            "action": relevance.action,
-            "reason": relevance.reason,
-            "representative_terms": terms,
+    test_queries = [
+         "SCHEDULER INFO ONLY - DO NOT READ THIS OUTLOUD TO THE PATIENT: Do you have approval from the requested specialty department to schedule this ED follow up?"
+    ]
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(run_single_query, pipeline, q, idx, output_config): q
+            for idx, q in enumerate(test_queries, 3)
         }
-
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(minimal_pipeline, q) for q in test_queries]
-
-        for f in as_completed(futures):
-            results.append(f.result())
-
-    with open("rep_term.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    print("rep_terms.json")
+        for future in as_completed(futures):
+            future.result()
