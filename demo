@@ -554,6 +554,30 @@ class CandidateTemporal(BaseModel):
     candidate: str
     temporal_signal: List[str] = Field(default_factory=list)
 
+    @field_validator("temporal_signal", mode="before")
+    @classmethod
+    def strip_type_prefix(cls, v: Any) -> List[str]:
+        """Strip type-label prefixes the LLM tends to prepend ("STATE:",
+        "Status:", "RELATIVE:", "ABSOLUTE:", "RANK:"). The prompt
+        documents these as types, and the model often echoes them as
+        prefixes — we want just the value, e.g. "Active" not
+        "STATE: Active". Case-insensitive prefix strip; empty / non-
+        string entries are dropped."""
+        if not isinstance(v, list):
+            return v
+        prefix_re = re.compile(
+            r"^\s*(?:state|status|relative|absolute|rank)\s*[:\-–]\s*",
+            re.IGNORECASE,
+        )
+        cleaned: List[str] = []
+        for item in v:
+            if not isinstance(item, str):
+                continue
+            s = prefix_re.sub("", item).strip()
+            if s:
+                cleaned.append(s)
+        return cleaned
+
 
 class IntentTemporal(BaseModel):
     intent_title: str
@@ -672,6 +696,14 @@ class Format_FullPipeline(BaseModel):
 # EXTRACTION RESULT — holds all intermediate data; emits all format views
 
 
+# Placeholder value emitted in temporal_signal when no temporal constraint
+# applies. Production downstream apps treat temporal_signal as a non-empty
+# list — special-casing [] forces every consumer to write the same guard.
+# A sentinel "NA" gives them a single contract: read element 0, branch on
+# whether it equals NA.
+NO_TEMPORAL_PLACEHOLDER = "NA"
+
+
 class ExtractionResult:
 
     def __init__(
@@ -725,14 +757,18 @@ class ExtractionResult:
         """Per-candidate temporal signal from Task 2.
 
         Primary: return the candidate's own emitted signal.
-        Fallback: if the LLM left this candidate's signal blank but emitted
-        a temporal signal for OTHER candidates under the same intent, the
-        query clearly has a temporal cue and the prompt's CASCADE RULE
-        should have propagated it. The LLM occasionally fails to cascade
-        for temporal-worded candidates ("date of X", "timestamp", etc.);
-        we catch that here by inheriting the intent-level union."""
+        Fallback 1: if the LLM left this candidate's signal blank but
+        emitted a temporal signal for OTHER candidates under the same
+        intent, the query clearly has a temporal cue and the prompt's
+        CASCADE RULE should have propagated it. The LLM occasionally
+        fails to cascade for temporal-worded candidates ("date of X",
+        "timestamp", etc.); we catch that here by inheriting the
+        intent-level union.
+        Fallback 2: when nothing applies, return [NO_TEMPORAL_PLACEHOLDER]
+        instead of []. Downstream apps then read a guaranteed non-empty
+        list and branch on whether the value is the sentinel."""
         if not self.temporal or not self.temporal.intents:
-            return []
+            return [NO_TEMPORAL_PLACEHOLDER]
         ikey = intent_title.strip().lower()
         ckey = candidate.strip().lower()
         for it in self.temporal.intents:
@@ -753,8 +789,9 @@ class ExtractionResult:
             # If this candidate got an explicit signal, use it.
             # If it's blank but its siblings under the same intent have
             # cues, inherit the intent-level union (cascade safety net).
-            return own if own else intent_union
-        return []
+            result = own if own else intent_union
+            return result if result else [NO_TEMPORAL_PLACEHOLDER]
+        return [NO_TEMPORAL_PLACEHOLDER]
 
     def _build_ctx(self, concept_name: str) -> RetrievalContext:
         cc = self._get_concept_context(concept_name)
@@ -843,7 +880,14 @@ class ExtractionResult:
     def _merge_signals(candidates: List[FinalCandidateItem]) -> FlatRetrievalSignals:
         """Merge candidate-level signals into an intent-level view.
         Every facet (including temporal_signal) is the dedup'd union of
-        its candidates' values."""
+        its candidates' values.
+
+        Special case for temporal_signal: if any candidate emitted a real
+        temporal value while others emitted [NO_TEMPORAL_PLACEHOLDER], the
+        intent-level view should reflect only the real values — keeping
+        "NA" alongside concrete cues like "last 12 months" would be noise.
+        If every candidate is NA, keep [NA] so the intent-level list
+        stays non-empty (same contract as candidate-level)."""
         def _union(getter) -> List[str]:
             seen_vals: dict = {}
             for fc in candidates:
@@ -853,11 +897,19 @@ class ExtractionResult:
                         seen_vals[val.lower()] = val
             return list(seen_vals.values())
 
+        temporal = _union(lambda s: s.temporal_signal)
+        real_temporal = [t for t in temporal if t != NO_TEMPORAL_PLACEHOLDER]
+        if real_temporal:
+            temporal = real_temporal
+        elif not temporal:
+            # Defensive: every candidate fell through with []; keep contract.
+            temporal = [NO_TEMPORAL_PLACEHOLDER]
+
         return FlatRetrievalSignals(
             record_types=_union(lambda s: s.record_types),
             author_roles=_union(lambda s: s.author_roles),
             longitudinal_scope=_union(lambda s: s.longitudinal_scope),
-            temporal_signal=_union(lambda s: s.temporal_signal),
+            temporal_signal=temporal,
             content_signals=_union(lambda s: s.content_signals),
             clinical_setting=_union(lambda s: s.clinical_setting),
         )
@@ -925,6 +977,20 @@ class ExtractionResult:
 
 
 # PIPELINE CLASS
+
+
+def _fmt_action_label(actions: Optional[List[str]]) -> str:
+    """Format an action list for the Status line.
+
+    snake_case -> 'Title case' per action, comma-joined for multi-action.
+    Examples: ['admin_response'] -> 'Admin response'
+              ['admin_response', 'information_retrieval'] -> 'Admin response, Information retrieval'
+              [] or None -> 'Unknown'
+    """
+    if not actions:
+        return "Unknown"
+    return ", ".join(a.replace("_", " ").capitalize() for a in actions)
+
 
 class ContextualIntentPipeline:
 
@@ -1175,14 +1241,7 @@ class ContextualIntentPipeline:
                 intents=[],
             )
             print(f"Query     : {query[:80]}")
-            print(
-                f"Status    : Rejected by relevance gate — "
-                f"action={relevance.action}  reason={relevance.reason}"
-            )
-            print(
-                f"Timing    : gate+expand={t_par_e:.1f}s  "
-                f"total={processing_time:.1f}s  (intents/context skipped)"
-            )
+            print(f"Status    : {_fmt_action_label(relevance.action)} - Rejected")
             print()
             return ExtractionResult(
                 query, empty_expansion, empty_intents,
@@ -1216,23 +1275,14 @@ class ContextualIntentPipeline:
         print(f"Query     : {query[:80]}")
         print(f"Expanded  : {expansion.expanded_query[:80]}")
         if intent_out.is_clinical:
-            print("Status    : Clinical")
-            print(
-                f"Action    : {relevance.action}  (gate reason: {relevance.reason})"
-            )
+            print(f"Status    : {_fmt_action_label(relevance.action)} - Processing")
             print(
                 f"Intents: {intent_out.total_intents_detected} | "
                 f"sub natures: {sub_nature_count} | "
                 f"candidates: {candidate_count}"
             )
-            print(
-                f"Timing    : gate+expand={t_par_e:.1f}s  "
-                f"intents={t2e:.1f}s  "
-                f"context={t3e:.1f}s  "
-                f"total={processing_time:.1f}s"
-            )
         else:
-            print(f"Status    : Non-clinical — {intent_out.reason}")
+            print(f"Status    : {_fmt_action_label(relevance.action)} - Non-clinical")
         print()
 
         return ExtractionResult(
