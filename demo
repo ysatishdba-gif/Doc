@@ -1,140 +1,279 @@
-"""
-Inspect the hierarchy graph (networkx_.pkl) to understand its structure
-before designing topic logic on top of it.
-
-Run after config.py has loaded it, or point HG_PATH at the pickle.
-"""
-
-import pickle
-import networkx as nx
-
-HG_PATH = "networkx_.pkl"   # or import `hierarchy` from config
+from google.cloud import bigquery
+import uuid
+from datetime import datetime
 
 
-def load_graph(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+PROJECT_ID = ""
+DATASET = ""
+
+RELATION_TABLE = f"{PROJECT_ID}.{DATASET}.transformed_subset_src_system_definitions_relations"
+SEMANTIC_TABLE = f"{PROJECT_ID}.{DATASET}.subset_src_system_semantic_types"
+
+def fetch_relation_data(client):
+    """
+    Fetch relation graph with semantic types
+    """
+
+    query = f"""
+    WITH semantic_map AS (
+        SELECT DISTINCT
+            cui,
+            semantic_type
+        FROM `{SEMANTIC_TABLE}`
+    )
+
+    SELECT
+        r.origin_cui,
+        r.origin_cui_name,
+        r.target_cui,
+        r.target_cui_name,
+        r.relation,
+
+        s1.semantic_type AS origin_semantic_type,
+        s2.semantic_type AS target_semantic_type
+
+    FROM `{RELATION_TABLE}` r
+
+    LEFT JOIN semantic_map s1
+        ON r.origin_cui = s1.cui
+
+    LEFT JOIN semantic_map s2
+        ON r.target_cui = s2.cui
+    """
+
+    return client.query(query).to_dataframe()
+
+def load_dataframe_to_bigquery(client, dataframe, table_name):
+    """
+    Load pandas dataframe into BigQuery
+    """
+
+    job = client.load_table_from_dataframe(
+        dataframe,
+        table_name
+    )
+
+    job.result()
+
+    print(f"Loaded {len(dataframe)} rows into {table_name}")
+def generate_cluster_id(prefix):
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-def inspect(G):
-    print("=" * 70)
-    print("GRAPH OVERVIEW")
-    print("=" * 70)
-    print(f"  type:          {type(G).__name__}")
-    print(f"  directed:      {G.is_directed()}")
-    print(f"  nodes:         {G.number_of_nodes():,}")
-    print(f"  edges:         {G.number_of_edges():,}")
+def build_clusters(df):
+    """
+    Logic:
 
-    # DAG check (only meaningful if directed)
-    if G.is_directed():
-        try:
-            is_dag = nx.is_directed_acyclic_graph(G)
-            print(f"  is DAG:        {is_dag}")
-        except Exception as e:
-            print(f"  is DAG:        could not determine ({e})")
+    1. Every semantic type becomes a SUPER cluster
+    2. Inside semantic type cluster:
+         - if relation differs => create subcluster
+         - if target semantic type differs => create cross-semantic cluster
+    3. Preserve hierarchy through parent_cluster_id
+    """
 
-    # ---- Node sample + attributes ----
-    print("\n" + "=" * 70)
-    print("NODE SAMPLE (first 5)")
-    print("=" * 70)
-    for i, n in enumerate(G.nodes()):
-        if i >= 5:
-            break
-        attrs = G.nodes[n]
-        print(f"  node: {n!r}")
-        if attrs:
-            for k, v in attrs.items():
-                print(f"      {k}: {str(v)[:80]}")
+    clusters = []
+    members = []
+    mappings = []
+
+    created_super_clusters = {}
+    created_relation_clusters = {}
+    created_cross_clusters = {}
+
+    now = datetime.utcnow()
+
+    for _, row in df.iterrows():
+
+        origin_cui = row["origin_cui"]
+        origin_name = row["origin_cui_name"]
+
+        target_cui = row["target_cui"]
+        target_name = row["target_cui_name"]
+
+        relation = row["relation"]
+
+        origin_sem = row["origin_semantic_type"]
+        target_sem = row["target_semantic_type"]
+
+        # =========================================================
+        # 1. SUPER CLUSTER : semantic type
+        # =========================================================
+
+        if origin_sem not in created_super_clusters:
+
+            super_cluster_id = generate_cluster_id("SUPER")
+
+            created_super_clusters[origin_sem] = super_cluster_id
+
+            clusters.append({
+                "cluster_id": super_cluster_id,
+                "cluster_name": f"SemanticType_{origin_sem}",
+                "cluster_type": "SUPER_SET",
+                "semantic_type": origin_sem,
+                "relation": None,
+                "parent_cluster_id": None,
+                "created_at": now
+            })
+
+        super_cluster_id = created_super_clusters[origin_sem]
+
+        # =========================================================
+        # 2. SAME SEMANTIC TYPE + SAME RELATION
+        # =========================================================
+
+        if origin_sem == target_sem:
+
+            relation_key = (origin_sem, relation)
+
+            if relation_key not in created_relation_clusters:
+
+                relation_cluster_id = generate_cluster_id("REL")
+
+                created_relation_clusters[relation_key] = relation_cluster_id
+
+                clusters.append({
+                    "cluster_id": relation_cluster_id,
+                    "cluster_name": f"{origin_sem}_{relation}",
+                    "cluster_type": "RELATION_CLUSTER",
+                    "semantic_type": origin_sem,
+                    "relation": relation,
+                    "parent_cluster_id": super_cluster_id,
+                    "created_at": now
+                })
+
+                mappings.append({
+                    "source_cluster_id": super_cluster_id,
+                    "target_cluster_id": relation_cluster_id,
+                    "mapping_type": "PARENT_CHILD",
+                    "created_at": now
+                })
+
+            relation_cluster_id = created_relation_clusters[relation_key]
+
+            # add origin member
+            members.append({
+                "cluster_id": relation_cluster_id,
+                "cui": origin_cui,
+                "cui_name": origin_name,
+                "semantic_type": origin_sem,
+                "role": "ORIGIN",
+                "created_at": now
+            })
+
+            # add target member
+            members.append({
+                "cluster_id": relation_cluster_id,
+                "cui": target_cui,
+                "cui_name": target_name,
+                "semantic_type": target_sem,
+                "role": "TARGET",
+                "created_at": now
+            })
+
+        # =========================================================
+        # 3. CROSS SEMANTIC TYPE CLUSTER
+        # =========================================================
+
         else:
-            print(f"      (no node attributes)")
 
-    # Are node attributes present at all?
-    nodes_with_attrs = sum(1 for n in G.nodes() if G.nodes[n])
-    print(f"\n  nodes with attributes: {nodes_with_attrs:,} / {G.number_of_nodes():,}")
+            cross_key = (origin_sem, target_sem, relation)
 
-    # ---- Edge sample + attributes ----
-    print("\n" + "=" * 70)
-    print("EDGE SAMPLE (first 5)")
-    print("=" * 70)
-    for i, (u, v) in enumerate(G.edges()):
-        if i >= 5:
-            break
-        attrs = G.edges[u, v]
-        print(f"  edge: {u!r} -> {v!r}")
-        if attrs:
-            for k, val in attrs.items():
-                print(f"      {k}: {str(val)[:80]}")
-        else:
-            print(f"      (no edge attributes)")
+            if cross_key not in created_cross_clusters:
 
-    edges_with_attrs = sum(1 for u, v in G.edges() if G.edges[u, v])
-    print(f"\n  edges with attributes: {edges_with_attrs:,} / {G.number_of_edges():,}")
+                cross_cluster_id = generate_cluster_id("CROSS")
 
-    # ---- Edge type distribution (if edges carry a 'rel' / 'rela' / 'type' attr) ----
-    print("\n" + "=" * 70)
-    print("EDGE LABEL DISTRIBUTION")
-    print("=" * 70)
-    label_keys = ("rel", "rela", "type", "relation", "label")
-    found_key = None
-    for key in label_keys:
-        sample_edge = next(iter(G.edges()), None)
-        if sample_edge and key in G.edges[sample_edge[0], sample_edge[1]]:
-            found_key = key
-            break
-    if found_key:
-        from collections import Counter
-        counts = Counter(G.edges[u, v].get(found_key) for u, v in G.edges())
-        print(f"  edge label key: {found_key!r}")
-        for label, n in counts.most_common(20):
-            print(f"    {str(label):40s}  {n:,}")
-    else:
-        print("  No recognizable edge-label attribute found.")
-        print("  (Edges may be bare 'isa' edges with no type attribute — likely")
-        print("   the whole graph IS the isa hierarchy, so every edge means 'isa'.)")
+                created_cross_clusters[cross_key] = cross_cluster_id
 
-    # ---- Direction check: child->parent or parent->child? ----
-    print("\n" + "=" * 70)
-    print("DIRECTION CHECK")
-    print("=" * 70)
-    if G.is_directed():
-        # Roots = no out-edges if child->parent, or no in-edges if parent->child
-        no_out = [n for n in G.nodes() if G.out_degree(n) == 0]
-        no_in  = [n for n in G.nodes() if G.in_degree(n) == 0]
-        print(f"  nodes with 0 out-edges (sinks): {len(no_out):,}")
-        print(f"  nodes with 0 in-edges  (sources): {len(no_in):,}")
-        print(f"  -> if few sinks: edges point child->parent (toward root)")
-        print(f"  -> if few sources: edges point parent->child (away from root)")
-        # show a few sinks and sources
-        print(f"  sample sinks:   {no_out[:5]}")
-        print(f"  sample sources: {no_in[:5]}")
+                clusters.append({
+                    "cluster_id": cross_cluster_id,
+                    "cluster_name": f"{origin_sem}_TO_{target_sem}_{relation}",
+                    "cluster_type": "CROSS_SEMANTIC_CLUSTER",
+                    "semantic_type": origin_sem,
+                    "relation": relation,
+                    "parent_cluster_id": super_cluster_id,
+                    "created_at": now
+                })
 
-        # Degree stats
-        in_degs  = [G.in_degree(n) for n in G.nodes()]
-        out_degs = [G.out_degree(n) for n in G.nodes()]
-        print(f"\n  in-degree:  max={max(in_degs)}  mean={sum(in_degs)/len(in_degs):.2f}")
-        print(f"  out-degree: max={max(out_degs)}  mean={sum(out_degs)/len(out_degs):.2f}")
+                mappings.append({
+                    "source_cluster_id": super_cluster_id,
+                    "target_cluster_id": cross_cluster_id,
+                    "mapping_type": "PARENT_CHILD",
+                    "created_at": now
+                })
 
-    # ---- Pick one CUI, show its neighborhood ----
-    print("\n" + "=" * 70)
-    print("SAMPLE NEIGHBORHOOD")
-    print("=" * 70)
-    sample = next(iter(G.nodes()), None)
-    if sample is not None:
-        print(f"  node: {sample!r}")
-        if G.is_directed():
-            preds = list(G.predecessors(sample))[:8]
-            succs = list(G.successors(sample))[:8]
-            print(f"  predecessors ({G.in_degree(sample)}): {preds}")
-            print(f"  successors   ({G.out_degree(sample)}): {succs}")
-        else:
-            nbrs = list(G.neighbors(sample))[:8]
-            print(f"  neighbors ({G.degree(sample)}): {nbrs}")
+            cross_cluster_id = created_cross_clusters[cross_key]
+
+            members.append({
+                "cluster_id": cross_cluster_id,
+                "cui": origin_cui,
+                "cui_name": origin_name,
+                "semantic_type": origin_sem,
+                "role": "ORIGIN",
+                "created_at": now
+            })
+
+            members.append({
+                "cluster_id": cross_cluster_id,
+                "cui": target_cui,
+                "cui_name": target_name,
+                "semantic_type": target_sem,
+                "role": "TARGET",
+                "created_at": now
+            })
+
+    return clusters, members, mappings
+def run_clustering():
+
+    client = bigquery.Client(project=PROJECT_ID)
 
 
+    print("Fetching relation graph...")
+    df = fetch_relation_data(client)
+
+    print(f"Fetched {len(df)} rows")
+
+    print("Building clusters...")
+    clusters, members, mappings = build_clusters(df)
+
+    import pandas as pd
+
+    cluster_df = pd.DataFrame(clusters).drop_duplicates()
+
+    member_df = pd.DataFrame(members).drop_duplicates()
+
+    map_df = pd.DataFrame(mappings).drop_duplicates()
+
+    print("Loading cluster table...")
+    load_dataframe_to_bigquery(
+        client,
+        cluster_df,
+        CLUSTER_TABLE
+    )
+
+    print("Loading member table...")
+    load_dataframe_to_bigquery(
+        client,
+        member_df,
+        MEMBER_TABLE
+    )
+
+    print("Loading map table...")
+    load_dataframe_to_bigquery(
+        client,
+        map_df,
+        MAP_TABLE
+    )
+
+    print("Scenario 4 clustering completed")
+
+    return {
+        "clusters": len(cluster_df),
+        "members": len(member_df),
+        "mappings": len(map_df)
+    }
+
+# Execute
 if __name__ == "__main__":
-    print(f"Loading graph from {HG_PATH}...")
-    G = load_graph(HG_PATH)
-    inspect(G)
-    print("\n" + "=" * 70)
-    print("Paste this output back to design the topic logic.")
-    print("=" * 70)
+
+    result = run_clustering()
+
+    print(result)
