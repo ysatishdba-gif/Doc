@@ -1,5 +1,7 @@
 import json
+import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -9,32 +11,115 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+# Silence noisy SDK / HTTP client loggers.
+for _name in ("google_genai", "httpx", "httpcore", "urllib3", "google"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
-# ===========================================================================
-# PROMPTS
-# ===========================================================================
+
+RELEVANCE_CHECK_PROMPT = """
+You are a routing gate for a clinical AI system. Classify the ORIGINAL user query into exactly ONE action category that describes the intended source for answering it, then decide whether downstream clinical extraction should run.
+
+====================================================
+ACTION CATEGORIES
+====================================================
+
+1. "conversational_response"
+   When applies:
+   - Greetings, small talk, courtesy acknowledgments, general non-clinical chat
+   - Patient-facing simplified explanations of conditions, anatomy, or basic health concepts (not chart-specific)
+   - Ambiguous, incomplete, or unparseable queries needing clarification
+   Examples: "Hi", "Thanks for your help", "Explain hypertension simply", "What is type 2 diabetes?", "How does my pacemaker work?", "Pain", "Tell me about it", "Help"
+
+2. "information_retrieval"
+   When applies:
+   - Any query whose answer is documented in patient charts, clinical records, internal protocols, drug references, lab references, or research literature
+   - Chart-specific lookups, protocol lookups, drug interaction lookups
+   Examples: "What's the patient's last A1C?", "What's our chest-pain protocol?", "Patient has type 2 diabetes - what are the latest treatment options?", "Drug interactions between metformin and contrast dye"
+
+3. "knowledge_fact_search"
+   When applies:
+   - Clinician-facing informational guidance — treatment overviews, standards of care, symptom management, prevention recommendations
+   - Non-prescriptive clinical guidance for a clinical audience (no specific patient context)
+   Examples: "What's the standard of care for early-stage breast cancer?", "How should I manage post-op nausea?", "Prevention recommendations for recurrent UTI"
+
+4. "admin_response"
+   When applies (either branch):
+   - SYMPTOM TRIAGE: symptoms, acute complaints, possible emergencies, severity assessment, disposition guidance
+   - OPERATIONAL WORKFLOW: scheduling, billing, registration, prior authorization, referrals, records requests, refills, claims
+   Examples: "Sudden weakness on one side", "Chest pain and sweating", "Should I go to the ER for this fever?", "Book me a cardiology appointment Tuesday", "Cancel my Friday appointment", "Refill my metformin", "Why was this claim denied?"
+
+5. "out_of_scope"
+   When applies:
+   - Unsafe medical instructions, self-harm, restricted clinical actions, prohibited content
+   - Entirely non-medical or off-topic queries
+   Examples: "How do I overdose safely?", "Write me a fake prescription", "What's the weather tomorrow?", "Recommend a restaurant in Chicago", "Tell me a joke"
+
+====================================================
+ROUTING DECISION (is_processable)
+====================================================
+
+Pick exactly ONE action — the primary one. When a query could fit multiple categories, pick the one that best describes how the answer should be produced. If a query is ambiguous (e.g., symptom triage that could also benefit from chart lookup), pick the one whose response shape is the most actionable for the user; do not try to express multiple intents.
+
+Per-action mapping to is_processable:
+- information_retrieval     -> processable
+- knowledge_fact_search     -> processable
+- admin_response (symptom triage branch)   -> processable
+- admin_response (operational branch)      -> not processable
+- conversational_response   -> not processable
+- out_of_scope              -> not processable
+
+is_processable=true means downstream intent extraction will run. is_processable=false short-circuits the pipeline; the action label tells the caller how to respond instead.
+
+====================================================
+PRAGMATIC SIGNALS
+====================================================
+
+Read the ORIGINAL query as written, before any expansion:
+- Verb form and addressee: questions to staff about staff actions ("Have you been instructed to...", "Did you verify...") are conversational/operational, not record queries.
+- Wrapper text: instructions ABOUT the utterance ("SCHEDULER INFO ONLY", "DO NOT READ ALOUD", "FOR INTERNAL USE") signal operational direction, not a data request.
+- Imperatives to the reader ("select", "click", "navigate", "confirm") are behaviors, not retrievals.
+- Patient-voice phrasing ("my", "I have", "should I") + simple explanation request -> conversational_response, not information_retrieval.
+- Clinician-voice phrasing + patient context ("the patient's...", "my patient with...") -> information_retrieval.
+
+DEFAULTS when uncertain:
+- Between information_retrieval and knowledge_fact_search -> prefer information_retrieval.
+- Between admin_response (triage) and information_retrieval -> prefer information_retrieval (downstream has its own safeguards).
+- Between processing and rejecting overall -> prefer is_processable=true.
+
+====================================================
+OUTPUT
+====================================================
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "action": "<one of: conversational_response | information_retrieval | knowledge_fact_search | admin_response | out_of_scope>",
+  "is_processable": <true | false>
+}}
+
+Original query: {query}
+"""
 
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
-
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
-
 INSTRUCTIONS:
 1. Expand ALL medical abbreviations to full terms (e.g., HTN → Hypertension, DM → Diabetes Mellitus, SOB → Shortness of Breath)
-2. Clarify vague medical terms with specific clinical language
-3. Add relevant medical context based on standard clinical practice
+2. Clarify vague medical terms with specific clinical language — always enumerate specifics when the query names a broad category (vitals, labs, imaging, medications, allergies, implants, etc.)
+3. Add relevant medical context based on standard clinical practice, even when no abbreviations are present
 4. Identify implicit clinical concepts that should be explicit
 5. DO NOT add assumptions beyond reasonable clinical interpretation
 6. DO NOT include action verbs like "analyze", "review", "check" unless in original query
 7. DO NOT hallucinate information not implied by the query
 8. Maintain the original query's intent and scope
-9.Make sure the Temporal accept is relevant to the Query context
+9. Make sure the Temporal accept is relevant to the Query context
 
 EXAMPLES:
 - "Pt with DM" → "Patient with Diabetes Mellitus"
 - "Check vitals" → "Vital signs measurement including blood pressure, heart rate, temperature, respiratory rate, oxygen saturation"
 - "Family hx of heart disease" → "Cardiovascular disease in family including coronary artery disease, myocardial infarction, heart failure"
 - "SOB on exertion" → "Shortness of breath on exertion"
+- "Current medicine list" → "Current active medication list including prescription medications, dosages, frequencies, and routes of administration"
+- "Do you have an implanted device?" → "Presence of an implanted medical device, including cardiac implants (pacemaker, defibrillator), orthopedic implants, neurostimulators, or other surgical implants"
 
 Return ONLY valid JSON (no markdown, no explanation):
 {{
@@ -109,6 +194,14 @@ For each intent:
 3. **nature** - What is the primary informational purpose? (Format: [Context] / [Purpose])
 4. **sub_natures[]** - What are the distinct dimensions of this information?
 5. **final_queries[]** - How would this appear in clinical documents?
+6. **representative_terms[]** - A short list (typically 1–3) of named clinical entities this intent is about. Read the intent's nature, sub_natures, and atomic_concepts together.Each term must name a thing that a typical
+   patient chart has its own section, list, or record for — diagnoses,medications, tests, procedures, devices, allergies, billing, insurance,visits, etc. If a candidate doesn't correspond to a chart section,drop it.
+
+   Ask: "what is this question ABOUT?" The answer is a named entity — a noun the chart has a section for — like "chemotherapy", "cancer", "medications". Pick the canonical name. NOT descriptive paraphrases or action phrases that wrap the entity in qualifiers (e.g. "prior systemic anti-cancer treatments", "review of pharmacotherapy"). The wrapping language describes what's being done WITH the entity; the entity is the subject — pick the subject.
+
+   A modifier narrows or scopes the question — it's a property of an entity, not the entity itself. Apply the deletion test: remove the candidate term from the question. If the question still makes coherent clinical sense without it, the term was a modifier — drop it. If removing it makes the question incoherent, the term is the subject — keep it. "Have you had a CT scan in the last 12 months" — remove "CT scan" and the question collapses (subject); remove "12 months" and the question still asks about CT scans (modifier). Pick "CT scan" only.
+
+   Do NOT enumerate atomic_concepts — those decompose; representative_terms summarize. Each term must name a DIFFERENT entity. Synonyms, abbreviations, and qualifier-wrapped forms of the same entity collapse to ONE — pick the canonical short name. Examples: "CT scan" and "computed tomography" name the same entity → pick one, not both. "billing", "billing statement", "billing process" all wrap the same entity → pick "billing", not all three.
 
 ====================================================
 SUB_NATURE DECOMPOSITION
@@ -192,7 +285,7 @@ Extract atomic_concepts directly as queries. Keep them SHORT and PRECISE.
 
 **Query Characteristics:**
 - 2-5 words, meaningful clinical phrase
-- Must infer from nature and sub nature context 
+- Must infer from nature and sub nature context
 - A candidate is invalid if it is only a qualifier, modifier, temporal expression, severity descriptor, or status/action word without naming the  entity it applies to
 - If a modifier or status word is clinically important, bundle it with the entity it modifies so the candidate still names a concept
 - Use standard medical terminology
@@ -236,42 +329,151 @@ User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
-CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist mapping where each clinical concept substantively lives within medical records. You are NOT explaining the concept. You ARE mapping its documentation footprint across real-world clinical workflow.
+CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. You are NOT explaining the concept.
+Your role is to map each concept's documentation footprint in medical records and infer appropriate retrieval time windows.
 
-Return exactly {concept_count} entries. Each entry MUST have at least one temporal_phase with ALL fields populated. Return atomic_concept and intent_title exactly as provided.
+You must complete TWO TASKS in one response:
 
-For each concept, return temporal phases ordered chronologically. Each phase represents a distinct documentation moment — group what co-occurs: which documents are generated, who writes them, where, and what signals indicate the concept.
+TASK 1 — RETRIEVAL FACETS
+TASK 2 — TEMPORAL INFERENCE
 
-For each concept, reason through its complete documentation lifecycle:
-- Where is this concept first recorded? By whom? In what document? At what setting?
+Task 1 must be completed first, as its output grounds Task 2.
+
+====================================================
+TASK 1: RETRIEVAL FACETS
+====================================================
+
+Return exactly {concept_count} entries in concepts_with_context. Return atomic_concept and intent_title exactly as provided.
+
+The atomic_concept is the search target — do NOT restate it in any facet. The five facets describe the clinical context that helps locate it:
+
+- record_types: WHERE information is documented (pathology_report, radiology_report, progress_note, etc.)
+ORDERING REQUIREMENT (CRITICAL):
+- Return record_types in STRICT descending order of relevance to the atomic_concept
+- First item = most definitive source where this concept is primarily documented
+- Last item = least direct / more incidental documentation
+- Do NOT output random or arbitrary order
+- Do NOT include irrelevant record types just to fill space
+- Keep list focused (typically 3–6 items)
+
+Relevance definition:
+- Highest: where the concept is directly created, measured, or diagnosed
+- Medium: where the concept is interpreted, discussed, or managed
+- Lowest: where the concept is summarized or passively mentioned
+
+If unsure, follow clinical workflow:
+diagnostic source > specialist interpretation > general documentation > summaries
+- author_roles: WHO documents the information (pathologist, radiologist, primary_care_physician, etc.)
+- longitudinal_scope: WHEN in the clinical lifecycle the information is documented (diagnostic_workup, active_treatment, follow_up, etc.)
+- content_signals: WHAT validates the information (icd_diagnosis_code, loinc_lab_code, measurement_value, structured_finding, etc.)
+- clinical_settings: IN WHAT SETTING information is documented (inpatient, outpatient, emergency_department, intensive_care_unit, etc.)
+
+For each concept, reason through its complete documentation footprint:
+- Where is this concept substantively recorded? By whom? In what setting?
 - Who evaluates or acts on it further? What additional documents are generated?
 - If severity or complexity increases, who gets involved? Where does documentation shift?
 - How is it tracked or summarized over time? Where does longitudinal documentation live?
 - Could it appear across different care settings depending on clinical circumstances?
 
-A new phase is justified only when the documentation pattern changes — different people, different documents, different settings, or different signals. If nothing changes, it is the same phase. The same author, setting, or document type can appear in multiple phases when clinically realistic.
-
 Include only sources where this concept is substantively documented — where a clinician would find meaningful clinical detail, assessment, or action. Exclude sources where the concept is merely listed, copied, or referenced in passing.
 
-All values must follow: "snake_case_term - documentation-focused definition"
+RULES:
+- Reason about THIS concept inside THIS intent inside THIS query. Do not emit generic filler lists that apply to every concept.
+- Facets must be internally coherent: if cardiologist authors it, record_types should be cardiology-relevant.
+- Use short snake_case strings. No tooltips. No prose.
+- An empty list means "reasoned and concluded this does not apply." record_types and author_roles should rarely be empty.
+
+====================================================
+TASK 2: TEMPORAL INFERENCE
+====================================================
+
+Task 2 operates at the intent level and may differ from the lifecycle scope in Task 1.
+
+Produce `temporal_by_intent`.
+
+For each intent:
+- Include intent_title (unchanged)
+- Include candidates (one per candidate)
+- Each candidate must include a `temporal_signal` (LIST)
+
+TEMPORAL SIGNAL (facet definition):
+- temporal_signal: WHAT TIME WINDOWS apply for retrieval. Each entry is a string. The actual values are derived from the query's wording and the concept's clinical nature — there is NO fixed vocabulary to draw from.
+
+TEMPORAL SIGNAL TYPES:
+
+Four categories. The values you emit come from the query's own language; do not pull from a predefined list.
+
+- RELATIVE: a duration or recency window expressed in the query's words
+- ABSOLUTE: the ISO date-range form of a RELATIVE signal — YYYY-MM-DD to YYYY-MM-DD, anchored to the query's reference date
+- STATE: a lifecycle qualifier — whether the concept is being asked about as present, ongoing, resolved, or past
+- RANK: an ordering cue — when the query asks for a positional pick rather than all instances
+
+Use the query's wording verbatim when it is unambiguous. Normalize only when the query's wording is vague, and derive the normalization from the concept's documentation cadence — not from a fixed lookup.
+
+EMISSION RULES:
+
+Emit ONLY the forms that are anchored in the query or in the concept's nature. Do NOT fabricate a window to "cover all types."
+
+- Emit RELATIVE only when the query expresses a duration or recency window in its wording.
+- Emit ABSOLUTE only when RELATIVE is present — it is the ISO form of that span.
+- Emit STATE only when (a) the query frames the concept as a state through its wording or tense, or (b) the concept is inherently a state — meaning its clinical documentation has no useful interpretation without a state qualifier.
+- Emit RANK only when the query asks for a positional pick (one or more specific positions in an ordered set).
+
+If the query carries no temporal cue and the concept is not inherently a state, return an empty list. An empty temporal_signal is a valid and often correct answer.
+
+INFERENCE PRINCIPLES:
+
+1. The query's wording is the primary anchor. Verb tense, phrasing, framing, and explicit time words are all signals — read them together.
+
+2. When the query expresses a span vaguely, normalize it using the concept's documentation cadence — how often that modality is typically generated, reviewed, or considered current in clinical workflow. Cadence is a property of the concept type, not a fixed table.
+
+3. Do NOT invent a temporal cue the query does not carry. A query with no temporal language and a non-stateful concept yields an empty list — that is the correct answer, not a failure.
+
+4. For concepts whose clinical documentation requires a state qualifier to be meaningful, emit STATE even if the query does not use a state word — but the qualifier you emit must reflect what the query's framing supports.
+
+5. Match concept type to signal type:
+   - Concepts that represent an ongoing condition → STATE matching query framing
+   - Concepts that represent past events → STATE or RELATIVE matching query framing
+   - Diagnostics and measurements → RELATIVE only if the query carries a recency cue; the span follows the modality's cadence
+   - Ranked queries → RANK matching the query's ordering language
+
+6. When uncertain, prefer precision over breadth. An empty or narrow list beats a fabricated wider one.
+
+OUTPUT RULES:
+
+- temporal_signal must be a list of plain strings
+- Values come from the query's wording or are normalized via concept cadence — never from a fixed dictionary
+- Use ISO format for absolute date ranges: YYYY-MM-DD to YYYY-MM-DD
+- No explanations or prose
+- Empty list is valid when no meaningful temporal dimension applies
+
+====================================================
+INPUTS
+====================================================
 
 Original query: {original_query}
 Expanded query: {expanded_query}
-Concepts: {concepts_json}"""
+
+Intents with candidates:
+{intents_json}
+
+Concepts to document:
+{concepts_json}
+"""
 
 
-# ===========================================================================
+
 # LLM EXTRACTION SCHEMAS
-# ===========================================================================
 
-class PipelineInput(BaseModel):
-    query: str
-    verbose: bool = False
-
-    @field_validator("query", mode="before")
-    @classmethod
-    def ensure_string(cls, v):
-        return str(v).strip()
+class RelevanceCheckOutput(BaseModel):
+    action: Literal[
+        "conversational_response",
+        "information_retrieval",
+        "knowledge_fact_search",
+        "admin_response",
+        "out_of_scope",
+    ] = "information_retrieval"
+    is_processable: bool = True
 
 
 class QueryExpansionOutput(BaseModel):
@@ -300,6 +502,9 @@ class Intent(BaseModel):
     nature: str = ""
     sub_natures: List[SubNature] = Field(default_factory=list)
     final_queries: List[str] = Field(default_factory=list)
+    # LLM-synthesized entity-level phrases (1–3) summarizing the intent.
+    # Not atomic_concepts copied verbatim — see INTENT STRUCTURE item 6.
+    representative_terms: list = Field(default_factory=list)
 
 
 class IntentExtractionResponse(BaseModel):
@@ -323,70 +528,99 @@ class IntentExtractionOutput(BaseModel):
     total_intents_detected: int = 0
     intents: List[Intent] = Field(default_factory=list)
 
-    @model_validator(mode="after")
-    def fix_intent_count(self) -> "IntentExtractionOutput":
-        self.total_intents_detected = len(self.intents)
-        return self
-
 
 # Contextual environment schemas
 
-class TemporalPhase(BaseModel):
-    phase_name: str = ""
-    document_types: List[str] = Field(default_factory=list)
+class ConceptContext(BaseModel):
+    """Flat retrieval capsule per atomic concept. Five facets describe where,
+    who, when, what, and in what setting the concept is documented. The
+    atomic_concept itself is the search target."""
+
+    atomic_concept: str
+    intent_title: str = ""
+    record_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
+    longitudinal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_settings: List[str] = Field(default_factory=list)
 
 
-class ConceptContext(BaseModel):
-    atomic_concept: str
-    intent_title: str = ""
-    temporal_phases: List[TemporalPhase] = Field(default_factory=list)
+class CandidateTemporal(BaseModel):
+    candidate: str
+    temporal_signal: List[str] = Field(default_factory=list)
+
+    @field_validator("temporal_signal", mode="before")
+    @classmethod
+    def strip_type_prefix(cls, v: Any) -> List[str]:
+        """Strip LLM-emitted type prefixes (STATE:, Status:, RELATIVE:,
+        ABSOLUTE:, RANK:) — we want bare values like "Active", not
+        "STATE: Active". Case-insensitive; empties dropped."""
+        if not isinstance(v, list):
+            return v
+        prefix_re = re.compile(
+            r"^\s*(?:state|status|relative|absolute|rank)\s*[:\-–]\s*",
+            re.IGNORECASE,
+        )
+        cleaned: List[str] = []
+        for item in v:
+            if not isinstance(item, str):
+                continue
+            s = prefix_re.sub("", item).strip()
+            if s:
+                cleaned.append(s)
+        return cleaned
+
+
+class IntentTemporal(BaseModel):
+    intent_title: str
+    candidates: List[CandidateTemporal] = Field(default_factory=list)
+
+
+class TemporalExtractionOutput(BaseModel):
+    intents: List[IntentTemporal] = Field(default_factory=list)
 
 
 class ContextualEnvironmentOutput(BaseModel):
     concepts_with_context: List[ConceptContext] = Field(default_factory=list)
+    temporal_by_intent: List[IntentTemporal] = Field(default_factory=list)
 
 
-# ===========================================================================
+
 # OUTPUT SCHEMAS
-# ===========================================================================
+
 
 class RetrievalContext(BaseModel):
-    document_types: List[str] = Field(default_factory=list)
+    record_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
-    temporal_scope: List[str] = Field(default_factory=list)
+    longitudinal_scope: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
-    context_sentences: List[str] = Field(default_factory=list)
 
 
 class FlatRetrievalSignals(BaseModel):
-    document_types: List[str] = Field(default_factory=list)
+    record_types: List[str] = Field(default_factory=list)
     author_roles: List[str] = Field(default_factory=list)
-    temporal_signals: List[str] = Field(default_factory=list)  # renamed from temporal_scope
+    longitudinal_scope: List[str] = Field(default_factory=list)
+    temporal_signal: List[str] = Field(default_factory=list)
     content_signals: List[str] = Field(default_factory=list)
     clinical_setting: List[str] = Field(default_factory=list)
     context_sentences: List[str] = Field(default_factory=list)
 
     @classmethod
     def from_retrieval_context(cls, ctx: "RetrievalContext") -> "FlatRetrievalSignals":
-        """Convert a structured RetrievalContext into a deduped list form."""
-        def _strip(v: str) -> str:
-            return v.split(" - ", 1)[0].replace("_", " ").strip() if v else ""
-
+        """Convert a structured RetrievalContext into a deduped list form.
+        temporal_signal and context_sentences are filled in by the caller."""
         def _as_list(lst: List[str]) -> List[str]:
-            cleaned = [_strip(v) for v in lst if v]
-            return list(dict.fromkeys(cleaned))  # dedup, preserve order
+            return list(dict.fromkeys(v.strip() for v in (lst or []) if v and v.strip()))
 
         return cls(
-            document_types=_as_list(ctx.document_types),
+            record_types=_as_list(ctx.record_types),
             author_roles=_as_list(ctx.author_roles),
-            temporal_signals=_as_list(ctx.temporal_scope),
+            longitudinal_scope=_as_list(ctx.longitudinal_scope),
+            temporal_signal=[],
             content_signals=_as_list(ctx.content_signals),
             clinical_setting=_as_list(ctx.clinical_setting),
-            context_sentences=ctx.context_sentences or [],
+            context_sentences=[],
         )
 
 
@@ -425,16 +659,16 @@ class Format_IntentExtraction(BaseModel):
     intents: List[IntentSummaryItem]
     is_clinical: bool
     rejected_reason: Optional[str] = None
-    timestamp: str
+    representative_terms: list = Field(default_factory=list)
 
 
 class Format_FinalQueries(BaseModel):
     user_query: str
     is_clinical: bool
     rejected_reason: Optional[str] = None
+    representative_terms: list = Field(default_factory=list)
     total_candidates: int
     final_candidates: List[FinalCandidateItem]
-    timestamp: str
 
 
 class Format_NatureBreakdown(BaseModel):
@@ -442,8 +676,8 @@ class Format_NatureBreakdown(BaseModel):
     reason: Optional[str] = None
     original_query: str
     total_intents_detected: int
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithoutQueries]
-    timestamp: str
 
 
 class Format_FullPipeline(BaseModel):
@@ -452,13 +686,18 @@ class Format_FullPipeline(BaseModel):
     original_query: str
     expanded_query: str
     total_intents_detected: int
+    representative_terms: list = Field(default_factory=list)
     intents: List[IntentWithContext]
-    timestamp: str
 
 
-# ===========================================================================
+
 # EXTRACTION RESULT — holds all intermediate data; emits all format views
-# ===========================================================================
+
+
+# Sentinel emitted in temporal_signal when no temporal constraint applies,
+# so downstream apps see a guaranteed non-empty list (read [0], branch on NA).
+NO_TEMPORAL_PLACEHOLDER = "current"
+
 
 class ExtractionResult:
 
@@ -468,142 +707,146 @@ class ExtractionResult:
         expansion: QueryExpansionOutput,
         intents: IntentExtractionOutput,
         context: Optional[ContextualEnvironmentOutput],
+        temporal: Optional[TemporalExtractionOutput],
         processing_time: float,
     ):
         self.original_query = original_query
         self.expansion = expansion
         self.intents = intents
         self.context = context
+        self.temporal = temporal
         self.processing_time = processing_time
-        self.timestamp = datetime.utcnow().isoformat()
 
-    # -- helpers --
+        # Build O(1) lookup index for concept contexts
+        self._concept_index: Optional[Dict[str, ConceptContext]] = None
+        if context and context.concepts_with_context:
+            self._concept_index = {
+                cc.atomic_concept.strip().lower(): cc
+                for cc in context.concepts_with_context
+            }
 
-    @staticmethod
-    def _clean(v: str) -> str:
-        if not v:
-            return ""
-        if " - " in v:
-            k, d = v.split(" - ", 1)
-            return k.replace("_", " ") + " - " + d
-        return v.replace("_", " ")
+    def _build_context_sentences(
+        self,
+        candidate: str,
+        ctx: RetrievalContext,
+    ) -> List[str]:
+        """Build descriptive sentence(s) from the candidate's retrieval context,
+        pairing the concept with where/by whom/in what setting it is documented.
+        Returns [] if there is no substantive context to describe."""
 
-    @staticmethod
-    def _pfx(v: str) -> str:
-        if not v:
-            return ""
-        return (
-            v.split(" - ", 1)[0].replace("_", " ")
-            if " - " in v
-            else v.replace("_", " ")
-        )
+        def _join(items: List[str]) -> str:
+            parts = [v.strip().replace("_", " ") for v in (items or []) if v and v.strip()]
+            if not parts:
+                return ""
+            if len(parts) == 1:
+                return parts[0]
+            if len(parts) == 2:
+                return f"{parts[0]} and {parts[1]}"
+            return ", ".join(parts[:-1]) + f", and {parts[-1]}"
 
-    @staticmethod
-    def _join(items: List[str]) -> str:
-        parts = [ExtractionResult._pfx(v) for v in (items or []) if v]
-        if not parts:
-            return ""
-        if len(parts) == 1:
-            return parts[0]
-        if len(parts) == 2:
-            return f"{parts[0]} and {parts[1]}"
-        return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
-    @staticmethod
-    def _dedup(values: List[str]) -> List[str]:
-        seen, out = set(), []
-        for v in values or []:
-            if not v:
-                continue
-            k = v.split(" - ", 1)[0].strip().lower()
-            if k and k not in seen:
-                out.append(v)
-                seen.add(k)
-        return out
-
-    @staticmethod
-    def _flatten_and_build(
-        concept_name: str, phases: List[TemporalPhase]
-    ) -> Tuple[List[str], List[str], List[str], List[str], List[str], List[str]]:
-        docs, auths, temps, sigs, setts, sentences = [], [], [], [], [], []
-        for p in phases or []:
-            if not p.document_types or not p.author_roles:
-                continue
-            if p.phase_name:
-                temps.append(p.phase_name)
-            docs.extend(p.document_types or [])
-            auths.extend(p.author_roles or [])
-            sigs.extend(p.content_signals or [])
-            setts.extend(p.clinical_settings or [])
-            d = ExtractionResult._join(p.document_types)
-            a = ExtractionResult._join(p.author_roles)
-            se = ExtractionResult._join(p.clinical_settings)
-            si = ExtractionResult._join(p.content_signals)
-            parts = [concept_name, f"documented in {d}", f"by {a}"]
-            if se:
-                parts.append(f"at {se}")
-            if si:
-                parts.append(f"capturing {si}")
-            sentences.append(", ".join(parts) + ".")
-        cl = ExtractionResult._clean
-        dd = ExtractionResult._dedup
-        return (
-            dd([cl(v) for v in docs]),
-            dd([cl(v) for v in auths]),
-            dd([cl(v) for v in temps]),
-            dd([cl(v) for v in sigs]),
-            dd([cl(v) for v in setts]),
-            sentences,
-        )
-
-    def _get_phases(self, atomic_concept: str) -> List[TemporalPhase]:
-        if not self.context or not self.context.concepts_with_context:
+        if not ctx or not (ctx.record_types or ctx.author_roles):
             return []
-        key = atomic_concept.strip().lower()
-        for cc in self.context.concepts_with_context:
-            if cc.atomic_concept.strip().lower() == key:
-                return cc.temporal_phases or []
-        return []
+
+        docs = _join(ctx.record_types)
+        auths = _join(ctx.author_roles)
+        setts = _join(ctx.clinical_setting)
+        sigs = _join(ctx.content_signals)
+
+        parts = [candidate]
+        if docs:
+            parts.append(f"documented in {docs}")
+        if auths:
+            parts.append(f"by {auths}")
+        if setts:
+            parts.append(f"at {setts}")
+        if sigs:
+            parts.append(f"capturing {sigs}")
+
+        return [", ".join(parts) + "."]
+
+    # helpers
+
+    @staticmethod
+    def _aggregate_facets(
+        concepts: List[ConceptContext],
+    ) -> Tuple[List[str], List[str], List[str], List[str], List[str]]:
+        """Union the five facets across one or more concept contexts, deduped."""
+        records, authors, scope, signals, settings = [], [], [], [], []
+        for cc in concepts or []:
+            records.extend(cc.record_types or [])
+            authors.extend(cc.author_roles or [])
+            scope.extend(cc.longitudinal_scope or [])
+            signals.extend(cc.content_signals or [])
+            settings.extend(cc.clinical_settings or [])
+        _dd = lambda xs: list(dict.fromkeys(x for x in xs if x))
+        return _dd(records), _dd(authors), _dd(scope), _dd(signals), _dd(settings)
+
+    def _get_concept_context(self, atomic_concept: str) -> Optional[ConceptContext]:
+        """O(1) lookup via cached index."""
+        if self._concept_index is None:
+            return None
+        return self._concept_index.get(atomic_concept.strip().lower())
+
+    def _temporal_for_candidate(self, intent_title: str, candidate: str) -> List[str]:
+        """Resolve a candidate's temporal signal from Task 2.
+
+        Priority: own emitted signal -> intent-level union (cascade
+        safety net for when the LLM forgets to propagate) ->
+        [NO_TEMPORAL_PLACEHOLDER]. Downstream always sees a non-empty list."""
+        if not self.temporal or not self.temporal.intents:
+            return [NO_TEMPORAL_PLACEHOLDER]
+        ikey = intent_title.strip().lower()
+        ckey = candidate.strip().lower()
+        for it in self.temporal.intents:
+            if it.intent_title.strip().lower() != ikey:
+                continue
+            own: List[str] = []
+            intent_union: List[str] = []
+            seen: set = set()
+            for co in it.candidates or []:
+                sig = list(co.temporal_signal or [])
+                if co.candidate.strip().lower() == ckey:
+                    own = sig
+                for s in sig:
+                    k = s.strip().lower()
+                    if k and k not in seen:
+                        intent_union.append(s)
+                        seen.add(k)
+            result = own if own else intent_union
+            return result if result else [NO_TEMPORAL_PLACEHOLDER]
+        return [NO_TEMPORAL_PLACEHOLDER]
 
     def _build_ctx(self, concept_name: str) -> RetrievalContext:
-        phases = self._get_phases(concept_name)
-        if not phases:
+        cc = self._get_concept_context(concept_name)
+        if cc is None:
             return RetrievalContext()
-        docs, auths, temps, sigs, setts, sents = self._flatten_and_build(
-            concept_name, phases
-        )
+        records, authors, scope, signals, settings = self._aggregate_facets([cc])
         return RetrievalContext(
-            document_types=docs,
-            author_roles=auths,
-            temporal_scope=temps,
-            content_signals=sigs,
-            clinical_setting=setts,
-            context_sentences=sents,
+            record_types=records,
+            author_roles=authors,
+            longitudinal_scope=scope,
+            content_signals=signals,
+            clinical_setting=settings,
         )
 
-    def _build_intent_ctx(self, intent_title: str) -> RetrievalContext:
-        if not self.context or not self.context.concepts_with_context:
-            return RetrievalContext()
-        all_phases: List[TemporalPhase] = []
-        key = intent_title.strip().lower()
-        for cc in self.context.concepts_with_context:
-            if cc.intent_title.strip().lower() == key:
-                all_phases.extend(cc.temporal_phases or [])
-        if not all_phases:
-            return RetrievalContext()
-        docs, auths, temps, sigs, setts, sents = self._flatten_and_build(
-            intent_title, all_phases
-        )
-        return RetrievalContext(
-            document_types=docs,
-            author_roles=auths,
-            temporal_scope=temps,
-            content_signals=sigs,
-            clinical_setting=setts,
-            context_sentences=sents,
-        )
+    # format methods
 
-    # -- format methods --
+    def _representative_terms(self) -> List[str]:
+        """Flatten per-intent representative_terms into one case-insensitively
+        deduped list."""
+        terms: List[str] = []
+        seen: set = set()
+        for intent in self.intents.intents:
+            for t in intent.representative_terms or []:
+                t_clean = str(t).strip()
+                if not t_clean:
+                    continue
+                key = t_clean.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                terms.append(t_clean)
+        return terms
 
     def to_intent_extraction(self) -> Dict[str, Any]:
         items = [
@@ -615,7 +858,7 @@ class ExtractionResult:
             intents=items,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
-            timestamp=self.timestamp,
+            representative_terms=self._representative_terms(),
         )
         return result.model_dump()
 
@@ -632,6 +875,13 @@ class ExtractionResult:
                     seen.add(key)
                     idx += 1
                     rich_ctx = self._build_ctx(c.strip())
+                    signals = FlatRetrievalSignals.from_retrieval_context(rich_ctx)
+                    signals.temporal_signal = self._temporal_for_candidate(
+                        i.intent_title, c.strip()
+                    )
+                    signals.context_sentences = self._build_context_sentences(
+                        c.strip(), rich_ctx
+                    )
                     candidates.append(
                         FinalCandidateItem(
                             candidate_id=f"fc_{idx:03d}",
@@ -639,18 +889,16 @@ class ExtractionResult:
                             nature=i.nature,
                             sub_nature=sn.category_path,
                             candidate=c.strip(),
-                            retrieval_signals=FlatRetrievalSignals.from_retrieval_context(
-                                rich_ctx
-                            ),
+                            retrieval_signals=signals,
                         )
                     )
         result = Format_FinalQueries(
             user_query=self.original_query,
             is_clinical=self.intents.is_clinical,
             rejected_reason=self.intents.reason,
+            representative_terms=self._representative_terms(),
             total_candidates=len(candidates),
             final_candidates=candidates,
-            timestamp=self.timestamp,
         )
         return result.model_dump()
 
@@ -669,15 +917,24 @@ class ExtractionResult:
             reason=self.intents.reason,
             original_query=self.intents.original_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intents_no_queries,
-            timestamp=self.timestamp,
         )
         return result.model_dump()
 
     @staticmethod
     def _merge_signals(candidates: List[FinalCandidateItem]) -> FlatRetrievalSignals:
+        """Merge candidate-level signals into an intent-level view.
+        Every facet (including temporal_signal and context_sentences) is the
+        dedup'd union of its candidates' values.
+
+        Special case for temporal_signal: if any candidate emitted a real
+        temporal value while others emitted [NO_TEMPORAL_PLACEHOLDER], the
+        intent-level view should reflect only the real values — keeping
+        "NA" alongside concrete cues like "last 12 months" would be noise.
+        If every candidate is NA, keep [NA] so the intent-level list
+        stays non-empty (same contract as candidate-level)."""
         def _union(getter) -> List[str]:
-            """Union items across candidates, case-insensitive dedup, preserve order."""
             seen_vals: dict = {}
             for fc in candidates:
                 for val in getter(fc.retrieval_signals):
@@ -686,17 +943,22 @@ class ExtractionResult:
                         seen_vals[val.lower()] = val
             return list(seen_vals.values())
 
+        temporal = _union(lambda s: s.temporal_signal)
+        real_temporal = [t for t in temporal if t != NO_TEMPORAL_PLACEHOLDER]
+        if real_temporal:
+            temporal = real_temporal
+        elif not temporal:
+            # Defensive: every candidate fell through with []; keep contract.
+            temporal = [NO_TEMPORAL_PLACEHOLDER]
+
         return FlatRetrievalSignals(
-            document_types=_union(lambda s: s.document_types),
+            record_types=_union(lambda s: s.record_types),
             author_roles=_union(lambda s: s.author_roles),
-            temporal_signals=_union(lambda s: s.temporal_signals),
+            longitudinal_scope=_union(lambda s: s.longitudinal_scope),
+            temporal_signal=temporal,
             content_signals=_union(lambda s: s.content_signals),
             clinical_setting=_union(lambda s: s.clinical_setting),
-            context_sentences=[
-                sent
-                for fc in candidates
-                for sent in fc.retrieval_signals.context_sentences
-            ],
+            context_sentences=_union(lambda s: s.context_sentences),
         )
 
     def to_full_pipeline(self) -> Dict[str, Any]:
@@ -716,6 +978,13 @@ class ExtractionResult:
                     seen.add(key)
                     idx += 1
                     rich_ctx = self._build_ctx(c.strip())
+                    signals = FlatRetrievalSignals.from_retrieval_context(rich_ctx)
+                    signals.temporal_signal = self._temporal_for_candidate(
+                        intent.intent_title, c.strip()
+                    )
+                    signals.context_sentences = self._build_context_sentences(
+                        c.strip(), rich_ctx
+                    )
                     items.append(
                         FinalCandidateItem(
                             candidate_id=f"fc_{idx:03d}",
@@ -723,9 +992,7 @@ class ExtractionResult:
                             nature=intent.nature,
                             sub_nature=sn.category_path,
                             candidate=c.strip(),
-                            retrieval_signals=FlatRetrievalSignals.from_retrieval_context(
-                                rich_ctx
-                            ),
+                            retrieval_signals=signals,
                         )
                     )
             return items
@@ -733,8 +1000,8 @@ class ExtractionResult:
         intent_blocks = []
         for i in self.intents.intents:
             candidates = _make_candidates(i)
-            # Intent-level signals = union of its own candidates' signals.
-            # Consistent with and never wider than the candidate-level data.
+            # Intent-level signals = union of its own candidates' signals
+            # (including temporal_signal and context_sentences — deduped).
             intent_signals = self._merge_signals(candidates)
             intent_blocks.append(
                 IntentWithContext(
@@ -753,23 +1020,28 @@ class ExtractionResult:
             original_query=self.original_query,
             expanded_query=self.expansion.expanded_query,
             total_intents_detected=self.intents.total_intents_detected,
+            representative_terms=self._representative_terms(),
             intents=intent_blocks,
-            timestamp=self.timestamp,
         )
         return result.model_dump()
 
-    def to_all_formats(self) -> Dict[str, Dict[str, Any]]:
-        return {
-            "intent_extraction": self.to_intent_extraction(),
-            "final_queries": self.to_final_queries(),
-            "nature_breakdown": self.to_nature_breakdown(),
-            "full_pipeline": self.to_full_pipeline(),
-        }
 
 
-# ===========================================================================
 # PIPELINE CLASS
-# ===========================================================================
+
+
+def _fmt_action_label(action: Optional[str]) -> str:
+    """Format an action category for display (e.g. Status lines, logs).
+
+    snake_case -> 'Title case'.
+    Examples: 'admin_response' -> 'Admin response'
+              'information_retrieval' -> 'Information retrieval'
+              None / '' -> 'Unknown'
+    """
+    if not action:
+        return "Unknown"
+    return action.replace("_", " ").capitalize()
+
 
 class ContextualIntentPipeline:
 
@@ -779,41 +1051,39 @@ class ContextualIntentPipeline:
         location: str = "us-central1",
         model: str = "gemini-2.5-flash",
     ):
-        self.client = genai.Client(
-            vertexai=True, project=project, location=location
-        )
         self.project = project
         self.location = location
         self.model_name = model
+        # Per-thread genai.Client — the SDK isn't guaranteed thread-safe,
+        # and sharing under ThreadPoolExecutor caused degraded responses.
+        self._tls = threading.local()
 
-    # -- low-level helpers --
+    @property
+    def client(self) -> "genai.Client":
+        c = getattr(self._tls, "client", None)
+        if c is None:
+            c = genai.Client(
+                vertexai=True, project=self.project, location=self.location
+            )
+            self._tls.client = c
+        return c
 
-    def _extract_json(self, response) -> Dict[str, Any]:
+    # low-level helpers
+
+    def _extract_json(self, response) -> Any:
+        """Parse JSON from a model response. Relies on response_mime_type
+        to produce valid JSON; raises on malformed output."""
         if hasattr(response, "text"):
             text = response.text
         elif hasattr(response, "candidates") and response.candidates:
             text = response.candidates[0].content.parts[0].text
         else:
             text = str(response)
-        text = re.sub(r"```json\s*", "", text)
-        text = re.sub(r"```\s*", "", text)
-        text = text.strip()
-        try:
-            return json.loads(text)
-        except Exception:
-            pass
-        for pattern, flags in [(r"\{.*?\}", re.DOTALL), (r"\[.*?\]", re.DOTALL)]:
-            matches = sorted(
-                re.finditer(pattern, text, flags),
-                key=lambda m: len(m.group(0)),
-                reverse=True,
-            )
-            for match in matches:
-                try:
-                    return json.loads(match.group(0))
-                except Exception:
-                    continue
-        raise ValueError(f"Could not parse JSON from response: {text[:500]}...")
+        # Strip code fences defensively — some model versions emit them
+        # despite the API contract.
+        text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+        text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
 
     def _call_model(
         self,
@@ -822,62 +1092,64 @@ class ContextualIntentPipeline:
         fallback=None,
         max_tokens: int = 8192,
     ):
-        last_error: Optional[Exception] = None
-        for attempt in range(2):
-            try:
-                config = types.GenerateContentConfig(
-                    temperature=0.1,
-                    top_p=0.2,
-                    seed=23,
-                    max_output_tokens=max_tokens,
-                    response_mime_type="application/json",
-                    response_schema=schema,
+        """Single-attempt LLM call with structured output. On failure,
+        returns `fallback` if provided or re-raises."""
+        try:
+            config = types.GenerateContentConfig(
+                temperature=0.0,
+                top_p=0.2,
+                seed=23,
+                max_output_tokens=max_tokens,
+                response_mime_type="application/json",
+                response_schema=schema,
+            )
+            response = self.client.models.generate_content(
+                model=self.model_name, contents=prompt, config=config
+            )
+            data = self._extract_json(response)
+            if isinstance(data, list):
+                fields = schema.model_fields
+                list_field = next(
+                    (k for k, v in fields.items() if "List" in str(v.annotation)),
+                    None,
                 )
-                response = self.client.models.generate_content(
-                    model=self.model_name, contents=prompt, config=config
-                )
-                data = self._extract_json(response)
-                # If the model returned a bare list instead of a wrapped dict,
-                # coerce it using the schema's first list field name.
-                if isinstance(data, list):
-                    fields = schema.model_fields
-                    list_field = next(
-                        (
-                            k
-                            for k, v in fields.items()
-                            if "List" in str(v.annotation)
-                        ),
-                        None,
-                    )
-                    data = {list_field: data} if list_field else data
-                return schema.model_validate(data)
-            except Exception as e:
-                last_error = e
-                if attempt == 0:
-                    print(f"  Retry ({schema.__name__}): {str(e)[:100]}")
-                    continue
-                print(f"  Failed ({schema.__name__}): {str(e)[:150]}")
-                if fallback is not None:
-                    return fallback
-                raise
-        # Defensive: if we somehow exit the loop without returning, surface the error.
-        if fallback is not None:
-            return fallback
-        raise last_error if last_error else RuntimeError("LLM call failed with no error")
+                data = {list_field: data} if list_field else data
+            return schema.model_validate(data)
+        except Exception:
+            if fallback is not None:
+                return fallback
+            raise
 
     # -- pipeline steps --
 
+    def check_relevance(self, query: str) -> RelevanceCheckOutput:
+        """Step 0 — classify the query into one of five action categories
+        and decide whether downstream extraction should run. Runs on the
+        ORIGINAL query before expansion (expansion hides pragmatic
+        signals — wrappers, staff-directed verbs, patient-voice phrasing).
+        Fallback fails open to processable, so a flaky gate never drops
+        legitimate clinical queries silently."""
+        return self._call_model(
+            RELEVANCE_CHECK_PROMPT.format(query=query),
+            RelevanceCheckOutput,
+            fallback=RelevanceCheckOutput(
+                action="information_retrieval",
+                is_processable=True,
+            ),
+            max_tokens=512,
+        )
+
     def expand_query(self, query: str) -> QueryExpansionOutput:
-        """Step 1 — expand abbreviations and add clinical context."""
+        """Step 1 — normalize the query (abbreviations + explicit temporals)."""
         return self._call_model(
             QUERY_EXPANSION_PROMPT.format(query=query),
             QueryExpansionOutput,
             fallback=QueryExpansionOutput(expanded_query=query),
-            max_tokens=2048,
+            max_tokens=1024,
         )
 
     def extract_intents(
-        self, original_query: str, expanded_query: str
+        self, original_query: str, expanded_query: str,
     ) -> IntentExtractionOutput:
         """Step 2 — extract clinical intents with sub-natures."""
         prompt = INTENT_EXTRACTION_PROMPT.format(
@@ -890,7 +1162,7 @@ class ContextualIntentPipeline:
             fallback=IntentExtractionResponse(
                 is_clinical=False, reason="LLM call failed"
             ),
-            max_tokens=16384,
+            max_tokens=8192,
         )
         return IntentExtractionOutput(
             is_clinical=raw.is_clinical,
@@ -907,11 +1179,12 @@ class ContextualIntentPipeline:
         expanded_query: str,
         intent_out: IntentExtractionOutput,
     ) -> Optional[ContextualEnvironmentOutput]:
-        """Step 3 — map each atomic concept's documentation footprint."""
+        """Step 3 — map each atomic concept's documentation facets AND
+        produce temporal signals per intent / candidate in one LLM call."""
         if not intent_out.is_clinical or not intent_out.intents:
             return None
 
-        # collect unique atomic concepts
+        # Flat list of unique concepts (Task 1 target list)
         concepts: List[Dict[str, str]] = []
         seen: set = set()
         for i in intent_out.intents:
@@ -926,73 +1199,88 @@ class ContextualIntentPipeline:
         if not concepts:
             return None
 
+        # Rich per-intent structure (for Task 2 temporal reasoning)
+        intents_payload: List[Dict[str, Any]] = []
+        for i in intent_out.intents:
+            cand_entries: List[str] = []
+            seen_c: set = set()
+            for sn in i.sub_natures:
+                for c in sn.atomic_concepts:
+                    k = c.strip().lower()
+                    if k and k not in seen_c:
+                        cand_entries.append(c.strip())
+                        seen_c.add(k)
+            intents_payload.append({
+                "intent_title": i.intent_title,
+                "description": i.description,
+                "nature": i.nature,
+                "sub_natures": [
+                    {"category_path": sn.category_path,
+                     "atomic_concepts": list(sn.atomic_concepts or [])}
+                    for sn in i.sub_natures
+                ],
+                "candidates": cand_entries,
+            })
+
         return self._call_model(
             CONTEXTUAL_ENVIRONMENT_PROMPT.format(
                 original_query=query,
                 expanded_query=expanded_query,
                 concepts_json=json.dumps(concepts, indent=2),
                 concept_count=len(concepts),
+                intents_json=json.dumps(intents_payload, indent=2),
             ),
             ContextualEnvironmentOutput,
             fallback=ContextualEnvironmentOutput(),
-            max_tokens=32768,
+            max_tokens=16384,
         )
 
     # -- main entry points --
 
-    def extract(self, query: str, verbose: bool = False) -> ExtractionResult:
+    def extract(self, query: str) -> ExtractionResult:
         if not query or not query.strip():
             raise ValueError("Empty query provided")
 
         t0 = datetime.utcnow()
 
-        # Step 1 — query expansion (fast, ~2-3 s)
-        t1 = datetime.utcnow()
+        # Step 1 — query normalization
         expansion = self.expand_query(query)
-        t1e = (datetime.utcnow() - t1).total_seconds()
 
-        # Step 2 — intent extraction (sequential dependency on step 1)
-        t2 = datetime.utcnow()
+        # Step 2 — intent extraction
         intent_out = self.extract_intents(query, expansion.expanded_query)
-        t2e = (datetime.utcnow() - t2).total_seconds()
 
-        # Step 3 — contextual environment (the heavy step)
-        t3 = datetime.utcnow()
+        # Step 3 — contextual environment (context + temporal in one LLM call)
         context = self.build_context(query, expansion.expanded_query, intent_out)
-        t3e = (datetime.utcnow() - t3).total_seconds()
+
+        temporal: Optional[TemporalExtractionOutput] = None
+        if context is not None:
+            temporal = TemporalExtractionOutput(
+                intents=list(context.temporal_by_intent or [])
+            )
 
         processing_time = (datetime.utcnow() - t0).total_seconds()
 
-        if verbose:
-            nc = len(context.concepts_with_context) if context else 0
-            total_concepts = sum(
-                len(sn.atomic_concepts)
-                for i in intent_out.intents
-                for sn in i.sub_natures
+        candidate_count = sum(
+            len(sn.atomic_concepts)
+            for i in intent_out.intents
+            for sn in i.sub_natures
+        )
+        sub_nature_count = sum(len(i.sub_natures) for i in intent_out.intents)
+        print(f"Query     : {query[:80]}")
+        print(f"Expanded  : {expansion.expanded_query[:80]}")
+        if intent_out.is_clinical:
+            print("Status    : Clinical")
+            print(
+                f"Intents: {intent_out.total_intents_detected} | "
+                f"sub natures: {sub_nature_count} | "
+                f"candidates: {candidate_count}"
             )
-            print(f"Query     : {query[:80]}")
-            print(f"Expanded  : {expansion.expanded_query[:80]}")
-            if intent_out.is_clinical:
-                ts = sum(len(i.sub_natures) for i in intent_out.intents)
-                print("Status    : Clinical")
-                print(
-                    f"Intents   : {intent_out.total_intents_detected} | "
-                    f"Sub-natures: {ts} | "
-                    f"Concepts: {total_concepts} | "
-                    f"Contexts: {nc}"
-                )
-                print(
-                    f"Timing    : expand={t1e:.1f}s  "
-                    f"intents={t2e:.1f}s  "
-                    f"context={t3e:.1f}s  "
-                    f"total={processing_time:.1f}s"
-                )
-            else:
-                print(f"Status    : Non-clinical — {intent_out.reason}")
-            print()
+        else:
+            print(f"Status    : Non-clinical — {intent_out.reason}")
+        print()
 
         return ExtractionResult(
-            query, expansion, intent_out, context, processing_time
+            query, expansion, intent_out, context, temporal, processing_time,
         )
 
     def run(
@@ -1004,10 +1292,9 @@ class ContextualIntentPipeline:
             "nature_breakdown",
             "full_pipeline",
         ] = "full_pipeline",
-        verbose: bool = False,
     ) -> Dict[str, Any]:
         try:
-            result = self.extract(query, verbose)
+            result = self.extract(query)
             dispatch = {
                 "intent_extraction": result.to_intent_extraction,
                 "final_queries": result.to_final_queries,
@@ -1015,15 +1302,7 @@ class ContextualIntentPipeline:
                 "full_pipeline": result.to_full_pipeline,
             }
             return dispatch[output_format]()
-        except ValueError as e:
-            return {
-                "error": str(e),
-                "query": query,
-                "timestamp": datetime.utcnow().isoformat(),
-            }
         except Exception as e:
-            if verbose:
-                print(f"Error: {e}\n")
             return {
                 "error": str(e),
                 "query": query,
@@ -1031,40 +1310,13 @@ class ContextualIntentPipeline:
             }
 
 
-# ===========================================================================
-# UTILITIES
-# ===========================================================================
+
 
 def save_json(data: Dict, filename: str) -> None:
     with open(filename, "w") as f:
         json.dump(data, f, indent=2)
-    print(f"  Saved: {filename}")
+    print(f"Saved: {filename}")
 
-
-def print_results(result: Dict) -> None:
-    print(json.dumps(result, indent=2))
-
-
-def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]]:
-    schema_map = {
-        "intent_extraction": Format_IntentExtraction,
-        "final_queries": Format_FinalQueries,
-        "nature_breakdown": Format_NatureBreakdown,
-        "full_pipeline": Format_FullPipeline,
-    }
-    schema = schema_map.get(format_type)
-    if schema is None:
-        return False, f"Unknown format type: {format_type}"
-    try:
-        schema.model_validate(result)
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
-# ===========================================================================
-# OUTPUT CONFIG & BATCH RUNNER
-# ===========================================================================
 
 @dataclass
 class OutputConfig:
@@ -1098,12 +1350,14 @@ def run_single_query(
 
     enabled = config.enabled()
     if not enabled:
-        print(f"  No outputs enabled for query {idx} — skipping.")
         return {"query": query, "status": "skipped", "files": []}
 
-    result = pipeline.extract(query, verbose=True)
+    try:
+        result = pipeline.extract(query)
+    except Exception as e:
+        print(f"Failed: {type(e).__name__}:{e}")
+        return {"query": query, "status": "failed", "error": str(e), "files": []}
 
-    # Build only the formats that are switched on
     format_dispatch = {
         "intent_extraction": result.to_intent_extraction,
         "final_queries": result.to_final_queries,
@@ -1118,47 +1372,50 @@ def run_single_query(
         data = format_dispatch[name]()
         filename = f"{prefix}_{name}.json"
         save_json(data, filename)
-        valid, err = validate_schema(data, name)
-        if not valid:
-            print(f"  Schema validation failed for {filename}: {err}")
         files.append(filename)
-
-    skipped = [n for n in format_dispatch if n not in enabled]
-    if skipped:
-        print(f"  Skipped outputs: {', '.join(skipped)}")
 
     print("-" * 60)
     return {"query": query, "status": "completed", "files": files}
 
+def minimal_pipeline(pipeline, q):
+    relevance = pipeline.check_relevance(q)
+
+    if not relevance.is_processable:
+        return {
+            "question": q,
+            "is_processable": False,
+            "action": relevance.action,
+        }
+
+    result = pipeline.extract(q)
+
+    fp = result.to_full_pipeline()
+
+    return {
+        "question": q,
+        "expanded_query": fp.get("expanded_query"),
+        "is_clinical": fp.get("is_clinical"),
+        "reason": fp.get("reason"),
+        "representative_terms": fp.get("representative_terms"),
+        "total_intents_detected": fp.get("total_intents_detected"),        
+        "intents": fp.get("intents"),
+    }
 
 
 if __name__ == "__main__":
-   
     PROJECT_ID = PROJECT_ID
-    LOCATION = "us-central1"
-    MODEL_VERSION = "gemini-2.5-flash"
-
-    output_config = OutputConfig(
-        # True = yes, False = skip
-        intent_extraction=False,
-        final_queries=False,
-        nature_breakdown=False,
-        full_pipeline=True,
-    )
+    LOCATION = LOCATION
+    MODEL_VERSION = MODEL_VERSION
 
     pipeline = ContextualIntentPipeline(
-        project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
+        project=PROJECT_ID,
+        location=LOCATION,
+        model=MODEL_VERSION
     )
 
-    test_queries = [ "Would you be interested in participating in a clinical trial at Mayo Clinic?"
-        # "PCP notes within the last year","Most recent EKG with tracings","Genetic testing","TNM staging summary","Most recent cross-sectional imaging"
-    ]
+    query = "CT scan that documents your hernia?"
 
-    results = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(run_single_query, pipeline, query, idx, output_config): query
-            for idx, query in enumerate(test_queries, 6)
-        }
-        for future in as_completed(futures):
-            results.append(future.result())
+    result = minimal_pipeline(pipeline, query)
+
+    with open("full_pipeline_results.json", "w") as f:
+        json.dump(result, f, indent=2)
