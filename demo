@@ -329,19 +329,10 @@ User Input: {expanded_query}
 Timestamp: {timestamp}
 """
 
-CONTEXTUAL_ENVIRONMENT_PROMPT = """You are a clinical documentation intelligence specialist. You are NOT explaining the concept.
-Your role is to map each concept's documentation footprint in medical records and infer appropriate retrieval time windows.
-
-You must complete TWO TASKS in one response:
-
-TASK 1 — RETRIEVAL FACETS
-TASK 2 — TEMPORAL INFERENCE
-
-Task 1 must be completed first, as its output grounds Task 2.
-
-====================================================
-TASK 1: RETRIEVAL FACETS
-====================================================
+# Split out of CONTEXTUAL_ENVIRONMENT_PROMPT — Task 1 only.
+# This call runs in parallel with TEMPORAL_INFERENCE_PROMPT.
+CONTEXT_FACETS_PROMPT = """You are a clinical documentation intelligence specialist. You are NOT explaining the concept.
+Your role is to map each concept's documentation footprint in medical records.
 
 Return exactly {concept_count} entries in concepts_with_context. Return atomic_concept and intent_title exactly as provided.
 
@@ -384,68 +375,85 @@ RULES:
 - An empty list means "reasoned and concluded this does not apply." record_types and author_roles should rarely be empty.
 
 ====================================================
-TASK 2: TEMPORAL INFERENCE
+INPUTS
 ====================================================
 
-Task 2 operates at the intent level and may differ from the lifecycle scope in Task 1.
+Original query: {original_query}
+Expanded query: {expanded_query}
+
+Concepts to document:
+{concepts_json}
+"""
+
+# Split out of CONTEXTUAL_ENVIRONMENT_PROMPT — Task 2 only.
+# This call runs in parallel with CONTEXT_FACETS_PROMPT.
+TEMPORAL_INFERENCE_PROMPT = """You are a clinical documentation intelligence specialist. Your role is to assign a short LIFECYCLE QUALIFIER to each candidate that describes what state of the concept the query is asking about.
 
 Produce `temporal_by_intent`.
 
 For each intent:
 - Include intent_title (unchanged)
 - Include candidates (one per candidate)
-- Each candidate must include a `temporal_signal` (LIST)
+- Each candidate must include a `temporal_signal` (LIST of short lifecycle qualifiers)
 
-TEMPORAL SIGNAL (facet definition):
-- temporal_signal: WHAT TIME WINDOWS apply for retrieval. Each entry is a string. The actual values are derived from the query's wording and the concept's clinical nature — there is NO fixed vocabulary to draw from.
+====================================================
+ALLOWED VALUES — STRICT
+====================================================
 
-TEMPORAL SIGNAL TYPES:
+Each entry in temporal_signal MUST be a short single-word (occasionally two-word) lifecycle qualifier. Pick from common clinical-state vocabulary such as:
 
-Four categories. The values you emit come from the query's own language; do not pull from a predefined list.
+- "current"
+- "active"
+- "ongoing"
+- "recent"
+- "resolved"
+- "past"
+- "historical"
+- "prior"
+- "chronic"
+- "acute"
+- "new onset"
 
-- RELATIVE: a duration or recency window expressed in the query's words
-- ABSOLUTE: the ISO date-range form of a RELATIVE signal — YYYY-MM-DD to YYYY-MM-DD, anchored to the query's reference date
-- STATE: a lifecycle qualifier — whether the concept is being asked about as present, ongoing, resolved, or past
-- RANK: an ordering cue — when the query asks for a positional pick rather than all instances
+You may use a synonym that fits the same family if the query clearly calls for it, but it MUST stay in the form of a short state/lifecycle word — never a sentence, never a phrase describing a time window.
 
-Use the query's wording verbatim when it is unambiguous. Normalize only when the query's wording is vague, and derive the normalization from the concept's documentation cadence — not from a fixed lookup.
+====================================================
+HARD PROHIBITIONS
+====================================================
 
-EMISSION RULES:
+DO NOT emit any of the following — these are violations:
 
-Emit ONLY the forms that are anchored in the query or in the concept's nature. Do NOT fabricate a window to "cover all types."
+- Sentences or explanatory phrases ("the most recent CT scan", "documented within the past year")
+- Duration windows ("last 12 months", "past 6 weeks", "since 2020")
+- ISO date ranges ("2024-05-15 to 2025-05-15")
+- Ranking phrases ("most recent", "latest", "first")  → if the query implies recency, use "recent" or "current" instead
+- Type prefixes ("STATE: active", "Status - current")
+- Empty strings or null values
 
-- Emit RELATIVE only when the query expresses a duration or recency window in its wording.
-- Emit ABSOLUTE only when RELATIVE is present — it is the ISO form of that span.
-- Emit STATE only when (a) the query frames the concept as a state through its wording or tense, or (b) the concept is inherently a state — meaning its clinical documentation has no useful interpretation without a state qualifier.
-- Emit RANK only when the query asks for a positional pick (one or more specific positions in an ordered set).
+Even if the query's wording contains a duration like "in the last 12 months", DO NOT echo that wording. Map it to the closest lifecycle qualifier ("recent" or "current").
 
-If the query carries no temporal cue and the concept is not inherently a state, return an empty list. An empty temporal_signal is a valid and often correct answer.
+====================================================
+INFERENCE RULES
+====================================================
 
-INFERENCE PRINCIPLES:
+1. Read the query's verb tense, framing, and the clinical nature of the concept.
+2. Pick the lifecycle qualifier that best matches how the query frames the concept:
+   - Present-tense / "do you have" / "current X" → "current" or "active"
+   - "History of" / "prior" / past-tense / "ever had" → "past" or "historical"
+   - "Latest" / "most recent" / "within the last [N]" → "recent"
+   - Long-running condition framing → "chronic" or "ongoing"
+   - Short-term symptom framing → "acute" or "new onset"
+3. If the query carries no clear state framing AND the concept is not inherently state-bound, emit ["current"] as a safe default.
+4. Each candidate's temporal_signal must be a LIST, even when it has only one value.
+5. Typically emit ONE value per candidate. Two values are acceptable only when both clearly apply (e.g. "active" + "chronic" for a long-standing ongoing condition). Never emit more than two.
 
-1. The query's wording is the primary anchor. Verb tense, phrasing, framing, and explicit time words are all signals — read them together.
+====================================================
+OUTPUT RULES
+====================================================
 
-2. When the query expresses a span vaguely, normalize it using the concept's documentation cadence — how often that modality is typically generated, reviewed, or considered current in clinical workflow. Cadence is a property of the concept type, not a fixed table.
-
-3. Do NOT invent a temporal cue the query does not carry. A query with no temporal language and a non-stateful concept yields an empty list — that is the correct answer, not a failure.
-
-4. For concepts whose clinical documentation requires a state qualifier to be meaningful, emit STATE even if the query does not use a state word — but the qualifier you emit must reflect what the query's framing supports.
-
-5. Match concept type to signal type:
-   - Concepts that represent an ongoing condition → STATE matching query framing
-   - Concepts that represent past events → STATE or RELATIVE matching query framing
-   - Diagnostics and measurements → RELATIVE only if the query carries a recency cue; the span follows the modality's cadence
-   - Ranked queries → RANK matching the query's ordering language
-
-6. When uncertain, prefer precision over breadth. An empty or narrow list beats a fabricated wider one.
-
-OUTPUT RULES:
-
-- temporal_signal must be a list of plain strings
-- Values come from the query's wording or are normalized via concept cadence — never from a fixed dictionary
-- Use ISO format for absolute date ranges: YYYY-MM-DD to YYYY-MM-DD
-- No explanations or prose
-- Empty list is valid when no meaningful temporal dimension applies
+- temporal_signal is a list of plain short strings
+- Each string is 1-2 words, lowercase
+- No sentences, no explanations, no dates, no durations, no ranking words
+- Return ONLY valid JSON matching the schema
 
 ====================================================
 INPUTS
@@ -456,9 +464,6 @@ Expanded query: {expanded_query}
 
 Intents with candidates:
 {intents_json}
-
-Concepts to document:
-{concepts_json}
 """
 
 
@@ -582,6 +587,18 @@ class TemporalExtractionOutput(BaseModel):
 
 class ContextualEnvironmentOutput(BaseModel):
     concepts_with_context: List[ConceptContext] = Field(default_factory=list)
+    temporal_by_intent: List[IntentTemporal] = Field(default_factory=list)
+
+
+# Split-call output schemas. Each schema enforces that the LLM produces only
+# its half — facets call cannot waste tokens emitting temporal data, and
+# vice versa.
+
+class FacetsOnlyOutput(BaseModel):
+    concepts_with_context: List[ConceptContext] = Field(default_factory=list)
+
+
+class TemporalOnlyOutput(BaseModel):
     temporal_by_intent: List[IntentTemporal] = Field(default_factory=list)
 
 
@@ -1180,11 +1197,17 @@ class ContextualIntentPipeline:
         intent_out: IntentExtractionOutput,
     ) -> Optional[ContextualEnvironmentOutput]:
         """Step 3 — map each atomic concept's documentation facets AND
-        produce temporal signals per intent / candidate in one LLM call."""
+        produce temporal signals per intent / candidate.
+
+        OPTIMIZATION: Task 1 (facets) and Task 2 (temporal) are independent —
+        Task 2 explicitly 'operates at the intent level and may differ from
+        the lifecycle scope in Task 1'. They run as two parallel LLM calls,
+        which is materially faster than the combined call because the
+        temporal half is much smaller and finishes well before facets."""
         if not intent_out.is_clinical or not intent_out.intents:
             return None
 
-        # Flat list of unique concepts (Task 1 target list)
+        # Flat list of unique concepts (facets call target)
         concepts: List[Dict[str, str]] = []
         seen: set = set()
         for i in intent_out.intents:
@@ -1199,7 +1222,7 @@ class ContextualIntentPipeline:
         if not concepts:
             return None
 
-        # Rich per-intent structure (for Task 2 temporal reasoning)
+        # Rich per-intent structure (temporal call target)
         intents_payload: List[Dict[str, Any]] = []
         for i in intent_out.intents:
             cand_entries: List[str] = []
@@ -1222,17 +1245,39 @@ class ContextualIntentPipeline:
                 "candidates": cand_entries,
             })
 
-        return self._call_model(
-            CONTEXTUAL_ENVIRONMENT_PROMPT.format(
-                original_query=query,
-                expanded_query=expanded_query,
-                concepts_json=json.dumps(concepts, indent=2),
-                concept_count=len(concepts),
-                intents_json=json.dumps(intents_payload, indent=2),
-            ),
-            ContextualEnvironmentOutput,
-            fallback=ContextualEnvironmentOutput(),
-            max_tokens=16384,
+        facets_prompt = CONTEXT_FACETS_PROMPT.format(
+            original_query=query,
+            expanded_query=expanded_query,
+            concepts_json=json.dumps(concepts, indent=2),
+            concept_count=len(concepts),
+        )
+        temporal_prompt = TEMPORAL_INFERENCE_PROMPT.format(
+            original_query=query,
+            expanded_query=expanded_query,
+            intents_json=json.dumps(intents_payload, indent=2),
+        )
+
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_facets = ex.submit(
+                self._call_model,
+                facets_prompt,
+                FacetsOnlyOutput,
+                FacetsOnlyOutput(),  # fallback
+                12288,                # max_tokens — facets are the bulk
+            )
+            f_temporal = ex.submit(
+                self._call_model,
+                temporal_prompt,
+                TemporalOnlyOutput,
+                TemporalOnlyOutput(),  # fallback
+                4096,                  # max_tokens — temporal output is small
+            )
+            facets = f_facets.result()
+            temporal = f_temporal.result()
+
+        return ContextualEnvironmentOutput(
+            concepts_with_context=facets.concepts_with_context,
+            temporal_by_intent=temporal.temporal_by_intent,
         )
 
     # -- main entry points --
@@ -1249,7 +1294,7 @@ class ContextualIntentPipeline:
         # Step 2 — intent extraction
         intent_out = self.extract_intents(query, expansion.expanded_query)
 
-        # Step 3 — contextual environment (context + temporal in one LLM call)
+        # Step 3 — contextual environment (facets + temporal in parallel internally)
         context = self.build_context(query, expansion.expanded_query, intent_out)
 
         temporal: Optional[TemporalExtractionOutput] = None
@@ -1273,7 +1318,8 @@ class ContextualIntentPipeline:
             print(
                 f"Intents: {intent_out.total_intents_detected} | "
                 f"sub natures: {sub_nature_count} | "
-                f"candidates: {candidate_count}"
+                f"candidates: {candidate_count} | "
+                f"time: {processing_time:.1f}s"
             )
         else:
             print(f"Status    : Non-clinical — {intent_out.reason}")
@@ -1377,8 +1423,20 @@ def run_single_query(
     print("-" * 60)
     return {"query": query, "status": "completed", "files": files}
 
+
 def minimal_pipeline(pipeline, q):
-    relevance = pipeline.check_relevance(q)
+    """OPTIMIZATION: check_relevance and expand_query both take only the
+    original query as input — no data dependency between them. Run them
+    in parallel and only block on relevance before deciding to continue.
+    If relevance says not_processable, the speculative expansion result is
+    discarded (cheap — expansion is a small call)."""
+    t0 = datetime.utcnow()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_rel = ex.submit(pipeline.check_relevance, q)
+        f_exp = ex.submit(pipeline.expand_query, q)
+        relevance = f_rel.result()
+        expansion = f_exp.result()
 
     if not relevance.is_processable:
         return {
@@ -1387,9 +1445,23 @@ def minimal_pipeline(pipeline, q):
             "action": relevance.action,
         }
 
-    result = pipeline.extract(q)
+    # Continue sequentially — intents needs expansion, context needs intents.
+    intent_out = pipeline.extract_intents(q, expansion.expanded_query)
+    context = pipeline.build_context(q, expansion.expanded_query, intent_out)
+
+    temporal: Optional[TemporalExtractionOutput] = None
+    if context is not None:
+        temporal = TemporalExtractionOutput(
+            intents=list(context.temporal_by_intent or [])
+        )
+
+    processing_time = (datetime.utcnow() - t0).total_seconds()
+    result = ExtractionResult(
+        q, expansion, intent_out, context, temporal, processing_time,
+    )
 
     fp = result.to_full_pipeline()
+    print(f"Total time: {processing_time:.1f}s")
 
     return {
         "question": q,
@@ -1397,7 +1469,7 @@ def minimal_pipeline(pipeline, q):
         "is_clinical": fp.get("is_clinical"),
         "reason": fp.get("reason"),
         "representative_terms": fp.get("representative_terms"),
-        "total_intents_detected": fp.get("total_intents_detected"),        
+        "total_intents_detected": fp.get("total_intents_detected"),
         "intents": fp.get("intents"),
     }
 
