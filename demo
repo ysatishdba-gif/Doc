@@ -103,6 +103,35 @@ Return ONLY valid JSON (no markdown, no explanation):
 Original query: {query}
 """
 
+REPRESENTATIVE_TERMS_PROMPT = """
+You are a clinical query analyst. Read the ORIGINAL user query exactly as written and identify the named clinical entities the query is ABOUT.
+
+A representative term is a canonical, named clinical entity that a typical patient chart has its own section, list, or record for — diagnoses, medications, tests, procedures, devices, allergies, labs, imaging, billing, insurance, visits, etc.
+
+RULES:
+- Work ONLY from the original query. Do NOT expand abbreviations into multiple terms, do NOT add related concepts, do NOT enrich with clinical context.
+- Return the FEWEST terms that capture what the query is about — typically 1, occasionally 2, rarely 3. NEVER more than 3.
+- Each term must name a DIFFERENT entity. Synonyms, abbreviations, and qualifier-wrapped forms of the same entity collapse to ONE canonical short name.
+- Pick the SUBJECT, not modifiers. Apply the deletion test: remove the candidate from the query — if the query still makes clinical sense, it was a modifier (drop it); if the query collapses, it is the subject (keep it).
+- A term is the canonical short noun (e.g. "CT scan", "metformin", "genetic testing"), NOT a descriptive paraphrase or action phrase ("review of prior imaging", "prior systemic therapy").
+- Temporal expressions, severities, statuses, and action verbs are NEVER representative terms on their own.
+- If the query names no clinical entity, return an empty list.
+
+EXAMPLES:
+- "Most recent EKG with tracings" -> ["EKG"]
+- "CT scan that documents your hernia?" -> ["CT scan", "hernia"]
+- "Patient with DM and HTN, current meds?" -> ["medications"]
+- "Genetic testing" -> ["genetic testing"]
+- "Why was this claim denied?" -> ["claim"]
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "representative_terms": ["canonical entity 1", "canonical entity 2"]
+}}
+
+Original query: {query}
+"""
+
 QUERY_EXPANSION_PROMPT = """
 You are an expert medical AI assistant specializing in clinical query expansion.
 TASK: Expand the user's query into a comprehensive, detailed clinical description.
@@ -510,6 +539,12 @@ class RelevanceCheckOutput(BaseModel):
         return self.actions[0]
 
 
+class RepresentativeTermsOutput(BaseModel):
+    """Canonical named clinical entities the ORIGINAL query is about.
+    Derived from the raw query (not the expansion) so the count stays small."""
+    representative_terms: List[str] = Field(default_factory=list)
+
+
 class QueryExpansionOutput(BaseModel):
     expanded_query: str
     abbreviations_expanded: List[str] = Field(default_factory=list)
@@ -724,6 +759,20 @@ class Format_FullPipeline(BaseModel):
     intents: List[IntentWithContext]
 
 
+class Format_MinimalPipeline(BaseModel):
+    """Schema-locked output for minimal_pipeline(). Fields beyond the first
+    three are populated only on the processable path; they stay None / empty
+    on the not-processable short-circuit."""
+    question: str
+    is_processable: bool
+    action_finder: List[str] = Field(default_factory=list)
+    expanded_query: Optional[str] = None
+    is_clinical: Optional[bool] = None
+    representative_terms: list = Field(default_factory=list)
+    total_intents_detected: Optional[int] = None
+    intents: Optional[List[IntentWithContext]] = None
+
+
 
 # EXTRACTION RESULT — holds all intermediate data; emits all format views
 
@@ -743,6 +792,7 @@ class ExtractionResult:
         context: Optional[ContextualEnvironmentOutput],
         temporal: Optional[TemporalExtractionOutput],
         processing_time: float,
+        representative_terms: Optional[List[str]] = None,
     ):
         self.original_query = original_query
         self.expansion = expansion
@@ -750,6 +800,10 @@ class ExtractionResult:
         self.context = context
         self.temporal = temporal
         self.processing_time = processing_time
+        # Query-level representative terms (derived from the ORIGINAL query
+        # by extract_representative_terms). When empty, _representative_terms()
+        # falls back to the per-intent terms.
+        self.representative_terms_list: List[str] = list(representative_terms or [])
 
         # Build O(1) lookup index for concept contexts
         self._concept_index: Optional[Dict[str, ConceptContext]] = None
@@ -866,20 +920,30 @@ class ExtractionResult:
     # format methods
 
     def _representative_terms(self) -> List[str]:
-        """Flatten per-intent representative_terms into one case-insensitively
-        deduped list."""
+        """Case-insensitively deduped representative terms.
+
+        Primary source: query-level terms from extract_representative_terms
+        (derived from the ORIGINAL query — kept small and focused).
+        Fallback: flatten the per-intent terms (legacy behavior) only when
+        the dedicated query-level extraction produced nothing."""
+        source = self.representative_terms_list
+        if not source:
+            source = [
+                t
+                for intent in self.intents.intents
+                for t in (intent.representative_terms or [])
+            ]
         terms: List[str] = []
         seen: set = set()
-        for intent in self.intents.intents:
-            for t in intent.representative_terms or []:
-                t_clean = str(t).strip()
-                if not t_clean:
-                    continue
-                key = t_clean.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                terms.append(t_clean)
+        for t in source:
+            t_clean = str(t).strip()
+            if not t_clean:
+                continue
+            key = t_clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(t_clean)
         return terms
 
     def to_intent_extraction(self) -> Dict[str, Any]:
@@ -1173,6 +1237,17 @@ class ContextualIntentPipeline:
             max_tokens=512,
         )
 
+    def extract_representative_terms(self, query: str) -> RepresentativeTermsOutput:
+        """Identify the canonical named clinical entities the ORIGINAL query
+        is about. Runs on the raw query (NOT the expansion) so abbreviation
+        fan-out and added clinical context don't inflate the term count."""
+        return self._call_model(
+            REPRESENTATIVE_TERMS_PROMPT.format(query=query),
+            RepresentativeTermsOutput,
+            fallback=RepresentativeTermsOutput(),
+            max_tokens=256,
+        )
+
     def expand_query(self, query: str) -> QueryExpansionOutput:
         """Step 1 — normalize the query (abbreviations + explicit temporals)."""
         return self._call_model(
@@ -1277,8 +1352,13 @@ class ContextualIntentPipeline:
 
         t0 = datetime.utcnow()
 
-        # Step 1 — query normalization
-        expansion = self.expand_query(query)
+        # Step 1 — query normalization + representative terms. Both depend
+        # only on the ORIGINAL query, so run them in parallel.
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_exp = ex.submit(self.expand_query, query)
+            f_rep = ex.submit(self.extract_representative_terms, query)
+            expansion = f_exp.result()
+            rep_terms = f_rep.result()
 
         # Step 2 — intent extraction
         intent_out = self.extract_intents(query, expansion.expanded_query)
@@ -1317,6 +1397,7 @@ class ContextualIntentPipeline:
 
         return ExtractionResult(
             query, expansion, intent_out, context, temporal, processing_time,
+            rep_terms.representative_terms,
         )
 
     def run(
@@ -1362,6 +1443,7 @@ def validate_schema(result: Dict, format_type: str) -> Tuple[bool, Optional[str]
         "final_queries": Format_FinalQueries,
         "nature_breakdown": Format_NatureBreakdown,
         "full_pipeline": Format_FullPipeline,
+        "minimal_pipeline": Format_MinimalPipeline,
     }
     schema = schema_map.get(format_type)
     if schema is None:
@@ -1431,26 +1513,30 @@ def run_single_query(
     return {"query": query, "status": "completed", "files": files}
 
 
-def minimal_pipeline(pipeline, q):
-    """OPTIMIZATION: check_relevance and expand_query both take only the
-    original query as input — no data dependency between them. Run them
-    in parallel and only block on relevance before deciding to continue.
-    If relevance says not_processable, the speculative expansion result is
-    discarded (cheap — expansion is a small call)."""
+def minimal_pipeline(pipeline, q) -> Dict[str, Any]:
+    """OPTIMIZATION: check_relevance, expand_query, and
+    extract_representative_terms all take only the original query as input —
+    no data dependency between them. Run all three in parallel and only
+    block on relevance before deciding to continue. If relevance says
+    not_processable, the speculative results are discarded (cheap).
+
+    Returns a Format_MinimalPipeline dict — schema-locked on both branches."""
     t0 = datetime.utcnow()
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         f_rel = ex.submit(pipeline.check_relevance, q)
         f_exp = ex.submit(pipeline.expand_query, q)
+        f_rep = ex.submit(pipeline.extract_representative_terms, q)
         relevance = f_rel.result()
         expansion = f_exp.result()
+        rep_terms = f_rep.result()
 
     if not relevance.is_processable:
-        return {
-            "question": q,
-            "is_processable": False,
-            "action_finder": relevance.actions,
-        }
+        return Format_MinimalPipeline(
+            question=q,
+            is_processable=False,
+            action_finder=relevance.actions,
+        ).model_dump()
 
     # Continue sequentially — intents needs expansion, context needs intents.
     intent_out = pipeline.extract_intents(q, expansion.expanded_query)
@@ -1465,20 +1551,22 @@ def minimal_pipeline(pipeline, q):
     processing_time = (datetime.utcnow() - t0).total_seconds()
     result = ExtractionResult(
         q, expansion, intent_out, context, temporal, processing_time,
+        rep_terms.representative_terms,
     )
 
     fp = result.to_full_pipeline()
     print(f"Total time: {processing_time:.1f}s")
 
-    return {
-        "question": q,
-        "action_finder": relevance.actions,
-        "expanded_query": fp.get("expanded_query"),
-        "is_clinical": fp.get("is_clinical"),
-        "representative_terms": fp.get("representative_terms"),
-        "total_intents_detected": fp.get("total_intents_detected"),
-        "intents": fp.get("intents"),
-    }
+    return Format_MinimalPipeline(
+        question=q,
+        is_processable=True,
+        action_finder=relevance.actions,
+        expanded_query=fp.get("expanded_query"),
+        is_clinical=fp.get("is_clinical"),
+        representative_terms=fp.get("representative_terms"),
+        total_intents_detected=fp.get("total_intents_detected"),
+        intents=fp.get("intents"),
+    ).model_dump()
 
 
 if __name__ == "__main__":
@@ -1486,14 +1574,6 @@ if __name__ == "__main__":
     PROJECT_ID = PROJECT_ID
     LOCATION = "us-central1"
     MODEL_VERSION = "gemini-2.5-flash"
-
-    output_config = OutputConfig(
-        # True = yes, False = skip
-        intent_extraction=False,
-        final_queries=False,
-        nature_breakdown=False,
-        full_pipeline=True,
-    )
 
     pipeline = ContextualIntentPipeline(
         project=PROJECT_ID, location=LOCATION, model=MODEL_VERSION
@@ -1510,8 +1590,16 @@ if __name__ == "__main__":
     results = []
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(run_single_query, pipeline, query, idx, output_config): query
-            for idx, query in enumerate(test_queries, 2)
+            executor.submit(minimal_pipeline, pipeline, query): query
+            for query in test_queries
         }
-        for future in as_completed(futures):
-            results.append(future.result())
+        for idx, future in enumerate(as_completed(futures), 2):
+            res = future.result()
+            results.append(res)
+            valid, err = validate_schema(res, "minimal_pipeline")
+            if not valid:
+                print(f"  Schema validation failed: {err}")
+            filename = f"query{idx}_minimal_pipeline.json"
+            save_json(res, filename)
+            print(json.dumps(res, indent=2))
+            print("-" * 60)
